@@ -30,7 +30,7 @@ public:
         return interests;
     }
 
-    void Submit(const RunRecord& record) override {
+    void Submit(const RunRecord& record) override try {
         if (const auto* progress = std::get_if<RunProgressRecord>(&record)) {
             SubmitProgressRecord(*progress);
             return;
@@ -42,10 +42,14 @@ public:
         if (const auto* artifact = std::get_if<RunArtifactRecord>(&record)) {
             SubmitArtifactRecord(*artifact);
         }
-    }
+    } catch (...) { RecordExportFailure(); }
 
     [[nodiscard]] std::string LastReportError() const {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_lastReportError.empty() && m_lastReportFailure != DataCodecReportExportFailure::None) {
+            return m_lastReportFailure == DataCodecReportExportFailure::Preparation
+                ? "report preparation failed" : "report write failed";
+        }
         return m_lastReportError;
     }
 
@@ -67,10 +71,12 @@ private:
 
     void SubmitStatus(const DataCodecStatusRecord& status) const {
         if (m_sinks.ui != nullptr) {
-            m_sinks.ui->SubmitUiStatus(status);
+            try { m_sinks.ui->SubmitUiStatus(status); }
+            catch (...) { RecordExportFailure(); }
         }
         if (m_sinks.console != nullptr) {
-            m_sinks.console->SubmitConsoleStatus(status);
+            try { m_sinks.console->SubmitConsoleStatus(status); }
+            catch (...) { RecordExportFailure(); }
         }
     }
 
@@ -89,7 +95,8 @@ private:
             .technicalDetail = record.technicalDetail,
         };
         if (m_sinks.progress != nullptr) {
-            m_sinks.progress->SubmitProgress(progress);
+            try { m_sinks.progress->SubmitProgress(progress); }
+            catch (...) { RecordExportFailure(); }
         }
         auto statusText = FormatDataCodecProgressText(progress);
         if (!statusText.empty()) {
@@ -150,14 +157,16 @@ private:
         if (m_sinks.reportFile == nullptr || record.artifact.text.empty()) {
             return;
         }
-        const auto result = m_sinks.reportFile->WriteReportFile(DataCodecReportFile{
+        const auto result = m_sinks.reportFile->TryWriteReportFile([&] { return DataCodecReportFile{
             .name = record.artifact.name,
             .mediaType = record.artifact.mediaType,
             .preferredExtension = record.artifact.preferredExtension,
             .content = record.artifact.text,
-        });
+        }; });
         if (!result.success) {
+            RecordExportFailure();
             std::lock_guard<std::mutex> lock(m_mutex);
+            m_lastReportFailure = result.failure;
             m_lastReportError = result.error;
         }
     }
@@ -165,6 +174,7 @@ private:
     DataCodecOutputSinks m_sinks;
     mutable std::mutex m_mutex;
     std::string m_lastReportError;
+    DataCodecReportExportFailure m_lastReportFailure{DataCodecReportExportFailure::None};
 };
 
 } // namespace datacodec

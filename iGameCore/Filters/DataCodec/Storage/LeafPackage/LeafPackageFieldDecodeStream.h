@@ -3,8 +3,9 @@
 
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
+#include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowBudget.h"
 #include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 #include "DataCodec/Codec/SubCodec/ZstdCodec.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
@@ -76,8 +77,8 @@ public:
         m_source = std::move(source);
         m_sourceByteSize = static_cast<std::size_t>(sourceByteSize);
         m_rawSize = rawSize;
-        m_scratchBytePool = &runtime.scratchBytePool;
-        m_windowBudget = &runtime.windowBudget;
+        m_scratchBytePool = &runtime.ScratchBytePool();
+        m_stop = runtime.Run().StopToken();
         m_rawMode = false;
         if (m_rawSize == 0u && sourceByteSize == 0u) {
             m_finished = true;
@@ -117,8 +118,8 @@ public:
         m_source = std::move(source);
         m_sourceByteSize = static_cast<std::size_t>(sourceByteSize);
         m_rawSize = rawSize;
-        m_scratchBytePool = &runtime.scratchBytePool;
-        m_windowBudget = &runtime.windowBudget;
+        m_scratchBytePool = &runtime.ScratchBytePool();
+        m_stop = runtime.Run().StopToken();
         m_rawMode = true;
         if (m_rawSize == 0u) {
             m_finished = true;
@@ -132,6 +133,7 @@ public:
         std::string* error = nullptr) {
         segment = {};
         hasSegment = false;
+        if (m_stop.stop_requested()) { return validation::AssignError(error, "field stream read cancelled"); }
         if (m_source == nullptr) {
             validation::AssignError(error, "zstd decode segment reader is not open");
             return false;
@@ -144,6 +146,7 @@ public:
         }
 
         while (!m_finished) {
+            if (m_stop.stop_requested()) { return validation::AssignError(error, "field stream read cancelled"); }
             if (m_inputCursor == m_inputLimit && !FillInput(error)) {
                 return false;
             }
@@ -152,14 +155,12 @@ public:
                 return false;
             }
 
-            if (m_scratchBytePool == nullptr || m_windowBudget == nullptr) {
+            if (m_scratchBytePool == nullptr) {
                 validation::AssignError(error, "zstd decode window resources are missing");
                 return false;
             }
             m_outputScratchBuffer.Release();
-            m_outputWindowLease.Release();
-            m_outputWindowLease = m_windowBudget->Acquire(kDecodeOutputWindowBytes);
-            m_outputScratchBuffer = m_scratchBytePool->Acquire(kDecodeOutputWindowBytes);
+            m_outputScratchBuffer = m_scratchBytePool->Acquire(kIoWindowBytes);
             auto outputBuffer = m_outputScratchBuffer.Span();
 
             std::size_t consumedBytes = 0u;
@@ -240,25 +241,23 @@ private:
         if (m_finished) {
             return true;
         }
-        if (m_scratchBytePool == nullptr || m_windowBudget == nullptr) {
+        if (m_scratchBytePool == nullptr) {
             validation::AssignError(error, "raw decode window resources are missing");
             return false;
         }
         const auto remainingBytes = m_rawSize - m_outputOffset;
         const auto currentBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
             remainingBytes,
-            static_cast<std::uint64_t>(kDecodeInputWindowBytes)));
+            static_cast<std::uint64_t>(kIoWindowBytes)));
         if (currentBytes == 0u) {
             m_finished = true;
             return true;
         }
 
         m_outputScratchBuffer.Release();
-        m_outputWindowLease.Release();
-        m_outputWindowLease = m_windowBudget->Acquire(currentBytes);
         m_outputScratchBuffer = m_scratchBytePool->Acquire(currentBytes);
         auto outputBuffer = m_outputScratchBuffer.Span();
-        if (!m_source->Read(m_outputOffset, outputBuffer, error)) {
+        if (!m_source->ReadCancellable(m_outputOffset, outputBuffer, m_stop, error)) {
             return false;
         }
         segment.rawOffset = m_outputOffset;
@@ -280,7 +279,7 @@ private:
         }
 
         const auto currentBytes = std::min<std::size_t>(
-            kDecodeInputWindowBytes,
+            kIoWindowBytes,
             m_sourceByteSize - m_inputOffset);
         if (currentBytes == 0u) {
             m_currentInputSegment = {};
@@ -289,18 +288,17 @@ private:
             return true;
         }
 
-        if (m_scratchBytePool == nullptr || m_windowBudget == nullptr) {
+        if (m_scratchBytePool == nullptr) {
             validation::AssignError(error, "zstd decode window resources are missing");
             return false;
         }
         m_inputScratchBuffer.Release();
-        m_inputWindowLease.Release();
-        m_inputWindowLease = m_windowBudget->Acquire(currentBytes);
         m_inputScratchBuffer = m_scratchBytePool->Acquire(currentBytes);
         auto inputBuffer = m_inputScratchBuffer.Span();
-        if (!m_source->Read(
+        if (!m_source->ReadCancellable(
                 static_cast<std::uint64_t>(m_inputOffset),
                 inputBuffer,
+                m_stop,
                 error)) {
             return false;
         }
@@ -326,20 +324,17 @@ private:
         m_finished = false;
         m_inputScratchBuffer.Release();
         m_outputScratchBuffer.Release();
-        m_inputWindowLease.Release();
-        m_outputWindowLease.Release();
         m_scratchBytePool = nullptr;
-        m_windowBudget = nullptr;
+        m_stop = {};
         m_rawMode = false;
     }
 
     void MoveFrom(FieldDecodeStreamReader&& other) noexcept {
         m_source = std::move(other.m_source);
+        m_stop = std::exchange(other.m_stop, {});
         m_zstdDecoder = std::move(other.m_zstdDecoder);
         m_inputScratchBuffer = std::move(other.m_inputScratchBuffer);
         m_outputScratchBuffer = std::move(other.m_outputScratchBuffer);
-        m_inputWindowLease = std::move(other.m_inputWindowLease);
-        m_outputWindowLease = std::move(other.m_outputWindowLease);
         const auto currentInputBytes = other.m_currentInputSegment.bytes.size();
         m_sourceByteSize = other.m_sourceByteSize;
         m_rawSize = other.m_rawSize;
@@ -353,7 +348,6 @@ private:
         m_outputOffset = other.m_outputOffset;
         m_finished = other.m_finished;
         m_scratchBytePool = other.m_scratchBytePool;
-        m_windowBudget = other.m_windowBudget;
         m_rawMode = other.m_rawMode;
         other.m_source.reset();
         other.m_sourceByteSize = 0u;
@@ -365,7 +359,6 @@ private:
         other.m_outputOffset = 0u;
         other.m_finished = false;
         other.m_scratchBytePool = nullptr;
-        other.m_windowBudget = nullptr;
         other.m_rawMode = false;
     }
 
@@ -373,10 +366,7 @@ private:
     codec::ZstdStreamingDecoder m_zstdDecoder;
     ScratchByteBuffer m_inputScratchBuffer;
     ScratchByteBuffer m_outputScratchBuffer;
-    window::WindowBudget::Lease m_inputWindowLease;
-    window::WindowBudget::Lease m_outputWindowLease;
     ScratchByteBufferPool* m_scratchBytePool{nullptr};
-    window::WindowBudget* m_windowBudget{nullptr};
     std::size_t m_sourceByteSize{0u};
     std::uint64_t m_rawSize{0u};
     std::size_t m_inputOffset{0};
@@ -386,6 +376,7 @@ private:
     std::uint64_t m_outputOffset{0};
     bool m_finished{false};
     bool m_rawMode{false};
+    std::stop_token m_stop;
 };
 
 inline bool OpenLeafPackageFieldDecodeStream(
@@ -405,6 +396,60 @@ inline bool OpenLeafPackageFieldDecodeStream(
     }
     validation::AssignError(error, "leaf package field uses an unsupported compression type");
     return false;
+}
+
+inline bool PrepareLeafPackageFieldPayload(
+    const LeafPackageField& field, const CacheResources& runtime, bytestore::ByteStoreSession& session,
+    std::shared_ptr<bytestore::IByteSource>& payload, std::string* error = nullptr) {
+    payload.reset();
+    auto& root = runtime.Run();
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return false; }
+    if (!field.source || !field.source->CanRead()) {
+        return validation::AssignError(error, "field payload requires a readable source");
+    }
+    if (field.compressionType == EncodedFieldCompressionType::None) {
+        if (field.source->ByteSizeHint() != field.rawSize) {
+            return validation::AssignError(error, "raw field payload size does not match metadata");
+        }
+        payload = field.source;
+        return true;
+    }
+    if (field.compressionType != EncodedFieldCompressionType::ZSTD) {
+        return validation::AssignError(error, "field payload compression type is unsupported");
+    }
+    auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, field.rawSize,
+        "prepared_field_payload", error);
+    if (!store) { return false; }
+    const bool success = RunTerminalWork(root, *phase, [&](WorkerContext& worker) {
+        FieldDecodeStreamReader reader;
+        if (!OpenLeafPackageFieldDecodeStream(field, runtime, reader, error)) { return false; }
+        std::uint64_t copied = 0u;
+        for (;;) {
+            if (worker.StopToken().stop_requested()) { return false; }
+            FieldOutputSegment segment;
+            bool hasSegment = false;
+            if (!reader.ReadNext(segment, hasSegment, error)) { return false; }
+            if (!hasSegment) { break; }
+            if (segment.rawOffset != copied || copied > field.rawSize ||
+                segment.bytes.size() > field.rawSize - copied) {
+                return validation::AssignError(error, "field payload segment has an invalid range");
+            }
+            for (std::size_t offset = 0u; offset < segment.bytes.size();) {
+                const auto count = std::min(kIoWindowBytes, segment.bytes.size() - offset);
+                if (!store->WriteBytesAt(copied + offset, segment.bytes.subspan(offset, count), error)) { return false; }
+                offset += count;
+            }
+            copied += segment.bytes.size();
+        }
+        if (copied != field.rawSize) {
+            return validation::AssignError(error, "field decoded payload does not match the full recorded size");
+        }
+        return store->Seal(error);
+    });
+    if (!success) { return false; }
+    payload = std::move(store);
+    return true;
 }
 
 class FieldDecodeByteStream {

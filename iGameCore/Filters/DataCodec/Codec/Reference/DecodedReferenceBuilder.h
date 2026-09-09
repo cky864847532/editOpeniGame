@@ -25,6 +25,7 @@ inline const LeafPackage::Field* FindLeafPackageField(
 inline bool BuildAttributeReference(
     const LeafPackage& leafPackage,
     AttributeReference& reference,
+    const CacheResources& runtime,
     std::string* error = nullptr) {
     reference = {};
 
@@ -36,8 +37,6 @@ inline bool BuildAttributeReference(
         return validation::AssignError(error, "encoded params field is too large");
     }
 
-    CacheResources runtime;
-    runtime.Configure(runtime.accessWindowBytes, runtime.activeWindowBytes);
     decodefield::FieldDecodeStreamReader paramsReader;
     if (!decodefield::OpenLeafPackageFieldDecodeStream(
             *paramsField,

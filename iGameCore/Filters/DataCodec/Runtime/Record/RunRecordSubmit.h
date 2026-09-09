@@ -15,7 +15,7 @@ inline void SubmitRunMessage(
     if (sink == nullptr || !sink->Wants(RunRecordKind::Message)) {
         return;
     }
-    sink->Submit(RunRecord{RunMessageRecord{
+    sink->TrySubmit(RunRecord{RunMessageRecord{
         .runId = runId,
         .message = std::move(message),
     }});

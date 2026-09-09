@@ -5,7 +5,7 @@
 #include "DataCodec/Codec/NumericArray/NumericArrayCodec.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/CodecControlParams.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 
 #include <algorithm>
@@ -61,7 +61,6 @@ class CodecStorageParamsFactory {
 public:
     [[nodiscard]] static bool TryFromEncodeAdapter(
         const IEncodeAdapter& adapter,
-        const CodecControlParams* controlParams,
         const std::span<const std::size_t> selectedAttrIndices,
         CodecStorageParams& output,
         std::string* error = nullptr,
@@ -73,11 +72,6 @@ public:
         // 拓扑规模属于输入固有元数据，复用拓扑的流水线也必须保留
         params.topoParams.cellCount = static_cast<ParamSize>(adapter.GetNumberOfCells());
         params.geomParams = GeometryStorageParamsFactory::MakeDefault(adapter.GetNumberOfPoints());
-        const auto spatialPolicy = controlParams != nullptr
-            ? controlParams->spatialBlockPolicy
-            : SpatialBlockPolicyParams{};
-        params.spatialBlockParams.pointElementCount = spatialPolicy.pointElementCount;
-        params.spatialBlockParams.cellElementCount = spatialPolicy.cellElementCount;
 
         int axisSize[3]{0, 0, 0};
         if (adapter.GetStructuredAxisSize(axisSize)) {

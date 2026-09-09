@@ -1,7 +1,7 @@
 #ifndef DATACODEC_TEST_FEATURE_DATACODECFEATUREOUTPUTSINKS_H
 #define DATACODEC_TEST_FEATURE_DATACODECFEATUREOUTPUTSINKS_H
 
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Log/Report/DataCodecProcessReportJson.h"
 #include "DataCodec/Log/Telemetry/Sinks/TelemetrySessionSink.h"
 #include "DataCodec/Runtime/Output/DataCodecOutputRouter.h"
@@ -227,7 +227,7 @@ public:
             .workingSetBytes = 1800u,
             .workingSetBeforeBytes = 1200u,
             .workingSetAfterBytes = 1500u,
-            .peakWorkingSetBytes = 1800u,
+            .sampledPeakWorkingSetBytes = 1800u,
         },
     });
     const std::vector<TelemetrySession> processSessions{
@@ -277,7 +277,7 @@ public:
         processJson.find("\"Attributes\"") != std::string::npos &&
             processJson.find("\"measuredTaskCount\": 33") != std::string::npos &&
             processJson.find("\"longestMeasuredTaskMs\": 8.0") != std::string::npos &&
-            processJson.find("\"peakWorkingSetBytes\": 1800") != std::string::npos &&
+            processJson.find("\"sampledPeakWorkingSetBytes\": 1800") != std::string::npos &&
             processJson.find("AttrDecodeStage[") == std::string::npos &&
             hasTypedDetails,
         "outputSinks.processTreeAggregation",
@@ -321,7 +321,6 @@ public:
         "encode process report should expose source size, compressed size, decimal ratio, and calculation note");
 
     DataCodecEncodeOptions encodeOptions;
-    encodeOptions.tier = DataCodecEncodeTier::TimePriority;
     encodeOptions.enableCompressionEnhancement = true;
     encodeOptions.packageZstdLevel = 7;
     const auto encodeDefinition = MakeEncodeConfigurationParams(encodeOptions);
@@ -331,7 +330,11 @@ public:
         .objectName = "configuration.igc",
         .success = true,
         .configuration = MakeDataCodecEncodeReportConfiguration(
-            encodeOptions.tier,
+            CodecResourceParams{
+                .mode = CodecResourceMode::Fixed,
+                .maxComputeThreads = 2u,
+                .ownedStorageLimitBytes = 8192u,
+            },
             encodeOptions.enableCompressionEnhancement,
             encodeDefinition),
     };
@@ -348,9 +351,9 @@ public:
     if (hasEncodeConfiguration) {
         const auto& configuration = encodeConfigurationDocument["configuration"];
         hasEncodeConfiguration =
-            configuration.HasMember("preset") &&
-            configuration["preset"].IsString() &&
-            std::string(configuration["preset"].GetString()) == "TimePriority" &&
+            configuration.HasMember("resourceMode") &&
+            configuration["resourceMode"].IsString() &&
+            std::string(configuration["resourceMode"].GetString()) == "Fixed" &&
             configuration.HasMember("runtimeProfile") &&
             configuration["runtimeProfile"].IsString() &&
             std::string(configuration["runtimeProfile"].GetString()) == "Native" &&
@@ -362,23 +365,20 @@ public:
             configuration["pipeline"].HasMember("packageZstdLevel") &&
             configuration["pipeline"]["packageZstdLevel"].IsInt64() &&
             configuration["pipeline"]["packageZstdLevel"].GetInt64() == 7 &&
-            configuration.HasMember("parallelism") &&
-            configuration["parallelism"].IsObject() &&
-            configuration["parallelism"].HasMember("attributeCompressionLanes") &&
-            configuration["parallelism"]["attributeCompressionLanes"].IsUint64() &&
-            configuration.HasMember("storage") &&
-            configuration["storage"].IsObject() &&
-            configuration.HasMember("resourceBudget") &&
-            configuration["resourceBudget"].IsObject();
+            configuration.HasMember("resourceLimits") &&
+            configuration["resourceLimits"].IsObject() &&
+            configuration["resourceLimits"].HasMember("maxComputeThreads") &&
+            configuration["resourceLimits"]["maxComputeThreads"].GetUint64() == 2u &&
+            configuration["resourceLimits"].HasMember("ownedStorageLimitBytes") &&
+            configuration["resourceLimits"]["ownedStorageLimitBytes"].GetUint64() == 8192u;
     }
     Require(
         result,
         hasEncodeConfiguration,
         "outputSinks.encodeConfiguration",
-        "encode process report should expose the preset and resolved key configuration values");
+        "encode process report must expose the resource mode and explicit startup limits");
 
     DataCodecDecodeOptions decodeOptions;
-    decodeOptions.tier = DataCodecDecodeTier::Fast;
     decodeOptions.validationProfile = DataCodecDecodeValidationProfile::Audit;
     const auto decodeDefinition = MakeDecodeConfigurationParams(decodeOptions);
     const DataCodecProcessReport decodeConfigurationReport{
@@ -387,7 +387,7 @@ public:
         .objectName = "configuration.igc",
         .success = true,
         .configuration = MakeDataCodecDecodeReportConfiguration(
-            std::optional<DataCodecDecodeTier>{decodeOptions.tier},
+            CodecResourceParams{.mode = CodecResourceMode::Adaptive},
             decodeDefinition,
             true),
     };
@@ -404,38 +404,26 @@ public:
     if (hasDecodeConfiguration) {
         const auto& configuration = decodeConfigurationDocument["configuration"];
         hasDecodeConfiguration =
-            configuration.HasMember("preset") &&
-            configuration["preset"].IsString() &&
-            std::string(configuration["preset"].GetString()) == "Fast" &&
+            configuration.HasMember("resourceMode") &&
+            configuration["resourceMode"].IsString() &&
+            std::string(configuration["resourceMode"].GetString()) == "Adaptive" &&
             configuration.HasMember("validation") &&
             configuration["validation"].IsObject() &&
             configuration["validation"].HasMember("mode") &&
             configuration["validation"]["mode"].IsString() &&
             std::string(configuration["validation"]["mode"].GetString()) == "Strict" &&
-            configuration.HasMember("execution") &&
-            configuration["execution"].IsObject() &&
-            configuration["execution"].HasMember("fullInputPrefetchEnabled") &&
-            configuration["execution"]["fullInputPrefetchEnabled"].IsBool() &&
-            configuration["execution"]["fullInputPrefetchEnabled"].GetBool() &&
             configuration.HasMember("caching") &&
             configuration["caching"].IsObject() &&
-            configuration.HasMember("storage") &&
-            configuration["storage"].IsObject() &&
-            configuration["storage"].HasMember("attributePayloadMode") &&
-            configuration["storage"]["attributePayloadMode"].IsString() &&
-            std::string(configuration["storage"]["attributePayloadMode"].GetString()) ==
-                "OneShotZstd" &&
-            configuration.HasMember("resourceBudget") &&
-            configuration["resourceBudget"].IsObject() &&
-            configuration["resourceBudget"].HasMember("residentLimitMiB") &&
-            configuration["resourceBudget"]["residentLimitMiB"].IsUint64() &&
-            configuration["resourceBudget"]["residentLimitMiB"].GetUint64() == 16384u;
+            configuration.HasMember("resourceLimits") &&
+            configuration["resourceLimits"].IsObject() &&
+            !configuration["resourceLimits"].HasMember("maxComputeThreads") &&
+            !configuration["resourceLimits"].HasMember("ownedStorageLimitBytes");
     }
     Require(
         result,
         hasDecodeConfiguration,
         "outputSinks.decodeConfiguration",
-        "decode process report should expose the preset and resolved key configuration values");
+        "adaptive report must leave unresolved startup limits absent");
 
     DataCodecProcessReport workflowMemoryReport{
         .operation = TelemetryRunKind::Encode,
@@ -449,7 +437,7 @@ public:
                     .valid = true,
                     .beforeWorkingSetBytes = 15000u,
                     .afterWorkingSetBytes = 19000u,
-                    .peakWorkingSetBytes = 20000u,
+                    .sampledPeakWorkingSetBytes = 20000u,
                 },
             },
             DataCodecProcessNode{
@@ -458,7 +446,7 @@ public:
                     .valid = true,
                     .beforeWorkingSetBytes = 3000u,
                     .afterWorkingSetBytes = 3500u,
-                    .peakWorkingSetBytes = 17000u,
+                    .sampledPeakWorkingSetBytes = 17000u,
                 },
             },
         },
@@ -468,7 +456,7 @@ public:
         result,
         workflowMemoryReport.memory.beforeWorkingSetBytes == 15000u &&
             workflowMemoryReport.memory.afterWorkingSetBytes == 3500u &&
-            workflowMemoryReport.memory.peakWorkingSetBytes == 20000u,
+            workflowMemoryReport.memory.sampledPeakWorkingSetBytes == 20000u,
         "outputSinks.processMemoryLifecycle",
         "process report memory should preserve workflow start, workflow end, and global peak");
     auto runningReport = processReport;
@@ -534,7 +522,7 @@ public:
         TelemetryResourceUsage{
             .valid = true,
             .workingSetBytes = 2048u,
-            .peakWorkingSetBytes = 2048u,
+            .sampledPeakWorkingSetBytes = 2048u,
         },
         TelemetryStageCategory::Attribute);
     summaryRecords.AddArtifact({

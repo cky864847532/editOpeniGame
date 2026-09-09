@@ -34,6 +34,8 @@ public:
     virtual bool BeginConnectivityTopology(
         const ConnectivityTopologyDecodeInfo& info,
         std::string* error = nullptr) = 0;
+    // 同步消费当前块，按值移出的数组归调用方所有
+    // 调用方自行创建的后台队列不属于 DataCodec 的在途资源范围
     virtual bool ObserveConnectivityBlock(
         DecodedConnectivityTopologyBlock block,
         std::string* error = nullptr) = 0;

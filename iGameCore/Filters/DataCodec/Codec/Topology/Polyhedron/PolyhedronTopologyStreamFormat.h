@@ -2,11 +2,64 @@
 #define DATACODEC_CODEC_TOPOLOGY_POLYHEDRON_POLYHEDRONTOPOLOGYSTREAMFORMAT_H
 
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 namespace datacodec::polyhedron {
+
+enum class PolyhedronBufferSample : std::size_t {
+    UniqueIds,
+    FaceVertexCounts,
+    LocalIds,
+    OverflowPoints,
+    OverflowLocals,
+    CellVertexOffsets,
+    CellFaceOffsets,
+    FaceVertexOffsets,
+    UniqueCounts,
+    CellFaceCounts,
+    FaceCountWindow,
+    StreamReadWindow,
+    IndexWriteWindow,
+    StreamUniqueCounts,
+    StreamUniqueIds,
+    StreamCellFaces,
+    StreamFaceVertices,
+    StreamLocalIds,
+    Count,
+};
+
+// 固定清单覆盖实际自有数组，流与批次各自保存独立取样身份
+struct PolyhedronCapacitySamples {
+    std::array<BufferCapacitySample, static_cast<std::size_t>(PolyhedronBufferSample::Count)> values{{
+        BufferCapacitySample{"polyhedron.unique_ids"},
+        BufferCapacitySample{"polyhedron.face_vertex_counts"},
+        BufferCapacitySample{"polyhedron.local_ids"},
+        BufferCapacitySample{"polyhedron.overflow_points"},
+        BufferCapacitySample{"polyhedron.overflow_locals"},
+        BufferCapacitySample{"polyhedron.cell_vertex_offsets"},
+        BufferCapacitySample{"polyhedron.cell_face_offsets"},
+        BufferCapacitySample{"polyhedron.face_vertex_offsets"},
+        BufferCapacitySample{"polyhedron.unique_counts"},
+        BufferCapacitySample{"polyhedron.cell_face_counts"},
+        BufferCapacitySample{"polyhedron.face_count_window"},
+        BufferCapacitySample{"polyhedron.stream_read_window"},
+        BufferCapacitySample{"polyhedron.index_write_window"},
+        BufferCapacitySample{"polyhedron.stream.unique_counts"},
+        BufferCapacitySample{"polyhedron.stream.unique_ids"},
+        BufferCapacitySample{"polyhedron.stream.cell_faces"},
+        BufferCapacitySample{"polyhedron.stream.face_vertices"},
+        BufferCapacitySample{"polyhedron.stream.local_ids"},
+    }};
+
+    template<class T>
+    void Observe(const PolyhedronBufferSample kind, const T& storage) noexcept {
+        values[static_cast<std::size_t>(kind)].Observe(storage);
+    }
+};
 
 enum class PolyhedronTopologyStreamKind : std::uint8_t {
     UniqueVertexCounts = 0,

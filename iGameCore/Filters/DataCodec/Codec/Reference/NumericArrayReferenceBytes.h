@@ -2,6 +2,7 @@
 #define DATACODEC_CODEC_REFERENCE_NUMERICARRAYREFERENCEBYTES_H
 
 #include "DataCodec/Codec/NumericArray/NumericArrayReader.h"
+#include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
@@ -86,7 +87,6 @@ inline bool BuildNumericArrayNormalizedResampledSourceRangeBytesTyped(
     const NumericArrayStorageParams& referenceMeta,
     const NumericArrayStorageParams& targetMeta,
     ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     const std::size_t targetElementOffset,
     const std::size_t targetElementCount,
     ScratchByteBuffer& outputBytes,
@@ -135,37 +135,6 @@ inline bool BuildNumericArrayNormalizedResampledSourceRangeBytesTyped(
         return normalized * static_cast<double>(localReferenceElementCount - 1u);
     };
 
-    const auto firstReferencePosition = resolveReferencePosition(targetElementOffset);
-    const auto lastReferencePosition = resolveReferencePosition(targetElementOffset + targetElementCount - 1u);
-    const auto firstReferenceIndex = static_cast<std::size_t>(std::floor(firstReferencePosition));
-    const auto lastReferenceIndex = std::min(
-        static_cast<std::size_t>(std::ceil(lastReferencePosition)),
-        localReferenceElementCount - 1u);
-    const auto referenceRangeCount = lastReferenceIndex - firstReferenceIndex + 1u;
-
-    ScratchByteBuffer referenceBytes;
-    if (!referenceReader.ReadElements(
-            firstReferenceIndex,
-            referenceRangeCount,
-            scratchBytePool,
-            acquireScratchQuota,
-            referenceBytes,
-            error)) {
-        return false;
-    }
-    std::size_t referenceRangeBytes = 0u;
-    if (!validation::CheckedMulSizeT(
-            referenceRangeCount,
-            tupleBytes,
-            referenceRangeBytes,
-            "numeric array resample reference range bytes",
-            error)) {
-        return false;
-    }
-    if (referenceBytes.Bytes().size() != referenceRangeBytes) {
-        return validation::AssignError(error, "numeric array resample reference range byte size mismatch");
-    }
-
     std::size_t outputByteCountSizeT = 0u;
     if (!validation::CheckedMulSizeT(
             targetElementCount,
@@ -177,24 +146,58 @@ inline bool BuildNumericArrayNormalizedResampledSourceRangeBytesTyped(
     }
     const auto outputByteCount = static_cast<std::uint64_t>(outputByteCountSizeT);
     outputBytes = scratchBytePool.Acquire(
-        static_cast<std::size_t>(outputByteCount),
-        acquireScratchQuota ? acquireScratchQuota(outputByteCount) : ScratchByteQuotaLease{});
-    const auto* referenceValues = reinterpret_cast<const TValue*>(referenceBytes.Bytes().data());
+        static_cast<std::size_t>(outputByteCount));
+    const auto windowTuples = std::max<std::size_t>(1u, kIoWindowBytes / tupleBytes);
+    const auto lastTargetIndex = targetElementOffset + targetElementCount - 1u;
+    const auto lastNeededIndex = std::min(
+        static_cast<std::size_t>(std::floor(resolveReferencePosition(lastTargetIndex))) + 1u,
+        localReferenceElementCount - 1u);
+    ScratchByteBuffer referenceWindow;
+    auto leftTuple = scratchBytePool.Acquire(tupleBytes);
+    auto rightTuple = scratchBytePool.Acquire(tupleBytes);
+    std::size_t windowBegin = 0u, windowCount = 0u;
+    const auto readTuple = [&](const std::size_t index, const std::size_t nextTargetIndex,
+                               ScratchByteBuffer& tuple) {
+        if (index < windowBegin || index - windowBegin >= windowCount) {
+            auto count = std::min(windowTuples, lastNeededIndex - index + 1u);
+            // 稀疏映射只读相邻 tuple，避免每个目标点搬运整个空隙窗口
+            if (nextTargetIndex <= lastTargetIndex) {
+                const auto nextIndex = static_cast<std::size_t>(
+                    std::floor(resolveReferencePosition(nextTargetIndex)));
+                if (nextIndex > index && nextIndex - index >= windowTuples) {
+                    count = std::min<std::size_t>(count, 2u);
+                }
+            }
+            if (!referenceReader.ReadElements(index, count, scratchBytePool, referenceWindow, error)) {
+                return false;
+            }
+            if (referenceWindow.Span().size() != count * tupleBytes) {
+                return validation::AssignError(error, "numeric array resample window byte size mismatch");
+            }
+            windowBegin = index;
+            windowCount = count;
+        }
+        std::memcpy(tuple.Bytes().data(), referenceWindow.Span().data() + (index - windowBegin) * tupleBytes,
+            tupleBytes);
+        return true;
+    };
     auto* outputValues = reinterpret_cast<TValue*>(outputBytes.Bytes().data());
     for (std::size_t localTargetIndex = 0; localTargetIndex < targetElementCount; ++localTargetIndex) {
         const auto targetIndex = targetElementOffset + localTargetIndex;
         const auto referencePosition = resolveReferencePosition(targetIndex);
         const auto leftIndex = static_cast<std::size_t>(std::floor(referencePosition));
         const auto rightIndex = std::min(leftIndex + 1u, localReferenceElementCount - 1u);
-        const auto localLeftIndex = leftIndex - firstReferenceIndex;
-        const auto localRightIndex = rightIndex - firstReferenceIndex;
+        if (!readTuple(leftIndex, targetIndex + 1u, leftTuple) ||
+            !readTuple(rightIndex, targetIndex + 1u, rightTuple)) { return false; }
+        const auto* leftValues = reinterpret_cast<const TValue*>(leftTuple.Span().data());
+        const auto* rightValues = reinterpret_cast<const TValue*>(rightTuple.Span().data());
         const auto weightRight = referencePosition - static_cast<double>(leftIndex);
         const auto weightLeft = 1.0 - weightRight;
         for (std::size_t componentIndex = 0; componentIndex < componentCount; ++componentIndex) {
             const auto leftValue =
-                static_cast<double>(referenceValues[localLeftIndex * componentCount + componentIndex]);
+                static_cast<double>(leftValues[componentIndex]);
             const auto rightValue =
-                static_cast<double>(referenceValues[localRightIndex * componentCount + componentIndex]);
+                static_cast<double>(rightValues[componentIndex]);
             outputValues[localTargetIndex * componentCount + componentIndex] =
                 static_cast<TValue>(leftValue * weightLeft + rightValue * weightRight);
         }
@@ -207,7 +210,6 @@ inline bool BuildNumericArrayNormalizedResampledSourceRangeBytes(
     const NumericArrayStorageParams& referenceMeta,
     const NumericArrayStorageParams& targetMeta,
     ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     const std::size_t targetElementOffset,
     const std::size_t targetElementCount,
     ScratchByteBuffer& outputBytes,
@@ -218,7 +220,6 @@ inline bool BuildNumericArrayNormalizedResampledSourceRangeBytes(
             referenceMeta,
             targetMeta,
             scratchBytePool,
-            acquireScratchQuota,
             targetElementOffset,
             targetElementCount,
             outputBytes,
@@ -230,7 +231,6 @@ inline bool BuildNumericArrayNormalizedResampledSourceRangeBytes(
             referenceMeta,
             targetMeta,
             scratchBytePool,
-            acquireScratchQuota,
             targetElementOffset,
             targetElementCount,
             outputBytes,
@@ -244,7 +244,6 @@ inline bool BuildNumericArrayReferenceRangeBytes(
     const NumericArrayStorageParams& referenceMeta,
     const NumericArrayStorageParams& targetMeta,
     ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     const std::size_t targetElementOffset,
     const std::size_t targetElementCount,
     ScratchByteBuffer& outputBytes,
@@ -254,7 +253,6 @@ inline bool BuildNumericArrayReferenceRangeBytes(
             targetElementOffset,
             targetElementCount,
             scratchBytePool,
-            acquireScratchQuota,
             outputBytes,
             error);
     }
@@ -263,28 +261,6 @@ inline bool BuildNumericArrayReferenceRangeBytes(
         referenceMeta,
         targetMeta,
         scratchBytePool,
-        acquireScratchQuota,
-        targetElementOffset,
-        targetElementCount,
-        outputBytes,
-        error);
-}
-
-inline bool BuildNumericArrayReferenceRangeBytes(
-    const numericarray::NumericArrayReader& referenceReader,
-    const NumericArrayStorageParams& referenceMeta,
-    const NumericArrayStorageParams& targetMeta,
-    ScratchByteBufferPool& scratchBytePool,
-    const std::size_t targetElementOffset,
-    const std::size_t targetElementCount,
-    ScratchByteBuffer& outputBytes,
-    std::string* error = nullptr) {
-    return BuildNumericArrayReferenceRangeBytes(
-        referenceReader,
-        referenceMeta,
-        targetMeta,
-        scratchBytePool,
-        {},
         targetElementOffset,
         targetElementCount,
         outputBytes,
@@ -310,7 +286,6 @@ inline bool BuildNumericArrayShiftedPredictorBlockBytesFromRange(
     const std::size_t firstReferenceIndex,
     const NumericArrayStorageParams& meta,
     ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     const std::size_t elementOffset,
     const std::size_t elementCount,
     const std::int32_t predictorOffset,
@@ -349,8 +324,7 @@ inline bool BuildNumericArrayShiftedPredictorBlockBytesFromRange(
     }
     const auto outputByteCount = static_cast<std::uint64_t>(outputByteCountSizeT);
     outputBytes = scratchBytePool.Acquire(
-        static_cast<std::size_t>(outputByteCount),
-        acquireScratchQuota ? acquireScratchQuota(outputByteCount) : ScratchByteQuotaLease{});
+        static_cast<std::size_t>(outputByteCount));
     auto& bytes = outputBytes.Bytes();
     for (std::size_t localIndex = 0; localIndex < elementCount; ++localIndex) {
         const auto sourceIndex = ClampNumericArrayShiftedReferenceIndex(
@@ -375,7 +349,6 @@ inline bool BuildNumericArrayPredictorReferenceBlockBytes(
     const NumericArrayStorageParams& referenceMeta,
     const NumericArrayStorageParams& targetMeta,
     ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     const std::size_t elementOffset,
     const std::size_t elementCount,
     const std::int32_t predictorOffset,
@@ -402,7 +375,6 @@ inline bool BuildNumericArrayPredictorReferenceBlockBytes(
             referenceMeta,
             targetMeta,
             scratchBytePool,
-            acquireScratchQuota,
             firstTargetIndex,
             targetRangeCount,
             referenceRangeBytes,
@@ -438,30 +410,6 @@ inline bool BuildNumericArrayPredictorReferenceBlockBytes(
         firstTargetIndex,
         targetMeta,
         scratchBytePool,
-        acquireScratchQuota,
-        elementOffset,
-        elementCount,
-        predictorOffset,
-        outputBytes,
-        error);
-}
-
-inline bool BuildNumericArrayPredictorReferenceBlockBytes(
-    const numericarray::NumericArrayReader& referenceReader,
-    const NumericArrayStorageParams& referenceMeta,
-    const NumericArrayStorageParams& targetMeta,
-    ScratchByteBufferPool& scratchBytePool,
-    const std::size_t elementOffset,
-    const std::size_t elementCount,
-    const std::int32_t predictorOffset,
-    ScratchByteBuffer& outputBytes,
-    std::string* error = nullptr) {
-    return BuildNumericArrayPredictorReferenceBlockBytes(
-        referenceReader,
-        referenceMeta,
-        targetMeta,
-        scratchBytePool,
-        {},
         elementOffset,
         elementCount,
         predictorOffset,

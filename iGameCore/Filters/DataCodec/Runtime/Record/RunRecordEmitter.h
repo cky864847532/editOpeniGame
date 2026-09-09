@@ -2,6 +2,8 @@
 #define DATACODEC_RUNTIME_RECORD_RUNRECORDEMITTER_H
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
+#include "DataCodec/Common/DataCodecError.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +22,18 @@ namespace datacodec {
 
 class RunRecordEmitter {
 public:
+    explicit RunRecordEmitter(DataCodecExecutionResources* resources = nullptr) noexcept : m_resources(resources) {}
+
+    [[nodiscard]] std::uint64_t ExportFailureCount() const noexcept {
+        return m_exportFailures.load(std::memory_order_relaxed);
+    }
+
+    template<class Function>
+    void TryExport(Function&& function) const noexcept {
+        try { std::forward<Function>(function)(); }
+        catch (...) { ReportExportFailure(); }
+    }
+
     void Reset(RunRecordInfo run, IRunRecordSink* sink) {
         if (run.runId == 0u) {
             run.runId = NextRunRecordId();
@@ -31,6 +45,8 @@ public:
         m_artifactOrder.store(0u, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(m_messageMutex);
         m_messages.clear();
+        m_messageRetention = {};
+        m_exportFailures.store(0u, std::memory_order_relaxed);
     }
 
     [[nodiscard]] std::uint64_t RunId() const noexcept {
@@ -53,19 +69,37 @@ public:
         return m_sink != nullptr && m_sink->Requests(kind);
     }
 
-    void BeginRun() const {
+    void BeginRun() const try {
         Submit(RunRecordKind::RunBegin, RunRecord{RunBeginRecord{m_run}});
-    }
+    } catch (...) { ReportExportFailure(); }
 
-    void EndRun(RunEndRecord record) const {
+    void EndRun(const RunEndRecord& input) const try {
+        auto record = input;
         record.run = m_run;
         Submit(RunRecordKind::RunEnd, RunRecord{std::move(record)});
+    } catch (...) { ReportExportFailure(); }
+
+    // 请求的固定失败结果和清理已完成，丰富报告为锁外可选导出
+    void TryEndFailedRun(const CodecFailureRecord& failure, const RunEndRecord& record = {}) noexcept {
+        try {
+            AddMessage(MakeCodecTelemetryMessage(
+                std::string(failure.origin.data()), failure.code, std::string(failure.message.data())));
+        } catch (...) {
+            ReportExportFailure();
+        }
+        try {
+            auto completion = record;
+            completion.success = false;
+            EndRun(std::move(completion));
+        } catch (...) {
+            ReportExportFailure();
+        }
     }
 
-    void SubmitProgress(RunProgressRecord record) const {
+    void SubmitProgress(RunProgressRecord record) const try {
         record.runId = m_run.runId;
         Submit(RunRecordKind::Progress, RunRecord{std::move(record)});
-    }
+    } catch (...) { ReportExportFailure(); }
 
     void SubmitProgress(
         const RunProgressPhase phase,
@@ -73,7 +107,7 @@ public:
         const DataCodecMessageId messageId,
         std::initializer_list<DataCodecMessageArgument> arguments = {},
         const bool success = false,
-        std::string technicalDetail = {}) const {
+        std::string technicalDetail = {}) const try {
         auto message = LocalizeDataCodecMessage(
             m_run.language,
             messageId,
@@ -89,7 +123,7 @@ public:
             .technicalDetail = std::move(message.technicalDetail),
             .success = success,
         });
-    }
+    } catch (...) { ReportExportFailure(); }
 
     void AddLocalizedMessage(
         const TelemetryMessageSeverity severity,
@@ -97,7 +131,7 @@ public:
         const DataCodecMessageId messageId,
         std::initializer_list<DataCodecMessageArgument> arguments = {},
         std::string code = {},
-        std::string technicalDetail = {}) {
+        std::string technicalDetail = {}) try {
         auto message = LocalizeDataCodecMessage(
             m_run.language,
             messageId,
@@ -113,13 +147,14 @@ public:
             .text = std::move(message.text),
             .technicalDetail = std::move(message.technicalDetail),
         });
-    }
+    } catch (...) { ReportExportFailure(); }
 
-    void AddMessage(TelemetryMessageRecord message) {
+    void AddMessage(TelemetryMessageRecord message) try {
         message.order = m_messageOrder.fetch_add(1u, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(m_messageMutex);
-            m_messages.push_back(message);
+            try { AppendRetainedTelemetryMessage(m_messages, message, &m_messageRetention); }
+            catch (...) { ReportExportFailure(); }
         }
         Submit(
             RunRecordKind::Message,
@@ -128,48 +163,56 @@ public:
                 .runKind = m_run.runKind,
                 .message = std::move(message),
             }});
-    }
+    } catch (...) { ReportExportFailure(); }
 
-    [[nodiscard]] std::vector<TelemetryMessageRecord> TakeMessages() {
-        std::lock_guard<std::mutex> lock(m_messageMutex);
-        std::stable_sort(
-            m_messages.begin(),
-            m_messages.end(),
+    [[nodiscard]] std::vector<TelemetryMessageRecord> TakeMessages() noexcept {
+        std::vector<TelemetryMessageRecord> messages;
+        {
+            std::lock_guard<std::mutex> lock(m_messageMutex);
+            messages.swap(m_messages);
+        }
+        // order 在接收时唯一赋值，原地排序无需 stable_sort 的临时数组
+        std::sort(
+            messages.begin(),
+            messages.end(),
             [](const auto& left, const auto& right) { return left.order < right.order; });
-        auto messages = std::move(m_messages);
-        m_messages.clear();
         return messages;
     }
 
-    void AddInfo(std::string origin, std::string text) {
+    [[nodiscard]] TelemetryRetentionStats MessageRetention() const {
+        std::lock_guard lock(m_messageMutex);
+        return m_messageRetention;
+    }
+
+    void AddInfo(std::string origin, std::string text) try {
         AddMessage(TelemetryMessageRecord{
             .severity = TelemetryMessageSeverity::Info,
             .origin = std::move(origin),
             .text = std::move(text),
         });
-    }
+    } catch (...) { ReportExportFailure(); }
 
-    void AddWarning(std::string origin, std::string text) {
+    void AddWarning(std::string origin, std::string text) try {
         AddMessage(TelemetryMessageRecord{
             .severity = TelemetryMessageSeverity::Warning,
             .origin = std::move(origin),
             .text = std::move(text),
         });
-    }
+    } catch (...) { ReportExportFailure(); }
 
-    void AddError(std::string origin, std::string text) {
+    void AddError(std::string origin, std::string text) try {
         AddMessage(TelemetryMessageRecord{
             .severity = TelemetryMessageSeverity::Error,
             .origin = std::move(origin),
             .text = std::move(text),
         });
-    }
+    } catch (...) { ReportExportFailure(); }
 
     void RecordStageTiming(
         std::string stageName,
         const double elapsedMs,
         const TelemetryStageCategory category = TelemetryStageCategory::General,
-        std::string scope = {}) {
+        std::string scope = {}) try {
         TelemetryStageRecord stage{
             .name = std::move(stageName),
             .order = m_stageOrder.fetch_add(1u, std::memory_order_relaxed),
@@ -180,25 +223,25 @@ public:
         Submit(
             RunRecordKind::StageTiming,
             RunRecord{RunStageTimingRecord{m_run.runId, std::move(stage)}});
-    }
+    } catch (...) { ReportExportFailure(); }
 
     void RecordResourceUsage(
         std::string stageName,
         const std::uint64_t logicalBytes,
         const TelemetryStageCategory category = TelemetryStageCategory::General,
-        std::string scope = {}) {
+        std::string scope = {}) try {
         RecordResourceUsage(
             std::move(stageName),
             MakeLogicalTelemetryResourceUsage(logicalBytes),
             category,
             std::move(scope));
-    }
+    } catch (...) { ReportExportFailure(); }
 
     void RecordResourceUsage(
         std::string stageName,
         TelemetryResourceUsage resource,
         const TelemetryStageCategory category = TelemetryStageCategory::General,
-        std::string scope = {}) {
+        std::string scope = {}) try {
         TelemetryStageRecord stage{
             .name = std::move(stageName),
             .order = m_stageOrder.fetch_add(1u, std::memory_order_relaxed),
@@ -209,43 +252,51 @@ public:
         Submit(
             RunRecordKind::ResourceUsage,
             RunRecord{RunResourceUsageRecord{m_run.runId, std::move(stage)}});
-    }
+    } catch (...) { ReportExportFailure(); }
 
-    void AddArtifact(TelemetryArtifactRecord artifact) {
+    void AddArtifact(TelemetryArtifactRecord artifact) try {
         artifact.order = m_artifactOrder.fetch_add(1u, std::memory_order_relaxed);
         Submit(
             RunRecordKind::Artifact,
             RunRecord{RunArtifactRecord{m_run.runId, std::move(artifact)}});
-    }
+    } catch (...) { ReportExportFailure(); }
 
     void RecordRemapOrder(
         BlockPath leafPath,
         const RunRemapDomain domain,
-        const IRemapProvider* provider) const {
+        std::shared_ptr<const IRemapProvider> provider) const try {
         Submit(
             RunRecordKind::RemapOrder,
             RunRecord{RunRemapOrderRecord{
                 .runId = m_run.runId,
                 .leafPath = std::move(leafPath),
                 .domain = domain,
-                .provider = provider,
+                .provider = std::move(provider),
             }});
-    }
+    } catch (...) { ReportExportFailure(); }
 
 private:
-    void Submit(const RunRecordKind kind, const RunRecord& record) const {
+    void ReportExportFailure() const noexcept {
+        m_exportFailures.fetch_add(1u, std::memory_order_relaxed);
+        if (m_resources != nullptr) { m_resources->RecordDiagnosticExportFailure(); }
+    }
+
+    void Submit(const RunRecordKind kind, const RunRecord& record) const noexcept {
         if (m_sink != nullptr && m_sink->Wants(kind)) {
-            m_sink->Submit(record);
+            if (!m_sink->TrySubmit(record)) { ReportExportFailure(); }
         }
     }
 
     RunRecordInfo m_run;
     IRunRecordSink* m_sink{nullptr};
+    DataCodecExecutionResources* m_resources{nullptr};
+    mutable std::atomic_uint64_t m_exportFailures{0u};
     std::atomic_uint64_t m_messageOrder{0u};
     std::atomic_uint64_t m_stageOrder{0u};
     std::atomic_uint64_t m_artifactOrder{0u};
-    std::mutex m_messageMutex;
+    mutable std::mutex m_messageMutex;
     std::vector<TelemetryMessageRecord> m_messages;
+    TelemetryRetentionStats m_messageRetention;
 };
 
 } // 命名空间 datacodec

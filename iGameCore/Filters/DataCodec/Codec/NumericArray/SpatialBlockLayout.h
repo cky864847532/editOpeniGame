@@ -11,6 +11,9 @@
 #include <vector>
 namespace datacodec::numericarray {
 
+// 新编码的 point/cell 基础块共用固定规格，解码继续读取文件中的实际布局
+inline constexpr std::uint32_t kSpatialBlockElementCount = 65536u;
+
 struct SpatialBlockRange {
     std::uint32_t blockIndex{0u};
     std::uint32_t elementOffset{0u};

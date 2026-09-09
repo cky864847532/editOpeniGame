@@ -3,16 +3,16 @@
 
 #include "IQCore/igQtExportModule.h"
 
-#include <DataCodec/API/Params/CodecPerformancePresetParams.h>
+#include <DataCodec/API/Params/CodecResourceParams.h>
 
 #include <cstddef>
 
+class QSettings;
+
 struct IG_QT_MODULE_EXPORT igQtDataCodecDecodeSettings {
-    ::datacodec::DataCodecDecodeTier performanceTier{
-        ::datacodec::DataCodecDecodeTier::Fast};
+    ::datacodec::CodecResourceParams resources;
     bool decodeAttributesOnDemand{false};
     bool enableDecodedResultCache{false};
-    std::size_t decodedResultCacheFrameLimit{3u};
     bool outputDecodeLogFile{false};
 };
 
@@ -21,6 +21,8 @@ public:
     [[nodiscard]] static igQtDataCodecDecodeSettings Load();
     static void Save(const igQtDataCodecDecodeSettings& settings);
     static void Apply(const igQtDataCodecDecodeSettings& settings);
+    [[nodiscard]] static ::datacodec::CodecResourceParams LoadResources(QSettings& storage);
+    static void SaveResources(QSettings& storage, const ::datacodec::CodecResourceParams& resources);
 };
 
 #endif

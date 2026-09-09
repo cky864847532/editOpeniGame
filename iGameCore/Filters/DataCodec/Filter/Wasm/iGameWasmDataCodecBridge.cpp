@@ -1,7 +1,6 @@
 #include "DataCodec/Filter/Wasm/iGameWasmDataCodecBridge.h"
 
 #include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
-#include "DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
 #include "DataCodec/Runtime/Record/RunRecordSubmit.h"
 #include "DataCodec/Filter/Wasm/iGameWasmDataCodecTiming.h"
@@ -56,14 +55,6 @@ void SetWasmDecodeError(
 
 } // 匿名命名空间
 
-std::shared_ptr<::datacodec::IParallelTaskRunner> MakeiGameWasmDataCodecTaskRunner() {
-    const auto capabilities = ::datacodec::wasm::DetectWasmRuntimeCapabilities();
-    if (capabilities.pthreadsAvailable) {
-        return DataCodecTaskRunner();
-    }
-    return nullptr;
-}
-
 std::future<void> SubmitiGameWasmDataCodecTask(std::function<void()> task) {
     return ThreadPool::Instance()->Commit(std::move(task));
 }
@@ -99,6 +90,10 @@ bool ResolveiGameWasmDataCodecFileSourceIdentity(
 iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
     iGameWasmDataCodecDecodeRequest request) {
     iGameWasmDataCodecDecodeResult result;
+    const auto exportDiagnostics = [&](auto&& prepare) noexcept {
+        try { prepare(); }
+        catch (...) { result.diagnosticsIncomplete = true; }
+    };
     bool completedSuccessfully = false;
     struct FailureCleanupScope {
         iGameWasmDataCodecDecodeResult& result;
@@ -134,16 +129,6 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
     }
     request.sourceIdentity = std::move(inspectedIdentity);
     result.cacheIdentityAvailable = true;
-    if (request.parallelTaskRunner == nullptr) {
-        request.parallelTaskRunner = MakeiGameWasmDataCodecTaskRunner();
-        if (request.parallelTaskRunner == nullptr) {
-            SetWasmDecodeError(
-                result,
-                request.runRecordSink.get(),
-                "DataCodec WASM decode requires pthread support");
-            return result;
-        }
-    }
     const auto browserReader = std::dynamic_pointer_cast<
         ::datacodec::wasm::WasmBrowserFileByteRangeReader>(request.inputReader);
 
@@ -152,8 +137,7 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
     std::shared_ptr<iGamePreparedSurfaceDecodeAdapter> surfaceObserver;
     if (preparedSurface) {
         try {
-            surfaceObserver = std::make_shared<iGamePreparedSurfaceDecodeAdapter>(
-                request.parallelTaskRunner);
+            surfaceObserver = std::make_shared<iGamePreparedSurfaceDecodeAdapter>();
         } catch (const std::exception& exception) {
             SetWasmDecodeError(
                 result,
@@ -178,21 +162,12 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
     if (request.enableEncodedInputCache.has_value()) {
         controls.encodedInputCachePolicy.enabled = *request.enableEncodedInputCache;
     }
-    if (request.enableFullInputPrefetch.has_value()) {
-        controls.execution.enableFullInputPrefetch = *request.enableFullInputPrefetch;
-    }
     controls.execution.topologyBlockObserver = surfaceObserver;
     controls.execution.topologyOutputMode = preparedSurface
         ? ::datacodec::TopologyDecodeOutputMode::ObserverOnly
         : ::datacodec::TopologyDecodeOutputMode::CommitToAdapter;
     result.encodedInputCacheEnabled = controls.encodedInputCachePolicy.enabled;
-    result.fullInputPrefetchEnabled = controls.execution.enableFullInputPrefetch;
 
-    const auto cacheRuntime = ::datacodec::DefaultDecodeCacheRuntime();
-    const auto frameCache = cacheRuntime->DefaultFrameCache();
-    const auto encodedInputCache = cacheRuntime->DefaultEncodedInputCache();
-    result.cacheStatsBefore = frameCache->Statistics();
-    result.encodedInputCacheStatsBefore = encodedInputCache->Statistics();
     iGameDataCodecTelemetryCapture recordSinks(std::move(request.runRecordSink));
     recordSinks.CaptureSessions(
         ::datacodec::kRunLifecycleRecordMask |
@@ -208,20 +183,18 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
         .language = controls.language,
         .decodedFrameCachePolicy = controls.decodedFrameCachePolicy,
         .encodedInputCachePolicy = controls.encodedInputCachePolicy,
-        .cacheRuntime = cacheRuntime,
-        .executionResources = ::datacodec::DataCodecExecutionResources{
-            .parallelTaskRunner = request.parallelTaskRunner.get(),
-        },
+        .resources = request.resources,
         .runRecordSink = runRecordSink,
     });
-    result.cacheStatsAfter = frameCache->Statistics();
-    result.encodedInputCacheStatsAfter = encodedInputCache->Statistics();
+    result.cacheStatsAfter = result.session->DecodedCacheStatistics();
+    result.encodedInputCacheStatsAfter = result.session->InputCacheStatistics();
     result.sourceIdentity = request.sourceIdentity;
     result.output = result.decodeResult.success
         ? result.decodeResult.output
         : DataObject::Pointer{};
-    result.timingDetail = BuildiGameWasmTopologyTimingDetail(
-        recordSinks.SnapshotCompletedTelemetrySessions());
+    exportDiagnostics([&] {
+        result.timingDetail = BuildiGameWasmTopologyTimingDetail(recordSinks.SnapshotCompletedTelemetrySessions());
+    });
     if (result.output == nullptr) {
         if (result.decodeResult.messages.empty()) {
             SetWasmDecodeError(
@@ -253,15 +226,15 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
                     ? "DataCodec WASM prepared surface construction failed"
                     : std::move(surfaceError));
             return result;
-        } else {
-            result.surfaceSummary = surfaceObserver->Summary();
         }
+        exportDiagnostics([&] { result.surfaceSummary = surfaceObserver->Summary(); });
+        result.diagnosticsIncomplete |= surfaceObserver->DiagnosticsIncomplete();
     }
 
+    exportDiagnostics([&] {
     std::ostringstream cacheTiming;
     cacheTiming << "cache-identity=" << (result.cacheIdentityAvailable ? 1 : 0)
                 << "; encoded-input-cache=" << (result.encodedInputCacheEnabled ? 1 : 0)
-                << "; full-input-prefetch=" << (result.fullInputPrefetchEnabled ? 1 : 0)
                 << "; frame-cache-hit=" << (result.decodeResult.decodedFrameCacheHit ? 1 : 0)
                 << "; cache-lookups-delta="
                 << (result.cacheStatsAfter.lookups - result.cacheStatsBefore.lookups)
@@ -274,8 +247,6 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
                 << "; cache-evictions-delta="
                 << (result.cacheStatsAfter.evictions - result.cacheStatsBefore.evictions)
                 << "; cache-resident-frames=" << result.cacheStatsAfter.residentFrames
-                << "; cache-resident-bytes=" << result.cacheStatsAfter.residentBytes
-                << "; cache-peak-bytes=" << result.cacheStatsAfter.peakResidentBytes
                 << "; encoded-cache-lookups-delta="
                 << (result.encodedInputCacheStatsAfter.lookups -
                     result.encodedInputCacheStatsBefore.lookups)
@@ -292,23 +263,14 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
                 << (result.encodedInputCacheStatsAfter.evictions -
                     result.encodedInputCacheStatsBefore.evictions)
                 << "; encoded-cache-resident-inputs="
-                << result.encodedInputCacheStatsAfter.residentInputs
-                << "; encoded-cache-resident-bytes="
-                << result.encodedInputCacheStatsAfter.residentBytes
-                << "; encoded-cache-peak-bytes="
-                << result.encodedInputCacheStatsAfter.peakResidentBytes;
-    if (browserReader != nullptr) {
-        const auto prefetchStats = browserReader->PrefetchStats();
-        cacheTiming << "; browser-prefetch-requests=" << prefetchStats.requests
-                    << "; browser-prefetch-accepted=" << prefetchStats.accepted
-                    << "; browser-prefetched-bytes=" << prefetchStats.prefetchedBytes
-                    << "; browser-prefetch-skipped-bytes=" << prefetchStats.skippedBytes;
-    }
+                << result.encodedInputCacheStatsAfter.residentInputs;
     if (!result.timingDetail.empty()) { result.timingDetail += "; "; }
     result.timingDetail += cacheTiming.str();
     if (!result.surfaceSummary.empty()) {
         result.timingDetail += "; " + result.surfaceSummary;
     }
+    });
+    result.diagnosticsIncomplete |= recordSinks.DiagnosticsIncomplete();
     result.success = true;
     completedSuccessfully = true;
     return result;
@@ -319,7 +281,6 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecFile(
     const bool enableReuseCache,
     const iGameWasmTopologyOutputMode topologyOutputMode,
     const std::optional<bool> enableEncodedInputCache,
-    const std::optional<bool> enableFullInputPrefetch,
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink,
     ::datacodec::DecodeSourceIdentity sourceIdentity) {
     if (filePath.empty()) {
@@ -336,27 +297,27 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecFile(
         .sourceIdentity = std::move(sourceIdentity),
         .enableReuseCache = enableReuseCache,
         .enableEncodedInputCache = enableEncodedInputCache,
-        .enableFullInputPrefetch = enableFullInputPrefetch,
         .topologyOutputMode = topologyOutputMode,
         .runRecordSink = std::move(runRecordSink),
     });
 }
 
 iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecMemory(
+    std::shared_ptr<const void> inputOwner,
     const std::span<const std::uint8_t> bytes,
     const bool enableReuseCache,
     const iGameWasmTopologyOutputMode topologyOutputMode,
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink) {
-    if (bytes.empty()) {
+    if (inputOwner == nullptr || bytes.empty()) {
         iGameWasmDataCodecDecodeResult result;
         SetWasmDecodeError(
             result,
             runRecordSink.get(),
-            "DataCodec WASM memory input is empty");
+            "DataCodec WASM memory input requires a nonempty retained owner");
         return result;
     }
     return DecodeiGameWasmDataCodec(iGameWasmDataCodecDecodeRequest{
-        .inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(bytes),
+        .inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(std::move(inputOwner), bytes),
         .enableReuseCache = enableReuseCache,
         .topologyOutputMode = topologyOutputMode,
         .runRecordSink = std::move(runRecordSink),
@@ -369,7 +330,6 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmBrowserFile(
     const bool enableReuseCache,
     const iGameWasmTopologyOutputMode topologyOutputMode,
     const std::optional<bool> enableEncodedInputCache,
-    const std::optional<bool> enableFullInputPrefetch,
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink) {
     std::string readerError;
     auto reader = ::datacodec::wasm::CreateWasmBrowserFileByteRangeReader(
@@ -388,7 +348,6 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmBrowserFile(
         .inputReader = std::move(reader),
         .enableReuseCache = enableReuseCache,
         .enableEncodedInputCache = enableEncodedInputCache,
-        .enableFullInputPrefetch = enableFullInputPrefetch,
         .topologyOutputMode = topologyOutputMode,
         .runRecordSink = std::move(runRecordSink),
     });

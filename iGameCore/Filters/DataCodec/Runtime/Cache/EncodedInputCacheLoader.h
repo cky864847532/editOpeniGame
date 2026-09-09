@@ -1,136 +1,169 @@
 #ifndef DATACODEC_RUNTIME_CACHE_ENCODEDINPUTCACHELOADER_H
 #define DATACODEC_RUNTIME_CACHE_ENCODEDINPUTCACHELOADER_H
 
-#include "DataCodec/API/Adapter/IEncodedInputCache.h"
+#include "DataCodec/Runtime/Cache/EncodedInputLruCache.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
-#include "DataCodec/Validation/Common/DataCodecValidation.h"
 
+#include <algorithm>
 #include <condition_variable>
-#include <cstddef>
-#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 namespace datacodec {
 
-// 将相同缓存后端和相同数据源的首次输入载入合并为一次实际读取
+// 同一根内按来源合并加载，等待者随根首错及取消唤醒
 class EncodedInputCacheLoader final {
 public:
     [[nodiscard]] EncodedInputBuffer Load(
-        const std::shared_ptr<IEncodedInputCache>& cache,
+        DataCodecExecutionResources& run,
+        const std::shared_ptr<EncodedInputLruCache>& cache,
         const DecodeSourceIdentity& sourceIdentity,
         const std::shared_ptr<IByteRangeReader>& sourceReader,
         const EncodedInputAccessKind accessKind,
-        std::string* error = nullptr) {
-        if (cache == nullptr || sourceReader == nullptr || !sourceIdentity.IsStable()) {
-            return {};
-        }
-        const auto lookup = cache->Find(sourceIdentity, accessKind);
-        if (lookup.IsError()) {
-            validation::AssignError(
-                error,
-                lookup.error.empty() ? "encoded input cache lookup failed" : lookup.error);
-            return {};
-        }
-        if (lookup.IsHit()) {
-            if (lookup.value == nullptr) {
-                validation::AssignError(error, "encoded input cache returned an invalid hit");
-                return {};
+        std::string* error = nullptr) noexcept {
+        try {
+            if (error != nullptr) { error->clear(); }
+            if (!sourceReader || !sourceIdentity.IsStable()) {
+                Fail(run, "encoded input source is invalid");
+                return Deliver(run, {}, error);
             }
-            return lookup.value;
-        }
+            if (run.Stopped()) { return Deliver(run, {}, error); }
+            if (!cache || !run.OptionalRetentionAllowed()) { return sourceReader; }
+            const auto lookup = cache->Find(sourceIdentity, accessKind);
+            if (lookup.IsError()) {
+                Fail(run, lookup.error);
+                return Deliver(run, {}, error);
+            }
+            if (lookup.IsHit()) {
+                if (!lookup.value) { Fail(run, "encoded input cache returned a null hit"); }
+                return Deliver(run, lookup.value, error);
+            }
 
-        const LoadKey key{cache.get(), sourceIdentity};
-        std::shared_ptr<InFlight> state;
-        bool leader = false;
-        {
-            std::unique_lock<std::mutex> lock(m_mutex);
-            const auto [iterator, inserted] = m_inFlight.try_emplace(key, std::make_shared<InFlight>());
-            state = iterator->second;
-            leader = inserted;
-            if (!leader) {
-                state->ready.wait(lock, [&state] { return state->completed; });
-                if (state->input == nullptr && error != nullptr) {
-                    *error = state->error;
+            std::shared_ptr<InFlight> state;
+            {
+                std::unique_lock lock(m_mutex);
+                const auto existing = m_inFlight.find(sourceIdentity);
+                if (existing != m_inFlight.end()) {
+                    state = existing->second;
+                    const auto stop = run.StopToken();
+                    state->ready.wait(lock, stop, [&] { return state->completed; });
+                    auto input = state->input;
+                    lock.unlock();
+                    return Deliver(run, std::move(input), error);
                 }
-                return state->input;
+                state = std::make_shared<InFlight>();
+                m_inFlight.emplace(sourceIdentity, state);
             }
-        }
 
-        auto input = sourceReader->RetainAllBytes();
-        std::string loadError;
-        if (input == nullptr) {
-            input = ReadAllBytes(*sourceReader, &loadError);
-        }
-        if (input != nullptr) {
-            const auto storeResult = cache->Store(sourceIdentity, input, accessKind);
-            if (storeResult.IsError()) {
-                loadError = storeResult.error.empty()
-                    ? "encoded input cache store failed"
-                    : storeResult.error;
-                input.reset();
+            EncodedInputBuffer input;
+            try {
+                input = Prepare(run, sourceReader, error);
+                if (input && run.OptionalRetentionAllowed()) {
+                    const auto stored = cache->Store(sourceIdentity, input, accessKind);
+                    if (stored.IsError()) {
+                        Fail(run, stored.error);
+                        input.reset();
+                    }
+                }
+            } catch (...) {
+                RecordExecutionException(run, "EncodedInputCacheLoader");
             }
+            if (run.Stopped()) { input.reset(); }
+            {
+                std::lock_guard lock(m_mutex);
+                state->input = std::move(input);
+                state->completed = true;
+                m_inFlight.erase(sourceIdentity);
+            }
+            state->ready.notify_all();
+            return Deliver(run, state->input, error);
+        } catch (...) {
+            RecordExecutionException(run, "EncodedInputCacheLoader");
+            return Deliver(run, {}, error);
         }
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            state->input = std::move(input);
-            state->error = std::move(loadError);
-            state->completed = true;
-            m_inFlight.erase(key);
-        }
-        state->ready.notify_all();
-        if (state->input == nullptr && error != nullptr) {
-            *error = state->error;
-        }
-        return state->input;
     }
 
 private:
-    struct LoadKey {
-        const IEncodedInputCache* cache{nullptr};
-        DecodeSourceIdentity source;
-
-        friend bool operator==(const LoadKey&, const LoadKey&) = default;
-    };
-
-    struct LoadKeyHash {
-        [[nodiscard]] std::size_t operator()(const LoadKey& key) const noexcept {
-            std::size_t seed = std::hash<const IEncodedInputCache*>{}(key.cache);
-            HashDecodeCacheValue(seed, DecodeSourceIdentityHash{}(key.source));
-            return seed;
-        }
-    };
-
     struct InFlight {
-        std::condition_variable ready;
+        std::condition_variable_any ready;
         EncodedInputBuffer input;
-        std::string error;
         bool completed{false};
     };
 
-    [[nodiscard]] static EncodedInputBuffer ReadAllBytes(
-        IByteRangeReader& source,
-        std::string* error) {
-        std::size_t byteSize = 0u;
-        if (!validation::CheckedCastSizeT(source.ByteSize(), byteSize, "encoded input cache byte size", error)) {
+    static void Fail(DataCodecExecutionResources& run, std::string_view message) noexcept {
+        run.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+            "encoded-input-failed", "EncodedInputCacheLoader", message));
+    }
+
+    static EncodedInputBuffer Deliver(DataCodecExecutionResources& run,
+                                      EncodedInputBuffer input, std::string* error) noexcept {
+        if (run.Stopped()) { input.reset(); }
+        if (!input && error != nullptr) {
+            try {
+                const auto failure = run.FirstFailure();
+                error->assign(failure ? failure->message.data() : "encoded input load cancelled");
+            } catch (...) {}
+        }
+        return input;
+    }
+
+    static EncodedInputBuffer Prepare(DataCodecExecutionResources& run,
+                                       const EncodedInputBuffer& source, std::string* error) {
+        // 已有连续输入只保留其宿主或原始自有 owner
+        if (source->RetainAllBytes() != nullptr ||
+            source->ContiguousRange(0u, source->ByteSize()).size() == source->ByteSize()) {
+            return source;
+        }
+        auto phase = WaitForHeavyPhase(run);
+        if (!phase) { return {}; }
+        if (!run.OptionalRetentionAllowed()) { return source; }
+        const auto size = source->ByteSize();
+        std::size_t localSize = 0u;
+        if (!validation::CheckedCastSizeT(size, localSize, "encoded input byte size", error)) {
+            Fail(run, "encoded input byte size exceeds address space");
             return {};
         }
-        auto bytes = std::make_shared<std::vector<std::uint8_t>>(byteSize);
-        if (!source.ReadAt(0u, std::span<std::uint8_t>(bytes->data(), bytes->size()), error)) {
+        auto capacity = run.StorageCapacity();
+        const auto tag = capacity->NewOwner(resource::StorageOwnerPurpose::Optional, "encoded-input-prefetch");
+        resource::CapacityRejection rejection;
+        auto lease = capacity->TryReserve(size, &rejection, tag);
+        if (!lease) {
+            run.RecordCapacityRejection(rejection, false);
+            return source;
+        }
+        bytestore::ByteStoreSession session;
+        session.BindStorage(run.StorageCapacity(), run.ExternalSpillAvailable());
+        auto owner = session.CreateReservedMemoryStore(std::move(*lease), error);
+        if (!owner) {
+            Fail(run, "encoded input allocation failed");
             return {};
         }
-        return bytes;
+        auto bytes = owner->WritableBytes();
+        for (std::size_t offset = 0u; offset < localSize;) {
+            if (run.Stopped()) { return {}; }
+            const auto count = std::min(localSize - offset, kIoWindowBytes);
+            if (!source->ReadAtCancellable(offset, bytes.subspan(offset, count), run.StopToken(), error)) {
+                Fail(run, error ? std::string_view(*error) : "encoded input read failed");
+                return {};
+            }
+            offset += count;
+        }
+        if (!owner->Seal(error)) {
+            Fail(run, "encoded input seal failed");
+            return {};
+        }
+        return std::make_shared<MemoryByteRangeReader>(owner, owner->ContiguousBytes());
     }
 
     std::mutex m_mutex;
-    std::unordered_map<LoadKey, std::shared_ptr<InFlight>, LoadKeyHash> m_inFlight;
+    std::unordered_map<DecodeSourceIdentity, std::shared_ptr<InFlight>, DecodeSourceIdentityHash> m_inFlight;
 };
 
-} // namespace datacodec
+}
 
 #endif

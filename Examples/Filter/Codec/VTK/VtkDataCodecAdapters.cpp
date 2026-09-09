@@ -881,10 +881,6 @@ bool VtkDataCodecDecodeAdapter::WriteAttributeRange(
     return true;
 }
 
-bool VtkDataCodecDecodeAdapter::SupportsConcurrentAttributeRangeWrites() const noexcept {
-    return false;
-}
-
 bool VtkDataCodecDecodeAdapter::SupportsAttributeDecodeStore() const noexcept {
     return false;
 }

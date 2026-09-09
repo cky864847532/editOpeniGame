@@ -2,7 +2,7 @@
 #define DATACODEC_API_ADAPTER_IDECODEDFRAMEASSEMBLY_H
 
 #include "DataCodec/API/Adapter/IFramePackageDecodeAssembly.h"
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 
 #include <memory>
 #include <string>

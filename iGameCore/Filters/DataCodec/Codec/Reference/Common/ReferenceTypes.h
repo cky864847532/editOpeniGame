@@ -5,6 +5,7 @@
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/API/Params/NumericArrayParams.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockWireFormat.h"
+#include "DataCodec/Codec/NumericArray/NumericArrayBuffer.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,8 @@
 #include <variant>
 #include <vector>
 namespace datacodec {
+
+namespace numericarray { class NumericArrayCompressorState; }
 
 enum class NumericArrayReferenceScope : std::uint8_t {
     None = 0,
@@ -50,7 +53,6 @@ struct NumericArrayReferenceCodecEncodeInput {
     const NumericArrayStorageParams& meta;
     CompressorConfig defaultCompressor;
     ScratchByteBufferPool& scratchBytePool;
-    ScratchByteQuotaAcquire acquireScratchQuota;
     NumericArrayReferenceCodecControl control;
     std::span<const std::uint8_t> currentBytes;
     std::span<const std::uint8_t> referenceBytes;
@@ -60,11 +62,12 @@ struct NumericArrayReferenceCodecEncodeInput {
     NumericArrayReferenceKind referenceKind{NumericArrayReferenceKind::None};
     std::uint16_t localParentFieldIndex{0xFFFFu};
     std::int32_t predictorOffset{0};
+    numericarray::NumericArrayCompressorState* compressorState{nullptr};
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples{nullptr};
 
     [[nodiscard]] ScratchByteBuffer AcquireScratch(const std::uint64_t bytes) const {
         return scratchBytePool.Acquire(
-            static_cast<std::size_t>(bytes),
-            acquireScratchQuota ? acquireScratchQuota(bytes) : ScratchByteQuotaLease{});
+            static_cast<std::size_t>(bytes));
     }
 };
 
@@ -145,7 +148,6 @@ struct NumericArrayReferenceEncodeResult {
 struct NumericArrayReferenceCodecDecodeTelemetry {
     ParamSize waveletLowBlobBytes{0u};
     ParamSize waveletHighBlobBytes{0u};
-    ParamSize waveletPeakTemporaryDoubleBytes{0u};
 };
 
 struct NumericArrayReferenceCodecDecodeInput {
@@ -154,6 +156,8 @@ struct NumericArrayReferenceCodecDecodeInput {
     std::span<const std::uint8_t> referenceBytes;
     std::size_t referenceElementOffset{0};
     NumericArrayReferenceCodecDecodeTelemetry* telemetry{nullptr};
+    numericarray::NumericArrayCompressorState* compressorState{nullptr};
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples{nullptr};
 };
 
 struct AffineReferenceBlockFields {

@@ -6,6 +6,7 @@
 #include "DataCodec/Runtime/Cache/TransferCache/ReferenceTransferCacheBuilder.h"
 #include "DataCodec/Test/Common/ReferenceCodecTestHarness.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureExecutionMechanism.h"
 
 #include <algorithm>
 #include <cmath>
@@ -133,6 +134,8 @@ inline bool RunReferenceCodecPrecisionCase(
         true);
     ScratchByteBufferPool scratchBytePool;
     NumericArrayReferenceEncodedBlock encoded;
+    numericarray::NumericArrayBlockCapacitySamples encodeSamples;
+    numericarray::NumericArrayBlockCapacitySamples decodeSamples;
     std::vector<std::uint8_t> decodedBytes;
     std::string error;
     const bool encodedOk = EncodeDecodeReferenceTestBlock(
@@ -145,13 +148,34 @@ inline bool RunReferenceCodecPrecisionCase(
         NumericArrayReferenceKind::IntraArray,
         encoded,
         decodedBytes,
-        &error);
+        &error, &encodeSamples, &decodeSamples);
     if (!Require(
             result,
             encodedOk,
             caseName + ".roundTrip",
             error.empty() ? "reference codec round trip failed" : error)) {
         return false;
+    }
+    if constexpr (std::is_floating_point_v<TValue>) {
+        if (codecId == NumericArrayReferenceCodecId::Wavelet) {
+            using Sample = numericarray::NumericBufferSample;
+            const auto& lowDelta = encodeSamples.values[static_cast<std::size_t>(Sample::WaveletLowDelta)];
+            const auto& referenceComponent = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletReferenceComponent)];
+            const auto& reconstructed = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletReconstructed)];
+            Require(result, lowDelta.capacityBytes.value_or(0u) >= ((tupleCount + 1u) / 2u) * sizeof(double) &&
+                referenceComponent.capacityBytes.value_or(0u) >= tupleCount * sizeof(double) &&
+                reconstructed.capacityBytes.value_or(0u) >= tupleCount * sizeof(double) &&
+                referenceComponent.scopeId != reconstructed.scopeId,
+                caseName + ".waveletCapacitySamples", "floating Wavelet arrays must carry independent actual capacity samples alongside precision checks");
+        } else {
+            using Sample = numericarray::NumericBufferSample;
+            const auto& prepared = encodeSamples.values[static_cast<std::size_t>(Sample::ReferencePreparedDelta)];
+            const auto& candidate = encodeSamples.values[static_cast<std::size_t>(Sample::ReferenceCandidate)];
+            Require(result, prepared.capacityBytes.value_or(0u) >= current.size() * sizeof(TValue) &&
+                candidate.capacityBytes.value_or(0u) >= ReferenceEncodedPayloadBytes(encoded) &&
+                prepared.scopeId != candidate.scopeId,
+                caseName + ".referenceCapacitySamples", "prepared residual and encoded candidate must retain independent actual capacities");
+        }
     }
     return CheckReferencePrecision(
         result,
@@ -261,6 +285,8 @@ inline bool RunIntegerWaveletCase(TestResult& result) {
     }
     ScratchByteBufferPool scratchBytePool;
     NumericArrayReferenceEncodedBlock encoded;
+    numericarray::NumericArrayBlockCapacitySamples encodeSamples;
+    numericarray::NumericArrayBlockCapacitySamples decodeSamples;
     std::vector<std::uint8_t> decodedBytes;
     std::string error;
     const bool roundTrip = EncodeDecodeReferenceTestBlock(
@@ -273,7 +299,16 @@ inline bool RunIntegerWaveletCase(TestResult& result) {
         NumericArrayReferenceKind::IntraArray,
         encoded,
         decodedBytes,
-        &error);
+        &error, &encodeSamples, &decodeSamples);
+    using Sample = numericarray::NumericBufferSample;
+    const auto& encodedLow = encodeSamples.values[static_cast<std::size_t>(Sample::WaveletLow)];
+    const auto& decodedLow = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletLow)];
+    const auto& decodedDelta = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletLowDelta)];
+    Require(result, encodedLow.capacityBytes.value_or(0u) >= (kTupleCount / 2u) * sizeof(std::uint64_t) &&
+        decodedLow.capacityBytes.value_or(0u) >= (kTupleCount / 2u) * sizeof(std::uint64_t) &&
+        decodedDelta.capacityBytes.value_or(0u) >= (kTupleCount / 2u) * sizeof(std::uint64_t) &&
+        decodedDelta.scopeId != decodedLow.scopeId,
+        "referenceCodec.wavelet.int32.capacity", "integer wavelet samples must reflect uint64 work arrays independently of int32 input");
     return Require(
                result,
                roundTrip,
@@ -331,9 +366,11 @@ inline bool RunBoundedProbePreparedPayloadCase(TestResult& result) {
         .meta = meta,
         .source = referenceSource,
     };
+    DataCodecExecutionResources root(CodecResourceParams{});
+    CodecRunScope scope(root);
     ScratchByteBufferPool scratchBytePool;
-    window::WindowBudget windowBudget(64u * 1024u * 1024u);
     bytestore::ByteStoreSession byteStoreSession;
+    byteStoreSession.BindStorage(std::make_shared<resource::ResidentByteBudget>(8u * 1024u * 1024u), true);
     std::shared_ptr<bytestore::IByteSource> transferCache;
     std::vector<NumericArrayBlockLayoutParams> blockLayouts;
     const auto built = numericarrayreference::BuildNumericArrayReferenceTransferCache(
@@ -346,13 +383,8 @@ inline bool RunBoundedProbePreparedPayloadCase(TestResult& result) {
             .affineBlockRSquared = 0.0,
             .selectionMode = ReferenceSelectionMode::Auto,
             .autoSelectionStrategy = ReferenceAutoSelectionStrategy::BoundedProbe,
-            .spatialBlockElementCount = static_cast<std::uint32_t>(kTupleCount),
-            .useMemoryStaging = true,
-            .useMemoryTransferCache = true,
         },
-        scratchBytePool,
-        windowBudget,
-        1u * 1024u * 1024u,
+        root,
         transferCache,
         byteStoreSession,
         &blockLayouts,
@@ -373,6 +405,126 @@ inline bool RunBoundedProbePreparedPayloadCase(TestResult& result) {
             blockLayouts.size() == 1u,
             "referenceCodec.boundedProbe.blockCount",
             "bounded probe transfer produced an unexpected block count");
+}
+
+inline void RunWindowedReferenceResampleCase(TestResult& result) {
+    constexpr std::size_t components = 3u;
+    constexpr std::size_t tupleBytes = components * sizeof(double);
+    for (const bool sparse : {false, true}) {
+        const std::size_t referenceCount = sparse ? 1000000001u : 2u * (kIoWindowBytes / tupleBytes) + 3u;
+        const std::size_t targetCount = sparse ? 11u : referenceCount + 7u;
+        struct SourceState { mutable std::size_t maxReadBytes{0u}, totalTuples{0u}; } state;
+        numericarray::NumericArraySource source{
+            .values = NumericArrayView{
+                .scalarType = ScalarType::Float64, .layout = ArrayLayout::GetterOnly,
+                .origin = ViewBufferOrigin::Borrowed, .tupleCount = referenceCount, .componentCount = components,
+                .userData = &state,
+                .getTupleBytes = [](const void*, std::size_t index, void* output, std::string*) {
+                    double values[components];
+                    for (std::size_t c = 0u; c < components; ++c) { values[c] = index * 0.125 + c; }
+                    std::memcpy(output, values, sizeof(values));
+                    return true;
+                },
+                .getTupleRangeBytes = [](const void* data, std::size_t begin, std::size_t count,
+                                         void* output, std::size_t byteCount, std::string*) {
+                    const auto& state = *static_cast<const SourceState*>(data);
+                    state.maxReadBytes = std::max(state.maxReadBytes, byteCount);
+                    state.totalTuples += count;
+                    auto* values = static_cast<double*>(output);
+                    for (std::size_t i = 0u; i < count; ++i) {
+                        for (std::size_t c = 0u; c < components; ++c) {
+                            values[i * components + c] = (begin + i) * 0.125 + c;
+                        }
+                    }
+                    return byteCount == count * tupleBytes;
+                },
+            },
+            .layout = numericarray::MakeNumericArrayLayout(DataType::Float64, sizeof(double), referenceCount, components),
+        };
+        numericarray::NumericArrayReader reader;
+        ScratchByteBufferPool scratch;
+        ScratchByteBuffer output;
+        std::string error;
+        bool matches = numericarray::BuildNumericArrayReader(source, reader, &error) &&
+            numericarrayreference::BuildNumericArrayNormalizedResampledSourceRangeBytes(
+                reader, MakeReferenceTestMeta<double>(referenceCount, components),
+                MakeReferenceTestMeta<double>(targetCount, components), scratch,
+                0u, targetCount, output, &error);
+        const auto* values = reinterpret_cast<const double*>(output.Span().data());
+        for (std::size_t i = 0u; matches && i < targetCount; ++i) {
+            const auto position = (static_cast<double>(i) / (targetCount - 1u)) * (referenceCount - 1u);
+            const auto left = static_cast<std::size_t>(std::floor(position));
+            const auto right = std::min(left + 1u, referenceCount - 1u);
+            const auto weightRight = position - left;
+            const auto weightLeft = 1.0 - weightRight;
+            for (std::size_t c = 0u; matches && c < components; ++c) {
+                const auto expected = (left * 0.125 + c) * weightLeft + (right * 0.125 + c) * weightRight;
+                matches = values[i * components + c] == expected;
+            }
+        }
+        Require(result, matches && state.maxReadBytes <= kIoWindowBytes &&
+            (!sparse || state.totalTuples <= 2u * targetCount),
+            "referenceCodec.windowedResample", error.empty() ?
+                "windowed interpolation must preserve arithmetic and avoid unused sparse source ranges" : error);
+    }
+}
+
+inline void RunReferenceBlockFlowCase(TestResult& result) {
+    constexpr std::size_t count = 2u * numericarray::kSpatialBlockElementCount + 7u;
+    constexpr std::uint64_t limit = 32u * 1024u * 1024u;
+    for (const bool externalSpill : {false, true}) {
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 2u, 4u},
+            limit, 2u, true, true, externalSpill});
+        CodecRunScope scope(root);
+        bytestore::ByteStoreSession session;
+        session.BindStorage(root.StorageCapacity(), externalSpill);
+        struct State { DataCodecExecutionResources& root; mutable bool valid{true}; } state{root};
+        numericarray::NumericArraySource source{
+            .values = NumericArrayView{
+                .scalarType = ScalarType::Float32, .layout = ArrayLayout::GetterOnly,
+                .origin = ViewBufferOrigin::Borrowed, .tupleCount = count, .componentCount = 1u,
+                .userData = &state,
+                .getTupleBytes = [](const void* data, std::size_t index, void* output, std::string*) {
+                    const auto& state = *static_cast<const State*>(data);
+                    if (index % numericarray::kSpatialBlockElementCount == 0u) {
+                        ResourceDebugSnapshot snapshot;
+                        state.valid &= CopyExecutionSnapshot(state.root, snapshot) && snapshot.admittedBlocks != 0u;
+                    }
+                    const float value = static_cast<float>(std::sin(index * 0.013));
+                    std::memcpy(output, &value, sizeof(value));
+                    return true;
+                },
+            },
+            .layout = numericarray::MakeNumericArrayLayout(DataType::Float32, sizeof(float), count, 1u),
+        };
+        const auto meta = MakeReferenceTestMeta<float>(count, 1u);
+        auto referenceMeta = meta;
+        referenceMeta.blockLayouts.push_back(NumericArrayBlockLayoutParams{
+            .elementOffset = 0u, .elementCount = count});
+        numericarrayreference::NumericArrayReferenceSourceData reference{
+            .candidate = {.scope = NumericArrayReferenceScope::IntraArray, .localParentFieldIndex = 0u},
+            .meta = std::move(referenceMeta), .source = source,
+        };
+        std::shared_ptr<bytestore::IByteSource> output;
+        std::vector<NumericArrayBlockLayoutParams> layouts;
+        std::string error;
+        const bool success = numericarrayreference::BuildNumericArrayReferenceTransferCache(meta,
+            MakeAbsoluteErrorNumericArrayCompressor(0.001), source, reference,
+            NumericArrayReferenceCodecId::Wavelet,
+            numericarrayreference::NumericArrayReferenceTransferControl{
+                .selectionMode = ReferenceSelectionMode::Forced},
+            root, output, session, &layouts, &error);
+        ResourceDebugSnapshot snapshot;
+        Require(result, success && state.valid && layouts.size() == 3u &&
+            layouts.back().elementCount == 7u && scope.Finish(success) && CopyExecutionSnapshot(root, snapshot) &&
+            snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u && snapshot.lastRetired == 2u,
+            "referenceCodec.blockFlow", error.empty() ?
+                "reference input and ordered results must use fixed blocks and one root flow" : error);
+        output.reset();
+        Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u &&
+            root.Scratch().SnapshotStats().activeBlockCount == 0u,
+            "referenceCodec.flowRelease", "reference inputs and candidates must be released after consumption");
+    }
 }
 
 [[nodiscard]] inline TestResult RunDataCodecFeatureReferenceCodecs() noexcept {
@@ -405,6 +557,8 @@ inline bool RunBoundedProbePreparedPayloadCase(TestResult& result) {
         RunReferenceCodecTypeDispatchCase(result);
         RunIntegerWaveletCase(result);
         RunBoundedProbePreparedPayloadCase(result);
+        RunWindowedReferenceResampleCase(result);
+        RunReferenceBlockFlowCase(result);
     } catch (const std::exception& exception) {
         result.AddFailure("referenceCodec.exception", exception.what());
     } catch (...) {

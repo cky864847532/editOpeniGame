@@ -1,6 +1,8 @@
 #ifndef DATACODEC_TEST_FEATURE_DATACODECFEATUREBYTERANGE_H
 #define DATACODEC_TEST_FEATURE_DATACODECFEATUREBYTERANGE_H
 
+#include "DataCodec/Test/Feature/DataCodecFeatureInputCancellation.h"
+
 #include "DataCodec/Storage/ByteIO/CallbackByteRangeReader.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
 
@@ -10,12 +12,36 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace datacodec::test {
 
 [[nodiscard]] inline TestResult RunDataCodecFeatureByteRange() noexcept {
     TestResult result;
+    static_assert(!std::is_constructible_v<MemoryByteRangeReader, std::span<const std::uint8_t>>);
+    static_assert(!std::is_constructible_v<MemoryByteRangeReader, std::vector<std::uint8_t>>);
+    {
+        auto owner = std::make_shared<const std::vector<std::uint8_t>>(8u, 23u);
+        std::weak_ptr<const std::vector<std::uint8_t>> lifetime = owner;
+        const auto* original = owner->data();
+        auto retained = std::make_shared<MemoryByteRangeReader>(owner, std::span(*owner).subspan(2u, 4u));
+        owner.reset();
+        Require(result, !lifetime.expired() && retained->ContiguousRange(0u, 4u).data() == original + 2u,
+            "byteRange.retained-input", "the input must retain its original allocation without copying");
+        SubrangeByteRangeReader range(retained, 1u, 2u);
+        retained.reset();
+        std::array<std::uint8_t, 2u> bytes{};
+        Require(result, !lifetime.expired() && range.ReadAt(0u, bytes) && bytes[0] == 23u,
+            "byteRange.retained-subrange", "a range must retain the original owner after the input reader is released");
+    }
+    {
+        const std::array<std::uint8_t, 1u> bytes{1u};
+        bool rejected = false;
+        try { MemoryByteRangeReader missing(std::shared_ptr<const void>{}, bytes); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        Require(result, rejected, "byteRange.missing-owner", "a nonempty span requires a retained owner");
+    }
     std::uint64_t observedOffset = 0u;
     std::size_t observedSize = 0u;
     std::size_t callbackCount = 0u;
@@ -65,7 +91,9 @@ namespace datacodec::test {
     Require(result, !missingRead, "byteRange.callback.missing", "missing callback read was accepted");
     Require(result, !error.empty(), "byteRange.callback.missingError", "missing callback did not report an error");
 
-    MemoryByteRangeReader memoryReader(std::vector<std::uint8_t>{1u, 2u, 3u, 4u});
+    auto memoryOwner = std::make_shared<const std::vector<std::uint8_t>>(
+        std::initializer_list<std::uint8_t>{1u, 2u, 3u, 4u});
+    MemoryByteRangeReader memoryReader(memoryOwner);
     std::span<const std::uint8_t> contiguousBytes;
     error.clear();
     const auto contiguousReady = memoryReader.PrepareContiguousRange(
@@ -114,7 +142,7 @@ namespace datacodec::test {
         "reader without prefetch capability did not report unavailable");
 
     auto sharedMemoryReader = std::make_shared<MemoryByteRangeReader>(
-        std::vector<std::uint8_t>{1u, 2u, 3u, 4u});
+        memoryOwner);
     SubrangeByteRangeReader subrangeReader(sharedMemoryReader, 1u, 2u);
     const auto prefetchError = subrangeReader.PrefetchRange(2u, 1u);
     Require(
@@ -122,6 +150,47 @@ namespace datacodec::test {
         prefetchError.IsError() && !prefetchError.error.empty(),
         "byteRange.prefetch.error",
         "invalid prefetch range did not produce an error status");
+    {
+        std::vector<std::uint8_t> target(2u * kIoWindowBytes + 7u);
+        std::array<std::size_t, 3u> sizes{};
+        std::array<std::uint64_t, 3u> offsets{};
+        std::size_t calls = 0u;
+        CallbackByteRangeReader bounded(target.size() + 23u,
+            [&](std::uint64_t offset, std::span<std::uint8_t> output, std::string*) {
+                if (calls >= sizes.size()) { return false; }
+                sizes[calls] = output.size();
+                offsets[calls] = offset;
+                ++calls;
+                std::fill(output.begin(), output.end(), static_cast<std::uint8_t>(calls));
+                return true;
+            });
+        Require(result, bounded.ReadAtCancellable(23u, target, {}) && calls == 3u &&
+            sizes == std::array<std::size_t, 3u>{kIoWindowBytes, kIoWindowBytes, 7u} &&
+            offsets == std::array<std::uint64_t, 3u>{23u, 23u + kIoWindowBytes, 23u + 2u * kIoWindowBytes} &&
+            target.front() == 1u && target[kIoWindowBytes] == 2u && target.back() == 3u,
+            "byteRange.windows", "large reads must sequentially fill exact one-MiB windows and the final tail");
+        std::stop_source cancellation;
+        calls = 0u;
+        CallbackByteRangeReader cancellable(target.size(),
+            [&](std::uint64_t, std::span<std::uint8_t>, std::string*) {
+                ++calls;
+                cancellation.request_stop();
+                return true;
+            });
+        Require(result, !cancellable.ReadAtCancellable(0u, target, cancellation.get_token()) && calls == 1u,
+            "byteRange.cancel-between-windows", "cancellation must prevent the next range read after current I/O returns");
+        calls = 0u;
+        Require(result, !cancellable.ReadAtCancellable(0u, target, cancellation.get_token()) && calls == 0u,
+            "byteRange.cancel-before-window", "a stopped read must not invoke the source");
+        CallbackByteRangeReader failing(target.size(),
+            [&](std::uint64_t, std::span<std::uint8_t>, std::string*) { ++calls; return false; });
+        Require(result, !failing.ReadAtCancellable(0u, target, {}) && calls == 1u,
+            "byteRange.window-error", "a failed read must end the operation without replaying or starting another range");
+    }
+    const auto cancellationResult = RunDataCodecFeatureInputCancellation();
+    result.passed &= cancellationResult.passed;
+    result.failures.insert(result.failures.end(), cancellationResult.failures.begin(), cancellationResult.failures.end());
+    result.AppendDiagnostics(cancellationResult.diagnostics);
     return result;
 }
 

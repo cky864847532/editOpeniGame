@@ -8,7 +8,7 @@
 #include "DataCodec/Codec/Topology/TopologyFingerprint.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Workflow/Encode/EncodePipelineBinding.h"
 #include "DataCodec/Workflow/Encode/EncodePipeline.h"
 #include "DataCodec/Runtime/Context/EncodeContext.h"
@@ -60,13 +60,14 @@ inline bool CheckResolvedFormalPipeline(
     auto dataset = MakePipelineContractUnstructuredDataset();
     TestEncodeAdapter adapter(dataset);
     auto params = CodecControlParamsFactory::MakeDefault();
-    params.SetSpatialBlockElementCounts(4u, 1u);
     const std::vector<AttributeTarget> targets{
         AttributeTarget{.frameIndex = 0u, .blockPath = {}, .attrIndex = 0u},
         AttributeTarget{.frameIndex = 0u, .blockPath = {}, .attrIndex = 1u},
         AttributeTarget{.frameIndex = 0u, .blockPath = {}, .attrIndex = 2u},
     };
-    EncodeContext context;
+    DataCodecExecutionResources resources(CodecResourceParams{.mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u});
+    CodecRunScope run(resources);
+    EncodeContext context(resources);
     context.adapter = &adapter;
     context.controlParams = &params;
     context.frameIndex = 0u;
@@ -75,7 +76,7 @@ inline bool CheckResolvedFormalPipeline(
         targets.data(),
         targets.size());
     auto controls = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{.tier = DataCodecEncodeTier::Balanced});
+        DataCodecEncodeOptions{});
     // 本用例显式选择双 Morton 流程以验证 Point 到 Cell 的阶段依赖
     controls.pipelineControl.cellOrder = EncodeCellOrderMode::Morton;
     EncodePipelineBinding binding;
@@ -83,11 +84,6 @@ inline bool CheckResolvedFormalPipeline(
         adapter,
         params,
         controls.pipelineControl,
-        EncodePipelineExecutionProfile{
-            .resourceBudget = params.resourceBudget,
-            .enableParallelStages = false,
-            .parallelTaskRunner = nullptr,
-        },
         binding,
         error,
         EncodePipelineOutputKind::LeafPackage)) {
@@ -101,8 +97,8 @@ inline bool CheckResolvedFormalPipeline(
     if (context.HasFailure()) {
         return validation::AssignError(
             error,
-            context.failure.has_value()
-                ? context.failure->formattedMessage
+            context.HasFailure()
+                ? FormatCodecFailure(*context.FirstFailure())
                 : "formal pipeline description failed");
     }
 
@@ -178,13 +174,14 @@ inline bool CheckFormalPipelineExecution(
     auto dataset = MakePipelineContractUnstructuredDataset();
     TestEncodeAdapter adapter(dataset);
     auto params = CodecControlParamsFactory::MakeDefault();
-    params.SetSpatialBlockElementCounts(4u, 1u);
     const std::vector<AttributeTarget> targets{
         AttributeTarget{.frameIndex = 0u, .blockPath = {}, .attrIndex = 0u},
         AttributeTarget{.frameIndex = 0u, .blockPath = {}, .attrIndex = 1u},
         AttributeTarget{.frameIndex = 0u, .blockPath = {}, .attrIndex = 2u},
     };
-    EncodeContext context;
+    DataCodecExecutionResources resources(CodecResourceParams{.mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u});
+    CodecRunScope run(resources);
+    EncodeContext context(resources);
     context.adapter = &adapter;
     context.controlParams = &params;
     context.objectName = dataset.name;
@@ -196,13 +193,11 @@ inline bool CheckFormalPipelineExecution(
         targets.size());
     const auto encoded = LeafEncodeExecutor::Execute(LeafEncodeRequest{
         .context = &context,
-        .enableParallelStages = false,
-        .parallelTaskRunner = nullptr,
     });
     if (!encoded.success || !encoded.hasEncodedOutput || encoded.encodedBytes.empty()) {
         if (error != nullptr) {
-            *error = context.failure.has_value()
-                ? context.failure->formattedMessage
+            *error = context.HasFailure()
+                ? FormatCodecFailure(*context.FirstFailure())
                 : "formal unstructured pipeline did not produce encoded output";
         }
         return false;
@@ -244,7 +239,7 @@ inline bool CheckFormalPipelineExecution(
         "pipeline.formalExecution",
         "formal unstructured pipeline did not complete every required stage");
 
-    EncodeContext rawContext;
+    EncodeContext rawContext(resources);
     rawContext.adapter = &adapter;
     rawContext.controlParams = &params;
     rawContext.objectName = dataset.name;
@@ -259,8 +254,6 @@ inline bool CheckFormalPipelineExecution(
     const auto rawEncoded = LeafEncodeExecutor::Execute(LeafEncodeRequest{
         .context = &rawContext,
         .pipelineControl = rawControl,
-        .enableParallelStages = false,
-        .parallelTaskRunner = nullptr,
     });
     const auto hasRaw = std::any_of(
         rawEncoded.stageExecutions.begin(),
@@ -295,7 +288,6 @@ inline bool CheckTemporalPipelineExecution(
     TestBlockTreeAdapter keyFrameAdapter(keyFrameDataset);
     TestBlockTreeAdapter predictedAdapter(predictedDataset);
     auto params = CodecControlParamsFactory::MakeDefault();
-    params.SetSpatialBlockElementCounts(4u, 1u);
     params.attrReference.temporalField.selectionMode = ReferenceSelectionMode::Forced;
     params.geometryReference.temporalField.selectionMode = ReferenceSelectionMode::Forced;
     class TemporalSequenceSource final : public IFrameSequenceEncodeSource {
@@ -342,7 +334,7 @@ inline bool CheckTemporalPipelineExecution(
             std::size_t,
             std::uint32_t,
             std::string*) override {
-            return std::make_unique<MemoryByteRangeOutput>();
+            return std::make_unique<MemoryByteRangeOutput>(m_outputRoot);
         }
 
         bool CommitFrame(
@@ -366,6 +358,8 @@ inline bool CheckTemporalPipelineExecution(
         }
 
     private:
+        DataCodecExecutionResources m_outputRoot{ResolvedResourceConfiguration{
+            {8u * 1024u * 1024u, 1u, 1u}, 8u * 1024u * 1024u, 1u, false, true}};
         std::uint64_t m_encodedBytes{0u};
     };
 
@@ -375,10 +369,12 @@ inline bool CheckTemporalPipelineExecution(
         .source = &source,
         .outputSink = &output,
         .controlParams = &params,
-        .enableParallelStages = false,
-        .parallelTaskRunner = nullptr,
+        .resources = {.mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u},
     });
     if (!encoded.success || encoded.encodedFrameCount != 2u || output.EncodedBytes() == 0u) {
+        if (encoded.failure) {
+            return validation::AssignError(error, FormatCodecFailure(*encoded.failure));
+        }
         return validation::AssignError(
             error,
             "temporal pipeline did not produce encoded frame outputs");
@@ -454,6 +450,7 @@ inline bool CheckEncodeSessionContracts(
     params.geometryReference.temporalField.keyFrameInterval = 0u;
 
     EncodeSessionWorkspace workspace;
+    DataCodecExecutionResources root(CodecResourceParams{});
     FrameEncodeState firstPlan;
     if (!workspace.PrepareFrame(
             DataCodecEncodeFrameInput{
@@ -464,14 +461,16 @@ inline bool CheckEncodeSessionContracts(
                 .controlParams = &params,
             },
             firstPlan,
+            root,
             error)) {
         return false;
     }
     const bool callerParamsPreserved =
-        firstPlan.controlParams.attrReference.temporalField.forcePredFrames &&
-        firstPlan.controlParams.attrReference.temporalField.keyFrameInterval == 0u &&
-        firstPlan.controlParams.geometryReference.temporalField.forcePredFrames &&
-        firstPlan.controlParams.geometryReference.temporalField.keyFrameInterval == 0u;
+        firstPlan.controlParams == &params && !firstPlan.defaultControlParams &&
+        firstPlan.controlParams->attrReference.temporalField.forcePredFrames &&
+        firstPlan.controlParams->attrReference.temporalField.keyFrameInterval == 0u &&
+        firstPlan.controlParams->geometryReference.temporalField.forcePredFrames &&
+        firstPlan.controlParams->geometryReference.temporalField.keyFrameInterval == 0u;
 
     FrameEncodeState repeatedPlan;
     std::string repeatedError;
@@ -484,6 +483,7 @@ inline bool CheckEncodeSessionContracts(
             .controlParams = &params,
         },
         repeatedPlan,
+        root,
         &repeatedError);
 
     workspace.ResetSession();
@@ -498,6 +498,7 @@ inline bool CheckEncodeSessionContracts(
             .controlParams = &params,
         },
         resetPlan,
+        root,
         &resetError);
 
     workspace.ResetSession();
@@ -512,6 +513,7 @@ inline bool CheckEncodeSessionContracts(
             .controlParams = &params,
         },
         treeSignatureFirstPlan,
+        root,
         &treeSignatureFirstError);
     TestBlockTreeAdapter differentTreeAdapter(dataset, "different-leaf");
     FrameEncodeState differentTreePlan;
@@ -525,6 +527,7 @@ inline bool CheckEncodeSessionContracts(
             .controlParams = &params,
         },
         differentTreePlan,
+        root,
         &differentTreeError);
 
     return Require(
@@ -536,6 +539,68 @@ inline bool CheckEncodeSessionContracts(
         resetError.empty()
             ? "encode session accepted an inconsistent multi-frame block tree or a non-sequential frame"
             : resetError);
+}
+
+inline bool CheckEncodeReferenceRetirement(TestResult& result, std::string* error) {
+    auto dataset = MakePipelineContractUnstructuredDataset();
+    TestBlockTreeAdapter adapter(dataset);
+    auto params = CodecControlParamsFactory::MakeDefault();
+    params.geometryReference.enabled = true;
+    params.geometryReference.temporalField.codec = TemporalFieldReferenceCodec::Predictor;
+    params.geometryReference.temporalField.keyFrameInterval = 2u;
+    params.geometryReference.temporalField.forcePredFrames = false;
+    params.attrReference.enabled = false;
+    DataCodecExecutionResources root(ResolvedResourceConfiguration{
+        {1024u, 1u, 1u}, 1024u, 1u, false, true, false});
+    CodecRunScope scope(root);
+    EncodeSessionWorkspace workspace;
+    FrameEncodeState keyFrame;
+    if (!workspace.PrepareFrame(DataCodecEncodeFrameInput{
+            .blockTreeAdapter = &adapter, .frameIndex = 0u, .frameCount = 3u,
+            .controlParams = &params,
+            .nextFrameReferences = FrameReferenceNeeds{
+                .geometry = {TemporalFieldRole::PredFrame, 0u}}}, keyFrame, root, error)) { return false; }
+    LeafEncodeRun keyLeaf;
+    if (!workspace.PrepareLeaf(keyFrame, 0u, keyLeaf, root, error)) { return false; }
+    auto* geometry = keyLeaf.context->currentGeometryReferenceCache;
+    if (!geometry) { return false; }
+    GeometryStorageParams meta;
+    meta.elementCount = 2u;
+    meta.dimension = 3;
+    meta.dataType = DataType::Float32;
+    const std::array<float, 6u> values{1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+    {
+        auto phase = WaitForHeavyPhase(root);
+        if (!phase || !geometry->BeginGeometry(meta, *keyLeaf.context->referenceByteStoreSession, error) ||
+            !geometry->WriteRange(0u, 2u, values.data(), sizeof(values), error) ||
+            !geometry->EndGeometry(error)) { return false; }
+    }
+    workspace.CompleteLeafReferences(keyFrame, keyLeaf);
+    FrameEncodeState predictedFrame;
+    if (!workspace.PrepareFrame(DataCodecEncodeFrameInput{
+            .blockTreeAdapter = &adapter, .frameIndex = 1u, .frameCount = 3u,
+            .controlParams = &params,
+            .nextFrameReferences = FrameReferenceNeeds{
+                .geometry = {TemporalFieldRole::KeyFrame, 2u}}}, predictedFrame, root, error)) { return false; }
+    LeafEncodeRun predictedLeaf;
+    if (!workspace.PrepareLeaf(predictedFrame, 0u, predictedLeaf, root, error)) { return false; }
+    const auto& active = predictedLeaf.context->geometryKeyFrameReference.geometryReferenceCache;
+    std::weak_ptr<DecodedGeometryReferenceCache> previous = active;
+    std::array<float, 6u> decoded{};
+    const bool survived = active && active->ReadRange(0u, 2u, decoded.data(), sizeof(decoded), error) && decoded == values;
+    workspace.CompleteLeafReferences(predictedFrame, predictedLeaf);
+    Require(result, survived && previous.expired() && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+        "pipeline.reference-last-consumer",
+        "reference must survive its consumer and retire before packaging when the next frame starts a new key");
+
+    FrameEncodeState lastFrame;
+    if (!workspace.PrepareFrame(DataCodecEncodeFrameInput{
+            .blockTreeAdapter = &adapter, .frameIndex = 2u, .frameCount = 3u,
+            .controlParams = &params}, lastFrame, root, error)) { return false; }
+    Require(result, lastFrame.nextFrameReferences.has_value() &&
+        lastFrame.nextFrameReferences->geometry.temporalRole == TemporalFieldRole::SingleFrame,
+        "pipeline.reference-final-frame", "final frame must retain no future reference dependency");
+    return true;
 }
 
 inline numericarray::NumericArraySource MakePipelineContractNumericSource(
@@ -601,7 +666,7 @@ inline numericarray::NumericArraySource MakePipelineContractCountingNumericSourc
 inline bool CheckSpatialReferenceBlockSelection(
     TestResult& result,
     std::string* error = nullptr) {
-    constexpr std::size_t kBlockElementCount = 256u;
+    constexpr std::size_t kBlockElementCount = numericarray::kSpatialBlockElementCount;
     constexpr std::size_t kBlockCount = 3u;
     std::vector<float> reference(kBlockElementCount * kBlockCount, 0.0f);
     std::vector<float> current(reference.size(), 0.0f);
@@ -619,9 +684,11 @@ inline bool CheckSpatialReferenceBlockSelection(
     meta.elementCount = current.size();
     meta.dimension = 1;
 
+    DataCodecExecutionResources root(CodecResourceParams{});
     CacheResources resources;
-    resources.Configure(64u * 1024u, 8u * 1024u * 1024u);
+    resources.BindRun(root);
     bytestore::ByteStoreSession byteStoreSession;
+    byteStoreSession.BindStorage(std::make_shared<resource::ResidentByteBudget>(8u * 1024u * 1024u), true);
     std::shared_ptr<bytestore::IByteSource> transferCache;
     std::vector<NumericArrayBlockLayoutParams> layouts;
     const auto built = numericarrayreference::BuildNumericArrayReferenceTransferCache(
@@ -640,13 +707,8 @@ inline bool CheckSpatialReferenceBlockSelection(
         numericarrayreference::NumericArrayReferenceTransferControl{
             .affineBlockRSquared = 0.90,
             .selectionMode = ReferenceSelectionMode::Auto,
-            .spatialBlockElementCount = static_cast<std::uint32_t>(kBlockElementCount),
-            .useMemoryStaging = true,
-            .useMemoryTransferCache = true,
         },
-        resources.scratchBytePool,
-        resources.windowBudget,
-        resources.accessWindowBytes,
+        root,
         transferCache,
         byteStoreSession,
         &layouts,
@@ -676,9 +738,6 @@ inline bool CheckSpatialReferenceBlockSelection(
             ordinaryBlockCount > 0u,
         "pipeline.spatialReferenceSelection",
         "spatial block auto mode did not preserve mixed ordinary and reference blocks");
-    if (transferCache != nullptr) {
-        transferCache->Release();
-    }
     return selected;
 }
 
@@ -728,6 +787,10 @@ inline bool CheckSampledIntraParentSelection(
         dependency.intraField.sampleCount = kSampleCount;
         dependency.intraField.minimumSampleScore = 0.5;
         dependency.intraField.affine.precheckRSquared = 0.90;
+        DataCodecExecutionResources root(CodecResourceParams{});
+        CodecRunScope scope(root);
+        bytestore::ByteStoreSession session;
+        session.BindStorage(root.StorageCapacity(), false);
         EncodeAttributeReferenceSchedule schedule;
         if (!BuildAttributeIntraFieldReferenceSchedule(
                 metas,
@@ -735,7 +798,8 @@ inline bool CheckSampledIntraParentSelection(
                 metaIndices,
                 referenceAllowed,
                 dependency,
-                scratchBytePool,
+                root,
+                session,
                 schedule,
                 error)) {
             return false;
@@ -743,6 +807,9 @@ inline bool CheckSampledIntraParentSelection(
         if (!Require(
                 result,
                 schedule.initialized &&
+                    root.StorageCapacity()->Snapshot().reservedBytes == 0u &&
+                    root.StorageCapacity()->Snapshot().peakReservedBytes >=
+                        kSampleCount * (sizeof(std::size_t) + metas.size() * sizeof(float)) &&
                     schedule.entries.size() == 3u &&
                     schedule.entries[0].hasIntraParent &&
                     schedule.entries[0].parentMetaIndex == 1u,
@@ -775,9 +842,12 @@ inline bool CheckForcedReferenceFailure(
     meta.dataType = DataType::Float32;
     meta.elementCount = kElementCount;
     meta.dimension = 1;
+    DataCodecExecutionResources root(CodecResourceParams{});
+    CodecRunScope scope(root);
     CacheResources resources;
-    resources.Configure(64u * 1024u, 8u * 1024u * 1024u);
+    resources.BindRun(root);
     bytestore::ByteStoreSession byteStoreSession;
+    byteStoreSession.BindRun(root);
     std::shared_ptr<bytestore::IByteSource> transferCache;
     std::string forcedError;
     const auto built = numericarrayreference::BuildNumericArrayReferenceTransferCache(
@@ -796,24 +866,18 @@ inline bool CheckForcedReferenceFailure(
         numericarrayreference::NumericArrayReferenceTransferControl{
             .affineBlockRSquared = 0.999999,
             .selectionMode = ReferenceSelectionMode::Forced,
-            .spatialBlockElementCount = 256u,
-            .useMemoryStaging = true,
-            .useMemoryTransferCache = true,
         },
-        resources.scratchBytePool,
-        resources.windowBudget,
-        resources.accessWindowBytes,
+        root,
         transferCache,
         byteStoreSession,
         nullptr,
         &forcedError,
         "pipeline_contract_forced_reference");
-    if (transferCache != nullptr) {
-        transferCache->Release();
-    }
+    const auto failure = root.FirstFailure();
     return Require(
         result,
-        !built && !forcedError.empty(),
+        !built && !transferCache && failure && !forcedError.empty() &&
+            std::string_view(failure->message.data()).find("forced reference spatial block was rejected") != std::string_view::npos,
         "pipeline.forcedReferenceFailure",
         "forced reference failure was converted into an ordinary block");
 }
@@ -843,7 +907,6 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
         .referenceEncode = false,
         .packageFields = PackageFieldEncodingParams{
             .mode = PackageFieldEncodingMode::Raw,
-            .workerCount = 1u,
         },
     };
     Require(
@@ -911,160 +974,64 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
         "pipeline.rejectSpatialLayoutMismatch",
         "numeric array block mismatch was accepted outside the shared spatial layout");
 
-    const auto timePriority = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{.tier = DataCodecEncodeTier::TimePriority});
-    const auto balanced = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{.tier = DataCodecEncodeTier::Balanced});
-    const auto memoryPriority = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{.tier = DataCodecEncodeTier::MemoryPriority});
-    const auto timeEnhanced = CodecControlParamsFactory::MakeEncodeConfiguration(
+    for (const auto fileBlockCount : {numericarray::kSpatialBlockElementCount, 262144u}) {
+        auto fileParams = spatialParams;
+        fileParams.spatialBlockParams.pointElementCount = fileBlockCount;
+        fileParams.spatialBlockParams.cellElementCount = fileBlockCount;
+        fileParams.geomParams.elementCount = static_cast<ParamSize>(fileBlockCount) * 2u + 3u;
+        for (std::size_t i = 0u; i < fileParams.geomParams.blockLayouts.size(); ++i) {
+            auto& block = fileParams.geomParams.blockLayouts[i];
+            block.elementOffset = static_cast<std::uint32_t>(i) * fileBlockCount;
+            block.elementCount = i == 2u ? 3u : fileBlockCount;
+        }
+        std::vector<std::uint8_t> bytes;
+        CodecStorageParams restored;
+        Require(result, SerializeCodecStorageParams(fileParams, bytes, &error) &&
+            DeserializeCodecStorageParams(bytes, restored, &error) &&
+            restored.spatialBlockParams.pointElementCount == fileBlockCount &&
+            restored.spatialBlockParams.cellElementCount == fileBlockCount &&
+            restored.geomParams.blockLayouts.back().elementOffset == 2u * fileBlockCount,
+            "pipeline.persist-file-granularity", "decoding metadata must preserve both new and legacy block boundaries");
+    }
+    {
+        auto dataset = MakePipelineContractUnstructuredDataset();
+        TestEncodeAdapter adapter(dataset);
+        CodecStorageParams created;
+        Require(result, CodecStorageParamsFactory::TryFromEncodeAdapter(adapter, {}, created, &error) &&
+            created.spatialBlockParams.pointElementCount == 65536u && created.spatialBlockParams.cellElementCount == 65536u,
+            "pipeline.fixed-encode-granularity", "the production storage factory must write fixed point and cell block sizes");
+    }
+
+    const auto defaults = CodecControlParamsFactory::MakeEncodeConfiguration({});
+    const auto enhanced = CodecControlParamsFactory::MakeEncodeConfiguration(
+        DataCodecEncodeOptions{.enableCompressionEnhancement = true});
+    const auto explicitOptions = CodecControlParamsFactory::MakeEncodeConfiguration(
         DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::TimePriority,
-            .enableCompressionEnhancement = true,
-        });
-    const auto balancedEnhanced = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::Balanced,
-            .enableCompressionEnhancement = true,
-        });
-    const auto memoryEnhanced = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::MemoryPriority,
-            .enableCompressionEnhancement = true,
-        });
-    const auto wasm4Enhanced = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::TimePriority,
-            .enableCompressionEnhancement = true,
-        },
-        DataCodecRuntimeProfile::Wasm4GiB);
-    const auto explicitZstdEnhanced = CodecControlParamsFactory::MakeEncodeConfiguration(
-        DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::MemoryPriority,
             .enableCompressionEnhancement = true,
             .packageZstdLevel = 17,
+            .temporalKeyFrameInterval = 5u,
         });
-    const auto sharedBlockAndReferenceParams =
-        timePriority.controlParams.spatialBlockPolicy.pointElementCount ==
-            balanced.controlParams.spatialBlockPolicy.pointElementCount &&
-        balanced.controlParams.spatialBlockPolicy.pointElementCount ==
-            memoryPriority.controlParams.spatialBlockPolicy.pointElementCount &&
-        timePriority.controlParams.spatialBlockPolicy.cellElementCount ==
-            balanced.controlParams.spatialBlockPolicy.cellElementCount &&
-        balanced.controlParams.spatialBlockPolicy.cellElementCount ==
-            memoryPriority.controlParams.spatialBlockPolicy.cellElementCount &&
-        timePriority.controlParams.attrReference.intraField.codec ==
-            balanced.controlParams.attrReference.intraField.codec &&
-        balanced.controlParams.attrReference.intraField.codec ==
-            memoryPriority.controlParams.attrReference.intraField.codec &&
-        timePriority.controlParams.attrReference.temporalField.codec ==
-            balanced.controlParams.attrReference.temporalField.codec &&
-        balanced.controlParams.attrReference.temporalField.codec ==
-            memoryPriority.controlParams.attrReference.temporalField.codec;
-    Require(
-        result,
-        sharedBlockAndReferenceParams,
-        "pipeline.performanceTierSharedSemantics",
-        "encode performance tiers changed shared block or reference semantics");
-
-    Require(
-        result,
-            timePriority.pipelineControl.pointOrder == EncodePointOrderMode::Morton &&
-            timePriority.pipelineControl.cellOrder == EncodeCellOrderMode::Original &&
-            timePriority.pipelineControl.packageFields.zstdLevel == 1 &&
-            timePriority.pipelineControl.packageFields.workerCount == 8u &&
-            balanced.pipelineControl.pointOrder == EncodePointOrderMode::Morton &&
-            balanced.pipelineControl.cellOrder == EncodeCellOrderMode::Original &&
-            balanced.pipelineControl.packageFields.zstdLevel == 3 &&
-            balanced.pipelineControl.packageFields.workerCount == 4u &&
-            memoryPriority.pipelineControl.pointOrder == EncodePointOrderMode::Morton &&
-            memoryPriority.pipelineControl.cellOrder == EncodeCellOrderMode::Original &&
-            memoryPriority.pipelineControl.packageFields.zstdLevel == 1 &&
-            memoryPriority.pipelineControl.packageFields.workerCount == 1u &&
-            memoryPriority.execution.enableParallelStages,
-        "pipeline.performanceTierVariants",
-        "encode performance tiers did not resolve to the documented pipeline variants");
-
-    Require(
-        result,
-        timeEnhanced.pipelineControl.cellOrder == EncodeCellOrderMode::Morton &&
-            balancedEnhanced.pipelineControl.cellOrder == EncodeCellOrderMode::Morton &&
-            memoryEnhanced.pipelineControl.cellOrder == EncodeCellOrderMode::Morton &&
-            balancedEnhanced.controlParams.attrReference.temporalField.predictor.enableLocalWindowSearch &&
-            balancedEnhanced.controlParams.attrReference.temporalField.predictor.searchStrategy ==
-                TemporalPredictorSearchStrategy::ExhaustiveEstimatedBytes &&
-            balancedEnhanced.controlParams.geometryReference.temporalField.predictor.enableLocalWindowSearch &&
-            balancedEnhanced.controlParams.geometryReference.temporalField.predictor.searchStrategy ==
-                TemporalPredictorSearchStrategy::ExhaustiveEstimatedBytes,
+    Require(result,
+        defaults.pipelineControl.pointOrder == EncodePointOrderMode::Morton &&
+        defaults.pipelineControl.cellOrder == EncodeCellOrderMode::Original &&
+        defaults.pipelineControl.packageFields.zstdLevel == 3,
+        "pipeline.defaultBusinessConfiguration",
+        "default configuration must specify the documented algorithm choices");
+    Require(result,
+        enhanced.pipelineControl.cellOrder == EncodeCellOrderMode::Morton &&
+        enhanced.controlParams.attrReference.temporalField.predictor.enableLocalWindowSearch &&
+        enhanced.controlParams.attrReference.temporalField.predictor.searchStrategy ==
+            TemporalPredictorSearchStrategy::ExhaustiveEstimatedBytes &&
+        enhanced.controlParams.geometryReference.temporalField.predictor.enableLocalWindowSearch &&
+        enhanced.controlParams.geometryReference.temporalField.predictor.searchStrategy ==
+            TemporalPredictorSearchStrategy::ExhaustiveEstimatedBytes,
         "pipeline.compressionEnhancementSemantics",
-        "compression enhancement did not enable remap and exhaustive predictor search");
-
-    Require(
-        result,
-        timeEnhanced.pipelineControl.packageFields.zstdLevel ==
-                timePriority.pipelineControl.packageFields.zstdLevel &&
-            timeEnhanced.pipelineControl.packageFields.workerCount ==
-                timePriority.pipelineControl.packageFields.workerCount &&
-            timeEnhanced.controlParams.resourceBudget.ResidentLimitBytes() ==
-                timePriority.controlParams.resourceBudget.ResidentLimitBytes() &&
-            timeEnhanced.controlParams.resourceBudget.AttributePressioLaneCount() ==
-                timePriority.controlParams.resourceBudget.AttributePressioLaneCount() &&
-            balancedEnhanced.pipelineControl.packageFields.zstdLevel ==
-                balanced.pipelineControl.packageFields.zstdLevel &&
-            balancedEnhanced.pipelineControl.packageFields.workerCount ==
-                balanced.pipelineControl.packageFields.workerCount &&
-            balancedEnhanced.controlParams.resourceBudget.ResidentLimitBytes() ==
-                balanced.controlParams.resourceBudget.ResidentLimitBytes() &&
-            balancedEnhanced.controlParams.resourceBudget.AttributePressioLaneCount() ==
-                balanced.controlParams.resourceBudget.AttributePressioLaneCount() &&
-            memoryEnhanced.pipelineControl.packageFields.zstdLevel ==
-                memoryPriority.pipelineControl.packageFields.zstdLevel &&
-            memoryEnhanced.pipelineControl.packageFields.workerCount ==
-                memoryPriority.pipelineControl.packageFields.workerCount &&
-            memoryEnhanced.controlParams.resourceBudget.ResidentLimitBytes() ==
-                memoryPriority.controlParams.resourceBudget.ResidentLimitBytes() &&
-            memoryEnhanced.controlParams.resourceBudget.AttributePressioLaneCount() ==
-                memoryPriority.controlParams.resourceBudget.AttributePressioLaneCount() &&
-            explicitZstdEnhanced.pipelineControl.packageFields.zstdLevel == 17,
-        "pipeline.compressionEnhancementComposition",
-        "compression enhancement changed resource-tier or explicit ZSTD configuration");
-
-    const auto remapWorkspaceFits = [](const DataCodecEncodeConfigurationParams& configuration) {
-        constexpr std::size_t kLargeRemapElementCount = 100000000u;
-        const auto& budget = configuration.controlParams.resourceBudget;
-        const auto leafElementCount = mortonremap::ResolveLeafBudgetElements(
-            budget.RemapMortonLeafBytes());
-        const auto maximumInMemoryWorkspaceBytes =
-            static_cast<std::uint64_t>(leafElementCount) *
-            (sizeof(mortonremap::MortonKeyedIndex) + sizeof(IndexType) * 2u);
-        const auto externalWorkspaceBytes = mortonremap::EstimateMortonWorkspaceBytes(
-            kLargeRemapElementCount,
-            budget.RemapMortonLeafBytes(),
-            budget.RemapMortonRunBufferBytes());
-        return maximumInMemoryWorkspaceBytes <= budget.RemapScratchQuotaBytes() &&
-            externalWorkspaceBytes <= budget.RemapScratchQuotaBytes();
-    };
-    Require(
-        result,
-        remapWorkspaceFits(timeEnhanced) &&
-            remapWorkspaceFits(balancedEnhanced) &&
-            remapWorkspaceFits(memoryEnhanced) &&
-            remapWorkspaceFits(wasm4Enhanced),
-        "pipeline.compressionEnhancementRemapBudget",
-        "compression enhancement exceeds the selected resource profile remap budget");
-
-    Require(
-        result,
-        timePriority.controlParams.resourceBudget.AttributePressioLaneCount() ==
-            balanced.controlParams.resourceBudget.AttributePressioLaneCount() &&
-        balanced.controlParams.resourceBudget.AttributePressioLaneCount() >
-            memoryPriority.controlParams.resourceBudget.AttributePressioLaneCount() &&
-        timePriority.controlParams.resourceBudget.ResidentLimitBytes() >
-            balanced.controlParams.resourceBudget.ResidentLimitBytes() &&
-        balanced.controlParams.resourceBudget.ResidentLimitBytes() >
-            memoryPriority.controlParams.resourceBudget.ResidentLimitBytes(),
-        "pipeline.performanceTierResources",
-        "encode performance tiers do not follow the time-to-memory resource axis");
+        "compression enhancement must enable remap and exhaustive predictor search");
+    Require(result,
+        enhanced.pipelineControl.packageFields.zstdLevel == defaults.pipelineControl.packageFields.zstdLevel &&
+        explicitOptions.pipelineControl.packageFields.zstdLevel == 17,
+        "pipeline.explicitAlgorithmOptions",
+        "explicit compression options must compose with enhancement");
 
     error.clear();
     if (!CheckSpatialReferenceBlockSelection(result, &error) && !error.empty()) {
@@ -1094,6 +1061,10 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
     error.clear();
     if (!CheckEncodeSessionContracts(result, &error) && !error.empty()) {
         result.AddFailure("pipeline.encodeSessionContracts", error);
+    }
+    error.clear();
+    if (!CheckEncodeReferenceRetirement(result, &error)) {
+        result.AddFailure("pipeline.referenceRetirement", error);
     }
 
     return result;

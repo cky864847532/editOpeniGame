@@ -21,15 +21,12 @@
 namespace datacodec::cellremap {
 
 struct BuildOptions {
+    DataCodecExecutionResources& resources;
     const IRemapProvider* pointInverse{nullptr};
     WritableRemapProviderFactory providerFactory{};
     bytestore::ByteStoreSession* byteStoreSession{nullptr};
-    resource::ActiveByteBudget* scratchBudget{nullptr};
-    std::size_t mortonLeafBudgetBytes{mortonremap::kMortonDefaultLeafBudgetBytes};
-    std::size_t mortonRunBufferBytes{mortonremap::kMortonRunBufferBytes};
-    bool useMemoryScratchStore{false};
     std::function<void(double)> progressCallback{};
-    std::function<void(std::string_view, std::uint64_t)> resourceCallback{};
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 inline bool BuildCellTopologyView(
@@ -213,8 +210,11 @@ inline bool BuildMortonRemapProvider(
     std::shared_ptr<IRemapProvider>& orderProvider,
     std::string* error = nullptr) {
     orderProvider.reset();
-    if (!ValidateCellTopologyView(topology, options.pointInverse, error)) {
-        return false;
+    {
+        auto phase = WaitForHeavyPhase(options.resources);
+        if (!phase || !RunTerminalWork(options.resources, *phase, [&](WorkerContext&) {
+                return ValidateCellTopologyView(topology, options.pointInverse, error);
+            })) { return false; }
     }
     if (topology.cellCount <= 1u) {
         orderProvider = std::make_shared<IdentityRemapProvider>(topology.cellCount);
@@ -222,17 +222,13 @@ inline bool BuildMortonRemapProvider(
         return true;
     }
 
-    mortonremap::MortonRemapOptions remapOptions;
+    mortonremap::MortonRemapOptions remapOptions{.resources = options.resources};
     remapOptions.resourcePrefix = "cell_remap.morton";
     remapOptions.progressCallback = options.progressCallback;
-    remapOptions.resourceCallback = options.resourceCallback;
+    remapOptions.recordCapacitySamples = options.recordCapacitySamples;
     remapOptions.providerFactory = options.providerFactory;
     remapOptions.byteStoreSession = options.byteStoreSession;
-    remapOptions.scratchBudget = options.scratchBudget;
-    remapOptions.leafBudgetBytes = options.mortonLeafBudgetBytes;
-    remapOptions.runBufferBytes = options.mortonRunBufferBytes;
     remapOptions.buildInverse = false;
-    remapOptions.useMemoryScratchStore = options.useMemoryScratchStore;
 
     mortonremap::MortonRemapResult result;
     try {

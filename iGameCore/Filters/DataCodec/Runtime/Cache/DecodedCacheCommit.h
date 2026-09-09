@@ -27,9 +27,6 @@ namespace datacodec {
 
 inline void ReleaseDecodedByteStore(
     std::shared_ptr<bytestore::IRandomAccessByteStore>& bytes) noexcept {
-    if (bytes != nullptr) {
-        bytes->Release();
-    }
     bytes.reset();
 }
 
@@ -187,7 +184,8 @@ inline bool CommitPolyhedronTopologyCache(
     const CacheResources& runtime,
     const DecodedPolyhedronCache& polyhedron,
     DecodedPolyhedronCache* releaseTarget,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
     if (!adapter.SupportsPolyhedronTopology()) {
         return validation::AssignError(error, "decode adapter does not support polyhedron topology");
     }
@@ -197,10 +195,6 @@ inline bool CommitPolyhedronTopologyCache(
     header.uniqueVertexIdCount = polyhedron.uniqueVertexIdCount;
     header.localFaceVertexIdCount = polyhedron.localFaceVertexIdCount;
 
-    if (!adapter.BeginPolyhedronTopology(static_cast<std::size_t>(header.cellCount), error)) {
-        return false;
-    }
-    std::uint64_t peakBatchBytes = 0u;
     std::uint64_t batchCount = 0u;
     if (!polyhedron::EmitPolyhedronCacheToAdapter(
             runtime,
@@ -211,39 +205,40 @@ inline bool CommitPolyhedronTopologyCache(
             polyhedron.faceVertexCounts,
             polyhedron.cellUniqueVertexIds,
             polyhedron.localFaceVertexIds,
-            peakBatchBytes,
             batchCount,
-            error)) {
-        (void)adapter.EndPolyhedronTopology(error);
+            error, recordCapacitySamples)) {
         return false;
     }
     if (releaseTarget != nullptr) {
         releaseTarget->Release();
     }
-    return adapter.EndPolyhedronTopology(error);
+    return true;
 }
 
 inline bool CommitPolyhedronTopologyCache(
     IDecodeAdapter& adapter,
     const CacheResources& runtime,
     const DecodedPolyhedronCache& polyhedron,
-    std::string* error = nullptr) {
-    return CommitPolyhedronTopologyCache(adapter, runtime, polyhedron, nullptr, error);
+    std::string* error = nullptr,
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
+    return CommitPolyhedronTopologyCache(adapter, runtime, polyhedron, nullptr, error, recordCapacitySamples);
 }
 
 inline bool CommitPolyhedronTopologyCacheAndRelease(
     IDecodeAdapter& adapter,
     const CacheResources& runtime,
     DecodedPolyhedronCache& polyhedron,
-    std::string* error = nullptr) {
-    return CommitPolyhedronTopologyCache(adapter, runtime, polyhedron, &polyhedron, error);
+    std::string* error = nullptr,
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
+    return CommitPolyhedronTopologyCache(adapter, runtime, polyhedron, &polyhedron, error, recordCapacitySamples);
 }
 
 inline bool CommitTopologyCache(
     IDecodeAdapter& adapter,
     const CacheResources& runtime,
     const DecodedTopologyCache& topology,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
     switch (topology.kind) {
         case DecodedTopologyCache::Kind::Structured:
             return adapter.SetStructuredAxisSize(topology.structuredAxisSize.data(), error);
@@ -251,7 +246,7 @@ inline bool CommitTopologyCache(
             return CommitConnectivityTopologyCache(adapter, runtime, topology, error);
         case DecodedTopologyCache::Kind::Polyhedron:
             return topology.polyhedron.complete &&
-                CommitPolyhedronTopologyCache(adapter, runtime, topology.polyhedron, error);
+                CommitPolyhedronTopologyCache(adapter, runtime, topology.polyhedron, error, recordCapacitySamples);
         case DecodedTopologyCache::Kind::None:
             return true;
     }
@@ -262,7 +257,8 @@ inline bool CommitTopologyCacheAndRelease(
     IDecodeAdapter& adapter,
     const CacheResources& runtime,
     DecodedTopologyCache& topology,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
     switch (topology.kind) {
         case DecodedTopologyCache::Kind::Structured:
             return adapter.SetStructuredAxisSize(topology.structuredAxisSize.data(), error);
@@ -270,7 +266,7 @@ inline bool CommitTopologyCacheAndRelease(
             return CommitConnectivityTopologyCacheAndRelease(adapter, runtime, topology, error);
         case DecodedTopologyCache::Kind::Polyhedron:
             return topology.polyhedron.complete &&
-                CommitPolyhedronTopologyCacheAndRelease(adapter, runtime, topology.polyhedron, error);
+                CommitPolyhedronTopologyCacheAndRelease(adapter, runtime, topology.polyhedron, error, recordCapacitySamples);
         case DecodedTopologyCache::Kind::None:
             return true;
     }
@@ -330,20 +326,16 @@ inline bool CommitAttributeCacheFields(
     const CacheResources& runtime,
     DecodedAttributeCacheSet& attributes,
     const std::span<const std::size_t> attrIndices,
-    std::string* error = nullptr,
-    IParallelTaskRunner* parallelTaskRunner = nullptr,
-    const std::size_t workerLimit = 0u,
-    const std::stop_token stopToken = {}) {
-    if (attrIndices.empty()) {
-        return true;
-    }
+    std::string* error = nullptr) {
+    if (attrIndices.empty()) { return true; }
     if (!attributes.IsInitialized()) {
         return validation::AssignError(error, "decoded attribute cache set is not initialized");
     }
-
-    std::vector<AttributeCommitField> fields;
-    fields.reserve(attrIndices.size());
+    auto& root = runtime.Run();
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return false; }
     for (const auto attrIndex : attrIndices) {
+        if (root.Stopped()) { return false; }
         if (attrIndex >= attributes.FieldCount() || !attributes.Complete(attrIndex)) {
             return validation::AssignError(error, "requested decoded attribute cache field is incomplete");
         }
@@ -353,88 +345,15 @@ inline bool CommitAttributeCacheFields(
             return validation::AssignError(error, "decoded attribute cache field is missing");
         }
         const auto tupleBytes = DecodeAttributeTupleBytes(*meta);
-        std::size_t localElementCount = 0u;
-        std::size_t totalBytes = 0u;
-        if (!ResolveAttributeCommitShape(*meta, tupleBytes, localElementCount, totalBytes, error)) {
-            return false;
-        }
-        fields.push_back(AttributeCommitField{
-            .attrIndex = attrIndex,
-            .meta = meta,
-            .bytes = std::move(bytes),
-            .tupleBytes = tupleBytes,
-            .elementCount = localElementCount,
-            .totalBytes = totalBytes,
-            .adapterBacked = attributes.AdapterBacked(attrIndex),
-        });
-    }
-
-    // Adapter 的容器扩容和原生数组分配保持串行
-    for (const auto& field : fields) {
-        if (stopToken.stop_requested()) {
-            return validation::AssignError(error, "decoded attribute commit was cancelled");
-        }
-        if (!field.adapterBacked && !adapter.BeginAttribute(field.attrIndex, *field.meta, error)) {
-            return false;
-        }
-    }
-
-    std::atomic<bool> writeFailed{false};
-    std::mutex writeErrorMutex;
-    std::string writeError;
-    const auto writeFields = [&](const std::size_t begin, const std::size_t end) {
-        for (auto index = begin; index < end; ++index) {
-            if (writeFailed.load(std::memory_order_acquire) || stopToken.stop_requested()) {
-                return;
-            }
-            std::string localError;
-            try {
-                if (fields[index].adapterBacked) {
-                    continue;
-                }
-                if (WriteAttributeCommitField(adapter, runtime, fields[index], &localError)) {
-                    continue;
-                }
-            } catch (const std::exception& exception) {
-                localError = std::string("decoded attribute commit failed: ") + exception.what();
-            } catch (...) {
-                localError = "decoded attribute commit failed with an unknown exception";
-            }
-            if (!writeFailed.exchange(true, std::memory_order_acq_rel)) {
-                std::lock_guard<std::mutex> lock(writeErrorMutex);
-                writeError = localError.empty()
-                    ? "failed to write decoded attribute cache"
-                    : std::move(localError);
-            }
-        }
-    };
-
-    const auto useParallelWrites = adapter.SupportsConcurrentAttributeRangeWrites() &&
-        ShouldParallelizeRange(fields.size(), 2u, parallelTaskRunner, workerLimit);
-    if (useParallelWrites) {
-        ParallelForChunks(
-            0u,
-            fields.size(),
-            writeFields,
-            parallelTaskRunner,
-            workerLimit,
-            stopToken);
-    } else {
-        writeFields(0u, fields.size());
-    }
-    if (stopToken.stop_requested() && !writeFailed.load(std::memory_order_acquire)) {
-        return validation::AssignError(error, "decoded attribute commit was cancelled");
-    }
-    if (writeFailed.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(writeErrorMutex);
-        return validation::AssignError(error, writeError);
-    }
-
-    // AttributeSet 挂接保持串行，避免外部对象容器并发修改
-    for (const auto& field : fields) {
-        if (!adapter.EndAttribute(field.attrIndex, error)) {
-            return false;
-        }
+        std::size_t elementCount = 0u, totalBytes = 0u;
+        if (!ResolveAttributeCommitShape(*meta, tupleBytes, elementCount, totalBytes, error)) { return false; }
+        AttributeCommitField field{attrIndex, meta, std::move(bytes), tupleBytes,
+            elementCount, totalBytes, attributes.AdapterBacked(attrIndex)};
+        // 每个字段的构造、窗口写入和挂接均在 driver 完成
+        if (!field.adapterBacked &&
+            (!adapter.BeginAttribute(attrIndex, *meta, error) ||
+             !WriteAttributeCommitField(adapter, runtime, field, error))) { return false; }
+        if (root.Stopped() || !adapter.EndAttribute(attrIndex, error)) { return false; }
     }
     return true;
 }

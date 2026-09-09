@@ -49,28 +49,9 @@ using EncodeStageNode = PipelineStageNode<std::unique_ptr<EncodeStage>>;
 using EncodeAfterStageCallback = std::function<void(const EncodeStageId&)>;
 
 struct EncodePipelineRunOptions {
-    bool enableParallelStages{true};
     int packageFieldZstdLevel{3};
-    std::size_t transferCacheWorkerCount{1u};
     PackageFieldEncodingMode packageFieldEncoding{PackageFieldEncodingMode::Zstd};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
-    std::size_t accessWindowBytes{kDefaultEncodeAccessWindowBytes};
-    std::uint64_t activeWindowBytes{kDefaultEncodeActiveWindowBytes};
 };
-
-namespace detail {
-
-inline const char* EncodeStorageModeName(const EncodeStorageMode mode) noexcept {
-    switch (mode) {
-        case EncodeStorageMode::Memory:
-            return "memory";
-        case EncodeStorageMode::Managed:
-        default:
-            return "managed";
-    }
-}
-
-} // namespace detail
 
 struct EncodePipelineOptions {
     std::optional<EncodePipelineBinding> binding;
@@ -78,8 +59,9 @@ struct EncodePipelineOptions {
 
 struct EncodePipelineResult {
     bool success{false};
+    std::optional<CodecFailureRecord> failure;
     bool hasEncodedOutput{false};
-    std::vector<std::uint8_t> encodedBytes;
+    EncodedBuffer encodedBytes;
     std::uint64_t encodedByteCount{0u};
     std::vector<EncodeStageExecutionRecord> stageExecutions;
 };
@@ -121,6 +103,7 @@ public:
             return {};
         }
         EncodeLeafWorkspace workspace;
+        RunBinding binding(workspace, context.resources);
         EncodeFailureGuard guard(context, workspace);
         if (!guard.Run("EncodePipeline", CodecErrorCode::PipelineFailure, [&]() {
                 PrepareDataflow(context, workspace, false);
@@ -148,7 +131,7 @@ public:
 
     // 运行一次单帧单块 encode pipeline 并返回编码输出字节
     EncodePipelineResult Execute(EncodeContext& context) const {
-        MemoryByteRangeOutput sink;
+        MemoryByteRangeOutput sink(context.resources);
         auto result = ExecuteInternal(context, &sink);
         if (result.hasEncodedOutput && result.encodedBytes.empty() && result.encodedByteCount != 0u) {
             result.encodedBytes = sink.TakeBytes();
@@ -351,14 +334,17 @@ private:
                 "EncodePipeline",
                 CodecErrorCode::MissingInput,
                 "EncodePipeline requires a valid encode adapter.");
+            result.failure = context.FirstFailure();
             return result;
         }
         EncodeLeafWorkspace workspace;
+        RunBinding runBinding(workspace, context.resources);
         EncodeFailureGuard guard(context, workspace);
         if (!guard.Run("EncodePipeline", CodecErrorCode::PipelineFailure, [&]() {
                 PrepareDataflow(context, workspace);
                 return !context.HasFailure();
             })) {
+            result.failure = context.FirstFailure();
             return result;
         }
         std::vector<EncodeStageNode> stageNodes;
@@ -366,19 +352,15 @@ private:
                 stageNodes = BuildStageSchedule(context, workspace);
                 return !context.HasFailure();
             })) {
+            result.failure = context.FirstFailure();
             return result;
         }
         auto releaseTracker = BuildResourceReleaseTracker(stageNodes);
 
         EncodePipelineRunOptions runOptions;
         const auto& binding = *m_options.binding;
-        runOptions.enableParallelStages = binding.executionProfile.enableParallelStages;
-        runOptions.parallelTaskRunner = binding.executionProfile.parallelTaskRunner;
         runOptions.packageFieldEncoding = binding.descriptor.packageFields.mode;
         runOptions.packageFieldZstdLevel = binding.descriptor.packageFields.zstdLevel;
-        runOptions.accessWindowBytes = workspace.CacheResourcesRef().accessWindowBytes;
-        runOptions.activeWindowBytes = workspace.CacheResourcesRef().activeWindowBytes;
-        runOptions.transferCacheWorkerCount = binding.descriptor.packageFields.workerCount;
 
         std::string runtimeError;
         std::uint64_t encodedByteCount = 0u;
@@ -408,6 +390,7 @@ private:
                     CodecErrorCode::PipelineFailure,
                     runtimeError.empty() ? "EncodePipeline runtime failed" : runtimeError);
             }
+            result.failure = context.FirstFailure();
             return result;
         }
         AppendActualReferenceExecutionRecords(
@@ -535,16 +518,14 @@ private:
         }
 
         if (UsesPointSpatialPartition(descriptor)) {
-            auto pointRemap = std::make_unique<PointRemapStage>(
-                workspace.ResourceBudget().RemapEncodeStorageMode());
+            auto pointRemap = std::make_unique<PointRemapStage>();
             pointRemapId = pointRemap->Id();
             AddStage(stageNodes, std::move(pointRemap));
             pointRemapDeps.push_back(*pointRemapId);
         }
 
         if (UsesCellSpatialPartition(descriptor)) {
-            auto cellRemap = std::make_unique<CellRemapStage>(
-                workspace.ResourceBudget().RemapEncodeStorageMode());
+            auto cellRemap = std::make_unique<CellRemapStage>();
             cellRemapId = cellRemap->Id();
             // Point Remap 存在时通过 DAG 依赖保证先后关系
             // Point Original 时 Cell Remap 直接消费初始 Order Source
@@ -799,7 +780,6 @@ private:
             PackageFieldEncodingParams{
                 .mode = runOptions.packageFieldEncoding,
                 .zstdLevel = runOptions.packageFieldZstdLevel,
-                .workerCount = runOptions.transferCacheWorkerCount,
             },
             outputSink,
             encodedByteCount,
@@ -966,189 +946,6 @@ private:
         return true;
     }
 
-    static bool ExecuteStageDagParallel(
-        EncodeContext& context,
-        EncodeLeafWorkspace& workspace,
-        const std::vector<EncodeStageNode>& stageNodes,
-        std::vector<std::vector<std::size_t>>& dependents,
-        std::vector<std::size_t>& remainingDependencies,
-        EncodeAfterStageCallback afterStage,
-        IParallelTaskRunner& runner,
-        std::vector<EncodeStageExecutionRecord>* stageExecutions,
-        std::string* error) {
-        std::mutex schedulerMutex;
-        std::condition_variable schedulerCv;
-        std::vector<std::uint8_t> submitted(stageNodes.size(), 0u);
-        std::vector<std::uint8_t> hasStageStatus(stageNodes.size(), 0u);
-        std::vector<EncodeStageExecutionStatus> stageStatuses(
-            stageNodes.size(),
-            EncodeStageExecutionStatus::Failed);
-        std::vector<std::size_t> completedQueue;
-        completedQueue.reserve(stageNodes.size());
-        std::exception_ptr firstException;
-        bool schedulingStopped = false;
-        std::size_t submittedCount = 0u;
-        std::size_t completedCount = 0u;
-        std::size_t activeAttributeStages = 0u;
-        const auto attributeStageLimit = static_cast<std::size_t>(
-            workspace.ResourceBudget().AttributePressioLaneCount());
-        const auto isAttributeStage = [&stageNodes](const std::size_t stageIndex) {
-            const auto stageName = stageNodes[stageIndex].stage->Id().name;
-            return stageName == PointAttributeStage::kTypeName ||
-                stageName == CellAttributeStage::kTypeName;
-        };
-
-        auto taskGroup = runner.CreateGroup(workspace.StopToken());
-        if (taskGroup == nullptr) {
-            const std::string message = "encode stage task group is unavailable";
-            FailEncodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-            validation::AssignError(error, message);
-            return false;
-        }
-
-        const auto submitStage = [&](const std::size_t stageIndex) {
-            if (submitted[stageIndex] != 0u || schedulingStopped) {
-                return false;
-            }
-            const auto attributeStage = isAttributeStage(stageIndex);
-            if (attributeStage && activeAttributeStages >= attributeStageLimit) {
-                return false;
-            }
-            submitted[stageIndex] = 1u;
-            ++submittedCount;
-            if (attributeStage) {
-                ++activeAttributeStages;
-            }
-            const double stageProgress = static_cast<double>(completedCount) /
-                static_cast<double>(stageNodes.size());
-            ReportStageProgress(
-                context,
-                workspace,
-                stageNodes[stageIndex].stage->Id(),
-                stageProgress);
-            taskGroup->Submit([&context, &workspace, &stageNodes, &schedulerMutex, &schedulerCv, &completedQueue,
-                           &firstException, &hasStageStatus, &stageStatuses, stageIndex]() {
-                try {
-                    stageStatuses[stageIndex] = context.HasFailure() || workspace.StopRequested()
-                        ? EncodeStageExecutionStatus::Failed
-                        : ExecuteSingleStageNode(
-                              context,
-                              workspace,
-                              stageNodes[stageIndex]);
-                    hasStageStatus[stageIndex] = 1u;
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(schedulerMutex);
-                    if (firstException == nullptr) {
-                        firstException = std::current_exception();
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(schedulerMutex);
-                    completedQueue.push_back(stageIndex);
-                }
-                schedulerCv.notify_one();
-            });
-            return true;
-        };
-        const auto submitReadyStages = [&]() {
-            bool submittedAny = false;
-            for (std::size_t stageIndex = 0u; stageIndex < stageNodes.size(); ++stageIndex) {
-                if (remainingDependencies[stageIndex] == 0u && submitStage(stageIndex)) {
-                    submittedAny = true;
-                }
-            }
-            return submittedAny;
-        };
-
-        submitReadyStages();
-        if (submittedCount == 0u) {
-            const std::string message = "encode pipeline scheduler detected a dependency cycle";
-            FailEncodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-            validation::AssignError(error, message);
-            return false;
-        }
-
-        while (completedCount < stageNodes.size()) {
-            std::vector<std::size_t> justCompleted;
-            {
-                std::unique_lock<std::mutex> lock(schedulerMutex);
-                schedulerCv.wait(lock, [&]() {
-                    return !completedQueue.empty() || firstException != nullptr;
-                });
-                justCompleted.swap(completedQueue);
-                if (firstException != nullptr) {
-                    schedulingStopped = true;
-                }
-            }
-
-            for (const auto stageIndex : justCompleted) {
-                if (isAttributeStage(stageIndex) && activeAttributeStages > 0u) {
-                    --activeAttributeStages;
-                }
-                ++completedCount;
-                ReportCompletedProgress(context, completedCount, stageNodes.size());
-                if (hasStageStatus[stageIndex] != 0u && stageExecutions != nullptr) {
-                    stageExecutions->push_back(EncodeStageExecutionRecord{
-                        .stageId = stageNodes[stageIndex].stage->Id(),
-                        .status = stageStatuses[stageIndex],
-                    });
-                }
-                if (hasStageStatus[stageIndex] != 0u &&
-                    stageStatuses[stageIndex] == EncodeStageExecutionStatus::Failed) {
-                    schedulingStopped = true;
-                }
-                if (context.HasFailure() || workspace.StopRequested()) {
-                    schedulingStopped = true;
-                }
-                if (schedulingStopped) {
-                    continue;
-                }
-                if (afterStage) {
-                    afterStage(stageNodes[stageIndex].stage->Id());
-                }
-                for (const auto dependentIndex : dependents[stageIndex]) {
-                    if (remainingDependencies[dependentIndex] > 0u) {
-                        --remainingDependencies[dependentIndex];
-                    }
-                }
-            }
-            if (!schedulingStopped) {
-                submitReadyStages();
-            }
-
-            if (!schedulingStopped && completedCount < stageNodes.size() && submittedCount == completedCount) {
-                const std::string message = "encode pipeline scheduler detected a dependency cycle";
-                FailEncodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                validation::AssignError(error, message);
-                schedulingStopped = true;
-            }
-            if (schedulingStopped) {
-                break;
-            }
-        }
-
-        taskGroup->Wait();
-        if (firstException != nullptr) {
-            try {
-                std::rethrow_exception(firstException);
-            } catch (const std::exception& exception) {
-                const auto message = std::string("encode stage failed: ") + exception.what();
-                FailEncodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                validation::AssignError(error, message);
-            } catch (...) {
-                const std::string message = "encode stage failed";
-                FailEncodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                validation::AssignError(error, message);
-            }
-            return false;
-        }
-        if (context.HasFailure() || workspace.StopRequested()) {
-            AssignFailureOrError(context, error, "encode pipeline stopped after a stage failed");
-            return false;
-        }
-        return completedCount == stageNodes.size();
-    }
-
     static bool ExecuteStageDag(
         EncodeContext& context,
         EncodeLeafWorkspace& workspace,
@@ -1165,34 +962,9 @@ private:
         if (!BuildStageDependencyGraph(context, workspace, stageNodes, dependents, remainingDependencies, error)) {
             return false;
         }
-        if (runOptions.enableParallelStages && runOptions.parallelTaskRunner == nullptr) {
-            const std::string message = "parallel DataCodec encode requires a task runner";
-            FailEncodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-            validation::AssignError(error, message);
-            return false;
-        }
-        if (!runOptions.enableParallelStages ||
-            ResolveParallelTaskCount(stageNodes.size(), runOptions.parallelTaskRunner) <= 1u) {
-            return ExecuteStageDagSerial(
-                context,
-                workspace,
-                stageNodes,
-                dependents,
-                remainingDependencies,
-                std::move(afterStage),
-                stageExecutions,
-                error);
-        }
-        return ExecuteStageDagParallel(
-            context,
-            workspace,
-            stageNodes,
-            dependents,
-            remainingDependencies,
-            std::move(afterStage),
-            *runOptions.parallelTaskRunner,
-            stageExecutions,
-            error);
+        return ExecuteStageDagSerial(
+            context, workspace, stageNodes, dependents, remainingDependencies,
+            std::move(afterStage), stageExecutions, error);
     }
 
     struct EncodeResourceReleaseTracker {
@@ -1226,104 +998,24 @@ private:
         if (!context.runRecords.Wants(RunRecordKind::ResourceUsage)) {
             return;
         }
-        const auto stats = workspace.AttributeEncodeSchedulerRef().SnapshotStats();
-        const auto recordByteQuota = [&context](
-            const std::string& prefix,
-            const AttributeByteQuotaStats& quota) {
-            context.runRecords.RecordResourceUsage(prefix + ".max_active_bytes", quota.maxActiveBytes);
-            context.runRecords.RecordResourceUsage(prefix + ".peak_active_bytes", quota.peakActiveBytes);
-            context.runRecords.RecordResourceUsage(prefix + ".peak_requested_bytes", quota.peakRequestedBytes);
-        };
-        recordByteQuota("attribute.runtime.scratch", stats.scratch);
-        recordByteQuota("attribute.runtime.staging", stats.staging);
+        const auto stats = workspace.AttributeEncodeTimingRef().SnapshotStats();
+        context.runRecords.TryExport([&] {
         context.AddInfo(
-            "AttributeEncodeScheduler",
-            "scratch acquire=" + std::to_string(stats.scratch.acquireCount) +
-                " wait=" + std::to_string(stats.scratch.waitCount) +
-                " waitNs=" + std::to_string(stats.scratch.totalWaitNanoseconds) +
-                "; staging acquire=" + std::to_string(stats.staging.acquireCount) +
-                " wait=" + std::to_string(stats.staging.waitCount) +
-                " waitNs=" + std::to_string(stats.staging.totalWaitNanoseconds));
-        context.AddInfo(
-            "AttributeEncodeScheduler",
-            "pressio lane peak=" + std::to_string(stats.pressioLane.peakActive) +
-                "/" + std::to_string(stats.pressioLane.laneCount) +
-                " acquire=" + std::to_string(stats.pressioLane.acquireCount) +
-                " wait=" + std::to_string(stats.pressioLane.waitCount) +
-                " waitNs=" + std::to_string(stats.pressioLane.totalWaitNanoseconds) +
-                "; reference lane peak=" + std::to_string(stats.referenceLane.peakActive) +
-                "/" + std::to_string(stats.referenceLane.laneCount) +
-                " acquire=" + std::to_string(stats.referenceLane.acquireCount) +
-                " wait=" + std::to_string(stats.referenceLane.waitCount) +
-                " waitNs=" + std::to_string(stats.referenceLane.totalWaitNanoseconds));
-        context.AddInfo(
-            "AttributeEncodeScheduler",
-            "pressio calls=" + std::to_string(stats.pressioCallCount) +
-                " totalNs=" + std::to_string(stats.pressioTotalNanoseconds) +
-                " maxNs=" + std::to_string(stats.pressioMaxNanoseconds));
+            "AttributeEncodeTiming",
+            "numeric blocks=" + std::to_string(stats.count) +
+                " totalNs=" + std::to_string(stats.totalNanoseconds) +
+                " maxNs=" + std::to_string(stats.maxNanoseconds));
+        });
     }
 
     static void RecordStoreRuntimeResourceUsage(
         EncodeContext& context,
-        const EncodeLeafWorkspace& workspace) {
-        if (!context.runRecords.Wants(RunRecordKind::ResourceUsage)) {
-            return;
-        }
-        const auto storeStats = workspace.ByteStoreSessionRef().SnapshotStats();
-        const auto scratchStats = workspace.ScratchBytePool().SnapshotStats();
-        const auto windowStats = workspace.CacheResourcesRef().windowBudget.SnapshotStats();
-        const auto remapScratchStats =
-            workspace.CacheResourcesRef().remapScratchBudget.SnapshotStats();
-        context.runRecords.RecordResourceUsage("bytestore.logical_bytes", storeStats.logicalBytes);
-        context.runRecords.RecordResourceUsage("bytestore.resident_bytes", storeStats.residentBytes);
-        context.runRecords.RecordResourceUsage("bytestore.peak_resident_bytes", storeStats.peakResidentBytes);
-        context.runRecords.RecordResourceUsage("bytestore.resident_limit_bytes", storeStats.residentLimitBytes);
-        context.runRecords.RecordResourceUsage("bytestore.mapped_bytes", storeStats.mappedBytes);
-        context.runRecords.RecordResourceUsage("bytestore.managed_file_bytes", storeStats.managedFileBytes);
-        context.runRecords.RecordResourceUsage("bytestore.store_count", storeStats.storeCount);
-        context.runRecords.RecordResourceUsage("scratch_pool.acquired_bytes", scratchStats.acquiredBytes);
-        context.runRecords.RecordResourceUsage(
-            "scratch_pool.max_retained_block_count",
-            scratchStats.maxRetainedBlockCount);
-        context.runRecords.RecordResourceUsage(
-            "scratch_pool.max_retained_block_bytes",
-            scratchStats.maxRetainedBlockBytes);
-        context.runRecords.RecordResourceUsage(
-            "scratch_pool.max_retained_total_bytes",
-            scratchStats.maxRetainedTotalBytes);
-        context.runRecords.RecordResourceUsage("scratch_pool.peak_active_bytes", scratchStats.peakActiveBytes);
-        context.runRecords.RecordResourceUsage("scratch_pool.retained_bytes", scratchStats.retainedBytes);
-        context.runRecords.RecordResourceUsage("scratch_pool.reused_block_count", scratchStats.reusedBlockCount);
-        context.runRecords.RecordResourceUsage("scratch_pool.allocation_count", scratchStats.allocationCount);
-        context.runRecords.RecordResourceUsage("window.max_active_bytes", windowStats.maxActiveBytes);
-        context.runRecords.RecordResourceUsage("window.peak_active_bytes", windowStats.peakActiveBytes);
-        context.runRecords.RecordResourceUsage("window.wait_count", windowStats.waitCount);
-        context.runRecords.RecordResourceUsage(
-            "remap_scratch.max_active_bytes",
-            remapScratchStats.maxActiveBytes);
-        context.runRecords.RecordResourceUsage(
-            "remap_scratch.peak_active_bytes",
-            remapScratchStats.peakActiveBytes);
-        context.runRecords.RecordResourceUsage(
-            "remap_scratch.wait_count",
-            remapScratchStats.waitCount);
-        if (context.referenceByteStoreSession != nullptr) {
-            const auto referenceStoreStats = context.referenceByteStoreSession->SnapshotStats();
-            context.runRecords.RecordResourceUsage(
-                "encode_reference.logical_bytes",
-                referenceStoreStats.logicalBytes);
-            context.runRecords.RecordResourceUsage(
-                "encode_reference.resident_bytes",
-                referenceStoreStats.residentBytes);
-            context.runRecords.RecordResourceUsage(
-                "encode_reference.peak_resident_bytes",
-                referenceStoreStats.peakResidentBytes);
-            context.runRecords.RecordResourceUsage(
-                "encode_reference.resident_limit_bytes",
-                referenceStoreStats.residentLimitBytes);
-            context.runRecords.RecordResourceUsage(
-                "encode_reference.managed_file_bytes",
-                referenceStoreStats.managedFileBytes);
+        const EncodeLeafWorkspace&) noexcept {
+        RecordRootCapacityAudit(context.runRecords, context.resources);
+        if (context.adapter != nullptr) {
+            context.runRecords.TryExport([&] {
+                RecordBufferCapacitySamples(context.runRecords, context.adapter->CapacitySamples());
+            });
         }
     }
 
@@ -1386,7 +1078,7 @@ private:
         context.runRecords.RecordRemapOrder(
             context.path,
             RunRemapDomain::Point,
-            source.Provider());
+            source.Handle());
     }
 
     static void RecordCellRemapLog(
@@ -1402,7 +1094,7 @@ private:
         context.runRecords.RecordRemapOrder(
             context.path,
             RunRemapDomain::Cell,
-            source.Provider());
+            source.Handle());
     }
 
     // 在 DAG 展开前构建本次运行的 transfer cache 布局
@@ -1420,32 +1112,8 @@ private:
             return;
         }
         {
-            workspace.SetResourceBudget(
-                m_options.binding->executionProfile.resourceBudget);
-            const auto& budget = workspace.ResourceBudget();
-            workspace.ConfigureCacheResources(
-                budget.AccessWindowBytes(),
-                budget.ActiveWindowBytes(),
-                budget.ScratchRetainedBlockCount(),
-                budget.ScratchRetainedBlockBytes(),
-                budget.ScratchRetainedTotalBytes(),
-                budget.RemapScratchQuotaBytes());
-            workspace.ConfigureAttributeEncodeResources(
+            workspace.ConfigureAttributeEncodeTiming(
                 context.runRecords.Wants(RunRecordKind::StageTiming));
-            context.AddInfo(
-                "EncodeStorageMode",
-                "geometryTransfer=" + std::string(detail::EncodeStorageModeName(
-                    budget.GeometryEncodeTransferCacheStorageMode())) +
-                    "; geometryStaging=" + detail::EncodeStorageModeName(
-                        budget.GeometryEncodeStagingStorageMode()) +
-                    "; attrTransfer=" + detail::EncodeStorageModeName(
-                        budget.AttributeEncodeTransferCacheStorageMode()) +
-                    "; attrStaging=" + detail::EncodeStorageModeName(
-                        budget.AttributeEncodeStagingStorageMode()) +
-                    "; topologyTransfer=" + detail::EncodeStorageModeName(
-                        budget.TopologyEncodeTransferCacheStorageMode()) +
-                    "; remap=" + detail::EncodeStorageModeName(
-                        budget.RemapEncodeStorageMode()));
         }
         std::string storageParamsError;
         std::vector<std::string> storageParamsWarnings;
@@ -1458,7 +1126,6 @@ private:
         }
         if (!CodecStorageParamsFactory::TryFromEncodeAdapter(
                 *context.adapter,
-                context.controlParams,
                 selectedAttributeIndices,
                 workspace.StorageParams(),
                 &storageParamsError,
@@ -1502,37 +1169,12 @@ private:
                 !context.currentAttributeReferenceCache->Initialize(
                     workspace.StorageParams(),
                     *context.referenceByteStoreSession,
-                    workspace.ResourceBudget().EncodeReferenceResidentLimitBytes(),
-                    workspace.ResourceBudget().AttributeEncodeReferenceCacheStorageMode() ==
-                        EncodeStorageMode::Memory
-                        ? DecodeStorageMode::Memory
-                        : DecodeStorageMode::Managed,
                     &referenceCacheError)) {
                 FailEncodePipeline(
                     context,
                     workspace,
                     CodecErrorCode::PipelineFailure,
                     "failed to initialize current attribute reference cache: " + referenceCacheError);
-            }
-        }
-        if (context.currentGeometryReferenceCache != nullptr &&
-            !context.currentGeometryReferenceCache->IsInitialized()) {
-            std::string geometryReferenceCacheError;
-            if (context.referenceByteStoreSession == nullptr ||
-                !context.currentGeometryReferenceCache->Initialize(
-                    workspace.StorageParams().geomParams,
-                    *context.referenceByteStoreSession,
-                    workspace.ResourceBudget().GeometryEncodeReferenceCacheStorageMode() ==
-                        EncodeStorageMode::Memory
-                        ? DecodeStorageMode::Memory
-                        : DecodeStorageMode::Managed,
-                    workspace.ResourceBudget().EncodeReferenceResidentLimitBytes(),
-                    &geometryReferenceCacheError)) {
-                FailEncodePipeline(
-                    context,
-                    workspace,
-                    CodecErrorCode::PipelineFailure,
-                    "failed to initialize current geometry reference cache: " + geometryReferenceCacheError);
             }
         }
         workspace.ClearTransferCaches();

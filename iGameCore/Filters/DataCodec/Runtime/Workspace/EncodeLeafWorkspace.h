@@ -3,12 +3,13 @@
 
 #include "DataCodec/Common/Views/ArrayViews.h"
 #include "DataCodec/Runtime/Failure/FailureCleanable.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 #include "DataCodec/Codec/NumericArray/NumericArraySource.h"
 #include "DataCodec/Runtime/Workspace/EncodeTransferCacheSet.h"
 #include "DataCodec/Codec/Attributes/AttributeSpooler.h"
-#include "DataCodec/Codec/Attributes/AttributeEncodeScheduler.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/API/Params/CodecControlParams.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 #include "DataCodec/Codec/Remap/RemapOrderSource.h"
@@ -58,11 +59,8 @@ class EncodeLeafWorkspace final : public IFailureCleanable {
 public:
     void Reset() {
         m_failureCleanupCompleted.store(false, std::memory_order_release);
-        m_stopSource = std::stop_source{};
         m_storageParams = {};
-        m_resourceBudget = {};
-        m_cacheResources.Clear();
-        m_attributeEncodeScheduler.Configure(nullptr);
+        m_attributeEncodeTiming.Configure();
         ClearAttributeReferenceSchedules();
         ClearGeometrySource();
         (void)ReleasePointRemap();
@@ -77,11 +75,6 @@ public:
 
     [[nodiscard]] CodecStorageParams& StorageParams() noexcept { return m_storageParams; }
     [[nodiscard]] const CodecStorageParams& StorageParams() const noexcept { return m_storageParams; }
-    [[nodiscard]] const EncodeResourceBudgetControlParams& ResourceBudget() const noexcept { return m_resourceBudget; }
-    void SetResourceBudget(EncodeResourceBudgetControlParams params) {
-        m_resourceBudget = std::move(params);
-        m_byteStoreSession.ConfigureResidentLimit(m_resourceBudget.ResidentLimitBytes());
-    }
     [[nodiscard]] CacheResources& CacheResourcesRef() noexcept { return m_cacheResources; }
     [[nodiscard]] const CacheResources& CacheResourcesRef() const noexcept { return m_cacheResources; }
     [[nodiscard]] bytestore::ByteStoreSession& ByteStoreSessionRef() noexcept { return m_byteStoreSession; }
@@ -92,32 +85,16 @@ public:
     [[nodiscard]] std::vector<std::string> TakeByteStoreDiagnostics() {
         return m_byteStoreSession.TakeDiagnostics();
     }
-    [[nodiscard]] ScratchByteBufferPool& ScratchBytePool() noexcept { return m_cacheResources.scratchBytePool; }
-    [[nodiscard]] const ScratchByteBufferPool& ScratchBytePool() const noexcept { return m_cacheResources.scratchBytePool; }
-    void ConfigureCacheResources(
-        const std::size_t accessWindowBytes = kDefaultEncodeAccessWindowBytes,
-        const std::uint64_t activeWindowBytes = kDefaultEncodeActiveWindowBytes,
-        const std::size_t scratchRetainedBlockCount = 16u,
-        const std::size_t scratchRetainedBlockBytes = 64u * 1024u * 1024u,
-        const std::uint64_t scratchRetainedTotalBytes = 1024ull * 1024ull * 1024ull,
-        const std::uint64_t remapScratchBudgetBytes = 256u * 1024u * 1024u) {
-        m_cacheResources.Configure(
-            accessWindowBytes,
-            activeWindowBytes,
-            scratchRetainedBlockCount,
-            scratchRetainedBlockBytes,
-            scratchRetainedTotalBytes);
-        m_cacheResources.ConfigureRemapScratchBudget(remapScratchBudgetBytes);
-    }
-    void ConfigureAttributeEncodeResources(
+    [[nodiscard]] ScratchByteBufferPool& ScratchBytePool() const { return m_cacheResources.ScratchBytePool(); }
+    void ConfigureAttributeEncodeTiming(
         const bool collectTiming = false) {
-        m_attributeEncodeScheduler.Configure(&m_resourceBudget, collectTiming);
+        m_attributeEncodeTiming.Configure(collectTiming);
     }
-    [[nodiscard]] AttributeEncodeScheduler& AttributeEncodeSchedulerRef() noexcept {
-        return m_attributeEncodeScheduler;
+    [[nodiscard]] callback::DurationAccumulator& AttributeEncodeTimingRef() noexcept {
+        return m_attributeEncodeTiming;
     }
-    [[nodiscard]] const AttributeEncodeScheduler& AttributeEncodeSchedulerRef() const noexcept {
-        return m_attributeEncodeScheduler;
+    [[nodiscard]] const callback::DurationAccumulator& AttributeEncodeTimingRef() const noexcept {
+        return m_attributeEncodeTiming;
     }
     [[nodiscard]] const RemapOrderSource& PointOrderSource() const noexcept { return m_pointOrderSource; }
     [[nodiscard]] const RemapOrderSource& PointInverseOrderSource() const noexcept {
@@ -161,9 +138,9 @@ public:
     [[nodiscard]] const EncodeTransferCacheLayout& TransferCacheLayout() const noexcept { return m_transferCacheLayout; }
     [[nodiscard]] EncodeTransferCacheSet& TransferCaches() noexcept { return m_transferCaches; }
     [[nodiscard]] const EncodeTransferCacheSet& TransferCaches() const noexcept { return m_transferCaches; }
-    [[nodiscard]] std::stop_token StopToken() const noexcept { return m_stopSource.get_token(); }
-    [[nodiscard]] bool StopRequested() const noexcept { return m_stopSource.stop_requested(); }
-    void RequestStop() noexcept { m_stopSource.request_stop(); }
+    [[nodiscard]] std::stop_token StopToken() const noexcept { return m_run ? m_run->StopToken() : std::stop_token{}; }
+    [[nodiscard]] bool StopRequested() const noexcept { return m_run && m_run->Stopped(); }
+    void RequestStop() noexcept { if (m_run && !m_run->Stopped()) { m_run->RequestStop(); } }
 
     [[nodiscard]] std::uint64_t ReleasePointRemap() {
         auto released = m_pointOrderSource.Release();
@@ -211,9 +188,6 @@ public:
             bytestore::ByteSourceConsumptionMode::OneShot);
         m_storageParams.attrPayloadOrder = MakeDefaultAttributePayloadOrder(attrCount);
         auto& record = m_transferCaches.TransferCache(*m_transferCacheLayout.attributes);
-        if (record.transferCache != nullptr) {
-            record.transferCache->Release();
-        }
         record.schedule.codecType = EncodedFieldCodecType::Raw;
         record.schedule.rawSize = bytestore::kUnknownByteSize;
         record.schedule.compressionType = EncodedFieldCompressionType::None;
@@ -292,7 +266,6 @@ public:
             return;
         }
         RequestStop();
-        m_resourceBudget = {};
         ClearGeometrySource();
         (void)ReleasePointRemap();
         (void)ReleaseCellRemap();
@@ -303,7 +276,6 @@ public:
             m_transferCaches.AbortAll();
             m_transferCacheLayout = {};
         }
-        m_cacheResources.Clear();
     }
 
     [[nodiscard]] std::size_t AddTransferCache(
@@ -322,16 +294,6 @@ public:
     }
     [[nodiscard]] const EncodeTransferUnit& TransferCache(const std::size_t index) const {
         return m_transferCaches.TransferCache(index);
-    }
-
-    void PublishTransferCacheBytes(
-        const std::size_t index,
-        std::vector<std::uint8_t> bytes,
-        const EncodedFieldCodecType codecType) {
-        {
-            std::lock_guard<std::mutex> lock(m_transferCacheMutex);
-            m_transferCaches.PublishTransferCacheBytes(index, std::move(bytes), codecType);
-        }
     }
 
     void PublishTransferCache(
@@ -536,11 +498,26 @@ private:
         return true;
     }
 
-    std::stop_source m_stopSource;
+    friend class RunBinding<EncodeLeafWorkspace>;
+    void BindRun(DataCodecExecutionResources& run) {
+        if (m_run) {
+            run.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+                "workspace-already-bound", "EncodeLeafWorkspace", "workspace already belongs to an active run"), true);
+            throw std::logic_error("encode workspace already bound");
+        }
+        m_byteStoreSession.BindRun(run);
+        m_cacheResources.BindRun(run);
+        m_run = &run;
+    }
+    void UnbindRun() noexcept {
+        m_byteStoreSession.UnbindRun();
+        m_cacheResources.UnbindRun();
+        m_run = nullptr;
+    }
+    DataCodecExecutionResources* m_run{nullptr};
     CodecStorageParams m_storageParams;
-    EncodeResourceBudgetControlParams m_resourceBudget;
     CacheResources m_cacheResources;
-    AttributeEncodeScheduler m_attributeEncodeScheduler;
+    callback::DurationAccumulator m_attributeEncodeTiming;
     bytestore::ByteStoreSession m_byteStoreSession;
     NumericArrayView m_geometrySourceView;
     std::shared_ptr<const void> m_geometrySourceOwner;

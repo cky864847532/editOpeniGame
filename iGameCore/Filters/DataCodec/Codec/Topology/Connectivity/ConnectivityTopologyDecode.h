@@ -87,16 +87,24 @@ inline bool LoadConnectivityEncodedStream(
     return true;
 }
 
-inline bool DecodeConnectivityTopologyToSink(
+struct ConnectivityDecodedBlock {
+    std::vector<IndexType> connectivity;
+    std::vector<IndexType> offsets;
+    std::vector<IndexType> cellTypes;
+    std::vector<std::uint16_t> polynomialOrders;
+};
+
+inline bool DecodeConnectivityTopologyBlock(
     const IConnectivityTopologyEncodedStreamReader& encoded,
     const std::size_t pointCount,
     const std::size_t cellCount,
     const std::size_t connectivityCount,
     const int fixedCellSize,
     const bool hasCellTypes,
-    IConnectivityTopologyDecodeSink& sink,
+    ConnectivityDecodedBlock& output,
     std::string* error = nullptr,
-    const ConnectivityTopologyDecodeTimingCallback& timingCallback = {}) {
+    const ConnectivityTopologyDecodeTimingCallback& timingCallback = {},
+    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
     const auto& metadata = encoded.Metadata();
     const auto inputStart = callback::StartTiming(timingCallback);
     ConnectivityEncodedStreamView connectivityStream;
@@ -129,6 +137,12 @@ inline bool DecodeConnectivityTopologyToSink(
             error)) {
         return false;
     }
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(TopologyBufferSample::ConnectivityReadCopy, connectivityStream.ownedBytes);
+        capacitySamples->Observe(TopologyBufferSample::CellSizeReadCopy, cellSizeStream.ownedBytes);
+        capacitySamples->Observe(TopologyBufferSample::PolynomialOrderReadCopy, cellPolynomialOrderStream.ownedBytes);
+        capacitySamples->Observe(TopologyBufferSample::CellTypeReadCopy, cellTypeStream.ownedBytes);
+    }
     RecordConnectivityTopologyDecodeTiming(
         timingCallback,
         "connectivity.input",
@@ -142,8 +156,9 @@ inline bool DecodeConnectivityTopologyToSink(
     const auto auxiliaryStart = callback::StartTiming(timingCallback);
     const bool hasOffsets = fixedCellSize <= 0;
     const bool hasCellPolynomialOrders = metadata.cellPolynomialOrderByteCount != 0u;
+    output = {};
     std::vector<IndexType> cellSizes;
-    std::vector<IndexType> offsets;
+    auto& offsets = output.offsets;
     if (hasOffsets) {
         if (!blockcodec::DecodeUnsignedSequence<IndexType>(
                 cellSizeStream.bytes,
@@ -192,7 +207,7 @@ inline bool DecodeConnectivityTopologyToSink(
     }
 
     const auto connectivityStart = callback::StartTiming(timingCallback);
-    std::vector<IndexType> connectivity;
+    auto& connectivity = output.connectivity;
     if (!blockcodec::DecodeConnectivity(
             connectivityStream.bytes,
             cellSizes,
@@ -201,7 +216,7 @@ inline bool DecodeConnectivityTopologyToSink(
             connectivityCount,
             fixedCellSize,
             connectivity,
-            error)) {
+            error, capacitySamples)) {
         return false;
     }
     RecordConnectivityTopologyDecodeTiming(
@@ -210,7 +225,7 @@ inline bool DecodeConnectivityTopologyToSink(
         connectivityStart,
         "values=" + std::to_string(connectivityCount));
 
-    std::vector<IndexType> cellTypes;
+    auto& cellTypes = output.cellTypes;
     if (hasCellTypes) {
         if (!blockcodec::DecodeUnsignedSequence<IndexType>(
                 cellTypeStream.bytes,
@@ -223,7 +238,7 @@ inline bool DecodeConnectivityTopologyToSink(
         return validation::AssignError(error, "topology carries cell types without the cell-type flag");
     }
 
-    std::vector<std::uint16_t> cellPolynomialOrders;
+    auto& cellPolynomialOrders = output.polynomialOrders;
     if (hasCellPolynomialOrders &&
         !blockcodec::DecodeUnsignedSequence<std::uint16_t>(
             cellPolynomialOrderStream.bytes,
@@ -232,33 +247,19 @@ inline bool DecodeConnectivityTopologyToSink(
             error)) {
         return false;
     }
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(TopologyBufferSample::Connectivity, connectivity);
+        capacitySamples->Observe(TopologyBufferSample::CellSizes, cellSizes);
+        capacitySamples->Observe(TopologyBufferSample::Offsets, offsets);
+        capacitySamples->Observe(TopologyBufferSample::CellTypes, cellTypes);
+        capacitySamples->Observe(TopologyBufferSample::PolynomialOrders, cellPolynomialOrders);
+    }
     RecordConnectivityTopologyDecodeTiming(
         timingCallback,
         "connectivity.auxiliary",
         auxiliaryStart,
         "cells=" + std::to_string(cellCount));
 
-    const auto sinkStart = callback::StartTiming(timingCallback);
-    if (!sink.BeginConnectivityTopology(
-            cellCount,
-            connectivityCount,
-            hasOffsets,
-            hasCellTypes,
-            hasCellPolynomialOrders,
-            error) ||
-        !sink.WriteConnectivityRange(0u, connectivity, error) ||
-        (hasOffsets && !sink.WriteOffsetsRange(0u, offsets, error)) ||
-        (hasCellTypes && !sink.WriteCellTypesRange(0u, cellTypes, error)) ||
-        (hasCellPolynomialOrders &&
-         !sink.WriteCellPolynomialOrdersRange(0u, cellPolynomialOrders, error)) ||
-        !sink.EndConnectivityTopology(error)) {
-        return false;
-    }
-    RecordConnectivityTopologyDecodeTiming(
-        timingCallback,
-        "connectivity.output",
-        sinkStart,
-        "connectivity=" + std::to_string(connectivityCount));
     return true;
 }
 

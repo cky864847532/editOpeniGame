@@ -2,6 +2,7 @@
 #define DATACODEC_RUNTIME_CONTEXT_ENCODECONTEXT_H
 
 #include "DataCodec/Runtime/Failure/FailureCleanable.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Common/DataCodecError.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
@@ -33,17 +34,11 @@ struct EncodeContextInitializeResult {
     explicit operator bool() const noexcept { return success; }
 };
 
-struct EncodeFailureState {
-    CodecErrorCode code{CodecErrorCode::EncodeFailure};
-    std::string stageName;
-    std::string message;
-    std::string formattedMessage;
-};
-
 struct EncodeContext : IFailureCleanable {
+    explicit EncodeContext(DataCodecExecutionResources& run) noexcept : resources(run), runRecords(&run) {}
+    DataCodecExecutionResources& resources;
     IEncodeAdapter* adapter{nullptr};
     const CodecControlParams* controlParams{nullptr};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
     RunRecordEmitter runRecords;
     RunEndRecord runSummary;
     TelemetryMemoryTraceRecorder* memoryTrace{nullptr};
@@ -60,16 +55,13 @@ struct EncodeContext : IFailureCleanable {
     EncodeAttributeReferenceFrame attributeKeyFrameReference;
     EncodeGeometryReferenceFrame geometryKeyFrameReference;
     DecodedAttributeCacheSet* currentAttributeReferenceCache{nullptr};
-    mutable std::mutex currentAttributeReferenceCacheMutex;
     DecodedGeometryReferenceCache* currentGeometryReferenceCache{nullptr};
     bytestore::ByteStoreSession* referenceByteStoreSession{nullptr};
-    mutable std::mutex currentGeometryReferenceCacheMutex;
-    std::optional<EncodeFailureState> failure;
-    mutable std::mutex failureMutex;
 
     // 校验必要字段并初始化运行记录，调用前需先设置各字段
     EncodeContextInitializeResult Initialize(IRunRecordSink* recordSink) {
         memoryTrace = nullptr;
+        runRecords.TryExport([&] {
         runRecords.Reset(
             RunRecordInfo{
                 .generatedAtUtc = runrecorddetail::MakeTimestampUtc(),
@@ -80,8 +72,8 @@ struct EncodeContext : IFailureCleanable {
                 .language = language,
             },
             recordSink);
+        });
         runSummary = {};
-        failure.reset();
         failureCleanupCompleted.store(false, std::memory_order_release);
 
         if (adapter == nullptr) {
@@ -105,58 +97,44 @@ struct EncodeContext : IFailureCleanable {
     bool RecordFailure(
         const std::string_view stageName,
         const CodecErrorCode code,
-        const std::string_view message) {
-        bool isFirstFailure = false;
-        {
-            std::lock_guard<std::mutex> lock(failureMutex);
-            if (!failure.has_value()) {
-                failure = EncodeFailureState{
-                    .code = code,
-                    .stageName = std::string(stageName),
-                    .message = std::string(message),
-                    .formattedMessage = FormatStageCodecError(stageName, code, message),
-                };
-                isFirstFailure = true;
-            }
-        }
-        runRecords.AddMessage(MakeCodecTelemetryMessage(std::string(stageName), code, std::string(message)));
-        return isFirstFailure;
+        const std::string_view message) noexcept {
+        return RecordFailure(MakeCodecFailureRecord(code, "operation-failed", stageName, message));
+    }
+
+    bool RecordFailure(const CodecFailureRecord& record) noexcept {
+        return resources.RecordFailure(record);
     }
 
     bool RecordFailure(
         const std::string_view stageName,
         const CodecErrorCode code,
-        const std::string& message) {
+        const std::string& message) noexcept {
         return RecordFailure(stageName, code, std::string_view(message));
     }
 
     bool RecordFailure(
         const std::string_view stageName,
         const CodecErrorCode code,
-        const char* message) {
+        const char* message) noexcept {
         assert(message != nullptr);
         return RecordFailure(stageName, code, std::string_view(message));
     }
 
-    [[nodiscard]] bool HasFailure() const {
-        std::lock_guard<std::mutex> lock(failureMutex);
-        return failure.has_value();
+    [[nodiscard]] bool HasFailure() const noexcept {
+        return resources.FirstFailure().has_value();
     }
 
-    [[nodiscard]] std::optional<EncodeFailureState> FirstFailure() const {
-        std::lock_guard<std::mutex> lock(failureMutex);
-        return failure;
+    [[nodiscard]] std::optional<CodecFailureRecord> FirstFailure() const noexcept {
+        return resources.FirstFailure();
     }
 
     void ResetCurrentAttributeReferenceCache() noexcept {
-        std::lock_guard<std::mutex> lock(currentAttributeReferenceCacheMutex);
         if (currentAttributeReferenceCache != nullptr) {
             currentAttributeReferenceCache->Reset();
         }
     }
 
     void ResetCurrentGeometryReferenceCache() noexcept {
-        std::lock_guard<std::mutex> lock(currentGeometryReferenceCacheMutex);
         if (currentGeometryReferenceCache != nullptr) {
             currentGeometryReferenceCache->Reset();
         }

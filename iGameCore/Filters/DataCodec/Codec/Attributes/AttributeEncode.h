@@ -9,7 +9,7 @@
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Codec/NumericArray/NumericArraySource.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
-#include "DataCodec/Codec/Attributes/AttributeEncodeScheduler.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Codec/Attributes/AttributeSpooler.h"
 #include "DataCodec/Runtime/Cache/TransferCache/ReferenceTransferCacheBuilder.h"
 #include "DataCodec/Codec/Reference/AttributeReferenceSchedule.h"
@@ -137,8 +137,7 @@ struct AttributeEncodeData {
 };
 
 struct AttributeEncodeSchedule {
-    AttributeEncodeScheduler& attributeScheduler;
-    const EncodeResourceBudgetControlParams& resourceBudget;
+    callback::DurationAccumulator& attributeTiming;
     EncodeAttributeReferenceSchedule& pointReferenceSchedule;
     EncodeAttributeReferenceSchedule& cellReferenceSchedule;
 };
@@ -151,10 +150,9 @@ struct AttributeEncodeCache {
 };
 
 struct AttributeEncodeContext {
-    std::function<void(std::string_view, std::uint64_t)> resourceCallback;
-    std::mutex* currentReferenceCacheMutex{nullptr};
     std::mutex& referenceScheduleMutex;
     std::mutex& referenceScheduleBuildMutex;
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 struct AttributeEncodeRuntime {
@@ -293,23 +291,17 @@ inline bool EnsureReferencePointOrderProvider(
     if (geometry.tupleCount != referenceAdapter.GetNumberOfPoints()) {
         return validation::AssignError(error, "reference geometry view tuple count does not match adapter point count");
     }
-    const bool useMemoryRemap =
-        runtime.schedule.resourceBudget.RemapEncodeStorageMode() == EncodeStorageMode::Memory;
     const auto providerFactory = MakeStoreBackedWritableRemapProviderFactory(
         runtime.cache.byteStoreSession,
-        "attribute_reference_point_remap",
-        useMemoryRemap);
+        "attribute_reference_point_remap");
     if (!pointremap::BuildPointMortonRemapProviders(
             geometry,
             result,
             error,
             pointremap::BuildOptions{
+                .resources = runtime.cache.cacheResources.Run(),
                 .providerFactory = providerFactory,
                 .byteStoreSession = &runtime.cache.byteStoreSession,
-                .scratchBudget = &runtime.cache.cacheResources.remapScratchBudget,
-                .mortonLeafBudgetBytes = runtime.schedule.resourceBudget.RemapMortonLeafBytes(),
-                .mortonRunBufferBytes = runtime.schedule.resourceBudget.RemapMortonRunBufferBytes(),
-                .useMemoryScratchStore = useMemoryRemap,
             })) {
         return false;
     }
@@ -343,26 +335,20 @@ inline bool EnsureReferenceCellOrderProvider(
     }
     const auto* pointInverse = reference.pointInverseOrderProvider.get();
 
-    const bool useMemoryRemap =
-        runtime.schedule.resourceBudget.RemapEncodeStorageMode() == EncodeStorageMode::Memory;
     const auto providerFactory = MakeStoreBackedWritableRemapProviderFactory(
         runtime.cache.byteStoreSession,
-        "attribute_reference_cell_remap",
-        useMemoryRemap);
+        "attribute_reference_cell_remap");
     std::shared_ptr<IRemapProvider> provider;
     if (referenceAdapter.IsPolyhedronMesh()) {
         if (!polyhedron::BuildPolyhedronCellRangeMortonRemapProvider(
                 referenceAdapter,
                 cellremap::BuildOptions{
+                    .resources = runtime.cache.cacheResources.Run(),
                     .pointInverse = pointInverse,
                     .providerFactory = providerFactory,
                     .byteStoreSession = &runtime.cache.byteStoreSession,
-                    .scratchBudget = &runtime.cache.cacheResources.remapScratchBudget,
-                    .mortonLeafBudgetBytes = runtime.schedule.resourceBudget.RemapMortonLeafBytes(),
-                    .mortonRunBufferBytes = runtime.schedule.resourceBudget.RemapMortonRunBufferBytes(),
-                    .useMemoryScratchStore = useMemoryRemap,
                     .progressCallback = {},
-                    .resourceCallback = runtime.context.resourceCallback,
+                    .recordCapacitySamples = runtime.context.recordCapacitySamples,
                 },
                 provider,
                 error)) {
@@ -376,14 +362,11 @@ inline bool EnsureReferenceCellOrderProvider(
         if (!cellremap::BuildMortonRemapProvider(
                 topology,
                 cellremap::BuildOptions{
+                    .resources = runtime.cache.cacheResources.Run(),
                     .pointInverse = pointInverse,
                     .providerFactory = providerFactory,
                     .byteStoreSession = &runtime.cache.byteStoreSession,
-                    .scratchBudget = &runtime.cache.cacheResources.remapScratchBudget,
-                    .mortonLeafBudgetBytes = runtime.schedule.resourceBudget.RemapMortonLeafBytes(),
-                    .mortonRunBufferBytes = runtime.schedule.resourceBudget.RemapMortonRunBufferBytes(),
-                    .useMemoryScratchStore = useMemoryRemap,
-                    .resourceCallback = runtime.context.resourceCallback,
+                    .recordCapacitySamples = runtime.context.recordCapacitySamples,
                 },
                 provider,
                 error)) {
@@ -483,9 +466,8 @@ inline bool SelectTemporalPredictorOffsetOnlyForBlockTyped(
     const AttrReferenceControlParams& dependency,
     const NumericArrayReferenceKind referenceKind,
     const std::uint16_t localParentFieldIndex,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     std::int32_t& predictorOffset,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     predictorOffset = 0;
     if (referenceKind != NumericArrayReferenceKind::TemporalKeyFrame ||
         !dependency.temporalField.predictor.enableLocalWindowSearch ||
@@ -504,7 +486,6 @@ inline bool SelectTemporalPredictorOffsetOnlyForBlockTyped(
                     referenceMeta,
                     meta,
                     scratchBytePool,
-                    acquireScratchQuota,
                     elementOffset,
                     elementCount,
                     candidateOffset,
@@ -527,7 +508,7 @@ inline bool SelectTemporalPredictorOffsetOnlyForBlockTyped(
                 strategy,
                 candidateOffset,
                 candidateResult,
-                error)) {
+                error, compressorState)) {
                 return false;
             }
             candidatePredictorBytes.Release();
@@ -571,9 +552,8 @@ inline bool SelectTemporalPredictorOffsetOnlyForBlock(
     const AttrReferenceControlParams& dependency,
     const NumericArrayReferenceKind referenceKind,
     const std::uint16_t localParentFieldIndex,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     std::int32_t& predictorOffset,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     const auto componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0));
     if (NumericArrayValueSize(meta) == sizeof(float)) {
         return SelectTemporalPredictorOffsetOnlyForBlockTyped<float>(
@@ -589,9 +569,8 @@ inline bool SelectTemporalPredictorOffsetOnlyForBlock(
             dependency,
             referenceKind,
             localParentFieldIndex,
-            acquireScratchQuota,
             predictorOffset,
-            error);
+            error, compressorState);
     }
     if (NumericArrayValueSize(meta) == sizeof(double)) {
         return SelectTemporalPredictorOffsetOnlyForBlockTyped<double>(
@@ -607,9 +586,8 @@ inline bool SelectTemporalPredictorOffsetOnlyForBlock(
             dependency,
             referenceKind,
             localParentFieldIndex,
-            acquireScratchQuota,
             predictorOffset,
-            error);
+            error, compressorState);
     }
     return validation::AssignError(error, "temporal predictor requires float32 or float64 data");
 }
@@ -768,8 +746,7 @@ inline bool WriteAttributeSourceToReferenceCache(
     const std::size_t attrMetaIndex,
     const AttrStorageParams& meta,
     const numericarray::NumericArraySource& source,
-    ScratchByteBufferPool& scratchBytePool,
-    const std::size_t windowBytes,
+    DataCodecExecutionResources& root,
     std::string* error = nullptr) {
     numericarray::NumericArrayReader reader;
     if (!numericarray::BuildNumericArrayReader(source, reader, error)) {
@@ -793,14 +770,18 @@ inline bool WriteAttributeSourceToReferenceCache(
     if (tupleBytes == 0u && localElementCount != 0u) {
         return validation::AssignError(error, "attribute reference cache tuple size is invalid");
     }
-    if (!store.BeginAttribute(attrMetaIndex, meta, error)) {
-        return false;
-    }
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase || !store.BeginAttribute(attrMetaIndex, meta, error)) { return false; }
+    struct Guard {
+        DecodedAttributeCacheSet& store;
+        std::size_t index;
+        ~Guard() { if (!store.Complete(index)) { store.ReleaseFieldBytes(index); } }
+    } guard{store, attrMetaIndex};
     if (tupleBytes == 0u) {
         return store.EndAttribute(attrMetaIndex, error);
     }
 
-    const auto resolvedWindowBytes = std::max<std::size_t>(windowBytes, tupleBytes);
+    const auto resolvedWindowBytes = std::max<std::size_t>(kIoWindowBytes, tupleBytes);
     const auto elementsPerWindow = std::max<std::size_t>(1u, resolvedWindowBytes / tupleBytes);
     std::size_t elementOffset = 0u;
     while (elementOffset < localElementCount) {
@@ -808,9 +789,9 @@ inline bool WriteAttributeSourceToReferenceCache(
             elementsPerWindow,
             localElementCount - elementOffset);
         ScratchByteBuffer bytes;
-        if (!reader.ReadElements(elementOffset, elementCount, scratchBytePool, bytes, error)) {
-            return false;
-        }
+        if (!RunTerminalWork(root, *phase, [&](WorkerContext& worker) {
+                return reader.ReadElements(elementOffset, elementCount, worker.Scratch(), bytes, error);
+            })) { return false; }
         std::size_t expectedWindowBytes = 0u;
         if (!validation::CheckedMulSizeT(
                 elementCount,
@@ -977,7 +958,8 @@ inline bool BuildAttributeReferenceScheduleForAttachment(
         metaIndices,
         referenceAllowed,
         dependency,
-        runtime.cache.cacheResources.scratchBytePool,
+        runtime.cache.cacheResources.Run(),
+        runtime.cache.byteStoreSession,
         schedule,
         error);
 }
@@ -1171,7 +1153,6 @@ struct AttributeReferenceTransferData {
     const ReferenceSourceData& referenceData;
     NumericArrayReferenceCodecId codecId{NumericArrayReferenceCodecId::NonReference};
     const AttrReferenceControlParams& dependency;
-    std::uint32_t spatialBlockElementCount{262144u};
 };
 
 inline ReferenceSelectionMode ResolveAttributeReferenceSelectionMode(
@@ -1192,20 +1173,14 @@ inline const NumericArrayControlParams& ResolveAttributeControlParams(
     return fallbackControl;
 }
 
-struct AttributeReferenceTransferSchedule {
-    AttributeEncodeScheduler& attributeScheduler;
-};
-
 struct AttributeReferenceTransferCache {
-    ScratchByteBufferPool& scratchBytePool;
-    window::WindowBudget& windowBudget;
-    std::size_t windowBytes{0u};
+    DataCodecExecutionResources& resources;
     bytestore::ByteStoreSession& byteStoreSession;
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 inline bool BuildReferenceTransferCache(
     const AttributeReferenceTransferData& data,
-    const AttributeReferenceTransferSchedule& schedule,
     const AttributeReferenceTransferCache& cache,
     std::shared_ptr<bytestore::IByteSource>& transferCache,
     std::vector<NumericArrayBlockLayoutParams>* blockLayouts = nullptr,
@@ -1219,10 +1194,7 @@ inline bool BuildReferenceTransferCache(
     NumericArrayControlParams fallbackControl;
     const auto& controlParams = ResolveAttributeControlParams(data.controlParams, fallbackControl);
     const auto& defaultCompressor = controlParams.regionControl.defaultPrecision.compressor;
-    ScratchByteQuotaAcquire acquireScratchQuota = [&schedule](const std::uint64_t bytes) {
-        return schedule.attributeScheduler.AcquireScratch(bytes);
-    };
-    auto selectPredictorOffset = [&data, &defaultCompressor, acquireScratchQuota](
+    auto selectPredictorOffset = [&data, &defaultCompressor](
         const NumericArrayStorageParams& currentMeta,
         const std::span<const std::uint8_t> currentBytes,
         const numericarray::NumericArrayReader& referenceReader,
@@ -1233,7 +1205,8 @@ inline bool BuildReferenceTransferCache(
         const NumericArrayReferenceKind referenceKind,
         const std::uint16_t localParentFieldIndex,
         std::int32_t& predictorOffset,
-        std::string* localError) {
+        std::string* localError,
+        numericarray::NumericArrayCompressorState* compressorState) {
         if (referenceKind == NumericArrayReferenceKind::IntraArray) {
             predictorOffset = 0;
             return true;
@@ -1250,36 +1223,9 @@ inline bool BuildReferenceTransferCache(
             data.dependency,
             referenceKind,
             localParentFieldIndex,
-            acquireScratchQuota,
             predictorOffset,
-            localError);
+            localError, compressorState);
     };
-    numericarrayreference::NumericArrayReferenceStagingStoreFactory createStagingStore =
-        [&cache, &schedule](
-            const std::string& label,
-            const std::uint64_t logicalBytes,
-            std::string* localError) -> std::shared_ptr<bytestore::IByteStore> {
-            auto stagingLease = std::make_shared<AttributeByteQuota::Lease>(
-                schedule.attributeScheduler.AcquireStaging(logicalBytes));
-            auto store = bytestore::CreateByteStore(
-                cache.byteStoreSession,
-                label,
-                schedule.attributeScheduler.StagingStorageMode() == EncodeStorageMode::Memory,
-                localError);
-            if (store == nullptr) {
-                stagingLease->Release();
-                return nullptr;
-            }
-            return std::shared_ptr<bytestore::IByteStore>(
-                store.get(),
-                [store = std::move(store), stagingLease](bytestore::IByteStore* rawStore) mutable {
-                    if (rawStore != nullptr) {
-                        rawStore->Release();
-                    }
-                    stagingLease->Release();
-                    store.reset();
-                });
-        };
     return numericarrayreference::BuildNumericArrayReferenceTransferCache(
         data.meta,
         defaultCompressor,
@@ -1296,23 +1242,14 @@ inline bool BuildReferenceTransferCache(
                 data.referenceData.candidate.scope == NumericArrayReferenceScope::IntraArray
                 ? data.dependency.intraField.autoSelectionStrategy
                 : ReferenceAutoSelectionStrategy::Exact,
-            .spatialBlockElementCount = data.spatialBlockElementCount,
-            .acquireScratchQuota = acquireScratchQuota,
             .selectPredictorOffset = std::move(selectPredictorOffset),
-            .createStagingStore = std::move(createStagingStore),
-            .useMemoryStaging =
-                schedule.attributeScheduler.StagingStorageMode() == EncodeStorageMode::Memory,
-            .useMemoryTransferCache =
-                schedule.attributeScheduler.TransferCacheStorageMode() == EncodeStorageMode::Memory,
         },
-        cache.scratchBytePool,
-        cache.windowBudget,
-        cache.windowBytes,
+        cache.resources,
         transferCache,
         cache.byteStoreSession,
         blockLayouts,
         error,
-        storeLabel);
+        storeLabel, cache.recordCapacitySamples);
 }
 
 inline bool EncodeNonReferenceField(
@@ -1336,32 +1273,21 @@ inline bool EncodeNonReferenceField(
     const auto& controlParams = ResolveAttributeControlParams(field.controlParams, fallbackControl);
     numericarray::ApplyNumericArrayControlParams(blockParams, controlParams);
     NumericArrayTransferCacheRuntime transferRuntime;
-    transferRuntime.useMemoryTransferCache =
-        runtime.schedule.attributeScheduler.TransferCacheStorageMode() == EncodeStorageMode::Memory;
-    transferRuntime.acquireScratchQuota = [&runtime](const std::uint64_t bytes) {
-        return runtime.schedule.attributeScheduler.AcquireScratch(bytes);
-    };
-    transferRuntime.acquireFloatingPointEncodeLane = [&runtime]() {
-        return std::static_pointer_cast<void>(
-            std::make_shared<AttributeLaneGate::Lease>(
-                runtime.schedule.attributeScheduler.AcquirePressioLane()));
-    };
-    if (runtime.schedule.attributeScheduler.CollectTiming()) {
+    transferRuntime.recordCapacitySamples = runtime.context.recordCapacitySamples;
+    if (runtime.schedule.attributeTiming.CollectTiming()) {
         transferRuntime.recordFloatingPointEncodeDuration =
             [&runtime](const std::chrono::nanoseconds duration) {
-                runtime.schedule.attributeScheduler.RecordPressioDuration(duration);
+                runtime.schedule.attributeTiming.RecordDuration(duration);
             };
     }
     if (!BuildNumericArrayTransferCache(
             blockParams,
             reader,
-            runtime.cache.cacheResources.scratchBytePool,
+            runtime.cache.cacheResources.Run(),
             numericArrayResult,
             runtime.cache.byteStoreSession,
             error,
             "attribute_" + std::to_string(field.request.metaIndex),
-            runtime.cache.cacheResources.accessWindowBytes,
-            runtime.data.storageParams.spatialBlockParams.ElementCount(field.request.attachment),
             &transferRuntime)) {
         return false;
     }
@@ -1393,8 +1319,6 @@ inline bool EncodeReferenceField(
         return validation::AssignError(error, "integer attribute reference requires wavelet codec");
     }
 
-    std::optional<AttributeLaneGate::Lease> referenceLane;
-    referenceLane.emplace(runtime.schedule.attributeScheduler.AcquireReferenceLane());
     if (!BuildReferenceTransferCache(
             AttributeReferenceTransferData{
                 .meta = payload.meta,
@@ -1403,17 +1327,11 @@ inline bool EncodeReferenceField(
                 .referenceData = decision.referenceSource,
                 .codecId = codecId,
                 .dependency = dependency,
-                .spatialBlockElementCount =
-                    runtime.data.storageParams.spatialBlockParams.ElementCount(field.request.attachment),
-            },
-            AttributeReferenceTransferSchedule{
-                .attributeScheduler = runtime.schedule.attributeScheduler,
             },
             AttributeReferenceTransferCache{
-                .scratchBytePool = runtime.cache.cacheResources.scratchBytePool,
-                .windowBudget = runtime.cache.cacheResources.windowBudget,
-                .windowBytes = runtime.cache.cacheResources.accessWindowBytes,
+                .resources = runtime.cache.cacheResources.Run(),
                 .byteStoreSession = runtime.cache.byteStoreSession,
+                .recordCapacitySamples = runtime.context.recordCapacitySamples,
             },
             payload.transferCache,
             &payload.meta.blockLayouts,
@@ -1492,48 +1410,22 @@ inline bool EncodeFieldPayload(
 }
 
 inline bool PublishDomainRecord(
-    AttributeEncodeRuntime& runtime,
-    const ResolvedAttributeField& field,
-    AttributeFieldPayload payload,
-    std::string* error = nullptr) {
-    auto transferCache = std::move(payload.transferCache);
+    AttributeEncodeRuntime& runtime, const ResolvedAttributeField& field,
+    AttributeFieldPayload payload, std::string* error = nullptr) {
     if (runtime.cache.attributeOutput == nullptr) {
         return validation::AssignError(error, "attribute output was not initialized");
     }
-    if (!runtime.cache.attributeOutput->SetRecordSource(
-            field.request.metaIndex,
-            transferCache,
-            error)) {
-        if (transferCache != nullptr) {
-            transferCache->Release();
+    if (auto* reference = runtime.cache.currentReferenceCache) {
+        if (!reference->IsInitialized()) {
+            return validation::AssignError(error, "current attribute reference cache is not initialized");
         }
-        return false;
+        if (!WriteAttributeSourceToReferenceCache(*reference, field.request.metaIndex, field.meta,
+                field.source, runtime.cache.cacheResources.Run(), error)) { return false; }
     }
-
-    runtime.data.storageParams.attrParams.at(field.request.metaIndex) = payload.meta;
-    if (runtime.cache.currentReferenceCache == nullptr) {
-        return true;
-    }
-    if (!runtime.cache.currentReferenceCache->IsInitialized()) {
-        return validation::AssignError(error, "current attribute reference cache is not initialized");
-    }
-    if (runtime.context.currentReferenceCacheMutex == nullptr) {
-        return validation::AssignError(error, "current attribute reference cache mutex is missing");
-    }
-
-    bool storeWriteOk = false;
-    {
-        std::lock_guard<std::mutex> lock(*runtime.context.currentReferenceCacheMutex);
-        storeWriteOk = WriteAttributeSourceToReferenceCache(
-            *runtime.cache.currentReferenceCache,
-            field.request.metaIndex,
-            field.meta,
-            field.source,
-            runtime.cache.cacheResources.scratchBytePool,
-            runtime.cache.cacheResources.accessWindowBytes,
-            error);
-    }
-    return storeWriteOk;
+    if (!runtime.cache.attributeOutput->SetRecordSource(field.request.metaIndex,
+            std::move(payload.transferCache), error)) { return false; }
+    runtime.data.storageParams.attrParams.at(field.request.metaIndex) = std::move(payload.meta);
+    return true;
 }
 
 } // namespace detail

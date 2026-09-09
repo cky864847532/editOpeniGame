@@ -7,7 +7,8 @@
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/Codec/Remap/RemapOrderSource.h"
-#include "DataCodec/Codec/Topology/Common/TopologyWorkBudget.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamEncoder.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 
@@ -18,6 +19,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -27,14 +29,11 @@ namespace datacodec::polyhedron {
 inline constexpr std::size_t kSmallCellLinearLookupThreshold = 24u;
 
 struct PolyhedronCellWorkWorkspace {
-    std::vector<IndexType> localIndexTable;
+    std::span<IndexType> localIndexTable;
     std::vector<IndexType> overflowPointIds;
     std::vector<IndexType> overflowLocalIds;
 
-    void Prepare(const std::size_t pointCount, const std::size_t overflowReserve) {
-        if (localIndexTable.size() < pointCount) {
-            localIndexTable.resize(pointCount, std::numeric_limits<IndexType>::max());
-        }
+    void Prepare(const std::size_t overflowReserve) {
         overflowPointIds.clear();
         overflowLocalIds.clear();
         overflowPointIds.reserve(overflowReserve);
@@ -60,8 +59,8 @@ struct PolyhedronTopologyData {
     const RemapOrderSource& cellOrderSource;
 };
 
-struct PolyhedronTopologySchedule {
-    const EncodeResourceBudgetControlParams& resourceBudget;
+struct PolyhedronTopologyExecution {
+    DataCodecExecutionResources& resources;
 };
 
 struct PolyhedronTopologyCache {
@@ -71,12 +70,12 @@ struct PolyhedronTopologyCache {
 struct PolyhedronTopologyContext {
     std::function<void(double)> progressCallback;
     std::function<void(std::string_view, double)> phaseTimingCallback;
-    std::function<void(const char*, std::uint64_t, std::string)> memoryCheckpoint;
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 struct PolyhedronTopologyEncodeInput {
     PolyhedronTopologyData data;
-    PolyhedronTopologySchedule schedule;
+    PolyhedronTopologyExecution execution;
     PolyhedronTopologyCache cache;
     PolyhedronTopologyContext context;
 };
@@ -149,7 +148,11 @@ inline bool ValidateAdapterPolyhedronTopology(
     const IndexType* faceVertexIds,
     const IndexType* faceVertexOffsets,
     const IRemapProvider* pointRemapInverse,
+    const std::span<std::uint8_t> visitedFaces,
+    bool& needsLocalIndexTable,
+    DataCodecExecutionResources& root,
     std::string* error = nullptr) {
+    needsLocalIndexTable = false;
     const auto cellCount = adapter.GetNumberOfCells();
     const auto faceCount = adapter.GetNumberOfFaces();
     const auto pointCount = adapter.GetNumberOfPoints();
@@ -187,8 +190,13 @@ inline bool ValidateAdapterPolyhedronTopology(
     (void)finalCellFaceOffset;
     (void)finalFaceVertexOffset;
 
-    std::vector<std::uint8_t> visitedFaces(faceCount, 0u);
+    if (visitedFaces.size() != faceCount) {
+        return validation::AssignError(error, "polyhedron visited-face owner has an unexpected size");
+    }
+    std::fill(visitedFaces.begin(), visitedFaces.end(), 0u);
     for (std::size_t cellIndex = 0; cellIndex < cellCount; ++cellIndex) {
+        if (root.Stopped()) { return false; }
+        std::size_t cellVertexReferences = 0u;
         const auto faceBegin = static_cast<std::size_t>(cellFaceOffsets[cellIndex]);
         const auto faceEnd = static_cast<std::size_t>(cellFaceOffsets[cellIndex + 1u]);
         if (faceEnd <= faceBegin) {
@@ -202,10 +210,6 @@ inline bool ValidateAdapterPolyhedronTopology(
                     error,
                     "polyhedron adapter topology contains an out-of-range face id");
             }
-            if (visitedFaces[faceId] != 0u) {
-                continue;
-            }
-
             const auto vertexBegin = static_cast<std::size_t>(faceVertexOffsets[faceId]);
             const auto vertexEnd = static_cast<std::size_t>(faceVertexOffsets[faceId + 1u]);
             if (vertexEnd < vertexBegin || vertexEnd - vertexBegin < 3u) {
@@ -213,6 +217,10 @@ inline bool ValidateAdapterPolyhedronTopology(
                     error,
                     "polyhedron adapter topology contains a face with fewer than three vertices");
             }
+            if (!validation::CheckedAddSizeT(cellVertexReferences, vertexEnd - vertexBegin,
+                    cellVertexReferences, "polyhedron cell vertex references", error)) { return false; }
+            needsLocalIndexTable |= cellVertexReferences > kSmallCellLinearLookupThreshold;
+            if (visitedFaces[faceId] != 0u) { continue; }
             for (std::size_t vertexCursor = vertexBegin; vertexCursor < vertexEnd; ++vertexCursor) {
                 IndexType translatedPointId = 0u;
                 if (!TryTranslateCellLocalPointId(
@@ -276,9 +284,11 @@ inline bool BuildAdapterPolyhedronCellWorkBuffer(
     workBuffer.localFaceVertexIds.reserve(totalFaceVertexCount);
     workBuffer.uniqueVertexIds.reserve(std::min<std::size_t>(totalFaceVertexCount, pointCount));
     if (totalFaceVertexCount > kSmallCellLinearLookupThreshold) {
-        workspace.Prepare(
-            pointRemapInverse == nullptr ? pointCount : pointRemapInverse->Size(),
-            totalFaceVertexCount);
+        const auto expected = pointRemapInverse == nullptr ? pointCount : pointRemapInverse->Size();
+        if (workspace.localIndexTable.size() != expected) {
+            return validation::AssignError(error, "polyhedron local index table was not prepared before block admission");
+        }
+        workspace.Prepare(totalFaceVertexCount);
     }
 
     for (const auto rawFaceId : faceIds) {
@@ -344,103 +354,6 @@ inline bool CompletePolyhedronTopologyStreamSpooler(
             error);
 }
 
-inline bool EncodeAdapterPolyhedronStreamsToTransferCache(
-    const IEncodeAdapter& adapter,
-    const IRemapProvider* cellOrderProvider,
-    const IRemapProvider* pointInverse,
-    topology::PolyhedronTopologyStreamSpooler& streams,
-    PolyhedronTopologyStreamStats& stats,
-    const std::function<void(double)>& progressCallback,
-    const std::function<void(std::string_view, double)>& phaseTimingCallback,
-    std::string* error = nullptr) {
-    stats = {};
-    if (!adapter.IsPolyhedronMesh()) {
-        return validation::AssignError(error, "adapter is not a polyhedron mesh");
-    }
-
-    const auto cellCount = adapter.GetNumberOfCells();
-    const auto* cellFaceIds = adapter.GetCellFaceBufferPtr();
-    const auto* cellFaceOffsets = adapter.GetCellFaceOffsetPtr();
-    const auto* faceVertexIds = adapter.GetFaceIdBufferPtr();
-    const auto* faceVertexOffsets = adapter.GetFaceIdOffsetPtr();
-    const auto faceCount = adapter.GetNumberOfFaces();
-    if (cellCount == 0) {
-        return true;
-    }
-    if (cellFaceIds == nullptr || cellFaceOffsets == nullptr || faceVertexIds == nullptr || faceVertexOffsets == nullptr) {
-        return validation::AssignError(error, "polyhedron stream encoder is missing adapter face table");
-    }
-
-    const auto pointCount = adapter.GetNumberOfPoints();
-    auto phaseStart = callback::StartPhase(phaseTimingCallback);
-    if (!ValidateAdapterPolyhedronTopology(
-            adapter,
-            cellFaceIds,
-            cellFaceOffsets,
-            faceVertexIds,
-            faceVertexOffsets,
-            pointInverse,
-            error)) {
-        return false;
-    }
-    phaseStart = callback::MarkPhase(phaseTimingCallback, "validate_adapter", phaseStart);
-    PolyhedronCellWorkWorkspace workspace;
-    PolyhedronCellWorkBuffer workBuffer;
-    PolyhedronTopologyStreamEncoder encoder(streams);
-    const auto progressStep = std::max<std::size_t>(cellCount / 64u, 1u);
-    phaseStart = callback::StartPhase(phaseTimingCallback);
-
-    for (std::size_t newCell = 0; newCell < cellCount; ++newCell) {
-        std::size_t oldCell = 0u;
-        if (!TryResolveOrderedCellIndex(
-                cellOrderProvider,
-                cellCount,
-                newCell,
-                oldCell,
-                error)) {
-            return false;
-        }
-        const auto begin = static_cast<std::size_t>(cellFaceOffsets[oldCell]);
-        const auto end = static_cast<std::size_t>(cellFaceOffsets[oldCell + 1u]);
-        if (!BuildAdapterPolyhedronCellWorkBuffer(
-                workBuffer,
-                std::span<const IndexType>(cellFaceIds + begin, end - begin),
-                faceVertexIds,
-                faceVertexOffsets,
-                faceCount,
-                pointCount,
-                pointInverse,
-                workspace,
-                error)) {
-            return false;
-        }
-        if (!encoder.AppendCell(
-                PolyhedronTopologyStreamCellView{
-                    std::span<const IndexType>(workBuffer.uniqueVertexIds.data(), workBuffer.uniqueVertexIds.size()),
-                    std::span<const IndexType>(workBuffer.faceVertexCounts.data(), workBuffer.faceVertexCounts.size()),
-                    std::span<const IndexType>(workBuffer.localFaceVertexIds.data(), workBuffer.localFaceVertexIds.size())},
-                error)) {
-            return false;
-        }
-        if (newCell + 1u == cellCount || (newCell + 1u) % progressStep == 0u) {
-            callback::InvokeProgress(
-                progressCallback,
-                static_cast<double>(newCell + 1u) / static_cast<double>(cellCount));
-        }
-    }
-    phaseStart = callback::MarkPhase(phaseTimingCallback, "adapter_cell_loop", phaseStart);
-    if (!encoder.Finish(error)) {
-        return false;
-    }
-    phaseStart = callback::MarkPhase(phaseTimingCallback, "adapter_encoder_finish", phaseStart);
-    stats = encoder.Stats();
-    const bool completed = CompletePolyhedronTopologyStreamSpooler(streams, stats, error);
-    if (completed) {
-        callback::MarkPhase(phaseTimingCallback, "adapter_complete_spooler", phaseStart);
-    }
-    return completed;
-}
-
 inline void UpdatePolyhedronStorageParamsFromStreamStats(
     TopoStorageParams& topo,
     const PolyhedronTopologyStreamStats& stats) {
@@ -449,96 +362,165 @@ inline void UpdatePolyhedronStorageParamsFromStreamStats(
     topo.polyhedronFaceVertexCount = stats.faceCount;
 }
 
+struct PolyhedronEncodeBatchResult {
+    std::size_t nextCell{0u};
+    std::optional<PolyhedronCapacitySamples> capacitySamples;
+};
+
 inline bool EncodePolyhedronTopologyToTransferCache(
     const PolyhedronTopologyEncodeInput& input,
-    PolyhedronTopologyEncodeResult& result,
-    std::string* error = nullptr) {
+    PolyhedronTopologyEncodeResult& result, std::string* error = nullptr) {
     result = {};
-
-    auto phaseStart = callback::StartPhase(input.context.phaseTimingCallback);
-    auto& topo = result.topo;
-    topo.cellCount = input.data.adapter.GetNumberOfCells();
-    topo.isPolyhedron = true;
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "input_counts", phaseStart);
-
-    if (!input.data.adapter.IsPolyhedronMesh()) {
-        return validation::AssignError(error, "adapter is not a polyhedron mesh");
+    auto& root = input.execution.resources;
+    auto& session = input.cache.byteStoreSession;
+    const auto& adapter = input.data.adapter;
+    if (!adapter.IsPolyhedronMesh()) { return validation::AssignError(error, "adapter is not a polyhedron mesh"); }
+    const auto cells = adapter.GetNumberOfCells();
+    const auto faces = adapter.GetNumberOfFaces();
+    const auto points = adapter.GetNumberOfPoints();
+    const auto* cellFaceIds = adapter.GetCellFaceBufferPtr();
+    const auto* cellFaceOffsets = adapter.GetCellFaceOffsetPtr();
+    const auto* faceVertexIds = adapter.GetFaceIdBufferPtr();
+    const auto* faceVertexOffsets = adapter.GetFaceIdOffsetPtr();
+    const auto* inverse = input.data.pointInverseOrderSource.Provider();
+    const auto* order = input.data.cellOrderSource.Provider();
+    std::size_t checked = 0u;
+    if (!validation::CheckedAddSizeT(cells, 1u, checked, "polyhedron cell offset count", error) ||
+        !validation::CheckedAddSizeT(faces, 1u, checked, "polyhedron face offset count", error)) { return false; }
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return false; }
+    bool needsTable = false;
+    auto visited = std::dynamic_pointer_cast<bytestore::MemoryStore>(
+        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, faces,
+            "polyhedron_visited_faces", error));
+    if (!visited) { return false; }
+    if (!RunTerminalWork(root, *phase, [&](WorkerContext&) {
+            auto bytes = visited->WritableBytes();
+            return ValidateAdapterPolyhedronTopology(adapter, cellFaceIds, cellFaceOffsets,
+                faceVertexIds, faceVertexOffsets, inverse, bytes, needsTable, root, error);
+        })) { return false; }
+    visited.reset();
+    std::shared_ptr<bytestore::MemoryStore> tableOwner;
+    std::span<IndexType> table;
+    if (needsTable) {
+        const auto count = inverse == nullptr ? points : inverse->Size();
+        if (count != points || !validation::CheckedMulSizeT(count, sizeof(IndexType), checked,
+                "polyhedron local index table bytes", error)) {
+            return validation::AssignError(error, "polyhedron remap point domain does not match the adapter");
+        }
+        tableOwner = std::dynamic_pointer_cast<bytestore::MemoryStore>(
+            session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, checked, "polyhedron_local_index", error));
+        if (!tableOwner) { return false; }
+        table = {reinterpret_cast<IndexType*>(tableOwner->WritableBytes().data()), count};
+        if (!RunTerminalWork(root, *phase, [&](WorkerContext&) {
+                std::fill(table.begin(), table.end(), std::numeric_limits<IndexType>::max());
+                return true;
+            })) { return false; }
     }
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "is_polyhedron_mesh", phaseStart);
-
-    if (topo.cellCount == 0) {
-        result.transferCache = std::make_shared<bytestore::VectorByteSource>(std::vector<std::uint8_t>{});
-        return true;
-    }
-
-    const auto topologyPath =
-        topology::MakePolyhedronAdapterTopologyEncodePath(input.data.adapter);
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "make_topology_path", phaseStart);
-    const auto topologyWorkBytes = topology::TopologyWorkBudget::Estimate(topologyPath);
-    if (input.context.memoryCheckpoint) {
-        input.context.memoryCheckpoint(
-            "topology.work_budget.requested",
-            topologyWorkBytes,
-            "polyhedron");
-    }
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "estimate_budget", phaseStart);
-
-    auto polyhedronStreamSpooler = topology::MakePolyhedronTopologyStreamSpooler(
-        input.cache.byteStoreSession,
-        input.schedule.resourceBudget.TopologyEncodeTransferCacheStorageMode() ==
-            EncodeStorageMode::Memory,
-        error);
-    if (polyhedronStreamSpooler == nullptr) {
-        return false;
-    }
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "make_spooler", phaseStart);
-    PolyhedronTopologyStreamStats streamStats;
-    const auto publishStreamProgress = [&](const double normalized) {
-        InvokePolyhedronTopologyProgress(input, 0.05 + normalized * 0.82);
+    auto streams = topology::MakePolyhedronTopologyStreamSpooler(session, root, error);
+    if (!streams) { return false; }
+    std::optional<PolyhedronTopologyStreamEncoder> encoder;
+    const auto recordStreamCapacities = [&] {
+        if (!input.context.recordCapacitySamples) { return; }
+        PolyhedronCapacitySamples samples;
+        encoder->ObserveCapacities(samples);
+        try { input.context.recordCapacitySamples(samples.values); }
+        catch (...) { root.RecordDiagnosticExportFailure(); }
     };
-    const bool encodedStreams = EncodeAdapterPolyhedronStreamsToTransferCache(
-        input.data.adapter,
-        input.data.cellOrderSource.Provider(),
-        input.data.pointInverseOrderSource.Provider(),
-        *polyhedronStreamSpooler,
-        streamStats,
-        publishStreamProgress,
-        input.context.phaseTimingCallback,
-        error);
-    phaseStart = callback::MarkPhase(
-        input.context.phaseTimingCallback,
-        "encode_adapter_streams",
-        phaseStart);
-    if (!encodedStreams) {
+    TopoStorageParams topo;
+    topo.cellCount = cells;
+    topo.isPolyhedron = true;
+    const auto finishStreams = [&] {
+        if (!encoder->Finish(error)) { return false; }
+        const auto stats = encoder->Stats();
+        if (stats.cellCount != cells) {
+            return validation::AssignError(error, "polyhedron encoded cell count does not match its input");
+        }
+        if (!CompletePolyhedronTopologyStreamSpooler(*streams, stats, error)) { return false; }
+        UpdatePolyhedronStorageParamsFromStreamStats(topo, stats);
+        if (!topology::ExportPolyhedronTopologyStreamLayouts(*streams, topo.polyhedronStreamLayouts, error)) { return false; }
+        auto source = topology::BuildPolyhedronTopologyStreamTransferCache(*streams, error);
+        if (!source) { return false; }
+        topo.binaryCount = source->ByteSizeHint();
+        result.topo = std::move(topo);
+        result.transferCache = std::move(source);
+        encoder.reset();
+        table = {};
+        tableOwner.reset();
+        InvokePolyhedronTopologyProgress(input, 0.98);
+        return true;
+    };
+    const auto finish = [&] {
+        if (finishStreams()) { return true; }
+        root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+            "polyhedron-stream-finalize", "EncodePolyhedronTopologyToTransferCache",
+            error != nullptr && !error->empty() ? std::string_view(*error) : "polyhedron stream finalization failed"));
         return false;
+    };
+    if (cells == 0u) {
+        encoder.emplace(*streams);
+        recordStreamCapacities();
+        return finish();
     }
-    if (streamStats.cellCount != topo.cellCount) {
-        return validation::AssignError(error, "encoded incomplete polyhedron topology stream transfer set");
-    }
-
-    UpdatePolyhedronStorageParamsFromStreamStats(
-        topo,
-        streamStats);
-    InvokePolyhedronTopologyProgress(input, 0.90);
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "update_storage_params", phaseStart);
-
-    if (!topology::ExportPolyhedronTopologyStreamLayouts(
-            *polyhedronStreamSpooler,
-            topo.polyhedronStreamLayouts,
-            error)) {
-        return false;
-    }
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "export_stream_layouts", phaseStart);
-    result.transferCache = topology::BuildPolyhedronTopologyStreamTransferCache(
-        *polyhedronStreamSpooler,
-        error);
-    if (result.transferCache == nullptr) {
-        return false;
-    }
-    phaseStart = callback::MarkPhase(input.context.phaseTimingCallback, "build_transfer_cache", phaseStart);
-    topo.binaryCount = static_cast<std::size_t>(result.transferCache->ByteSizeHint());
-    InvokePolyhedronTopologyProgress(input, 0.98);
-    return true;
+    std::size_t cursor = 0u;
+    phase.reset();
+    root.SetWorkType({.path = ResourceWorkPath::PolyhedronEncode,
+        .blockElements = numericarray::kSpatialBlockElementCount});
+    const bool success = RunOrderedBlocks<std::size_t, PolyhedronEncodeBatchResult>(root,
+        [&] { return cursor < cells; },
+        [&](std::size_t& first) {
+            first = cursor;
+            if (!encoder) {
+                encoder.emplace(*streams);
+                recordStreamCapacities();
+            }
+            return true;
+        },
+        [&](const std::size_t first, PolyhedronEncodeBatchResult& output, WorkerContext&) {
+            if (input.context.recordCapacitySamples) { output.capacitySamples.emplace(); }
+            const auto count = std::min<std::size_t>(numericarray::kSpatialBlockElementCount, cells - first);
+            PolyhedronCellWorkWorkspace workspace{.localIndexTable = table};
+            PolyhedronCellWorkBuffer work;
+            std::string localError;
+            const auto failed = [&] {
+                root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                    "polyhedron-cell-encode", "EncodePolyhedronTopologyToTransferCache", localError));
+                return false;
+            };
+            for (std::size_t cell = first; cell < first + count; ++cell) {
+                if (root.Stopped()) { return false; }
+                std::size_t oldCell = 0u;
+                if (!TryResolveOrderedCellIndex(order, cells, cell, oldCell, &localError)) { return failed(); }
+                const auto begin = static_cast<std::size_t>(cellFaceOffsets[oldCell]);
+                const auto end = static_cast<std::size_t>(cellFaceOffsets[oldCell + 1u]);
+                if (!BuildAdapterPolyhedronCellWorkBuffer(work, {cellFaceIds + begin, end - begin},
+                        faceVertexIds, faceVertexOffsets, faces, points, inverse, workspace, &localError) ||
+                    !encoder->AppendCell({work.uniqueVertexIds, work.faceVertexCounts, work.localFaceVertexIds}, &localError)) {
+                    return failed();
+                }
+                if (output.capacitySamples) {
+                    auto& samples = *output.capacitySamples;
+                    samples.Observe(PolyhedronBufferSample::UniqueIds, work.uniqueVertexIds);
+                    samples.Observe(PolyhedronBufferSample::FaceVertexCounts, work.faceVertexCounts);
+                    samples.Observe(PolyhedronBufferSample::LocalIds, work.localFaceVertexIds);
+                    samples.Observe(PolyhedronBufferSample::OverflowPoints, workspace.overflowPointIds);
+                    samples.Observe(PolyhedronBufferSample::OverflowLocals, workspace.overflowLocalIds);
+                }
+            }
+            output.nextCell = first + count;
+            return true;
+        },
+        [&](PolyhedronEncodeBatchResult& output) {
+            cursor = output.nextCell;
+            if (output.capacitySamples && input.context.recordCapacitySamples) {
+                try { input.context.recordCapacitySamples(output.capacitySamples->values); }
+                catch (...) { root.RecordDiagnosticExportFailure(); }
+            }
+            InvokePolyhedronTopologyProgress(input, 0.05 + 0.82 * static_cast<double>(cursor) / cells);
+            return cursor != cells || finish();
+        }, true);
+    if (!success) { result = {}; }
+    return success;
 }
 
 } // namespace datacodec::polyhedron

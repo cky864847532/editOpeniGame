@@ -12,6 +12,22 @@ namespace datacodec {
 
 class DecodeCacheRuntime final {
 public:
+    explicit DecodeCacheRuntime(DataCodecExecutionResources& run)
+        : m_referenceCache(std::make_shared<DecodeReferenceCache>(&run)),
+          m_defaultFrameCache(std::make_shared<DecodedFrameLruCache>(&run)),
+          m_defaultEncodedInputCache(std::make_shared<EncodedInputLruCache>(&run)) {
+        m_defaultFrameCache->Configure(2u);
+        m_defaultEncodedInputCache->Configure(1u);
+    }
+
+    // 顺序逐项解除可选引用，实际容量由最后 owner 的 lease 归还
+    bool TrimOne() {
+        return m_defaultEncodedInputCache->TrimOne() ||
+            m_defaultFrameCache->TrimOne() || m_referenceCache->TrimOne();
+    }
+
+    void TrimAll() { while (TrimOne()) {} }
+
     [[nodiscard]] std::shared_ptr<DecodeReferenceCache> ReferenceCache() const noexcept {
         return m_referenceCache;
     }
@@ -37,16 +53,11 @@ public:
     }
 
 private:
-    std::shared_ptr<DecodeReferenceCache> m_referenceCache = std::make_shared<DecodeReferenceCache>();
-    std::shared_ptr<DecodedFrameLruCache> m_defaultFrameCache = std::make_shared<DecodedFrameLruCache>();
-    std::shared_ptr<EncodedInputLruCache> m_defaultEncodedInputCache = std::make_shared<EncodedInputLruCache>();
+    std::shared_ptr<DecodeReferenceCache> m_referenceCache;
+    std::shared_ptr<DecodedFrameLruCache> m_defaultFrameCache;
+    std::shared_ptr<EncodedInputLruCache> m_defaultEncodedInputCache;
     EncodedInputCacheLoader m_encodedInputLoader;
 };
-
-[[nodiscard]] inline std::shared_ptr<DecodeCacheRuntime> DefaultDecodeCacheRuntime() {
-    static auto runtime = std::make_shared<DecodeCacheRuntime>();
-    return runtime;
-}
 
 } // namespace datacodec
 

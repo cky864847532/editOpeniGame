@@ -8,7 +8,6 @@
 #include <memory>
 #include <span>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
@@ -68,18 +67,20 @@ inline ZstdDecompressionContextHandle CreateDecompressionContext(
 inline bool ConfigureCompressionContext(
     ZSTD_CCtx& context,
     const int level,
-    const std::size_t workerCount,
+    const std::size_t computeUnits,
     std::string* error = nullptr) {
     const auto clampedLevel = level <= 0 ? 1 : level;
     const auto levelResult = ZSTD_CCtx_setParameter(&context, ZSTD_c_compressionLevel, clampedLevel);
     if (ZSTD_isError(levelResult)) {
         return AssignZstdResultError(error, "zstd failed to set compression level: ", levelResult);
     }
-    if (workerCount <= 1u) {
-        return true;
+    if (computeUnits == 0u || computeUnits - 1u > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return validation::AssignError(error, "zstd compute units are outside the supported range");
     }
+    // 调用 worker 占一个额度，C 小于三时固定使用同步压缩
+    const auto libraryWorkers = computeUnits >= 3u ? computeUnits - 1u : 0u;
     const auto workerResult =
-        ZSTD_CCtx_setParameter(&context, ZSTD_c_nbWorkers, static_cast<int>(workerCount));
+        ZSTD_CCtx_setParameter(&context, ZSTD_c_nbWorkers, static_cast<int>(libraryWorkers));
     if (ZSTD_isError(workerResult)) {
         return AssignZstdResultError(error, "zstd failed to set worker count: ", workerResult);
     }
@@ -91,30 +92,6 @@ inline bool ConfigureCompressionContext(
 class ZstdCodec {
 public:
     [[nodiscard]] static bool IsAvailable() { return true; }
-
-    [[nodiscard]] static std::size_t RecommendWorkerCount(const std::size_t inputBytes) {
-        constexpr std::size_t kMaxWorkerCount = 16u;
-        const auto hardwareConcurrency = static_cast<std::size_t>(std::thread::hardware_concurrency());
-        if (hardwareConcurrency <= 1u) {
-            return 1;
-        }
-
-        std::size_t requestedWorkerCount = 1;
-        if (inputBytes >= 32u * 1024u * 1024u) {
-            requestedWorkerCount = 2;
-        }
-        if (inputBytes >= 128u * 1024u * 1024u) {
-            requestedWorkerCount = 4;
-        }
-        if (inputBytes >= 512u * 1024u * 1024u) {
-            requestedWorkerCount = 8;
-        }
-
-        if (requestedWorkerCount > kMaxWorkerCount) {
-            requestedWorkerCount = kMaxWorkerCount;
-        }
-        return requestedWorkerCount < hardwareConcurrency ? requestedWorkerCount : hardwareConcurrency;
-    }
 
     static bool Compress(
         const std::span<const std::uint8_t> input,
@@ -139,9 +116,11 @@ public:
         output.resize(bound, 0);
 
         const auto clampedLevel = level <= 0 ? 1 : level;
-        const auto resolvedWorkerCount = workerCount == 0 ? RecommendWorkerCount(input.size()) : workerCount;
+        if (workerCount == 0u) {
+            return validation::AssignError(error, "zstd compression requires explicit compute units");
+        }
         size_t compressedSize = 0;
-        if (resolvedWorkerCount <= 1u) {
+        if (workerCount <= 2u) {
             compressedSize = ZSTD_compress(output.data(), output.size(), input.data(), input.size(), clampedLevel);
         } else {
             auto context = detail::CreateCompressionContext(error);
@@ -150,7 +129,7 @@ public:
                 return false;
             }
 
-            if (!detail::ConfigureCompressionContext(*context, clampedLevel, resolvedWorkerCount, error)) {
+            if (!detail::ConfigureCompressionContext(*context, clampedLevel, workerCount, error)) {
                 output.clear();
                 return false;
             }
@@ -214,17 +193,17 @@ public:
         }
         m_outputBuffer.resize(ZSTD_CStreamOutSize());
 
-        const auto knownRawBytes = bytestore::IsUnknownByteSize(rawBytes)
-            ? 0u
-            : static_cast<std::size_t>(std::min<std::uint64_t>(
-                rawBytes,
-                static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())));
-        const auto resolvedWorkerCount = workerCount == 0u
-            ? ZstdCodec::RecommendWorkerCount(knownRawBytes)
-            : workerCount;
-        if (!detail::ConfigureCompressionContext(*m_context, level, resolvedWorkerCount, error)) {
+        if (!detail::ConfigureCompressionContext(*m_context, level, workerCount, error)) {
             Release();
             return false;
+        }
+        if (!bytestore::IsUnknownByteSize(rawBytes)) {
+            const auto result = ZSTD_CCtx_setPledgedSrcSize(m_context.get(), rawBytes);
+            if (ZSTD_isError(result)) {
+                detail::AssignZstdResultError(error, "zstd failed to set source size: ", result);
+                Release();
+                return false;
+            }
         }
         return true;
     }

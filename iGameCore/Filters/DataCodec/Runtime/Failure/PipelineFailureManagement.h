@@ -36,15 +36,20 @@ template <typename TContext>
 inline void AssignFailureOrError(
     const TContext& context,
     std::string* error,
-    std::string defaultMessage) {
+    const std::string_view defaultMessage) noexcept {
     if (error == nullptr) {
         return;
     }
-    if (const auto failure = context.FirstFailure(); failure.has_value()) {
-        validation::AssignError(error, failure->formattedMessage);
-        return;
+    // 固定首错已经保存，文本导出失败不覆盖首错
+    try {
+        if (const auto failure = context.FirstFailure(); failure.has_value()) {
+            *error = FormatCodecFailure(*failure);
+            return;
+        }
+        error->assign(defaultMessage);
+    } catch (...) {
+        error->clear();
     }
-    validation::AssignError(error, std::move(defaultMessage));
 }
 
 // --- 失败后的统一清理入口 ---
@@ -63,14 +68,15 @@ inline void PublishByteStoreCleanupDiagnostics(
 inline void CleanupAfterEncodeFailure(
     EncodeContext& context,
     EncodeLeafWorkspace& workspace) noexcept {
+    context.resources.CancelAndWaitRun();
     workspace.CleanupOnFailure();
-    PublishByteStoreCleanupDiagnostics(context, workspace);
     context.CleanupOnFailure();
 }
 
 inline void CleanupAfterDecodeFailure(
     DecodeContext& context,
     DecodeLeafWorkspace& workspace) noexcept {
+    context.resources.CancelAndWaitRun();
     workspace.CleanupOnFailure();
     context.CleanupOnFailure();
 }

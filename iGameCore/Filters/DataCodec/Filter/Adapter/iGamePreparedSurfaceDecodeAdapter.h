@@ -2,7 +2,6 @@
 #define iGamePreparedSurfaceDecodeAdapter_h
 
 #include "DataCodec/API/Adapter/IDecodeTopologyBlockObserver.h"
-#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "iGameDataObject.h"
 
 #include <cstddef>
@@ -14,10 +13,7 @@ IGAME_NAMESPACE_BEGIN
 class iGamePreparedSurfaceDecodeAdapter final
     : public ::datacodec::IDecodeTopologyBlockObserver {
 public:
-    explicit iGamePreparedSurfaceDecodeAdapter(
-        std::shared_ptr<::datacodec::IParallelTaskRunner> taskRunner,
-        std::size_t workerCount = 12u,
-        std::size_t maxPendingBlockCount = 24u);
+    iGamePreparedSurfaceDecodeAdapter();
     ~iGamePreparedSurfaceDecodeAdapter() override;
 
     iGamePreparedSurfaceDecodeAdapter(const iGamePreparedSurfaceDecodeAdapter&) = delete;
@@ -35,6 +31,7 @@ public:
         const DataObject::Pointer& root,
         std::string* error = nullptr);
     [[nodiscard]] std::string Summary() const;
+    [[nodiscard]] bool DiagnosticsIncomplete() const noexcept;
 
 private:
     struct Impl;

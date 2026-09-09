@@ -4,9 +4,14 @@
 #include "DataCodec/API/Adapter/RunRecordTypes.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 
+#include <algorithm>
 #include <cassert>
+#include <array>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 namespace datacodec {
 
@@ -21,6 +26,59 @@ enum class CodecErrorCode {
     UnsupportedFormat,
     UnsupportedPlatform,
 };
+
+struct CodecFailureRecord {
+    CodecErrorCode code{CodecErrorCode::PipelineFailure};
+    bool cancelled{false};
+    std::array<char, 32> reason{};
+    std::array<char, 64> origin{};
+    std::array<char, 256> message{};
+    bool textTruncated{false};
+    std::optional<std::uint64_t> requestedBytes;
+    std::optional<std::uint64_t> reservedBytes;
+    std::optional<std::uint64_t> limitBytes;
+};
+
+static_assert(sizeof(CodecFailureRecord) <= 512u);
+static_assert(std::is_trivially_copyable_v<CodecFailureRecord>);
+static_assert(std::is_nothrow_move_constructible_v<CodecFailureRecord>);
+
+namespace failuredetail {
+
+// 错误路径只写固定数组，完整保留 UTF-8 字符并预留结尾零字节
+template<std::size_t N>
+inline bool CopyText(std::array<char, N>& output, const std::string_view text) noexcept {
+    static_assert(N > 0u);
+    output.fill('\0');
+    auto count = std::min(text.size(), N - 1u);
+    if (count < text.size()) {
+        while (count != 0u &&
+               (static_cast<unsigned char>(text[count]) & 0xc0u) == 0x80u) {
+            --count;
+        }
+    }
+    for (std::size_t index = 0u; index < count; ++index) {
+        output[index] = text[index];
+    }
+    return count != text.size();
+}
+
+} // 失败文本工具命名空间
+
+[[nodiscard]] inline CodecFailureRecord MakeCodecFailureRecord(
+    const CodecErrorCode code,
+    const std::string_view reason,
+    const std::string_view origin,
+    const std::string_view message,
+    const bool cancelled = false) noexcept {
+    CodecFailureRecord record;
+    record.code = code;
+    record.cancelled = cancelled;
+    record.textTruncated = failuredetail::CopyText(record.reason, reason);
+    record.textTruncated |= failuredetail::CopyText(record.origin, origin);
+    record.textTruncated |= failuredetail::CopyText(record.message, message);
+    return record;
+}
 
 struct CodecStatus {
     bool success{true};
@@ -125,6 +183,14 @@ inline std::string FormatStageCodecError(
     output.append(": ");
     output.append(FormatCodecError(code, message));
     return output;
+}
+
+// 丰富文本只在结果展示和可选报告阶段构造
+inline std::string FormatCodecFailure(const CodecFailureRecord& failure) {
+    return FormatStageCodecError(
+        std::string_view(failure.origin.data()),
+        failure.code,
+        std::string_view(failure.message.data()));
 }
 
 inline std::string FormatStageCodecError(

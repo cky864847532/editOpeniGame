@@ -68,10 +68,10 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
             return result;
         }
 
-        auto encodedBytes = encodeResult.encodedBytes;
+        auto encodedOwner = std::make_shared<const EncodedBuffer>(std::move(encodeResult.encodedBytes));
         TestDecodeAdapter decodeAdapter;
         auto decodeResult = DecodePackage(DecodePackageRequest{
-            .inputReader = std::make_shared<MemoryByteRangeReader>(std::move(encodedBytes)),
+            .inputReader = std::make_shared<MemoryByteRangeReader>(encodedOwner),
             .leafAdapter = &decodeAdapter,
             .attributeSelection = AttributeSelectionMode::Explicit,
             .attributeTargets = targets,
@@ -135,7 +135,8 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
             Require(result, bytesMatch, check + ".values", "attribute values do not match");
         }
 
-        auto malformedBytes = encodeResult.encodedBytes;
+        const auto encodedSpan = encodedOwner->span();
+        std::vector<std::uint8_t> malformedBytes(encodedSpan.begin(), encodedSpan.end());
         if (malformedBytes.size() > 1u) {
             malformedBytes.resize(malformedBytes.size() / 2u);
         } else {
@@ -143,7 +144,8 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
         }
         TestDecodeAdapter malformedAdapter;
         const auto malformedResult = DecodePackage(DecodePackageRequest{
-            .inputReader = std::make_shared<MemoryByteRangeReader>(std::move(malformedBytes)),
+            .inputReader = std::make_shared<MemoryByteRangeReader>(
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(malformedBytes))),
             .leafAdapter = &malformedAdapter,
             .attributeSelection = AttributeSelectionMode::Explicit,
             .attributeTargets = targets,

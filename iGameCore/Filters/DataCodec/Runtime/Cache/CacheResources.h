@@ -2,8 +2,9 @@
 #define DATACODEC_RUNTIME_CACHE_CACHERESOURCES_H
 
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowBudget.h"
+#include "DataCodec/Storage/ByteIO/ByteBudget.h"
 #include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 
 #include <algorithm>
@@ -12,45 +13,41 @@
 namespace datacodec {
 
 struct CacheResources {
-    std::size_t accessWindowBytes{kDefaultEncodeAccessWindowBytes};
-    std::uint64_t activeWindowBytes{kDefaultEncodeActiveWindowBytes};
-    mutable ScratchByteBufferPool scratchBytePool;
-    mutable window::WindowBudget windowBudget{kDefaultEncodeActiveWindowBytes};
-    mutable resource::ActiveByteBudget remapScratchBudget{256u * 1024u * 1024u};
-
-    void Configure(
-        const std::size_t requestedAccessWindowBytes,
-        const std::uint64_t requestedActiveWindowBytes,
-        const std::size_t scratchRetainedBlockCount = 16u,
-        const std::size_t scratchRetainedBlockBytes = 64u * 1024u * 1024u,
-        const std::uint64_t scratchRetainedTotalBytes = 1024ull * 1024ull * 1024ull) {
-        accessWindowBytes = std::max<std::size_t>(requestedAccessWindowBytes, 1u);
-        activeWindowBytes = std::max<std::uint64_t>(requestedActiveWindowBytes, 1u);
-        scratchBytePool.Clear();
-        scratchBytePool.Configure(
-            scratchRetainedBlockCount,
-            scratchRetainedBlockBytes,
-            scratchRetainedTotalBytes);
-        windowBudget.Reset(activeWindowBytes);
+    [[nodiscard]] DataCodecExecutionResources& Run() const {
+        if (m_run == nullptr) {
+            throw std::logic_error("cache resources require an active root");
+        }
+        return *m_run;
     }
-
-    void ConfigureRemapScratchBudget(const std::uint64_t remapScratchBudgetBytes) {
-        remapScratchBudget.Reset(remapScratchBudgetBytes);
+    void BindRun(DataCodecExecutionResources& run) noexcept { m_run = &run; }
+    void UnbindRun() noexcept { m_run = nullptr; }
+    [[nodiscard]] std::shared_ptr<resource::ResidentByteBudget> StorageCapacity() const {
+        if (m_run == nullptr) {
+            throw std::logic_error("cache resources require an active root");
+        }
+        return m_run->StorageCapacity();
     }
-
-    void Clear() {
-        scratchBytePool.Clear();
-        windowBudget.Reset(activeWindowBytes);
-        remapScratchBudget.Reset(remapScratchBudget.MaxActiveBytes());
+    [[nodiscard]] bool ExternalSpillAvailable() const {
+        if (m_run == nullptr) {
+            throw std::logic_error("cache resources require an active root");
+        }
+        return m_run->ExternalSpillAvailable();
     }
-
+    [[nodiscard]] ScratchByteBufferPool& ScratchBytePool() const {
+        if (m_run == nullptr) {
+            throw std::logic_error("scratch access requires an active root");
+        }
+        return m_run->Scratch();
+    }
     template<typename TValue>
     [[nodiscard]] std::size_t ValuesPerWindow(const std::size_t valuesPerElement = 1u) const noexcept {
         return std::max<std::size_t>(
             1u,
-            accessWindowBytes /
+            kIoWindowBytes /
                 std::max<std::size_t>(sizeof(TValue) * valuesPerElement, sizeof(TValue)));
     }
+private:
+    DataCodecExecutionResources* m_run{nullptr};
 };
 
 } // namespace datacodec

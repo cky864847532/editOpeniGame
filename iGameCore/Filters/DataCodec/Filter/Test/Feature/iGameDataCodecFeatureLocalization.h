@@ -45,7 +45,7 @@ namespace iGame::datacodec_test {
         iGameDataCodecHostMessage(
             ::datacodec::DataCodecLanguage::SimplifiedChinese,
             iGameDataCodecHostMessageId::CompressionRatioCalculationNote) ==
-                "压缩率计算公式: 压缩结果文件大小 / 源文件大小" &&
+                "压缩率采用小数表示，计算公式为：压缩结果文件大小 ÷ 源文件大小" &&
             iGameDataCodecHostMessage(
                 ::datacodec::DataCodecLanguage::English,
                 iGameDataCodecHostMessageId::CompressionRatioCalculationNote) ==

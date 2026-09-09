@@ -4,9 +4,10 @@
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/API/Adapter/IDecodeAdapter.h"
 #include "DataCodec/API/Adapter/IDecodeTopologyBlockObserver.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Runtime/Failure/FailureCleanable.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Codec/Reference/DecodedReference.h"
 #include "DataCodec/Common/DataCodecError.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackage.h"
@@ -36,14 +37,9 @@ struct DecodeContextInitializeResult {
     explicit operator bool() const noexcept { return success; }
 };
 
-struct DecodeFailureState {
-    CodecErrorCode code{CodecErrorCode::DecodeFailure};
-    std::string stageName;
-    std::string message;
-    std::string formattedMessage;
-};
-
 struct DecodeContext : IFailureCleanable {
+    explicit DecodeContext(DataCodecExecutionResources& run) noexcept : resources(run), runRecords(&run) {}
+    DataCodecExecutionResources& resources;
     IDecodeAdapter* adapter{nullptr};
     const LeafPackage* leafPackage{nullptr};
     DecodedAttributeReference* attributeKeyFrameReference{nullptr};
@@ -59,15 +55,13 @@ struct DecodeContext : IFailureCleanable {
     RunRecordEmitter runRecords;
     RunEndRecord runSummary;
     TelemetryMemoryTraceRecorder* memoryTrace{nullptr};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
     TopologyDecodeOutputMode topologyOutputMode{TopologyDecodeOutputMode::CommitToAdapter};
     std::shared_ptr<IDecodeTopologyBlockObserver> topologyBlockObserver;
-    std::optional<DecodeFailureState> failure;
-    mutable std::mutex failureMutex;
 
     // 校验必要字段并初始化运行记录，调用前需先设置各字段
     DecodeContextInitializeResult Initialize(IRunRecordSink* recordSink) {
         memoryTrace = nullptr;
+        runRecords.TryExport([&] {
         runRecords.Reset(
             RunRecordInfo{
                 .generatedAtUtc = runrecorddetail::MakeTimestampUtc(),
@@ -77,8 +71,8 @@ struct DecodeContext : IFailureCleanable {
                 .language = language,
             },
             recordSink);
+        });
         runSummary = {};
-        failure.reset();
         failureCleanupCompleted.store(false, std::memory_order_release);
 
         if (adapter == nullptr) {
@@ -105,47 +99,35 @@ struct DecodeContext : IFailureCleanable {
     bool RecordFailure(
         const std::string_view stageName,
         const CodecErrorCode code,
-        const std::string_view message) {
-        bool isFirstFailure = false;
-        {
-            std::lock_guard<std::mutex> lock(failureMutex);
-            if (!failure.has_value()) {
-                failure = DecodeFailureState{
-                    .code = code,
-                    .stageName = std::string(stageName),
-                    .message = std::string(message),
-                    .formattedMessage = FormatStageCodecError(stageName, code, message),
-                };
-                isFirstFailure = true;
-            }
-        }
-        runRecords.AddMessage(MakeCodecTelemetryMessage(std::string(stageName), code, std::string(message)));
-        return isFirstFailure;
+        const std::string_view message) noexcept {
+        return RecordFailure(MakeCodecFailureRecord(code, "operation-failed", stageName, message));
+    }
+
+    bool RecordFailure(const CodecFailureRecord& record) noexcept {
+        return resources.RecordFailure(record);
     }
 
     bool RecordFailure(
         const std::string_view stageName,
         const CodecErrorCode code,
-        const std::string& message) {
+        const std::string& message) noexcept {
         return RecordFailure(stageName, code, std::string_view(message));
     }
 
     bool RecordFailure(
         const std::string_view stageName,
         const CodecErrorCode code,
-        const char* message) {
+        const char* message) noexcept {
         assert(message != nullptr);
         return RecordFailure(stageName, code, std::string_view(message));
     }
 
-    [[nodiscard]] bool HasFailure() const {
-        std::lock_guard<std::mutex> lock(failureMutex);
-        return failure.has_value();
+    [[nodiscard]] bool HasFailure() const noexcept {
+        return resources.FirstFailure().has_value();
     }
 
-    [[nodiscard]] std::optional<DecodeFailureState> FirstFailure() const {
-        std::lock_guard<std::mutex> lock(failureMutex);
-        return failure;
+    [[nodiscard]] std::optional<CodecFailureRecord> FirstFailure() const noexcept {
+        return resources.FirstFailure();
     }
 
     void AddError(std::string origin, std::string text) {

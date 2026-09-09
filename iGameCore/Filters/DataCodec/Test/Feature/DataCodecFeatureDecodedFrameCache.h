@@ -48,7 +48,7 @@ inline DecodedFrameKey Key(const std::uint32_t frameIndex, const std::string& re
 
 inline bool TestLeastRecentlyUsedFrameIsEvicted() {
     DecodedFrameLruCache cache;
-    cache.Configure(2u, 0u);
+    cache.Configure(2u);
     (void)cache.Store(Key(0u), std::make_shared<TestFrame>(0u, 8u), DecodedFrameAccessKind::UserRequest);
     (void)cache.Store(Key(1u), std::make_shared<TestFrame>(1u, 8u), DecodedFrameAccessKind::Prefetch);
     {
@@ -61,20 +61,27 @@ inline bool TestLeastRecentlyUsedFrameIsEvicted() {
         cache.Find(Key(2u), DecodedFrameAccessKind::UserRequest).IsHit();
 }
 
-inline bool TestResidentByteLimitUsesSameLRUOrder() {
+inline bool TestTrimPreservesConsumerAndIgnoresSizeHint() {
     DecodedFrameLruCache cache;
-    cache.Configure(0u, 16u);
-    (void)cache.Store(Key(0u), std::make_shared<TestFrame>(0u, 8u), DecodedFrameAccessKind::UserRequest);
-    (void)cache.Store(Key(1u), std::make_shared<TestFrame>(1u, 8u), DecodedFrameAccessKind::UserRequest);
-    (void)cache.Store(Key(2u), std::make_shared<TestFrame>(2u, 8u), DecodedFrameAccessKind::UserRequest);
-    const auto stats = cache.Statistics();
-    return cache.Find(Key(0u), DecodedFrameAccessKind::UserRequest).IsMiss() &&
-        stats.residentFrames == 2u && stats.residentBytes == 16u;
+    cache.Configure(1u);
+    auto consumer = std::make_shared<TestFrame>(0u, UINT64_MAX);
+    std::weak_ptr<TestFrame> lifetime = consumer;
+    if (!cache.Store(Key(0u), consumer, DecodedFrameAccessKind::UserRequest).IsStored() ||
+        !cache.TrimOne() || cache.TrimOne() || lifetime.expired() ||
+        !cache.Find(Key(0u), DecodedFrameAccessKind::UserRequest).IsMiss() ||
+        consumer->FrameIndex() != 0u || cache.Statistics().residentFrames != 0u) {
+        return false;
+    }
+    consumer.reset();
+    cache.Configure(0u);
+    return lifetime.expired() && cache.Store(
+        Key(1u), std::make_shared<TestFrame>(1u, 1u),
+        DecodedFrameAccessKind::UserRequest).IsRejectedByPolicy();
 }
 
 inline bool TestSourceRevisionSeparatesEntries() {
     DecodedFrameLruCache cache;
-    cache.Configure(4u, 0u);
+    cache.Configure(4u);
     (void)cache.Store(Key(0u, "r1"), std::make_shared<TestFrame>(0u, 4u), DecodedFrameAccessKind::UserRequest);
     return cache.Find(Key(0u, "r1"), DecodedFrameAccessKind::UserRequest).IsHit() &&
         cache.Find(Key(0u, "r2"), DecodedFrameAccessKind::UserRequest).IsMiss();
@@ -82,7 +89,7 @@ inline bool TestSourceRevisionSeparatesEntries() {
 
 inline bool TestDisableClearsAndBlocksFrameCaching() {
     DecodedFrameLruCache cache;
-    cache.Configure(4u, 0u);
+    cache.Configure(4u);
     (void)cache.Store(Key(0u), std::make_shared<TestFrame>(0u, 8u), DecodedFrameAccessKind::UserRequest);
     cache.SetEnabled(false);
     const auto disabledStats = cache.Statistics();
@@ -105,15 +112,17 @@ inline bool TestDisableClearsAndBlocksFrameCaching() {
 
 inline bool TestDirectionalPrefetchIsIndependentFromEviction() {
     PlaybackPrefetchPlanner planner;
-    planner.Configure({10u, 20u, 30u, 40u, 50u}, 2u);
-    return planner.Plan(30u, PlaybackDirection::Forward) == std::vector<std::uint32_t>({40u, 50u}) &&
-        planner.Plan(30u, PlaybackDirection::Backward) == std::vector<std::uint32_t>({20u, 10u}) &&
-        planner.Plan(10u, PlaybackDirection::Random) == std::vector<std::uint32_t>({20u, 30u});
+    planner.Configure({10u, 20u, 30u, 40u, 50u}, true);
+    const bool enabled = planner.Plan(30u, PlaybackDirection::Forward) == std::vector<std::uint32_t>({40u}) &&
+        planner.Plan(30u, PlaybackDirection::Backward) == std::vector<std::uint32_t>({20u}) &&
+        planner.Plan(10u, PlaybackDirection::Random) == std::vector<std::uint32_t>({20u});
+    planner.SetEnabled(false);
+    return enabled && planner.Plan(30u, PlaybackDirection::Forward).empty();
 }
 
 inline bool TestInvalidCacheAccessIsReportedAsError() {
     DecodedFrameLruCache cache;
-    cache.Configure(2u, 0u);
+    cache.Configure(2u);
     const DecodedFrameKey unstableKey{.frameIndex = 0u};
     const auto lookup = cache.Find(
         unstableKey,
@@ -136,7 +145,7 @@ namespace datacodec::test
 inline int RunDataCodecFeatureDecodedFrameCache() {
     using namespace feature_decoded_frame_cache;
     if (!TestLeastRecentlyUsedFrameIsEvicted() ||
-        !TestResidentByteLimitUsesSameLRUOrder() ||
+        !TestTrimPreservesConsumerAndIgnoresSizeHint() ||
         !TestSourceRevisionSeparatesEntries() ||
         !TestDisableClearsAndBlocksFrameCaching() ||
         !TestDirectionalPrefetchIsIndependentFromEviction() ||

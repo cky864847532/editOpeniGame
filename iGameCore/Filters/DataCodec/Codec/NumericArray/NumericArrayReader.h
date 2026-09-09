@@ -3,6 +3,7 @@
 
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
 #include "DataCodec/Codec/NumericArray/NumericArraySource.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <cstddef>
@@ -24,7 +25,8 @@ struct NumericArrayReader {
         const std::uint64_t elementOffset,
         const std::uint64_t elementCount,
         std::vector<std::uint8_t>& output,
-        std::string* error) const {
+        std::string* error,
+        BufferCapacitySample* orderCapacity = nullptr) const {
         output.clear();
         std::size_t outputBytes = 0u;
         if (!PrepareElementRead(elementOffset, elementCount, outputBytes, error)) {
@@ -34,7 +36,7 @@ struct NumericArrayReader {
         if (outputBytes == 0u) {
             return true;
         }
-        return ReadElementsInto(elementOffset, elementCount, std::span<std::uint8_t>(output.data(), output.size()), error);
+        return ReadElementsInto(elementOffset, elementCount, std::span<std::uint8_t>(output.data(), output.size()), error, orderCapacity);
     }
 
     [[nodiscard]] bool ReadElements(
@@ -42,30 +44,18 @@ struct NumericArrayReader {
         const std::uint64_t elementCount,
         ScratchByteBufferPool& scratchBytePool,
         ScratchByteBuffer& output,
-        std::string* error) const {
-        return ReadElements(elementOffset, elementCount, scratchBytePool, {}, output, error);
-    }
-
-    [[nodiscard]] bool ReadElements(
-        const std::uint64_t elementOffset,
-        const std::uint64_t elementCount,
-        ScratchByteBufferPool& scratchBytePool,
-        const ScratchByteQuotaAcquire& acquireScratchQuota,
-        ScratchByteBuffer& output,
-        std::string* error) const {
+        std::string* error,
+        BufferCapacitySample* orderCapacity = nullptr) const {
         output.Release();
         std::size_t outputBytes = 0u;
         if (!PrepareElementRead(elementOffset, elementCount, outputBytes, error)) {
             return false;
         }
-        const auto outputByteCount = static_cast<std::uint64_t>(outputBytes);
-        output = scratchBytePool.Acquire(
-            outputBytes,
-            acquireScratchQuota ? acquireScratchQuota(outputByteCount) : ScratchByteQuotaLease{});
+        output = scratchBytePool.Acquire(outputBytes);
         if (outputBytes == 0u) {
             return true;
         }
-        return ReadElementsInto(elementOffset, elementCount, output.Span(), error);
+        return ReadElementsInto(elementOffset, elementCount, output.Span(), error, orderCapacity);
     }
 
     [[nodiscard]] bool ReadComponentElements(
@@ -74,7 +64,8 @@ struct NumericArrayReader {
         const std::size_t componentIndex,
         ScratchByteBufferPool& scratchBytePool,
         ScratchByteBuffer& output,
-        std::string* error) const {
+        std::string* error,
+        BufferCapacitySample* orderCapacity = nullptr) const {
         output.Release();
         std::size_t outputBytes = 0u;
         if (!PrepareComponentRead(elementOffset, elementCount, componentIndex, outputBytes, error)) {
@@ -89,7 +80,7 @@ struct NumericArrayReader {
             elementCount,
             componentIndex,
             output.Span(),
-            error);
+            error, orderCapacity);
     }
 
     [[nodiscard]] bool TryResolveContiguousComponentBytes(
@@ -222,7 +213,8 @@ private:
         const std::uint64_t elementOffset,
         const std::uint64_t elementCount,
         const std::span<std::uint8_t> output,
-        std::string* error) const {
+        std::string* error,
+        BufferCapacitySample* orderCapacity) const {
         const auto tupleBytes = ElementBytes();
         std::size_t localElementOffset = 0u;
         std::size_t localElementCount = 0u;
@@ -258,6 +250,7 @@ private:
                 return false;
             }
         }
+        if (orderCapacity != nullptr) { orderCapacity->Observe(orderBlock); }
         const auto resolveSourceIndex = [&](const std::size_t newIndex, const std::size_t localIndex) -> std::size_t {
             if (!orderBlock.empty()) {
                 return static_cast<std::size_t>(orderBlock[localIndex]);
@@ -378,7 +371,8 @@ private:
         const std::uint64_t elementCount,
         const std::size_t componentIndex,
         const std::span<std::uint8_t> output,
-        std::string* error) const {
+        std::string* error,
+        BufferCapacitySample* orderCapacity) const {
         std::size_t localElementOffset = 0u;
         std::size_t localElementCount = 0u;
         std::size_t expectedBytes = 0u;
@@ -415,6 +409,7 @@ private:
                 return false;
             }
         }
+        if (orderCapacity != nullptr) { orderCapacity->Observe(orderBlock); }
         const auto resolveSourceIndex = [&](const std::size_t newIndex, const std::size_t localIndex) -> std::size_t {
             if (!orderBlock.empty()) {
                 return static_cast<std::size_t>(orderBlock[localIndex]);

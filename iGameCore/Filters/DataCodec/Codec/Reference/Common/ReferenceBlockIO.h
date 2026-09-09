@@ -375,6 +375,7 @@ inline bool VerifyNumericArrayReferenceEncodedBlock(
                 .block = parsed,
                 .referenceBytes = input.referenceBytes,
                 .referenceElementOffset = 0u,
+                .compressorState = input.compressorState,
             },
             decodedBytes,
             error)) {
@@ -449,11 +450,14 @@ inline bool EncodeNumericArrayReferenceValueBytes(
     std::vector<std::uint8_t>& encodedBytes,
     NumericArrayBytesCodec& bytesCodec,
     std::vector<NumericArrayComponentLayoutParams>* componentLayouts = nullptr,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    numericarray::NumericArrayCompressorState* compressorState = nullptr,
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
+    params.capacitySamples = capacitySamples;
     return numericarray::ResolveEncodedNumericArrayBlockBytes(
         params,
         defaultCompressor,
@@ -463,18 +467,21 @@ inline bool EncodeNumericArrayReferenceValueBytes(
         bytesCodec,
         error,
         &scratchBytePool,
-        componentLayouts);
+        componentLayouts, compressorState);
 }
 
 inline bool DecodeNumericArrayReferenceValueBytes(
     const NumericArrayStorageParams& meta,
     const ParsedNumericArrayBlock& block,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    numericarray::NumericArrayCompressorState* compressorState = nullptr,
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
+    params.capacitySamples = capacitySamples;
     return numericarray::ResolveDecodedNumericArrayBlockBytes(
         params,
         block.backgroundCompressor,
@@ -483,7 +490,7 @@ inline bool DecodeNumericArrayReferenceValueBytes(
         block.componentLayouts,
         block.bytes,
         decodedBytes,
-        error);
+        error, compressorState);
 }
 
 template<typename TValue>

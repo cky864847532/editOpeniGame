@@ -8,6 +8,7 @@
 #include "DataCodec/Runtime/Failure/DecodeFailureManagement.h"
 #include "DataCodec/Workflow/Decode/Stages/FieldDecodeInput.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 #include <chrono>
 #include <memory>
@@ -147,14 +148,6 @@ public:
                     event.scope);
             };
         }
-        const bool retainAsReference =
-            context.topologyReferenceStore != nullptr && !context.topologyReferenceKey.empty();
-        const auto topologyCacheStorageMode = retainAsReference
-            ? workspace.ResourceBudget().TopologyDecodeReferenceCacheStorageMode()
-            : workspace.ResourceBudget().TopologyDecodeCacheStorageMode();
-        const auto topologyMemoryCacheLimitBytes = retainAsReference
-            ? workspace.ResourceBudget().TopologyDecodeMemoryReferenceLimitBytes()
-            : workspace.ResourceBudget().TopologyDecodeMemoryCacheLimitBytes();
         TopologyDecodeRuntime decodeRuntime{
             .data = TopologyDecodeData{
                 .storageParams = workspace.StorageParams(),
@@ -163,19 +156,11 @@ public:
                 .cacheResources = workspace.CacheResourcesRef(),
                 .byteStoreSession = workspace.ByteStoreSessionRef(),
                 .topology = workspace.MutableTopology(),
-                .topologyMemoryInputLimitBytes =
-                    workspace.ResourceBudget().TopologyDecodeMemoryInputLimitBytes(),
-                .topologyMemoryCacheLimitBytes = topologyMemoryCacheLimitBytes,
-                .topologyInputStorageMode = workspace.ResourceBudget().TopologyDecodeInputStorageMode(),
-                .topologyCacheStorageMode = topologyCacheStorageMode,
             },
             .context = TopologyDecodeContext{
                 .timingCallback = std::move(topologyTiming),
                 .topologyBlockObserver = context.topologyBlockObserver,
-            },
-            .schedule = TopologyDecodeSchedule{
-                .parallelTaskRunner = context.parallelTaskRunner,
-                .workerCount = workspace.ResourceBudget().TopologyBlockLaneCount(),
+                .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
             },
         };
         const auto result = DecodeTopologyFieldToCache(
@@ -185,9 +170,7 @@ public:
         std::string topologyScope;
         if (topology != nullptr) {
             const auto& topoParams = workspace.StorageParams().topoParams;
-            topologyScope = std::string("input=") + topology->InputByteStoreModeName() +
-                " decoded=" + topology->ByteStoreModeName() +
-                " fixedCellSize=" + std::to_string(topoParams.fixedCellSize) +
+            topologyScope = "fixedCellSize=" + std::to_string(topoParams.fixedCellSize) +
                 " hasCellTypes=" + std::to_string(static_cast<int>(topoParams.hasCellTypes));
         }
         RecordTopologyTiming(

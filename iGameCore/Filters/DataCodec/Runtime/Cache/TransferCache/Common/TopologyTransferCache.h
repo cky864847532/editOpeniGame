@@ -21,112 +21,6 @@
 namespace datacodec {
 namespace topology {
 
-inline std::size_t TopologyStreamIndex(const topocodec::ConnectivityTopologyStreamKind kind) noexcept {
-    return static_cast<std::size_t>(kind);
-}
-
-class ConnectivityTopologyStreamSpooler final : public topocodec::IConnectivityTopologyEncodedStreamSink {
-public:
-    explicit ConnectivityTopologyStreamSpooler(
-        std::array<std::shared_ptr<bytestore::IByteWriter>, 4> transferWriters)
-        : m_transferWriters(std::move(transferWriters)) {}
-
-    bool BeginStream(
-        const topocodec::ConnectivityTopologyStreamKind kind,
-        std::string* error = nullptr) override {
-        const auto index = TopologyStreamIndex(kind);
-        if (index >= m_transferWriters.size() || m_transferWriters[index] == nullptr) {
-            return validation::AssignError(error, "connectivity topology stream index is out of range");
-        }
-        if (m_written[index]) {
-            return validation::AssignError(error, "connectivity topology stream was already written");
-        }
-        if (m_open[index]) {
-            return validation::AssignError(error, "connectivity topology stream is already open");
-        }
-        m_open[index] = true;
-        return true;
-    }
-
-    bool WriteStreamBytes(
-        const topocodec::ConnectivityTopologyStreamKind kind,
-        const std::span<const std::uint8_t> bytes,
-        std::string* error = nullptr) override {
-        const auto index = TopologyStreamIndex(kind);
-        if (index >= m_transferWriters.size() || m_transferWriters[index] == nullptr) {
-            return validation::AssignError(error, "connectivity topology stream index is out of range");
-        }
-        if (!m_open[index] || m_written[index]) {
-            return validation::AssignError(error, "connectivity topology stream is not open for writing");
-        }
-
-        if (!m_transferWriters[index]->Write(bytes, error)) {
-            return false;
-        }
-        m_sizes[index] = m_transferWriters[index]->ByteSizeHint();
-        return true;
-    }
-
-    bool EndStream(
-        const topocodec::ConnectivityTopologyStreamKind kind,
-        std::string* error = nullptr) override {
-        const auto index = TopologyStreamIndex(kind);
-        if (index >= m_transferWriters.size() || m_transferWriters[index] == nullptr) {
-            return validation::AssignError(error, "connectivity topology stream index is out of range");
-        }
-        if (!m_open[index] || m_written[index]) {
-            return validation::AssignError(error, "connectivity topology stream is not open for completion");
-        }
-        m_sizes[index] = m_transferWriters[index]->ByteSizeHint();
-        m_open[index] = false;
-        m_written[index] = true;
-        return true;
-    }
-
-    [[nodiscard]] std::uint64_t StreamSize(const topocodec::ConnectivityTopologyStreamKind kind) const noexcept override {
-        const auto index = TopologyStreamIndex(kind);
-        return index < m_sizes.size() ? m_sizes[index] : 0u;
-    }
-
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-        std::uint64_t residentBytes = 0u;
-        for (const auto& writer : m_transferWriters) {
-            if (writer != nullptr) {
-                residentBytes = validation::SaturatingAddU64(residentBytes, writer->ResidentSizeHint());
-            }
-        }
-        return residentBytes;
-    }
-
-    [[nodiscard]] bool Complete() const noexcept {
-        for (const auto written : m_written) {
-            if (!written) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool HasAllWriters() const noexcept {
-        for (const auto& writer : m_transferWriters) {
-            if (writer == nullptr) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    [[nodiscard]] const std::shared_ptr<bytestore::IByteWriter>& TransferWriter(
-        const topocodec::ConnectivityTopologyStreamKind kind) const noexcept {
-        return m_transferWriters[TopologyStreamIndex(kind)];
-    }
-
-private:
-    std::array<std::shared_ptr<bytestore::IByteWriter>, 4> m_transferWriters{};
-    std::array<std::uint64_t, 4> m_sizes{};
-    std::array<bool, 4> m_open{};
-    std::array<bool, 4> m_written{};
-};
 
 class PolyhedronTopologyStreamSpooler final : public polyhedron::IPolyhedronTopologyStreamWriter {
 public:
@@ -246,8 +140,8 @@ private:
 class TransferCacheEncodeWriter final : public bytestore::IByteWriter {
 public:
     explicit TransferCacheEncodeWriter(
-        std::shared_ptr<bytestore::IAppendableByteStore> transferCache)
-        : m_transferCache(std::move(transferCache)) {}
+        std::shared_ptr<bytestore::IAppendableByteStore> transferCache, DataCodecExecutionResources& run)
+        : m_transferCache(std::move(transferCache)), m_writer(m_transferCache, run) {}
 
     bool Write(const std::span<const std::uint8_t> bytes, std::string* error = nullptr) override {
         if (m_transferCache == nullptr) {
@@ -256,7 +150,7 @@ public:
         if (bytes.empty()) {
             return true;
         }
-        return m_transferCache->AppendBytes(bytes, error);
+        return m_writer.Write(bytes, error);
     }
 
     [[nodiscard]] std::uint64_t ByteSizeHint() const noexcept override {
@@ -280,6 +174,7 @@ public:
 
 private:
     std::shared_ptr<bytestore::IAppendableByteStore> m_transferCache;
+    bytestore::AppendableByteStoreWriter m_writer;
 };
 
 template<std::size_t N>
@@ -308,13 +203,12 @@ inline std::shared_ptr<bytestore::IByteSource> TransferCacheFromWriter(
 
 inline std::shared_ptr<TransferCacheEncodeWriter> MakeByteStoreTransferCacheEncodeWriter(
     bytestore::ByteStoreSession& session,
+    DataCodecExecutionResources& run,
     const std::string& label,
-    const bool useMemoryStore,
     std::string* error = nullptr) {
     auto cache = bytestore::CreateAppendableByteStore(
         session,
         label,
-        useMemoryStore,
         error);
     if (cache == nullptr) {
         if (error != nullptr && error->empty()) {
@@ -322,55 +216,21 @@ inline std::shared_ptr<TransferCacheEncodeWriter> MakeByteStoreTransferCacheEnco
         }
         return nullptr;
     }
-    return std::make_shared<TransferCacheEncodeWriter>(std::move(cache));
+    return std::make_shared<TransferCacheEncodeWriter>(std::move(cache), run);
 }
 
-inline const char* ConnectivityTopologyStreamKindLabel(
-    const topocodec::ConnectivityTopologyStreamKind kind) noexcept {
-    switch (kind) {
-        case topocodec::ConnectivityTopologyStreamKind::Connectivity:
-            return "connectivity";
-        case topocodec::ConnectivityTopologyStreamKind::CellSize:
-            return "cell_size";
-        case topocodec::ConnectivityTopologyStreamKind::CellPolynomialOrder:
-            return "cell_polynomial_order";
-        case topocodec::ConnectivityTopologyStreamKind::CellType:
-            return "cell_type";
-    }
-    return "unknown";
-}
-
-inline ConnectivityTopologyStreamSpooler MakeConnectivityTopologyStreamSpooler(
-    bytestore::ByteStoreSession& session,
-    const bool useMemoryStore,
-    std::string* error = nullptr) {
-    std::array<std::shared_ptr<bytestore::IByteWriter>, 4> writers{};
-    for (std::size_t index = 0; index < writers.size(); ++index) {
-        const auto kind = static_cast<topocodec::ConnectivityTopologyStreamKind>(index);
-        auto writer = MakeByteStoreTransferCacheEncodeWriter(
-            session,
-            std::string("topology_connectivity_") + ConnectivityTopologyStreamKindLabel(kind),
-            useMemoryStore,
-            error);
-        if (writer == nullptr) {
-            return ConnectivityTopologyStreamSpooler({});
-        }
-        writers[index] = std::move(writer);
-    }
-    return ConnectivityTopologyStreamSpooler(std::move(writers));
-}
 
 inline std::shared_ptr<PolyhedronTopologyStreamSpooler> MakePolyhedronTopologyStreamSpooler(
     bytestore::ByteStoreSession& session,
-    const bool useMemoryStore,
+    DataCodecExecutionResources& run,
     std::string* error = nullptr) {
     std::array<std::shared_ptr<bytestore::IByteWriter>, polyhedron::kStatefulPolyhedronTopologyStreamOrder.size()> writers{};
     for (std::size_t index = 0; index < polyhedron::kStatefulPolyhedronTopologyStreamOrder.size(); ++index) {
         const auto kind = polyhedron::kStatefulPolyhedronTopologyStreamOrder[index];
         auto writer = MakeByteStoreTransferCacheEncodeWriter(
             session,
+            run,
             std::string("topology_polyhedron_") + polyhedron::PolyhedronTopologyStreamKindName(kind),
-            useMemoryStore,
             error);
         if (writer == nullptr) {
             return nullptr;
@@ -380,45 +240,6 @@ inline std::shared_ptr<PolyhedronTopologyStreamSpooler> MakePolyhedronTopologySt
     return std::make_shared<PolyhedronTopologyStreamSpooler>(std::move(writers));
 }
 
-inline std::shared_ptr<bytestore::IByteSource> BuildTopologyTransferCache(
-    ConnectivityTopologyStreamSpooler& topologyStreamSpooler,
-    std::string* error = nullptr) {
-    if (!topologyStreamSpooler.Complete()) {
-        validation::AssignError(error, "connectivity topology transfer cache writer is incomplete");
-        return nullptr;
-    }
-
-
-    auto connectivityTransferCache = TransferCacheFromWriter(
-        topologyStreamSpooler.TransferWriter(topocodec::ConnectivityTopologyStreamKind::Connectivity),
-        error);
-    auto cellSizeTransferCache = TransferCacheFromWriter(
-        topologyStreamSpooler.TransferWriter(topocodec::ConnectivityTopologyStreamKind::CellSize),
-        error);
-    auto cellPolynomialOrderTransferCache = TransferCacheFromWriter(
-        topologyStreamSpooler.TransferWriter(topocodec::ConnectivityTopologyStreamKind::CellPolynomialOrder),
-        error);
-    auto cellTypeTransferCache = TransferCacheFromWriter(
-        topologyStreamSpooler.TransferWriter(topocodec::ConnectivityTopologyStreamKind::CellType),
-        error);
-    if (connectivityTransferCache == nullptr ||
-        cellSizeTransferCache == nullptr ||
-        cellPolynomialOrderTransferCache == nullptr ||
-        cellTypeTransferCache == nullptr) {
-        return nullptr;
-    }
-
-    auto transferCache = std::make_shared<bytestore::SegmentedBinaryObject>(
-        std::vector<bytestore::SegmentedBinaryObject::Segment>{},
-        bytestore::ByteSourceConsumptionMode::OneShot);
-    if (!transferCache->AddSegment(std::move(connectivityTransferCache), error) ||
-        !transferCache->AddSegment(std::move(cellSizeTransferCache), error) ||
-        !transferCache->AddSegment(std::move(cellPolynomialOrderTransferCache), error) ||
-        !transferCache->AddSegment(std::move(cellTypeTransferCache), error)) {
-        return nullptr;
-    }
-    return transferCache;
-}
 
 inline bool ExportPolyhedronTopologyStreamLayouts(
     const PolyhedronTopologyStreamSpooler& streams,

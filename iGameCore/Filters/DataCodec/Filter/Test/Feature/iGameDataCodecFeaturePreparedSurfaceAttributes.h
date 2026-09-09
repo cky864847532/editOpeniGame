@@ -1,6 +1,8 @@
 #ifndef iGameDataCodecFeaturePreparedSurfaceAttributes_h
 #define iGameDataCodecFeaturePreparedSurfaceAttributes_h
 
+#include "DataCodec/Filter/Adapter/iGamePreparedSurfaceDecodeAdapter.h"
+
 #include "iGameAttributeSet.h"
 #include "iGameCellArray.h"
 #include "iGameFlatArray.h"
@@ -164,7 +166,59 @@ namespace iGame::datacodec_test {
     return true;
 }
 
+[[nodiscard]] inline bool TestSynchronousPreparedSurfaceObserver() {
+    iGamePreparedSurfaceDecodeAdapter observer;
+    const ::datacodec::ConnectivityTopologyDecodeInfo info{
+        .blockCount = 1u, .pointCount = 4u, .cellCount = 1u, .fixedCellSize = 4, .hasCellTypes = true};
+    std::string error;
+    if (!observer.BeginConnectivityTopology(info, &error)) { return false; }
+    ::datacodec::DecodedConnectivityTopologyBlock block{
+        .blockIndex = 0u, .cellOffset = 0u, .fixedCellSize = 4,
+        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {IG_TETRA}};
+    if (!observer.ObserveConnectivityBlock(std::move(block), &error) ||
+        !observer.EndConnectivityTopology(&error)) { return false; }
+    auto source = UnstructuredMesh::New();
+    auto points = Points::New();
+    points->AddPoint(0.0f, 0.0f, 0.0f);
+    points->AddPoint(1.0f, 0.0f, 0.0f);
+    points->AddPoint(0.0f, 1.0f, 0.0f);
+    points->AddPoint(0.0f, 0.0f, 1.0f);
+    source->SetPoints(points);
+    auto cells = CellArray::New();
+    const igIndex tetra[]{0, 1, 2, 3};
+    cells->AddCellIds(tetra, 4);
+    auto types = UnsignedIntArray::New();
+    types->AddValue(IG_TETRA);
+    source->SetCells(cells, types);
+    if (!observer.AttachPreparedSurface(source, &error) ||
+        observer.Summary().find("surface-faces=4") == std::string::npos) { return false; }
+
+    iGamePreparedSurfaceDecodeAdapter failed;
+    if (!failed.BeginConnectivityTopology(info, &error)) { return false; }
+    ::datacodec::DecodedConnectivityTopologyBlock invalid{
+        .fixedCellSize = 4, .connectivity = {0u}, .cellTypes = {IG_TETRA}};
+    if (failed.ObserveConnectivityBlock(std::move(invalid), &error) ||
+        failed.EndConnectivityTopology(&error) || failed.AttachPreparedSurface(source, &error)) { return false; }
+    if (!failed.BeginConnectivityTopology(info, &error)) { return false; }
+    ::datacodec::DecodedConnectivityTopologyBlock outOfOrder{
+        .blockIndex = 1u, .cellOffset = 0u, .fixedCellSize = 4,
+        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {IG_TETRA}};
+    if (failed.ObserveConnectivityBlock(std::move(outOfOrder), &error) ||
+        failed.EndConnectivityTopology(&error)) { return false; }
+    if (!failed.BeginConnectivityTopology(info, &error)) { return false; }
+    ::datacodec::DecodedConnectivityTopologyBlock restarted{
+        .blockIndex = 0u, .cellOffset = 0u, .fixedCellSize = 4,
+        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {IG_TETRA}};
+    return failed.ObserveConnectivityBlock(std::move(restarted), &error) &&
+        failed.EndConnectivityTopology(&error) && failed.AttachPreparedSurface(source, &error) &&
+        !failed.AttachPreparedSurface(source, &error);
+}
+
 [[nodiscard]] inline int RunDataCodecFeaturePreparedSurfaceAttributes() {
+    if (!TestSynchronousPreparedSurfaceObserver()) {
+        std::cerr << "synchronous prepared surface observer contract failed\n";
+        return 1;
+    }
     if (!TestRobustRangeCollapseRecovery()) { return 1; }
     if (!TestPreparedSurfacePointAndCellAttributes()) { return 1; }
     return 0;

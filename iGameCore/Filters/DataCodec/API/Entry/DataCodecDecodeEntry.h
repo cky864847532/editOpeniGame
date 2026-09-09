@@ -5,9 +5,10 @@
 #include "DataCodec/API/Adapter/IFramePackageDecodeAssembly.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/API/Output/DataCodecOutputSinks.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Common/DataCodecTypes.h"
-#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
+#include "DataCodec/Common/DataCodecError.h"
+#include "DataCodec/API/Params/CodecResourceParams.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
 #include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
 
@@ -36,8 +37,7 @@ struct DecodePackageRequest {
         MakeDefaultDecodePackageConfigurationParams()};
     DataCodecOutputSinks outputSinks;
     std::shared_ptr<IRunRecordSink> runRecordSink;
-    DecodeSession* session{nullptr};
-    DataCodecExecutionResources executionResources;
+    CodecResourceParams resources;
     std::stop_token stopToken;
 };
 
@@ -47,6 +47,7 @@ struct DecodePackageResult {
     bool decodedFramePackage{false};
     std::uint64_t inputBytes{0u};
     std::vector<TelemetryMessageRecord> messages;
+    std::optional<CodecFailureRecord> failure;
 };
 
 [[nodiscard]] DecodePackageResult DecodePackage(const DecodePackageRequest& request);

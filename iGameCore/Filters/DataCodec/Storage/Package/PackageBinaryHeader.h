@@ -32,7 +32,8 @@ struct PackageInspection {
 inline bool InspectPackage(
     IByteRangeReader& reader,
     PackageInspection& inspection,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    const std::stop_token stop = {}) {
     constexpr std::size_t kFixedHeaderByteCount =
         sizeof(std::uint32_t) + sizeof(std::uint16_t) + sizeof(std::uint64_t) * 2u;
     inspection = {};
@@ -45,9 +46,10 @@ inline bool InspectPackage(
     }
 
     std::array<std::uint8_t, kFixedHeaderByteCount> bytes{};
-    if (!reader.ReadAt(
+    if (!reader.ReadAtCancellable(
             0u,
             std::span<std::uint8_t>(bytes),
+            stop,
             error)) {
         return false;
     }

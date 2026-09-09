@@ -1,10 +1,13 @@
 #ifndef DATACODEC_COMMON_DATACODECCALLBACK_H
 #define DATACODEC_COMMON_DATACODECCALLBACK_H
 
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,8 +15,36 @@ namespace datacodec::callback {
 
 using ProgressCallback = std::function<void(double)>;
 using ResourceCallback = std::function<void(std::string_view, std::uint64_t)>;
+using CapacityCallback = std::function<void(std::span<const BufferCapacitySample>)>;
 using PhaseTimingCallback = std::function<void(std::string_view, double)>;
 using PhaseTimePoint = std::chrono::steady_clock::time_point;
+
+struct DurationStats {
+    std::uint64_t count{0u};
+    std::uint64_t totalNanoseconds{0u};
+    std::uint64_t maxNanoseconds{0u};
+};
+
+// 由 driver 在有序提交时记录，统计不参与任务准入
+class DurationAccumulator final {
+public:
+    void Configure(const bool enabled = false) noexcept {
+        m_enabled = enabled;
+        m_stats = {};
+    }
+    bool CollectTiming() const noexcept { return m_enabled; }
+    void RecordDuration(const std::chrono::nanoseconds duration) noexcept {
+        if (!m_enabled) { return; }
+        const auto value = static_cast<std::uint64_t>(std::max<std::int64_t>(duration.count(), 0));
+        ++m_stats.count;
+        m_stats.totalNanoseconds += value;
+        m_stats.maxNanoseconds = std::max(m_stats.maxNanoseconds, value);
+    }
+    DurationStats SnapshotStats() const noexcept { return m_stats; }
+private:
+    bool m_enabled{false};
+    DurationStats m_stats;
+};
 
 inline PhaseTimePoint Now() {
     return std::chrono::steady_clock::now();

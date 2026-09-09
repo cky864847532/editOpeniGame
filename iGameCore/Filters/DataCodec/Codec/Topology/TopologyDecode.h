@@ -48,27 +48,18 @@ struct TopologyDecodeCache {
     const CacheResources& cacheResources;
     bytestore::ByteStoreSession& byteStoreSession;
     DecodedTopologyCache& topology;
-    std::uint64_t topologyMemoryInputLimitBytes{0u};
-    std::uint64_t topologyMemoryCacheLimitBytes{0u};
-    DecodeStorageMode topologyInputStorageMode{DecodeStorageMode::Managed};
-    DecodeStorageMode topologyCacheStorageMode{DecodeStorageMode::Managed};
 };
 
 struct TopologyDecodeContext {
     TopologyDecodeTimingCallback timingCallback;
     std::shared_ptr<IDecodeTopologyBlockObserver> topologyBlockObserver;
-};
-
-struct TopologyDecodeSchedule {
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
-    std::size_t workerCount{1u};
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 struct TopologyDecodeRuntime {
     TopologyDecodeData data;
     TopologyDecodeCache cache;
     TopologyDecodeContext context;
-    TopologyDecodeSchedule schedule;
 };
 
 namespace detail {
@@ -130,556 +121,196 @@ inline topocodec::ConnectivityTopologyEncodedMetadata MakeConnectivityTopologyEn
     return metadata;
 }
 
-class TopologyBlockCacheSink final : public topocodec::IConnectivityTopologyDecodeSink {
-public:
-    TopologyBlockCacheSink(
-        topology::CacheTopologyDecodeSink& output,
-        std::mutex& outputWriteMutex,
-        std::shared_ptr<IDecodeTopologyBlockObserver> observer,
-        const std::size_t blockIndex,
-        const std::size_t cellOffset,
-        const std::size_t connectivityOffset,
-        const std::size_t cellCount,
-        const std::size_t connectivityCount,
-        const int fixedCellSize,
-        const bool hasOffsets,
-        const bool hasCellTypes,
-        const bool hasCellPolynomialOrders)
-        : m_output(output),
-          m_outputWriteMutex(outputWriteMutex),
-          m_observer(std::move(observer)),
-          m_cellOffset(cellOffset),
-          m_connectivityOffset(connectivityOffset),
-          m_cellCount(cellCount),
-          m_connectivityCount(connectivityCount),
-          m_hasOffsets(hasOffsets),
-          m_hasCellTypes(hasCellTypes),
-          m_hasCellPolynomialOrders(hasCellPolynomialOrders) {
-        if (m_observer != nullptr) {
-            m_observedBlock.blockIndex = blockIndex;
-            m_observedBlock.cellOffset = cellOffset;
-            m_observedBlock.fixedCellSize = fixedCellSize;
-            m_observedBlock.connectivity.resize(connectivityCount);
-            if (hasOffsets) { m_observedBlock.offsets.resize(cellCount + 1u); }
-            if (hasCellTypes) { m_observedBlock.cellTypes.resize(cellCount); }
-        }
-    }
-
-    bool BeginConnectivityTopology(
-        const std::size_t cellCount,
-        const std::size_t connectivityCount,
-        const bool hasOffsets,
-        const bool hasCellTypes,
-        const bool hasCellPolynomialOrders,
-        std::string* error) override {
-        if (cellCount != m_cellCount ||
-            connectivityCount != m_connectivityCount ||
-            hasOffsets != m_hasOffsets ||
-            hasCellTypes != m_hasCellTypes ||
-            hasCellPolynomialOrders != m_hasCellPolynomialOrders) {
-            return validation::AssignError(error, "topology block output layout does not match decoder layout");
-        }
-        return true;
-    }
-
-    bool WriteConnectivityRange(
-        const std::size_t offset,
-        const std::span<const IndexType> values,
-        std::string* error) override {
-        std::size_t outputOffset = 0u;
-        if (!ValidateRange(offset, values.size(), m_connectivityCount, "topology block connectivity", error) ||
-            !TryAddOffset(m_connectivityOffset, offset, outputOffset, "topology block connectivity", error)) {
-            return false;
-        }
-        if (m_observer != nullptr) {
-            std::copy(
-                values.begin(),
-                values.end(),
-                m_observedBlock.connectivity.begin() + static_cast<std::ptrdiff_t>(offset));
-        }
-        std::lock_guard<std::mutex> lock(m_outputWriteMutex);
-        return m_output.WriteConnectivityRange(outputOffset, values, error);
-    }
-
-    bool WriteOffsetsRange(
-        const std::size_t offset,
-        const std::span<const IndexType> values,
-        std::string* error) override {
-        if (!m_hasOffsets ||
-            !ValidateRange(offset, values.size(), m_cellCount + 1u, "topology block offsets", error)) {
-            return false;
-        }
-        if (m_observer != nullptr) {
-            std::copy(
-                values.begin(),
-                values.end(),
-                m_observedBlock.offsets.begin() + static_cast<std::ptrdiff_t>(offset));
-        }
-        auto outputValues = values;
-        std::size_t outputLocalOffset = offset;
-        if (m_cellOffset != 0u && outputLocalOffset == 0u && !outputValues.empty()) {
-            outputValues = outputValues.subspan(1u);
-            ++outputLocalOffset;
-        }
-        if (outputValues.empty()) {
-            return true;
-        }
-        std::size_t outputOffset = 0u;
-        if (!TryAddOffset(m_cellOffset, outputLocalOffset, outputOffset, "topology block offsets", error)) {
-            return false;
-        }
-        if (m_connectivityOffset == 0u) {
-            std::lock_guard<std::mutex> lock(m_outputWriteMutex);
-            return m_output.WriteOffsetsRange(outputOffset, outputValues, error);
-        }
-        if (m_connectivityOffset > static_cast<std::size_t>(std::numeric_limits<IndexType>::max())) {
-            return validation::AssignError(error, "topology block connectivity offset exceeds index capacity");
-        }
-        const auto connectivityBase = static_cast<IndexType>(m_connectivityOffset);
-        m_offsetScratch.assign(outputValues.begin(), outputValues.end());
-        for (auto& value : m_offsetScratch) {
-            if (value > std::numeric_limits<IndexType>::max() - connectivityBase) {
-                return validation::AssignError(error, "topology block offset exceeds index capacity");
-            }
-            value += connectivityBase;
-        }
-        std::lock_guard<std::mutex> lock(m_outputWriteMutex);
-        return m_output.WriteOffsetsRange(outputOffset, m_offsetScratch, error);
-    }
-
-    bool WriteCellTypesRange(
-        const std::size_t offset,
-        const std::span<const IndexType> values,
-        std::string* error) override {
-        std::size_t outputOffset = 0u;
-        if (!m_hasCellTypes ||
-            !ValidateRange(offset, values.size(), m_cellCount, "topology block cell types", error) ||
-            !TryAddOffset(m_cellOffset, offset, outputOffset, "topology block cell types", error)) {
-            return false;
-        }
-        if (m_observer != nullptr) {
-            std::copy(
-                values.begin(),
-                values.end(),
-                m_observedBlock.cellTypes.begin() + static_cast<std::ptrdiff_t>(offset));
-        }
-        std::lock_guard<std::mutex> lock(m_outputWriteMutex);
-        return m_output.WriteCellTypesRange(outputOffset, values, error);
-    }
-
-    bool WriteCellPolynomialOrdersRange(
-        const std::size_t offset,
-        const std::span<const std::uint16_t> values,
-        std::string* error) override {
-        std::size_t outputOffset = 0u;
-        if (!m_hasCellPolynomialOrders ||
-            !ValidateRange(offset, values.size(), m_cellCount, "topology block cell polynomial orders", error) ||
-            !TryAddOffset(m_cellOffset, offset, outputOffset, "topology block cell polynomial orders", error)) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(m_outputWriteMutex);
-        return m_output.WriteCellPolynomialOrdersRange(outputOffset, values, error);
-    }
-
-    bool EndConnectivityTopology(std::string* error) override {
-        if (m_observer != nullptr) {
-            return m_observer->ObserveConnectivityBlock(
-                std::move(m_observedBlock),
-                error);
-        }
-        return true;
-    }
-
-private:
-    static bool ValidateRange(
-        const std::size_t offset,
-        const std::size_t valueCount,
-        const std::size_t capacity,
-        const char* label,
-        std::string* error) {
-        if (offset > capacity || valueCount > capacity - offset) {
-            return validation::AssignError(error, std::string(label) + " range is invalid");
-        }
-        return true;
-    }
-
-    static bool TryAddOffset(
-        const std::size_t base,
-        const std::size_t localOffset,
-        std::size_t& outputOffset,
-        const char* label,
-        std::string* error) {
-        if (base > std::numeric_limits<std::size_t>::max() - localOffset) {
-            return validation::AssignError(error, std::string(label) + " output offset exceeds local size capacity");
-        }
-        outputOffset = base + localOffset;
-        return true;
-    }
-
-    topology::CacheTopologyDecodeSink& m_output;
-    std::mutex& m_outputWriteMutex;
-    std::shared_ptr<IDecodeTopologyBlockObserver> m_observer;
-    DecodedConnectivityTopologyBlock m_observedBlock;
-    std::size_t m_cellOffset{0u};
-    std::size_t m_connectivityOffset{0u};
-    std::size_t m_cellCount{0u};
-    std::size_t m_connectivityCount{0u};
-    bool m_hasOffsets{false};
-    bool m_hasCellTypes{false};
-    bool m_hasCellPolynomialOrders{false};
-    std::vector<IndexType> m_offsetScratch;
+struct TopologyBlockInput {
+    std::size_t index{0u};
+    topocodec::ConnectivityTopologyDecodeInputReader encoded;
 };
 
-template<typename TStream>
-inline bool DecodeConnectivityTopologyBlocksToCache(
-    const TopoStorageParams& topo,
-    TopologyDecodeRuntime& decodeRuntime,
-    TStream& stream,
-    std::string* error = nullptr) {
-    const auto& cacheResources = decodeRuntime.cache.cacheResources;
-    auto& byteStoreSession = decodeRuntime.cache.byteStoreSession;
-    auto& topologyCache = decodeRuntime.cache.topology;
-    const auto& timingCallback = decodeRuntime.context.timingCallback;
-    const auto topologyBlockObserver = decodeRuntime.context.topologyBlockObserver;
-    const auto& blocks = topo.connectivityLayout.blockLayouts;
-    if (blocks.empty()) {
-        return validation::AssignError(error, "connectivity topology block layout is empty");
-    }
-    if (decodeRuntime.cache.topologyInputStorageMode == DecodeStorageMode::Memory &&
-        (decodeRuntime.cache.topologyMemoryInputLimitBytes == 0u ||
-         topo.binaryCount > decodeRuntime.cache.topologyMemoryInputLimitBytes)) {
-        return validation::AssignError(error, "connectivity topology block input exceeds configured memory limit");
-    }
+struct TopologyBlockOutput {
+    std::size_t index{0u};
+    topocodec::ConnectivityDecodedBlock decoded;
+    double computeMs{0.0};
+    std::optional<topocodec::TopologyBlockCapacitySamples> capacitySamples;
+};
 
-    struct BlockDecodeState {
-        std::mutex mutex;
-        std::condition_variable available;
-        std::size_t inFlight{0u};
-        bool failed{false};
-        std::string error;
-    } blockState;
-
-    double inputLoadMs = 0.0;
-    bool allMemory = true;
-    std::size_t cellCount = 0u;
-    std::size_t connectivityCount = 0u;
-    if (!TryParamSizeToSizeT(topo.cellCount, cellCount) ||
-        !TryParamSizeToSizeT(topo.cellBufferSize, connectivityCount)) {
-        return validation::AssignError(error, "topology counts exceed local size capacity");
+template<typename TValue, typename TWrite>
+inline bool WriteTopologyBlockWindows(DataCodecExecutionResources& root,
+    const std::span<const TValue> values, const std::size_t base, TWrite&& write) {
+    constexpr auto window = kIoWindowBytes / sizeof(TValue);
+    for (std::size_t offset = 0u; offset < values.size();) {
+        if (root.Stopped()) { return false; }
+        const auto count = std::min<std::size_t>(window, values.size() - offset);
+        if (!write(base + offset, values.subspan(offset, count))) { return false; }
+        offset += count;
     }
-    topology::CacheTopologyDecodeSink outputSink(
-        topologyCache,
-        byteStoreSession,
-        decodeRuntime.cache.topologyMemoryCacheLimitBytes,
-        decodeRuntime.cache.topologyCacheStorageMode);
-    const auto hasOffsets = topo.fixedCellSize <= 0;
-    const auto hasOrders = std::any_of(
-        blocks.begin(),
-        blocks.end(),
-        [](const TopologyConnectivityBlockLayoutParams& block) {
-            return block.cellPolynomialOrderByteCount != 0u;
-        });
-    if (!outputSink.BeginConnectivityTopology(
-            cellCount,
-            connectivityCount,
-            hasOffsets,
-            topo.hasCellTypes != 0u,
-            hasOrders,
-            error)) {
-        return false;
-    }
-    std::size_t pointCount = 0u;
-    if (!TryParamSizeToSizeT(
-            decodeRuntime.data.storageParams.geomParams.elementCount,
-            pointCount)) {
-        return validation::AssignError(error, "topology point count exceeds local size capacity");
-    }
-    if (topologyBlockObserver != nullptr) {
-        try {
-            if (!topologyBlockObserver->BeginConnectivityTopology(
-                    ConnectivityTopologyDecodeInfo{
-                    .blockCount = blocks.size(),
-                    .pointCount = pointCount,
-                    .cellCount = cellCount,
-                    .fixedCellSize = static_cast<int>(topo.fixedCellSize),
-                    .hasOffsets = hasOffsets,
-                    .hasCellTypes = topo.hasCellTypes != 0u,
-                },
-                    error)) {
-                return false;
-            }
-        } catch (const std::exception& exception) {
-            return validation::AssignError(
-                error,
-                std::string("topology observer initialization failed: ") + exception.what());
-        } catch (...) {
-            return validation::AssignError(error, "topology observer initialization failed");
-        }
-    }
-    bool observerFinalized = false;
-    std::string observerEndError;
-    const auto finalizeObserver = [&]() noexcept {
-        if (topologyBlockObserver == nullptr || observerFinalized) {
-            return true;
-        }
-        observerFinalized = true;
-        try {
-            return topologyBlockObserver->EndConnectivityTopology(&observerEndError);
-        } catch (const std::exception& exception) {
-            observerEndError = std::string("topology observer finalization raised an exception: ") + exception.what();
-        } catch (...) {
-            observerEndError = "topology observer finalization raised an unknown exception";
-        }
-        return false;
-    };
-
-    const auto workerCount = ResolveNestedParallelTaskCount(
-        blocks.size(),
-        decodeRuntime.schedule.parallelTaskRunner,
-        decodeRuntime.schedule.workerCount);
-    const bool parallelBlocks = workerCount > 1u && decodeRuntime.schedule.parallelTaskRunner != nullptr;
-    const std::size_t maxInFlightBlocks = std::max<std::size_t>(workerCount, 1u);
-    std::mutex outputWriteMutex;
-    std::mutex timingMutex;
-    topocodec::ConnectivityTopologyDecodeTimingCallback connectivityTiming;
-    if (timingCallback) {
-        connectivityTiming = [&timingCallback, &timingMutex](const topocodec::ConnectivityTopologyDecodeTimingEvent& event) {
-            std::lock_guard<std::mutex> lock(timingMutex);
-            ForwardConnectivityTopologyDecodeTiming(timingCallback, event);
-        };
-    }
-    const auto decodeBlock = [&](const std::size_t blockIndex,
-                                 const TopologyConnectivityBlockLayoutParams& layout,
-                                 const std::shared_ptr<topocodec::ConnectivityTopologyDecodeInputReader>& encodedBlock,
-                                 const std::size_t localCellCount,
-                                 const std::size_t localConnectivityCount,
-                                 const std::size_t cellOffset,
-                                 const std::size_t connectivityOffset) {
-        std::string blockError;
-        try {
-            TopologyBlockCacheSink blockSink(
-                outputSink,
-                outputWriteMutex,
-                topologyBlockObserver,
-                blockIndex,
-                cellOffset,
-                connectivityOffset,
-                localCellCount,
-                localConnectivityCount,
-                static_cast<int>(topo.fixedCellSize),
-                hasOffsets,
-                topo.hasCellTypes != 0u,
-                hasOrders);
-            const auto decoded = topocodec::DecodeConnectivityTopologyToSink(
-                *encodedBlock,
-                pointCount,
-                localCellCount,
-                localConnectivityCount,
-                static_cast<int>(topo.fixedCellSize),
-                topo.hasCellTypes != 0u,
-                blockSink,
-                &blockError,
-                connectivityTiming);
-            if (!decoded && blockError.empty()) {
-                blockError = "topology block decoder returned failure";
-            }
-        } catch (const std::exception& exception) {
-            blockError = std::string("topology block decoder raised an exception: ") + exception.what();
-        } catch (...) {
-            blockError = "topology block decoder raised an unknown exception";
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(blockState.mutex);
-            if (!blockError.empty() && !blockState.failed) {
-                blockState.failed = true;
-                blockState.error = "topology block " + std::to_string(blockIndex) + " decode failed: " + blockError;
-            }
-            --blockState.inFlight;
-        }
-        blockState.available.notify_all();
-    };
-    std::unique_ptr<IParallelTaskGroup> taskGroup;
-    if (parallelBlocks) {
-        try {
-            taskGroup = decodeRuntime.schedule.parallelTaskRunner->CreateGroup();
-        } catch (const std::exception& exception) {
-            const auto message = std::string("topology block task group creation failed: ") + exception.what();
-            (void)finalizeObserver();
-            return validation::AssignError(error, message);
-        } catch (...) {
-            (void)finalizeObserver();
-            return validation::AssignError(error, "topology block task group creation failed");
-        }
-        if (taskGroup == nullptr) {
-            (void)finalizeObserver();
-            return validation::AssignError(error, "topology block task group is unavailable");
-        }
-    }
-    const auto blockDecodeStart = callback::StartTiming(timingCallback);
-    for (std::size_t blockIndex = 0u; blockIndex < blocks.size(); ++blockIndex) {
-        const auto& layout = blocks[blockIndex];
-        std::size_t localCellCount = 0u;
-        std::size_t localConnectivityCount = 0u;
-        std::size_t cellOffset = 0u;
-        std::size_t connectivityOffset = 0u;
-        if (!TryParamSizeToSizeT(layout.cellCount, localCellCount) ||
-            !TryParamSizeToSizeT(layout.connectivityCount, localConnectivityCount) ||
-            !TryParamSizeToSizeT(layout.cellOffset, cellOffset) ||
-            !TryParamSizeToSizeT(layout.connectivityOffset, connectivityOffset)) {
-            {
-                std::lock_guard<std::mutex> lock(blockState.mutex);
-                blockState.failed = true;
-                blockState.error = "topology block layout exceeds local size capacity";
-            }
-            blockState.available.notify_all();
-            break;
-        }
-
-        {
-            std::unique_lock<std::mutex> lock(blockState.mutex);
-            blockState.available.wait(lock, [&]() {
-                return blockState.failed || blockState.inFlight < maxInFlightBlocks;
-            });
-            if (blockState.failed) {
-                break;
-            }
-            ++blockState.inFlight;
-        }
-
-        auto encodedBlock = std::make_shared<topocodec::ConnectivityTopologyDecodeInputReader>();
-        const auto inputLoadStart = callback::StartTiming(timingCallback);
-        if (!encodedBlock->LoadFrom(
-                stream,
-                MakeConnectivityTopologyEncodedMetadata(layout),
-                cacheResources,
-                byteStoreSession,
-                decodeRuntime.cache.topologyMemoryInputLimitBytes,
-                decodeRuntime.cache.topologyInputStorageMode,
-                error)) {
-            {
-                std::lock_guard<std::mutex> lock(blockState.mutex);
-                --blockState.inFlight;
-                blockState.failed = true;
-                blockState.error = error != nullptr && !error->empty()
-                    ? *error
-                    : "failed to load topology block input";
-            }
-            blockState.available.notify_all();
-            break;
-        }
-        if (timingCallback) {
-            std::lock_guard<std::mutex> lock(timingMutex);
-            inputLoadMs += callback::ElapsedMilliseconds(inputLoadStart);
-        }
-        allMemory = allMemory &&
-            encodedBlock->StoreMode() == topocodec::ConnectivityTopologyDecodeInputReader::ByteStoreMode::Memory;
-
-        const auto* blockLayout = &layout;
-        if (taskGroup != nullptr) {
-            try {
-                taskGroup->Submit([&, blockIndex, blockLayout, encodedBlock, localCellCount, localConnectivityCount, cellOffset, connectivityOffset]() {
-                    decodeBlock(
-                        blockIndex,
-                        *blockLayout,
-                        encodedBlock,
-                        localCellCount,
-                        localConnectivityCount,
-                        cellOffset,
-                        connectivityOffset);
-                });
-            } catch (const std::exception& exception) {
-                {
-                    std::lock_guard<std::mutex> lock(blockState.mutex);
-                    if (!blockState.failed) {
-                        blockState.failed = true;
-                        blockState.error = std::string("topology block task submission failed: ") + exception.what();
-                    }
-                    --blockState.inFlight;
-                }
-                blockState.available.notify_all();
-                break;
-            } catch (...) {
-                {
-                    std::lock_guard<std::mutex> lock(blockState.mutex);
-                    if (!blockState.failed) {
-                        blockState.failed = true;
-                        blockState.error = "topology block task submission failed";
-                    }
-                    --blockState.inFlight;
-                }
-                blockState.available.notify_all();
-                break;
-            }
-        } else {
-            decodeBlock(
-                blockIndex,
-                *blockLayout,
-                encodedBlock,
-                localCellCount,
-                localConnectivityCount,
-                cellOffset,
-                connectivityOffset);
-        }
-    }
-    try {
-        if (taskGroup != nullptr) {
-            taskGroup->Wait();
-        }
-    } catch (const std::exception& exception) {
-        std::lock_guard<std::mutex> lock(blockState.mutex);
-        if (!blockState.failed) {
-            blockState.failed = true;
-            blockState.error = std::string("topology block task group wait failed: ") + exception.what();
-        }
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(blockState.mutex);
-        if (!blockState.failed) {
-            blockState.failed = true;
-            blockState.error = "topology block task group wait failed";
-        }
-    }
-    const auto observerEnded = finalizeObserver();
-    {
-        std::lock_guard<std::mutex> lock(blockState.mutex);
-        if (blockState.failed) {
-            return validation::AssignError(error, blockState.error);
-        }
-    }
-    if (!observerEnded) {
-        return validation::AssignError(error, observerEndError);
-    }
-    if (timingCallback) {
-        timingCallback(TopologyDecodeTimingEvent{
-            "TopoDecodeCoreStage.connectivity.block_input_load",
-            inputLoadMs,
-            "blocks=" + std::to_string(blocks.size()) +
-                ";bytes=" + std::to_string(topo.binaryCount),
-        });
-        timingCallback(TopologyDecodeTimingEvent{
-            "TopoDecodeCoreStage.connectivity.block_decode",
-            callback::ElapsedMilliseconds(blockDecodeStart),
-            "blocks=" + std::to_string(blocks.size()) +
-                ";workers=" + std::to_string(workerCount),
-        });
-    }
-    if (!outputSink.EndConnectivityTopology(error)) {
-        return false;
-    }
-    topologyCache.SetInputByteStoreMode(
-        allMemory
-            ? DecodedTopologyCache::ByteStoreMode::Memory
-            : DecodedTopologyCache::ByteStoreMode::Managed);
     return true;
 }
 
 template<typename TStream>
+inline bool DecodeConnectivityTopologyBlocksToCache(
+    const TopoStorageParams& topo, TopologyDecodeRuntime& runtime,
+    TStream& stream, std::string* error = nullptr) {
+    auto& root = runtime.cache.cacheResources.Run();
+    const auto& blocks = topo.connectivityLayout.blockLayouts;
+    if (blocks.empty()) { return validation::AssignError(error, "connectivity topology block layout is empty"); }
+    std::size_t cells = 0u, indices = 0u, points = 0u;
+    if (!TryParamSizeToSizeT(topo.cellCount, cells) || !TryParamSizeToSizeT(topo.cellBufferSize, indices) ||
+        !TryParamSizeToSizeT(runtime.data.storageParams.geomParams.elementCount, points)) {
+        return validation::AssignError(error, "topology counts exceed local size capacity");
+    }
+    std::uint64_t nextCell = 0u, nextIndex = 0u, payloadBytes = 0u;
+    bool singleRecord = false, hasOrders = false;
+    for (const auto& layout : blocks) {
+        if (layout.cellOffset != nextCell || layout.connectivityOffset != nextIndex ||
+            !validation::CheckedAddU64(nextCell, layout.cellCount, nextCell, "topology block cells", error) ||
+            !validation::CheckedAddU64(nextIndex, layout.connectivityCount, nextIndex, "topology block indices", error) ||
+            nextCell > cells || nextIndex > indices) {
+            return validation::AssignError(error, "topology blocks do not form contiguous ranges");
+        }
+        for (const auto bytes : {layout.connectivityByteCount, layout.cellSizeByteCount,
+                layout.cellPolynomialOrderByteCount, layout.cellTypeByteCount}) {
+            if (!validation::CheckedAddU64(payloadBytes, bytes, payloadBytes, "topology input payload", error)) { return false; }
+        }
+        std::size_t checkedBytes = 0u, offsetCount = 0u;
+        if (!validation::CheckedAddSizeT(static_cast<std::size_t>(layout.cellCount), 1u,
+                offsetCount, "topology block offset count", error) ||
+            !validation::CheckedMulSizeT(offsetCount, sizeof(IndexType), checkedBytes, "topology block offsets", error) ||
+            !validation::CheckedMulSizeT(static_cast<std::size_t>(layout.connectivityCount), sizeof(IndexType),
+                checkedBytes, "topology block connectivity", error)) { return false; }
+        singleRecord |= layout.cellCount > numericarray::kSpatialBlockElementCount;
+        hasOrders |= layout.cellPolynomialOrderByteCount != 0u;
+    }
+    if (nextCell != cells || nextIndex != indices || payloadBytes != topo.binaryCount) {
+        return validation::AssignError(error, "topology block totals do not match field metadata");
+    }
+    const bool hasOffsets = topo.fixedCellSize <= 0;
+    const bool hasTypes = topo.hasCellTypes != 0u;
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return false; }
+    auto& cache = runtime.cache.topology;
+    bool completed = false;
+    struct OutputGuard {
+        DecodedTopologyCache& cache;
+        bool& completed;
+        ~OutputGuard() { if (!completed) { cache.Release(); } }
+    } outputGuard{cache, completed};
+    topology::CacheTopologyDecodeSink sink(cache, runtime.cache.byteStoreSession);
+    if (!sink.BeginConnectivityTopology(cells, indices, hasOffsets, hasTypes, hasOrders, error)) { return false; }
+    auto observer = runtime.context.topologyBlockObserver;
+    bool observerStarted = false, observerEnded = false;
+    struct ObserverGuard {
+        std::shared_ptr<IDecodeTopologyBlockObserver>& observer;
+        DataCodecExecutionResources& root;
+        bool& started;
+        bool& ended;
+        ~ObserverGuard() {
+            if (!observer || !started || ended) { return; }
+            ended = true;
+            try { (void)observer->EndConnectivityTopology(nullptr); }
+            catch (...) { RecordExecutionException(root, "topology-observer-cleanup"); }
+        }
+    } observerGuard{observer, root, observerStarted, observerEnded};
+    if (observer) {
+        observerStarted = true;
+        if (!observer->BeginConnectivityTopology({blocks.size(), points, cells,
+                static_cast<int>(topo.fixedCellSize), hasOffsets, hasTypes}, error)) { return false; }
+    }
+    std::size_t cursor = 0u, committed = 0u;
+    const auto begin = stream.Position();
+    phase.reset();
+    root.SetWorkType({.path = ResourceWorkPath::ConnectivityDecode,
+        .blockElements = numericarray::kSpatialBlockElementCount});
+    completed = RunOrderedBlocks<TopologyBlockInput, TopologyBlockOutput>(root,
+        [&] { return cursor < blocks.size(); },
+        [&](TopologyBlockInput& input, const SlotLease& slot) {
+            input.index = cursor++;
+            // 顺序字段的外层解压复用原槽位并取得计算额度
+            return RunTerminalWork(root, slot, [&](WorkerContext&) {
+                return input.encoded.LoadFrom(stream, MakeConnectivityTopologyEncodedMetadata(blocks[input.index]),
+                    runtime.cache.cacheResources, error);
+            });
+        },
+        [&](const TopologyBlockInput& input, TopologyBlockOutput& output, WorkerContext&) {
+            output.index = input.index;
+            if (runtime.context.recordCapacitySamples) {
+                output.capacitySamples.emplace();
+                input.encoded.ObserveCapacities(*output.capacitySamples);
+            }
+            const auto& layout = blocks[input.index];
+            const auto start = callback::StartTiming(static_cast<bool>(runtime.context.timingCallback));
+            std::string localError;
+            if (!topocodec::DecodeConnectivityTopologyBlock(input.encoded, points,
+                    static_cast<std::size_t>(layout.cellCount), static_cast<std::size_t>(layout.connectivityCount),
+                    static_cast<int>(topo.fixedCellSize), hasTypes, output.decoded, &localError, {},
+                    output.capacitySamples ? &*output.capacitySamples : nullptr)) {
+                root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+                    "topology-block-decode", "DecodeConnectivityTopologyBlock", localError));
+                return false;
+            }
+            output.computeMs = callback::ElapsedMilliseconds(start);
+            return true;
+        },
+        [&](TopologyBlockOutput& output) {
+            if (output.index != committed) { return validation::AssignError(error, "topology blocks committed out of order"); }
+            const auto& layout = blocks[output.index];
+            auto& data = output.decoded;
+            const auto cellBase = static_cast<std::size_t>(layout.cellOffset);
+            const auto indexBase = static_cast<std::size_t>(layout.connectivityOffset);
+            if (!WriteTopologyBlockWindows<IndexType>(root, data.connectivity, indexBase,
+                    [&](auto offset, auto values) { return sink.WriteConnectivityRange(offset, values, error); }) ||
+                !WriteTopologyBlockWindows<IndexType>(root, data.cellTypes, cellBase,
+                    [&](auto offset, auto values) { return sink.WriteCellTypesRange(offset, values, error); }) ||
+                !WriteTopologyBlockWindows<std::uint16_t>(root, data.polynomialOrders, cellBase,
+                    [&](auto offset, auto values) { return sink.WriteCellPolynomialOrdersRange(offset, values, error); })) { return false; }
+            if (hasOffsets) {
+                const auto first = cellBase == 0u ? 0u : 1u;
+                std::vector<IndexType> adjusted;
+                adjusted.resize(std::min<std::size_t>(kIoWindowBytes / sizeof(IndexType), data.offsets.size() - first));
+                if (output.capacitySamples) {
+                    output.capacitySamples->Observe(topocodec::TopologyBufferSample::AdjustedOffsets, adjusted);
+                }
+                for (std::size_t offset = first; offset < data.offsets.size();) {
+                    if (root.Stopped()) { return false; }
+                    const auto count = std::min(adjusted.size(), data.offsets.size() - offset);
+                    for (std::size_t i = 0u; i < count; ++i) {
+                        if (indexBase > std::numeric_limits<IndexType>::max() ||
+                            data.offsets[offset + i] > std::numeric_limits<IndexType>::max() - indexBase) {
+                            return validation::AssignError(error, "topology global offset exceeds index capacity");
+                        }
+                        adjusted[i] = static_cast<IndexType>(indexBase + data.offsets[offset + i]);
+                    }
+                    if (!sink.WriteOffsetsRange(cellBase + offset, std::span<const IndexType>(adjusted).first(count), error)) { return false; }
+                    offset += count;
+                }
+            }
+            if (observer && !observer->ObserveConnectivityBlock({output.index, cellBase,
+                    static_cast<int>(topo.fixedCellSize), std::move(data.connectivity),
+                    std::move(data.offsets), std::move(data.cellTypes)}, error)) { return false; }
+            if (output.capacitySamples && runtime.context.recordCapacitySamples) {
+                try { runtime.context.recordCapacitySamples(output.capacitySamples->values); }
+                catch (...) { root.RecordDiagnosticExportFailure(); }
+            }
+            if (runtime.context.timingCallback) {
+                runtime.context.timingCallback({"TopoDecodeCoreStage.connectivity.block_decode",
+                    output.computeMs, "block=" + std::to_string(output.index)});
+            }
+            if (++committed != blocks.size()) { return true; }
+            if (!validation::ValidateExactConsumed(stream.Position() - begin, topo.binaryCount,
+                    "topology blocks", error) || !sink.EndConnectivityTopology(error)) { return false; }
+            if (observer) {
+                observerEnded = true;
+                if (!observer->EndConnectivityTopology(error)) { return false; }
+            }
+            return true;
+        }, singleRecord);
+    return completed;
+}
+
+template<typename TStream>
 inline bool DecodeConnectivityTopologyStreamToCache(
-    const TopoStorageParams& topo,
-    TopologyDecodeRuntime& decodeRuntime,
-    TStream& stream,
-    std::string* error = nullptr) {
-    return DecodeConnectivityTopologyBlocksToCache(topo, decodeRuntime, stream, error);
+    const TopoStorageParams& topo, TopologyDecodeRuntime& runtime,
+    TStream& stream, std::string* error = nullptr) {
+    return DecodeConnectivityTopologyBlocksToCache(topo, runtime, stream, error);
 }
 
 
@@ -734,12 +365,10 @@ inline TopologyDecodeResult DecodeTopologyFieldToCache(
         if (!polyhedron::DecodePolyhedronTopologyStreamsToCache(
                 cacheResources,
                 byteStoreSession,
-                decodeRuntime.cache.topologyCacheStorageMode,
-                decodeRuntime.cache.topologyMemoryCacheLimitBytes,
                 topology,
                 storageParams.topoParams,
                 stream,
-                &error)) {
+                &error, decodeRuntime.context.recordCapacitySamples)) {
             return detail::MakeTopologyDecodeFailure(
                 CodecErrorCode::InvalidTopology,
                 "failed to decode polyhedron topology streams: " + error);

@@ -3,7 +3,7 @@
 
 #include "DataCodec/Codec/Attributes/AttributeEncode.h"
 #include "DataCodec/Runtime/Failure/EncodeFailureManagement.h"
-#include "DataCodec/Workflow/Encode/Stages/EncodeStageCallbacks.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
 
 #include <functional>
@@ -28,8 +28,7 @@ inline encodeimpl::AttributeEncodeRuntime MakeAttributeEncodeRuntime(
             .keyFrameIndex = context.attributeKeyFrameIndex,
         },
         .schedule = encodeimpl::AttributeEncodeSchedule{
-            .attributeScheduler = workspace.AttributeEncodeSchedulerRef(),
-            .resourceBudget = workspace.ResourceBudget(),
+            .attributeTiming = workspace.AttributeEncodeTimingRef(),
             .pointReferenceSchedule = workspace.MutableAttributeReferenceSchedule(AttrAttachment::Point),
             .cellReferenceSchedule = workspace.MutableAttributeReferenceSchedule(AttrAttachment::Cell),
         },
@@ -40,10 +39,9 @@ inline encodeimpl::AttributeEncodeRuntime MakeAttributeEncodeRuntime(
             .attributeOutput = std::move(attributeOutput),
         },
         .context = encodeimpl::AttributeEncodeContext{
-            .resourceCallback = MakeEncodeResourceCallback(context),
-            .currentReferenceCacheMutex = &context.currentAttributeReferenceCacheMutex,
             .referenceScheduleMutex = workspace.AttributeReferenceScheduleMutex(),
             .referenceScheduleBuildMutex = workspace.AttributeReferenceScheduleBuildMutex(),
+            .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
         },
     };
 }

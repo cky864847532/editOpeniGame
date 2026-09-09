@@ -1,4 +1,5 @@
 #include "DataCodec/Workflow/Session/PlaybackSession.h"
+#include "DataCodec/Workflow/Session/CodecRunEntry.h"
 
 #include "DataCodec/Workflow/FrameSequence/FrameSequenceDependencyPlanner.h"
 #include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
@@ -71,7 +72,7 @@ void AddPlaybackMessage(
         .text = std::move(text),
     };
     SubmitRunMessage(runRecordSink, message);
-    messages.push_back(std::move(message));
+    AppendRetainedTelemetryMessage(messages, message);
 }
 
 template <typename TResult>
@@ -183,22 +184,50 @@ private:
 };
 
 struct PlaybackSession::Impl {
-    using TargetTaskCoordinator = DecodeTaskCoordinator<PlaybackFrameResult>;
+    using CommandResult = std::variant<PlaybackFrameResult, DecodedFrameAttributeResult>;
+    using TargetTaskCoordinator = DecodeTaskCoordinator<CommandResult>;
+
+    static bool WaitFrame(const TargetTaskCoordinator::Handle& handle, PlaybackFrameResult& result) {
+        CommandResult command;
+        if (!handle.Wait(command)) { return false; }
+        if (auto* frame = std::get_if<PlaybackFrameResult>(&command)) {
+            result = std::move(*frame);
+            return true;
+        }
+        return false;
+    }
     struct DecodedFrameWorkResult {
         bool success{false};
+        std::optional<CodecFailureRecord> failure;
         bool cancelled{false};
         std::shared_ptr<IDecodedFrameAssembly> assembly;
         std::shared_ptr<DecodeSession> session;
         std::vector<TelemetryMessageRecord> messages;
+        std::vector<DecodeReferenceCache::RequiredFrameLease> requiredReferences;
     };
-    using ReferenceTaskCoordinator = DecodeTaskCoordinator<DecodedFrameWorkResult>;
+
+    std::vector<DecodeReferenceCache::RequiredFrameLease> RequireReferenceFrames(
+        const std::vector<std::uint32_t>& frames) {
+        std::vector<DecodeReferenceCache::RequiredFrameLease> leases;
+        leases.reserve(frames.size());
+        for (const auto frame : frames) {
+            const auto key = ReferenceCacheKey(frame);
+            if (!key) { throw std::invalid_argument("reference dependency requires a stable source identity"); }
+            leases.push_back(referenceCache->RequireFrame(*key));
+        }
+        return leases;
+    }
 
     mutable std::mutex stateMutex;
     std::vector<TargetTaskCoordinator::Handle> prefetchTasks;
     std::unordered_set<std::uint32_t> queuedFrames;
     FrameSequenceDependencyPlanner::FrameReaderMap frameReaders;
     FrameSequenceDependencyPlanner::FramePackageMap framePackages;
-    DecodeSession::FrameIdentityMap frameIdentities;
+    std::shared_ptr<const DecodeSession::FrameIdentityMap> frameIdentities;
+    const DecodeSession::FrameIdentityMap& FrameIdentities() const noexcept {
+        static const DecodeSession::FrameIdentityMap empty;
+        return frameIdentities ? *frameIdentities : empty;
+    }
     std::unique_ptr<FrameSequenceDependencyPlanner> dependencyPlanner;
     IDecodedFrameAssemblyFactory::Pointer assemblyFactory;
     DecodeControlParams controlParams{MakeDefaultDecodeControlParams()};
@@ -209,15 +238,12 @@ struct PlaybackSession::Impl {
     EncodedInputCachePolicy encodedInputCachePolicy;
     std::string decodedFrameResultIdentity;
     PlaybackPrefetchPlanner prefetchPlanner;
-    std::shared_ptr<IDecodedFrameCache> frameCache;
-    std::shared_ptr<IEncodedInputCache> encodedInputCache;
-    std::shared_ptr<DecodeCacheRuntime> cacheRuntime;
+    std::shared_ptr<DecodedFrameLruCache> frameCache;
+    std::shared_ptr<EncodedInputLruCache> encodedInputCache;
+    DecodeCacheRuntime* cacheRuntime{nullptr};
     std::shared_ptr<DecodeReferenceCache> referenceCache;
-    bool usingDefaultFrameCache{false};
-    bool usingDefaultEncodedInputCache{false};
+    std::shared_ptr<DataCodecExecutionResources> resources;
     std::unique_ptr<TargetTaskCoordinator> taskCoordinator;
-    std::unique_ptr<ReferenceTaskCoordinator> referenceTaskCoordinator;
-    std::shared_ptr<IParallelTaskRunner> parallelTaskRunner;
     std::vector<std::uint32_t> playbackFrameOrder;
     std::unordered_map<std::uint32_t, std::size_t> playbackOrdinals;
     std::optional<std::uint32_t> currentFrameIndex;
@@ -232,11 +258,11 @@ struct PlaybackSession::Impl {
         if (backgroundMessages.size() == kBackgroundMessageLimit) {
             backgroundMessages.pop_front();
         }
-        backgroundMessages.push_back({
+        backgroundMessages.push_back(CopyRetainedTelemetryMessage({
             .severity = TelemetryMessageSeverity::Warning,
             .origin = "DataCodecPlaybackSession",
             .text = std::move(text),
-        });
+        }));
     }
 
     void RecordPrefetchResultLocked(const PlaybackFrameResult& result) {
@@ -271,8 +297,8 @@ struct PlaybackSession::Impl {
     }
 
     [[nodiscard]] std::optional<DecodedFrameKey> FrameCacheKey(const std::uint32_t frameIndex) const {
-        const auto identity = frameIdentities.find(frameIndex);
-        if (identity == frameIdentities.end() || !identity->second.IsStable()) { return std::nullopt; }
+        const auto identity = FrameIdentities().find(frameIndex);
+        if (identity == FrameIdentities().end() || !identity->second.IsStable()) { return std::nullopt; }
         return DecodedFrameKey{
             .source = identity->second,
             .frameIndex = frameIndex,
@@ -282,8 +308,8 @@ struct PlaybackSession::Impl {
 
     [[nodiscard]] std::optional<DecodeReferenceKey> ReferenceCacheKey(
         const std::uint32_t frameIndex) const {
-        const auto identity = frameIdentities.find(frameIndex);
-        if (identity == frameIdentities.end() || !identity->second.IsStable()) { return std::nullopt; }
+        const auto identity = FrameIdentities().find(frameIndex);
+        if (identity == FrameIdentities().end() || !identity->second.IsStable()) { return std::nullopt; }
         return DecodeReferenceKey{
             .source = identity->second,
             .keyFrameIndex = frameIndex,
@@ -292,16 +318,16 @@ struct PlaybackSession::Impl {
 
     [[nodiscard]] DecodeSourceIdentity SequenceIdentity() const {
         if (playbackFrameOrder.empty()) { return {}; }
-        const auto identity = frameIdentities.find(playbackFrameOrder.front());
-        return identity == frameIdentities.end() ? DecodeSourceIdentity{} : identity->second;
+        const auto identity = FrameIdentities().find(playbackFrameOrder.front());
+        return identity == FrameIdentities().end() ? DecodeSourceIdentity{} : identity->second;
     }
 
     [[nodiscard]] std::vector<DecodeSourceIdentity> DistinctSourceIdentities() const {
         std::vector<DecodeSourceIdentity> identities;
-        identities.reserve(frameIdentities.size());
+        identities.reserve(FrameIdentities().size());
         std::unordered_set<std::string> stableIds;
-        stableIds.reserve(frameIdentities.size());
-        for (const auto& [frameIndex, identity] : frameIdentities) {
+        stableIds.reserve(FrameIdentities().size());
+        for (const auto& [frameIndex, identity] : FrameIdentities()) {
             (void)frameIndex;
             if (identity.IsStable() && stableIds.insert(identity.stableId).second) {
                 identities.push_back(identity);
@@ -332,24 +358,20 @@ struct PlaybackSession::Impl {
             encodedInputCache == nullptr || cacheRuntime == nullptr) {
             return reader == frameReaders.end() ? nullptr : reader->second;
         }
-        const auto identity = frameIdentities.find(frameIndex);
-        if (identity == frameIdentities.end() || !identity->second.IsStable()) {
-            return reader->second;
-        }
-        if (encodedInputCachePolicy.residentLimitBytes != 0u &&
-            reader->second->ByteSize() > encodedInputCachePolicy.residentLimitBytes &&
-            reader->second->RetainAllBytes() == nullptr) {
+        const auto identity = FrameIdentities().find(frameIndex);
+        if (identity == FrameIdentities().end() || !identity->second.IsStable()) {
             return reader->second;
         }
         std::string error;
         const auto bytes = cacheRuntime->EncodedInputLoader().Load(
+            *resources,
             encodedInputCache,
             identity->second,
             reader->second,
             accessKind,
             &error);
         if (bytes != nullptr) {
-            return std::make_shared<MemoryByteRangeReader>(bytes);
+            return bytes;
         }
         AddPlaybackMessage(
             messages,
@@ -375,8 +397,7 @@ struct PlaybackSession::Impl {
 
     [[nodiscard]] bool CanUseDecodedFrameCache() const {
         if (!decodedFrameCachePolicy.enabled || frameCache == nullptr) { return false; }
-        return !usingDefaultFrameCache ||
-            (cacheRuntime != nullptr && cacheRuntime->DefaultDecodedFrameCacheEnabled());
+        return frameCache->IsEnabled();
     }
 
     [[nodiscard]] TargetTaskCoordinator::Handle SubmitDecodeTask(
@@ -415,9 +436,8 @@ struct PlaybackSession::Impl {
                 }
                 return result;
             };
-            return prefetch
-                ? taskCoordinator->Submit(taskKey, std::move(task))
-                : taskCoordinator->SubmitInline(taskKey, std::move(task));
+            return taskCoordinator->Submit(taskKey, std::move(task),
+                prefetch ? DecodeCommandKind::Prefetch : DecodeCommandKind::Foreground);
         } catch (const std::exception& exception) {
             if (prefetch) {
                 RecordBackgroundWarningLocked(
@@ -468,7 +488,7 @@ struct PlaybackSession::Impl {
         if (inputReader == nullptr) { return result; }
 
         auto frameSession = std::make_shared<DecodeSession>();
-        frameSession->ConfigureReferenceCache(referenceCache, frameIdentities);
+        frameSession->ConfigureReferences(*resources, frameIdentities);
         auto decodeRecords = std::make_shared<ProgressRangeRunRecordSink>(
             request.runRecordSink.get(),
             progressBegin,
@@ -480,7 +500,7 @@ struct PlaybackSession::Impl {
         const auto* framePackageMetadata = metadata != framePackages.end() && metadata->second != nullptr
             ? metadata->second.get()
             : nullptr;
-        auto frameResult = DecodePackage({
+        auto frameResult = DecodePackageInRun({
             .inputReader = inputReader,
             .framePackageMetadata = framePackageMetadata,
             .frameAssembly = assembly.get(),
@@ -495,12 +515,9 @@ struct PlaybackSession::Impl {
                 .language = language,
             },
             .runRecordSink = request.runRecordSink != nullptr ? decodeRecords : nullptr,
-            .session = frameSession.get(),
-            .executionResources = DataCodecExecutionResources{
-                .parallelTaskRunner = parallelTaskRunner.get(),
-            },
             .stopToken = stopToken,
-        });
+        }, *resources, frameSession.get());
+        result.failure = frameResult.failure;
         result.messages = std::move(frameResult.messages);
         result.cancelled = frameResult.cancelled || stopToken.stop_requested();
         result.success = frameResult.success && !result.cancelled;
@@ -552,54 +569,9 @@ struct PlaybackSession::Impl {
                 return result;
             }
         }
-        if (referenceTaskCoordinator == nullptr) {
-            AddPlaybackMessage(
-                result,
-                request.runRecordSink.get(),
-                TelemetryMessageSeverity::Error,
-                "playback reference task coordinator is unavailable");
-            return result;
-        }
-        const auto identity = frameIdentities.find(frameIndex);
-        const auto variant = identity != frameIdentities.end()
-            ? "reference:" + identity->second.stableId + ":" + identity->second.revision
-            : "reference";
-        auto referenceTask = referenceTaskCoordinator->SubmitInline(
-            DecodeTaskKey{
-                .scope = 1u,
-                .frameIndex = frameIndex,
-                .variant = variant,
-            },
-            [this,
-             frameIndex,
-             request,
-             progressBegin,
-             progressEnd,
-             progressFrameOrdinal,
-             progressFrameCount,
-             inputAccessKind,
-             progressLabel = std::move(progressLabel)](const std::stop_token referenceStopToken) mutable {
-                // 依赖关键帧需要形成可独立复用的完整 reference
-                return DecodeOneFrame(
-                    frameIndex,
-                    true,
-                    inputAccessKind,
-                    request,
-                    progressBegin,
-                    progressEnd,
-                    progressFrameOrdinal,
-                    progressFrameCount,
-                    std::move(progressLabel),
-                    referenceStopToken);
-            });
-        if (!referenceTask.Wait(result)) {
-            AddPlaybackMessage(
-                result,
-                request.runRecordSink.get(),
-                TelemetryMessageSeverity::Error,
-                "playback reference task coordinator is unavailable");
-            return result;
-        }
+        result = DecodeOneFrame(frameIndex, true, inputAccessKind, request,
+            progressBegin, progressEnd, progressFrameOrdinal, progressFrameCount,
+            std::move(progressLabel), stopToken);
         if (result.success && referenceCache != nullptr) {
             const auto key = ReferenceCacheKey(frameIndex);
             const auto publishedReference = key.has_value() ? referenceCache->Find(*key) : nullptr;
@@ -641,6 +613,7 @@ struct PlaybackSession::Impl {
         for (const auto frameIndex : plan.decodeOrder) {
             if (frameIndex != targetFrameIndex) { references.push_back(frameIndex); }
         }
+        result.requiredReferences = RequireReferenceFrames(references);
         PlaybackFrameRequest frameRequest;
         frameRequest.frameIndex = targetFrameIndex;
         frameRequest.runRecordSink = request.runRecordSink;
@@ -660,10 +633,7 @@ struct PlaybackSession::Impl {
                     references.size(),
                     references[ordinal]),
                 request.stopToken);
-            result.messages.insert(
-                result.messages.end(),
-                referenceResult.messages.begin(),
-                referenceResult.messages.end());
+            AppendRetainedTelemetryMessages(result.messages, referenceResult.messages);
             if (!referenceResult.success) {
                 result.cancelled = referenceResult.cancelled || request.stopToken.stop_requested();
                 return result;
@@ -734,6 +704,7 @@ struct PlaybackSession::Impl {
             return result;
         }
 
+        auto requiredReferences = RequireReferenceFrames(dependencyPlan.referenceFrames);
         std::shared_ptr<IDecodedFrameAssembly> targetAssembly;
         std::shared_ptr<DecodeSession> targetSession;
         const auto decodeCount = std::max<std::size_t>(dependencyPlan.decodeOrder.size(), 1u);
@@ -784,10 +755,12 @@ struct PlaybackSession::Impl {
                     stopToken);
                 ++referenceOrdinal;
             }
-            result.messages.insert(
-                result.messages.end(),
-                frameResult.messages.begin(),
-                frameResult.messages.end());
+            if (frameResult.failure && !result.failure) {
+                result.failure = frameResult.failure;
+            }
+            if (frameResult.success) {
+                AppendRetainedTelemetryMessages(result.messages, frameResult.messages);
+            }
             if (frameResult.cancelled || stopToken.stop_requested()) {
                 result.cancelled = true;
                 return result;
@@ -825,7 +798,7 @@ struct PlaybackSession::Impl {
 
     void SchedulePrefetchLocked() {
         if (!currentFrameIndex.has_value() || !CanUseDecodedFrameCache() || taskCoordinator == nullptr ||
-            taskCoordinator->Concurrency() <= 1u) {
+            !resources->Threaded() || !resources->OptionalRetentionAllowed()) {
             return;
         }
         prefetchTasks.clear();
@@ -845,6 +818,8 @@ struct PlaybackSession::Impl {
             auto task = SubmitDecodeTask(request, true);
             if (task.Valid()) {
                 prefetchTasks.push_back(std::move(task));
+                // 只登记一个可选预取，后续候选由下次呈现事件重新规划
+                break;
             } else {
                 queuedFrames.erase(frameIndex);
                 RecordBackgroundWarningLocked("prefetch task was not accepted");
@@ -859,32 +834,29 @@ struct PlaybackSession::Impl {
         for (std::size_t ordinal = 0u; ordinal < playbackFrameOrder.size(); ++ordinal) {
             playbackOrdinals.emplace(playbackFrameOrder[ordinal], ordinal);
         }
-        prefetchPlanner.Configure(playbackFrameOrder, decodedFrameCachePolicy.prefetchFrameCount);
+        prefetchPlanner.Configure(playbackFrameOrder, decodedFrameCachePolicy.prefetchEnabled);
     }
 
     void ClearState() {
         taskCoordinator.reset();
-        referenceTaskCoordinator.reset();
-        parallelTaskRunner.reset();
+        resources.reset();
         prefetchTasks.clear();
         queuedFrames.clear();
         dependencyPlanner.reset();
         assemblyFactory.reset();
         frameReaders.clear();
         framePackages.clear();
-        frameIdentities.clear();
+        frameIdentities.reset();
         decodedFrameResultIdentity.clear();
         playbackFrameOrder.clear();
         playbackOrdinals.clear();
         frameCache.reset();
         encodedInputCache.reset();
         referenceCache.reset();
-        cacheRuntime.reset();
+        cacheRuntime = nullptr;
         currentFrameIndex.reset();
         lastUserRequestedFrameIndex.reset();
         backgroundMessages.clear();
-        usingDefaultFrameCache = false;
-        usingDefaultEncodedInputCache = false;
         open = false;
     }
 };
@@ -985,20 +957,15 @@ bool PlaybackSession::Open(const PlaybackOpenRequest& request, std::string* erro
         .executionOptions = request.executionOptions,
         .configurationSource = request.configurationSource,
         .language = request.language,
-        .parallelTaskRunner = request.parallelTaskRunner,
+        .resources = request.resources,
         .decodedFrameCachePolicy = request.decodedFrameCachePolicy,
-        .decodedFrameCache = request.decodedFrameCache,
         .encodedInputCachePolicy = request.encodedInputCachePolicy,
-        .encodedInputCache = request.encodedInputCache,
-        .cacheRuntime = request.cacheRuntime,
         .loadAllAvailableAttributes = request.loadAllAvailableAttributes,
     }, error);
 }
 
 bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, std::string* error) {
     Reset();
-    AssertValidDecodedFrameCachePolicy(request.decodedFrameCachePolicy);
-    AssertValidEncodedInputCachePolicy(request.encodedInputCachePolicy);
     if (request.decodeSources.empty()) {
         return validation::AssignError(error, "playback sequence requires decode sources");
     }
@@ -1038,6 +1005,7 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
             framePackages.emplace(source.frameIndex, source.framePackage);
         }
     }
+    auto sharedFrameIdentities = std::make_shared<const DecodeSession::FrameIdentityMap>(std::move(frameIdentities));
     std::sort(allFrameOrder.begin(), allFrameOrder.end());
 
     auto playbackFrameOrder = request.playbackFrameOrder.empty() ? allFrameOrder : request.playbackFrameOrder;
@@ -1052,46 +1020,21 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
         return validation::AssignError(error, "playback frame order is empty");
     }
 
-    auto taskCoordinator = std::make_unique<Impl::TargetTaskCoordinator>(request.parallelTaskRunner);
-    auto referenceTaskCoordinator = std::make_unique<Impl::ReferenceTaskCoordinator>(request.parallelTaskRunner);
-    auto cacheRuntime = request.cacheRuntime != nullptr ? request.cacheRuntime : DefaultDecodeCacheRuntime();
+    auto resources = std::make_shared<DataCodecExecutionResources>(request.resources);
+    auto taskCoordinator = std::make_unique<Impl::TargetTaskCoordinator>(*resources);
+    auto* cacheRuntime = &resources->Caches();
     auto referenceCache = cacheRuntime->ReferenceCache();
-    referenceCache->Configure(
-        request.controlParams != nullptr
-            ? request.controlParams->resourceBudget.DecodeReferenceFrameLimit()
-            : MakeDefaultDecodeControlParams().resourceBudget.DecodeReferenceFrameLimit(),
-        request.controlParams != nullptr
-            ? request.controlParams->resourceBudget.DecodeReferenceResidentLimitBytes()
-            : MakeDefaultDecodeControlParams().resourceBudget.DecodeReferenceResidentLimitBytes());
-    const bool usingDefaultFrameCache = request.decodedFrameCache == nullptr && request.decodedFrameCachePolicy.enabled;
-    auto frameCache = request.decodedFrameCache != nullptr
-        ? request.decodedFrameCache
-        : usingDefaultFrameCache
-            ? std::static_pointer_cast<IDecodedFrameCache>(cacheRuntime->DefaultFrameCache())
-            : nullptr;
-    if (usingDefaultFrameCache) {
-        cacheRuntime->DefaultFrameCache()->Configure(
-            request.decodedFrameCachePolicy.residentFrameLimit,
-            request.decodedFrameCachePolicy.residentLimitBytes);
-    }
-    const bool usingDefaultEncodedInputCache =
-        request.encodedInputCache == nullptr && request.encodedInputCachePolicy.enabled;
-    auto encodedInputCache = request.encodedInputCache != nullptr
-        ? request.encodedInputCache
-        : usingDefaultEncodedInputCache
-            ? std::static_pointer_cast<IEncodedInputCache>(cacheRuntime->DefaultEncodedInputCache())
-            : nullptr;
-    if (usingDefaultEncodedInputCache) {
-        cacheRuntime->DefaultEncodedInputCache()->Configure(
-            request.encodedInputCachePolicy.residentInputLimit,
-            request.encodedInputCachePolicy.residentLimitBytes);
-    }
+    referenceCache->Configure(1u);
+    auto frameCache = cacheRuntime->DefaultFrameCache();
+    frameCache->SetEnabled(request.decodedFrameCachePolicy.enabled);
+    auto encodedInputCache = request.encodedInputCachePolicy.enabled
+        ? cacheRuntime->DefaultEncodedInputCache() : nullptr;
 
     {
         std::lock_guard<std::mutex> lock(m_impl->stateMutex);
         m_impl->frameReaders = std::move(frameReaders);
         m_impl->framePackages = std::move(framePackages);
-        m_impl->frameIdentities = std::move(frameIdentities);
+        m_impl->frameIdentities = std::move(sharedFrameIdentities);
         m_impl->dependencyPlanner = std::make_unique<FrameSequenceDependencyPlanner>(
             m_impl->frameReaders,
             m_impl->framePackages);
@@ -1115,11 +1058,8 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
         m_impl->referenceCache = std::move(referenceCache);
         m_impl->frameCache = std::move(frameCache);
         m_impl->encodedInputCache = std::move(encodedInputCache);
-        m_impl->usingDefaultFrameCache = usingDefaultFrameCache;
-        m_impl->usingDefaultEncodedInputCache = usingDefaultEncodedInputCache;
-        m_impl->parallelTaskRunner = request.parallelTaskRunner;
+        m_impl->resources = std::move(resources);
         m_impl->taskCoordinator = std::move(taskCoordinator);
-        m_impl->referenceTaskCoordinator = std::move(referenceTaskCoordinator);
         m_impl->SetPlaybackOrder(std::move(playbackFrameOrder));
         m_impl->open = true;
     }
@@ -1127,6 +1067,12 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
 }
 
 PlaybackFrameResult PlaybackSession::RequestFrame(const PlaybackFrameRequest& request) {
+    if (m_impl->taskCoordinator && m_impl->taskCoordinator->IsDriverThread()) {
+        PlaybackFrameResult result;
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+            "driver-reentry", "PlaybackSession", "playback callback cannot synchronously request a frame");
+        return result;
+    }
     Impl::TargetTaskCoordinator::Handle matchingPrefetchTask;
     {
         std::lock_guard<std::mutex> lock(m_impl->stateMutex);
@@ -1190,7 +1136,7 @@ PlaybackFrameResult PlaybackSession::RequestFrame(const PlaybackFrameRequest& re
         ? std::move(matchingPrefetchTask)
         : m_impl->SubmitDecodeTask(request, false);
     try {
-        if (!decodeTask.Wait(result)) {
+        if (!Impl::WaitFrame(decodeTask, result)) {
             AddPlaybackMessage(
                 result,
                 request.runRecordSink.get(),
@@ -1251,6 +1197,50 @@ PlaybackFrameResult PlaybackSession::RequestFrame(const PlaybackFrameRequest& re
 }
 
 DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
+    const DecodedFrameLease::Pointer& frame, const DecodedFrameAttributeRequest& request) {
+    DecodedFrameAttributeResult result;
+    if (!m_impl->taskCoordinator || m_impl->taskCoordinator->IsDriverThread() || !frame) {
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+            "attribute-command-rejected", "PlaybackSession", "attribute command requires an open session and an external caller");
+        return result;
+    }
+    try {
+        DecodeTaskKey key{.scope = 2u, .frameIndex = frame->FrameIndex(),
+            .variant = std::to_string(static_cast<unsigned>(request.mode))};
+        for (const auto& target : request.attributeTargets) {
+            key.variant += ":" + std::to_string(target.frameIndex) + ":" + target.blockPath + ":" + std::to_string(target.attrIndex);
+        }
+        auto task = m_impl->taskCoordinator->Submit(key,
+            [this, frame, request](std::stop_token stop) -> Impl::CommandResult {
+                auto current = request;
+                current.stopToken = stop;
+                return RequestDecodedFrameAttributesInRun(frame, current);
+            });
+        Impl::CommandResult completed;
+        if (!task.Wait(completed, request.stopToken)) {
+            result.cancelled = request.stopToken.stop_requested();
+            result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure, "cancelled",
+                "PlaybackSession", "attribute command wait cancelled", result.cancelled);
+            return result;
+        }
+        if (auto* attributes = std::get_if<DecodedFrameAttributeResult>(&completed)) { return std::move(*attributes); }
+        const auto& failed = std::get<PlaybackFrameResult>(completed);
+        result.failure = failed.failure;
+        result.cancelled = failed.cancelled;
+    } catch (const std::bad_alloc&) {
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+            "allocation-failed", "PlaybackSession", "attribute command allocation failed");
+    } catch (const std::exception& error) {
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+            "command-exception", "PlaybackSession", error.what());
+    } catch (...) {
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+            "command-exception", "PlaybackSession", "unknown attribute command exception");
+    }
+    return result;
+}
+
+DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
     const DecodedFrameLease::Pointer& lease,
     const DecodedFrameAttributeRequest& request) {
     DecodedFrameAttributeResult result;
@@ -1282,7 +1272,7 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
     DecodeExecutionOptions execution;
     DataCodecDecodeConfigurationSource configurationSource;
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
-    std::shared_ptr<IParallelTaskRunner> parallelTaskRunner;
+    std::shared_ptr<DataCodecExecutionResources> resources;
     {
         std::lock_guard<std::mutex> stateLock(m_impl->stateMutex);
         if (!m_impl->open) {
@@ -1297,7 +1287,7 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
         execution = m_impl->execution;
         configurationSource = m_impl->configurationSource;
         language = m_impl->language;
-        parallelTaskRunner = m_impl->parallelTaskRunner;
+        resources = m_impl->resources;
     }
 
     Impl::DecodedFrameWorkResult referenceResult;
@@ -1318,10 +1308,7 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
             "playback reference decode failed with an unknown exception");
         return result;
     }
-    result.messages.insert(
-        result.messages.end(),
-        referenceResult.messages.begin(),
-        referenceResult.messages.end());
+    AppendRetainedTelemetryMessages(result.messages, referenceResult.messages);
     if (!referenceResult.success) {
         result.cancelled = referenceResult.cancelled;
         return result;
@@ -1401,9 +1388,9 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
             .language = language,
             .runRecordSink = request.runRecordSink.get(),
             .stopToken = request.stopToken,
-            .parallelTaskRunner = parallelTaskRunner.get(),
+            .resources = resources.get(),
         });
-        result.messages.insert(result.messages.end(), leafResult.messages.begin(), leafResult.messages.end());
+        AppendRetainedTelemetryMessages(result.messages, leafResult.messages);
         if (!leafResult.success) {
             result.success = false;
             result.cancelled = request.stopToken.stop_requested();
@@ -1444,24 +1431,12 @@ void PlaybackSession::NotifyFramePresented(const std::uint32_t frameIndex) {
 }
 
 void PlaybackSession::ConfigureDecodedFrameCachePolicy(const DecodedFrameCachePolicy& policy) {
-    AssertValidDecodedFrameCachePolicy(policy);
     std::lock_guard<std::mutex> lock(m_impl->stateMutex);
     m_impl->prefetchTasks.clear();
     m_impl->queuedFrames.clear();
     m_impl->decodedFrameCachePolicy = policy;
-    m_impl->prefetchPlanner.SetPrefetchFrameCount(policy.prefetchFrameCount);
-    if (m_impl->cacheRuntime != nullptr && (m_impl->usingDefaultFrameCache || m_impl->frameCache == nullptr)) {
-        if (policy.enabled) {
-            m_impl->cacheRuntime->DefaultFrameCache()->Configure(
-                policy.residentFrameLimit,
-                policy.residentLimitBytes);
-            m_impl->frameCache = m_impl->cacheRuntime->DefaultFrameCache();
-            m_impl->usingDefaultFrameCache = true;
-        } else if (m_impl->usingDefaultFrameCache) {
-            m_impl->frameCache.reset();
-            m_impl->usingDefaultFrameCache = false;
-        }
-    }
+    m_impl->prefetchPlanner.SetEnabled(policy.prefetchEnabled);
+    if (m_impl->frameCache) { m_impl->frameCache->SetEnabled(policy.enabled); }
 }
 
 DecodedFrameCachePolicy PlaybackSession::GetDecodedFrameCachePolicy() const {
@@ -1470,22 +1445,13 @@ DecodedFrameCachePolicy PlaybackSession::GetDecodedFrameCachePolicy() const {
 }
 
 void PlaybackSession::ConfigureEncodedInputCachePolicy(const EncodedInputCachePolicy& policy) {
-    AssertValidEncodedInputCachePolicy(policy);
     std::lock_guard<std::mutex> lock(m_impl->stateMutex);
     m_impl->encodedInputCachePolicy = policy;
-    if (m_impl->cacheRuntime == nullptr ||
-        (!m_impl->usingDefaultEncodedInputCache && m_impl->encodedInputCache != nullptr)) {
-        return;
-    }
-    if (policy.enabled) {
-        m_impl->cacheRuntime->DefaultEncodedInputCache()->Configure(
-            policy.residentInputLimit,
-            policy.residentLimitBytes);
-        m_impl->encodedInputCache = m_impl->cacheRuntime->DefaultEncodedInputCache();
-        m_impl->usingDefaultEncodedInputCache = true;
-    } else if (m_impl->usingDefaultEncodedInputCache) {
-        m_impl->encodedInputCache.reset();
-        m_impl->usingDefaultEncodedInputCache = false;
+    if (m_impl->cacheRuntime == nullptr) { return; }
+    m_impl->encodedInputCache = policy.enabled
+        ? m_impl->cacheRuntime->DefaultEncodedInputCache() : nullptr;
+    if (!policy.enabled) {
+        while (m_impl->cacheRuntime->DefaultEncodedInputCache()->TrimOne()) {}
     }
 }
 
@@ -1557,7 +1523,7 @@ void PlaybackSession::WaitForPrefetch() {
     for (const auto& task : tasks) {
         PlaybackFrameResult result;
         try {
-            if (!task.Wait(result)) {
+            if (!Impl::WaitFrame(task, result)) {
                 std::lock_guard<std::mutex> lock(m_impl->stateMutex);
                 m_impl->RecordBackgroundWarningLocked("prefetch task wait failed");
             }
@@ -1588,14 +1554,13 @@ std::vector<TelemetryMessageRecord> PlaybackSession::TakeBackgroundMessages() {
 
 void PlaybackSession::Reset() {
     if (m_impl == nullptr) { return; }
-    if (m_impl->referenceTaskCoordinator != nullptr) {
-        m_impl->referenceTaskCoordinator->CancelAll();
+    if (m_impl->taskCoordinator && m_impl->taskCoordinator->IsDriverThread()) {
+        m_impl->resources->RecordFailure(MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+            "driver-reentry", "PlaybackSession", "playback callback cannot synchronously reset its session"));
+        return;
     }
     if (m_impl->taskCoordinator != nullptr) {
         m_impl->taskCoordinator->CancelAll();
-    }
-    if (m_impl->referenceTaskCoordinator != nullptr) {
-        m_impl->referenceTaskCoordinator->WaitIdle();
     }
     if (m_impl->taskCoordinator != nullptr) {
         m_impl->taskCoordinator->WaitIdle();

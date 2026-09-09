@@ -1,205 +1,192 @@
 #ifndef DATACODEC_TEST_FEATURE_DATACODECFEATUREENCODEDINPUTCACHE_H
 #define DATACODEC_TEST_FEATURE_DATACODECFEATUREENCODEDINPUTCACHE_H
 
-#include "DataCodec/Runtime/Cache/EncodedInputCacheLoader.h"
-#include "DataCodec/Runtime/Cache/EncodedInputLruCache.h"
+#include "DataCodec/Runtime/Cache/DecodeCacheRuntime.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
-#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace datacodec::test::feature_encoded_input_cache {
 
 class CountingInputReader final : public IByteRangeReader {
 public:
-    explicit CountingInputReader(std::vector<std::uint8_t> bytes) : m_bytes(std::move(bytes)) {}
-
-    [[nodiscard]] std::uint64_t ByteSize() const noexcept override {
-        return static_cast<std::uint64_t>(m_bytes.size());
-    }
-
-    bool ReadAt(
-        const std::uint64_t offset,
-        const std::span<std::uint8_t> output,
-        std::string* error = nullptr) override {
-        if (offset > m_bytes.size() || output.size() > m_bytes.size() - static_cast<std::size_t>(offset)) {
-            return validation::AssignError(error, "counting input reader range is outside the buffer");
+    explicit CountingInputReader(std::vector<std::uint8_t> bytes, std::size_t failAt = 0u)
+        : m_bytes(std::move(bytes)), m_failAt(failAt) {}
+    std::uint64_t ByteSize() const noexcept override { return m_bytes.size(); }
+    bool ReadAt(std::uint64_t offset, std::span<std::uint8_t> output,
+                std::string* error = nullptr) override {
+        ++readCount;
+        maxWindow = std::max(maxWindow, output.size());
+        if (readCount == m_failAt) {
+            return validation::AssignError(error, "injected input read failure");
         }
-        ++m_readCount;
-        if (!output.empty()) {
-            std::memcpy(output.data(), m_bytes.data() + static_cast<std::size_t>(offset), output.size());
+        if (offset > m_bytes.size() || output.size() > m_bytes.size() - offset) {
+            return validation::AssignError(error, "input read outside buffer");
         }
+        std::memcpy(output.data(), m_bytes.data() + offset, output.size());
         return true;
     }
-
-    [[nodiscard]] std::size_t ReadCount() const noexcept { return m_readCount; }
-
+    std::size_t readCount{0u};
+    std::size_t maxWindow{0u};
 private:
     std::vector<std::uint8_t> m_bytes;
-    std::size_t m_readCount{0u};
+    std::size_t m_failAt;
 };
 
-class FailingEncodedInputCache final : public IEncodedInputCache {
-public:
-    explicit FailingEncodedInputCache(const bool failLookup)
-        : m_failLookup(failLookup) {}
-
-    [[nodiscard]] EncodedInputCacheLookupResult Find(
-        const DecodeSourceIdentity&,
-        EncodedInputAccessKind) override {
-        return m_failLookup
-            ? EncodedInputCacheLookupResult::Error("injected encoded cache lookup failure")
-            : EncodedInputCacheLookupResult::Miss();
-    }
-
-    [[nodiscard]] CacheStoreResult Store(
-        const DecodeSourceIdentity&,
-        EncodedInputBuffer,
-        EncodedInputAccessKind) override {
-        return CacheStoreResult::Error("injected encoded cache store failure");
-    }
-
-    void InvalidateSource(const DecodeSourceIdentity&) override {}
-
-    [[nodiscard]] EncodedInputCacheStats Statistics() const override {
-        return {};
-    }
-
-private:
-    bool m_failLookup{false};
-};
-
-[[nodiscard]] inline DecodeSourceIdentity Source(const std::string& revision) {
-    return DecodeSourceIdentity{.stableId = "synthetic-encoded-input", .revision = revision};
+inline DataCodecExecutionResources MakeRun(std::uint64_t capacity) {
+    return DataCodecExecutionResources(ResolvedResourceConfiguration{
+        .initialLimits = {capacity, 1u, 1u},
+        .storageCeilingBytes = capacity,
+        .computeCeiling = 1u,
+        .threaded = false,
+    });
 }
 
-[[nodiscard]] inline EncodedInputBuffer Input(std::initializer_list<std::uint8_t> bytes) {
-    return std::make_shared<const std::vector<std::uint8_t>>(bytes);
+inline DecodeSourceIdentity Source(const std::string& revision) {
+    return {.stableId = "encoded-input-test", .revision = revision};
 }
 
-inline bool TestLeastRecentlyUsedInputIsEvicted() {
+inline EncodedInputBuffer Input(std::uint8_t value) {
+    return std::make_shared<MemoryByteRangeReader>(
+        std::make_shared<const std::vector<std::uint8_t>>(1u, value));
+}
+
+inline bool TestCountAndActiveConsumer() {
     EncodedInputLruCache cache;
-    cache.Configure(2u, 0u);
-    (void)cache.Store(Source("a"), Input({1u}), EncodedInputAccessKind::UserRequest);
-    (void)cache.Store(Source("b"), Input({2u}), EncodedInputAccessKind::Prefetch);
-    {
-        const auto touched = cache.Find(Source("a"), EncodedInputAccessKind::UserRequest);
-        if (!touched.IsHit()) { return false; }
-    }
-    (void)cache.Store(Source("c"), Input({3u}), EncodedInputAccessKind::UserRequest);
-    return cache.Find(Source("a"), EncodedInputAccessKind::UserRequest).IsHit() &&
-        cache.Find(Source("b"), EncodedInputAccessKind::UserRequest).IsMiss() &&
-        cache.Find(Source("c"), EncodedInputAccessKind::UserRequest).IsHit();
-}
-
-inline bool TestMemoryInputKeepsExistingByteOwner() {
-    auto bytes = std::make_shared<const std::vector<std::uint8_t>>(
-        std::initializer_list<std::uint8_t>{4u, 5u, 6u});
-    auto reader = std::make_shared<MemoryByteRangeReader>(bytes);
-    auto cache = std::make_shared<EncodedInputLruCache>();
-    cache->Configure(2u, 0u);
-    EncodedInputCacheLoader loader;
-    std::string error;
-    const auto retained = loader.Load(
-        cache,
-        Source("shared"),
-        reader,
-        EncodedInputAccessKind::UserRequest,
-        &error);
-    const auto lookup = cache->Find(Source("shared"), EncodedInputAccessKind::UserRequest);
-    return error.empty() && retained != nullptr && retained.get() == bytes.get() &&
-        lookup.IsHit() && lookup.value.get() == bytes.get();
-}
-
-inline bool TestRepeatedStreamInputLoadsOnlyOnce() {
-    auto reader = std::make_shared<CountingInputReader>(std::vector<std::uint8_t>{7u, 8u, 9u, 10u});
-    auto cache = std::make_shared<EncodedInputLruCache>();
-    cache->Configure(2u, 0u);
-    EncodedInputCacheLoader loader;
-    std::string error;
-    const auto first = loader.Load(
-        cache,
-        Source("stream"),
-        reader,
-        EncodedInputAccessKind::UserRequest,
-        &error);
-    const auto second = loader.Load(
-        cache,
-        Source("stream"),
-        reader,
-        EncodedInputAccessKind::UserRequest,
-        &error);
-    return error.empty() && first != nullptr && first == second && reader->ReadCount() == 1u;
-}
-
-inline bool TestInvalidCacheAccessIsReportedAsError() {
-    EncodedInputLruCache cache;
-    cache.Configure(2u, 0u);
-    const auto lookup = cache.Find({}, EncodedInputAccessKind::UserRequest);
-    const auto store = cache.Store(
-        Source("invalid"),
-        {},
-        EncodedInputAccessKind::UserRequest);
-    const auto stats = cache.Statistics();
-    return lookup.IsError() && !lookup.error.empty() &&
-        store.IsError() && !store.error.empty() &&
-        stats.lookupErrors == 1u && stats.storeErrors == 1u;
-}
-
-inline bool TestBackendErrorsDoNotLoadThroughAnotherPath() {
-    EncodedInputCacheLoader loader;
-    auto lookupReader = std::make_shared<CountingInputReader>(
-        std::vector<std::uint8_t>{1u, 2u, 3u});
-    auto lookupCache = std::make_shared<FailingEncodedInputCache>(true);
-    std::string lookupError;
-    const auto lookupResult = loader.Load(
-        lookupCache,
-        Source("lookup-error"),
-        lookupReader,
-        EncodedInputAccessKind::UserRequest,
-        &lookupError);
-    if (lookupResult != nullptr || lookupReader->ReadCount() != 0u ||
-        lookupError != "injected encoded cache lookup failure") {
+    cache.Configure(2u);
+    auto consumer = Input(1u);
+    std::weak_ptr<IByteRangeReader> lifetime = consumer;
+    if (!cache.Store(Source("a"), consumer, EncodedInputAccessKind::UserRequest).IsStored() ||
+        !cache.Store(Source("b"), Input(2u), EncodedInputAccessKind::Prefetch).IsStored()) {
         return false;
     }
-
-    auto storeReader = std::make_shared<CountingInputReader>(
-        std::vector<std::uint8_t>{4u, 5u, 6u});
-    auto storeCache = std::make_shared<FailingEncodedInputCache>(false);
-    std::string storeError;
-    const auto storeResult = loader.Load(
-        storeCache,
-        Source("store-error"),
-        storeReader,
-        EncodedInputAccessKind::UserRequest,
-        &storeError);
-    return storeResult == nullptr && storeReader->ReadCount() == 1u &&
-        storeError == "injected encoded cache store failure";
+    (void)cache.Find(Source("a"), EncodedInputAccessKind::UserRequest);
+    if (!cache.Store(Source("c"), Input(3u), EncodedInputAccessKind::UserRequest).IsStored() ||
+        !cache.Find(Source("b"), EncodedInputAccessKind::UserRequest).IsMiss() ||
+        !cache.TrimOne() || lifetime.expired()) { return false; }
+    std::array<std::uint8_t, 1u> byte{};
+    if (!consumer->ReadAt(0u, byte) || byte[0] != 1u) { return false; }
+    consumer.reset();
+    cache.Configure(0u);
+    return lifetime.expired() && cache.Statistics().residentInputs == 0u &&
+        cache.Store(Source("d"), Input(4u), EncodedInputAccessKind::UserRequest).IsRejectedByPolicy();
 }
 
-} // namespace datacodec::test::feature_encoded_input_cache
+inline bool TestBorrowedInputAndRootIsolation() {
+    auto run = MakeRun(64u);
+    CodecRunScope scope(run);
+    auto host = Input(3u);
+    auto& runtime = run.Caches();
+    std::string error;
+    auto retained = runtime.EncodedInputLoader().Load(run, runtime.DefaultEncodedInputCache(),
+        Source("borrowed"), host, EncodedInputAccessKind::UserRequest, &error);
+    auto other = MakeRun(64u);
+    return scope && retained == host && error.empty() &&
+        run.StorageCapacity()->Snapshot().reservedBytes == 0u &&
+        other.Caches().DefaultEncodedInputCache()->Find(
+            Source("borrowed"), EncodedInputAccessKind::UserRequest).IsMiss() &&
+        scope.Finish(true);
+}
+
+inline bool TestExactCapacityWindowsAndLifetime() {
+    constexpr std::size_t size = 2u * kIoWindowBytes + 13u;
+    auto run = MakeRun(size);
+    CodecRunScope scope(run);
+    auto source = std::make_shared<CountingInputReader>(std::vector<std::uint8_t>(size, 77u));
+    auto& runtime = run.Caches();
+    auto cache = runtime.DefaultEncodedInputCache();
+    std::string error;
+    auto first = runtime.EncodedInputLoader().Load(run, cache, Source("large"), source,
+        EncodedInputAccessKind::UserRequest, &error);
+    auto second = runtime.EncodedInputLoader().Load(run, cache, Source("large"), source,
+        EncodedInputAccessKind::UserRequest, &error);
+    if (!first || first == source || second != first || !error.empty() ||
+        source->readCount != 3u || source->maxWindow != kIoWindowBytes ||
+        run.StorageCapacity()->Snapshot().reservedBytes != size) { return false; }
+    if (!run.UpdateLimits({0u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck)) { return false; }
+    run.ServiceDriverEvents();
+    std::array<std::uint8_t, 1u> tail{};
+    if (cache->Statistics().residentInputs != 0u ||
+        run.StorageCapacity()->Snapshot().reservedBytes != size ||
+        !first->ReadAt(size - 1u, tail) || tail[0] != 77u) { return false; }
+    second.reset();
+    first.reset();
+    return run.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(true);
+}
+
+inline bool TestAdmissionDenialDoesNotStartRead() {
+    auto run = MakeRun(1u);
+    CodecRunScope scope(run);
+    auto source = std::make_shared<CountingInputReader>(std::vector<std::uint8_t>(4u, 2u));
+    auto& runtime = run.Caches();
+    std::string error;
+    auto result = runtime.EncodedInputLoader().Load(run, runtime.DefaultEncodedInputCache(),
+        Source("denied"), source, EncodedInputAccessKind::UserRequest, &error);
+    return result == source && source->readCount == 0u && error.empty() &&
+        run.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(true);
+}
+
+inline bool TestNecessaryStorageReclaimsOnlyReleasedOwners() {
+    auto run = MakeRun(64u);
+    CodecRunScope scope(run);
+    auto source = std::make_shared<CountingInputReader>(std::vector<std::uint8_t>(64u, 5u));
+    auto& runtime = run.Caches();
+    std::string error;
+    auto retained = runtime.EncodedInputLoader().Load(run, runtime.DefaultEncodedInputCache(),
+        Source("necessary"), source, EncodedInputAccessKind::UserRequest, &error);
+    if (!retained || retained == source) { return false; }
+    bytestore::ByteStoreSession stores;
+    stores.BindRun(run);
+    auto phase = WaitForHeavyPhase(run);
+    if (!phase) { return false; }
+    auto denied = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 1u, "denied", &error);
+    if (denied || runtime.DefaultEncodedInputCache()->Statistics().residentInputs != 0u ||
+        run.StorageCapacity()->Snapshot().reservedBytes != 64u) { return false; }
+    retained.reset();
+    error.clear();
+    auto acquired = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 64u, "necessary", &error);
+    if (!acquired || !error.empty() || run.StorageCapacity()->Snapshot().reservedBytes != 64u) { return false; }
+    acquired.reset();
+    stores.UnbindRun();
+    phase.reset();
+    return run.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(true);
+}
+
+inline bool TestStartedReadFailureDoesNotReplay() {
+    const auto size = kIoWindowBytes + 7u;
+    auto run = MakeRun(size);
+    CodecRunScope scope(run);
+    auto source = std::make_shared<CountingInputReader>(std::vector<std::uint8_t>(size), 2u);
+    auto& runtime = run.Caches();
+    std::string error;
+    const auto result = runtime.EncodedInputLoader().Load(run, runtime.DefaultEncodedInputCache(),
+        Source("failure"), source, EncodedInputAccessKind::UserRequest, &error);
+    return !result && run.FirstFailure().has_value() && !error.empty() &&
+        source->readCount == 2u && runtime.DefaultEncodedInputCache()->Statistics().residentInputs == 0u &&
+        run.StorageCapacity()->Snapshot().reservedBytes == 0u && !scope.Finish(false);
+}
+
+}
 
 namespace datacodec::test {
-
 inline int RunDataCodecFeatureEncodedInputCache() {
     using namespace feature_encoded_input_cache;
-    if (!TestLeastRecentlyUsedInputIsEvicted() ||
-        !TestMemoryInputKeepsExistingByteOwner() ||
-        !TestRepeatedStreamInputLoadsOnlyOnce() ||
-        !TestInvalidCacheAccessIsReportedAsError() ||
-        !TestBackendErrorsDoNotLoadThroughAnotherPath()) {
+    if (!TestCountAndActiveConsumer() || !TestBorrowedInputAndRootIsolation() ||
+        !TestExactCapacityWindowsAndLifetime() || !TestAdmissionDenialDoesNotStartRead() ||
+        !TestNecessaryStorageReclaimsOnlyReleasedOwners() ||
+        !TestStartedReadFailureDoesNotReplay()) {
         std::cerr << "DataCodec encoded input cache feature test failed\n";
         return 1;
     }
-    std::cout << "DataCodec encoded input cache feature test passed\n";
     return 0;
 }
-
-} // namespace datacodec::test
+}
 
 #endif

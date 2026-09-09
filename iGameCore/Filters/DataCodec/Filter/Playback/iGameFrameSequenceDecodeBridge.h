@@ -2,10 +2,10 @@
 #define iGameFrameSequenceDecodeBridge_h
 
 #include "Attribute/iGameAttributeDataSource.h"
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Workflow/Session/PlaybackSession.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Params/DecodedFrameCacheParams.h"
 #include "DataCodec/API/Params/EncodedInputCacheParams.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
@@ -31,10 +31,8 @@ struct FrameSequenceDecodeRequest {
     ::datacodec::DataCodecLanguage language{
         ::datacodec::DataCodecLanguage::SimplifiedChinese};
     ::datacodec::DecodedFrameCachePolicy decodedFrameCachePolicy;
-    std::shared_ptr<::datacodec::IDecodedFrameCache> decodedFrameCache;
     ::datacodec::EncodedInputCachePolicy encodedInputCachePolicy;
-    std::shared_ptr<::datacodec::IEncodedInputCache> encodedInputCache;
-    std::shared_ptr<::datacodec::IParallelTaskRunner> parallelTaskRunner;
+    ::datacodec::CodecResourceParams resources;
     bool loadAllAvailableAttributes{true};
     bool enableConsoleLog{true};
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink;

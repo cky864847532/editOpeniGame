@@ -34,7 +34,6 @@ struct LeafPackage {
 
         void Release() noexcept {
             if (source != nullptr) {
-                source->Release();
                 source.reset();
             }
         }

@@ -6,10 +6,9 @@
 #include <DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h>
 #include <DataCodec/Filter/Adapter/iGameFramePresentationBridge.h>
 #include <DataCodec/Workflow/Session/PlaybackSession.h>
-#include <DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h>
 #include <DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h>
 #include <DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h>
-#include <DataCodec/API/Adapter/IDecodedFrameCache.h>
+#include <DataCodec/API/Adapter/DecodedFrameTypes.h>
 #include <DataCodec/Storage/FramePackage/FramePackageIO.h>
 #include <DataCodec/API/Params/TimeSeriesControlParams.h>
 #include <DataCodec/Test/Feature/DataCodecFeatureDecodeReferenceCache.h>
@@ -60,95 +59,6 @@ private:
     std::vector<iGame::DataObject::Pointer> m_frames;
 };
 
-class RecordingDecodedFrameCache final : public ::datacodec::IDecodedFrameCache {
-public:
-    ::datacodec::DecodedFrameCacheLookupResult Find(
-            const ::datacodec::DecodedFrameKey& key,
-            ::datacodec::DecodedFrameAccessKind) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_findCounts[key.frameIndex];
-        m_condition.notify_all();
-        const auto iterator = m_frames.find(key.frameIndex);
-        return iterator == m_frames.end()
-            ? ::datacodec::DecodedFrameCacheLookupResult::Miss()
-            : ::datacodec::DecodedFrameCacheLookupResult::Hit(iterator->second);
-    }
-
-    [[nodiscard]] ::datacodec::CacheStoreResult Store(
-            const ::datacodec::DecodedFrameKey& key,
-            ::datacodec::DecodedFrameLease::Pointer frame,
-            ::datacodec::DecodedFrameAccessKind) override {
-        if (frame == nullptr) {
-            return ::datacodec::CacheStoreResult::Error("test cache received a null frame");
-        }
-        std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_storeCounts[key.frameIndex];
-        m_frames[key.frameIndex] = std::move(frame);
-        ++m_stats.stores;
-        m_stats.residentFrames = m_frames.size();
-        return ::datacodec::CacheStoreResult::Stored();
-    }
-
-    void InvalidateSource(const ::datacodec::DecodeSourceIdentity&) override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_clearCount;
-        m_frames.clear();
-        m_stats.residentFrames = 0u;
-    }
-
-    [[nodiscard]] std::vector<std::uint32_t> ResidentFrameIndices(
-            const ::datacodec::DecodeSourceIdentity&) const override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        std::vector<std::uint32_t> frames;
-        frames.reserve(m_frames.size());
-        for (const auto& [frameIndex, frame]: m_frames) {
-            (void) frame;
-            frames.push_back(frameIndex);
-        }
-        std::sort(frames.begin(), frames.end());
-        return frames;
-    }
-
-    [[nodiscard]] ::datacodec::DecodedFrameCacheStats Statistics() const override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_stats;
-    }
-
-    [[nodiscard]] bool Contains(const std::uint32_t frameIndex) const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_frames.contains(frameIndex);
-    }
-
-    [[nodiscard]] std::size_t StoreCount(const std::uint32_t frameIndex) const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        const auto iterator = m_storeCounts.find(frameIndex);
-        return iterator == m_storeCounts.end() ? 0u : iterator->second;
-    }
-
-    [[nodiscard]] std::size_t ClearCount() const {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_clearCount;
-    }
-
-    [[nodiscard]] bool WaitForFind(
-            const std::uint32_t frameIndex,
-            const std::chrono::milliseconds timeout) const {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        return m_condition.wait_for(lock, timeout, [this, frameIndex]() {
-            const auto iterator = m_findCounts.find(frameIndex);
-            return iterator != m_findCounts.end() && iterator->second > 0u;
-        });
-    }
-
-private:
-    mutable std::mutex m_mutex;
-    mutable std::condition_variable m_condition;
-    std::unordered_map<std::uint32_t, ::datacodec::DecodedFrameLease::Pointer> m_frames;
-    std::unordered_map<std::uint32_t, std::size_t> m_findCounts;
-    std::unordered_map<std::uint32_t, std::size_t> m_storeCounts;
-    std::size_t m_clearCount{0u};
-    ::datacodec::DecodedFrameCacheStats m_stats;
-};
 
 struct BlockingPlaybackAssemblyState {
     std::mutex mutex;
@@ -611,10 +521,9 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
                         .decodeSources = selectedSequence.decodeSources,
                         .playbackFrameOrder = selectedSequence.selectedFrameIndices,
                         .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
-                        .parallelTaskRunner = iGame::DataCodecTaskRunner(),
+                        .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
                         .decodedFrameCachePolicy = ::datacodec::DecodedFrameCachePolicy{
-                                .residentFrameLimit = 4u,
-                                .prefetchFrameCount = 1u,
+                                .prefetchEnabled = true,
                         },
                 },
                 &error)) {
@@ -643,18 +552,15 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     sparseSession.ClearDecodedFrameCache();
 
     auto blockingState = std::make_shared<BlockingPlaybackAssemblyState>();
-    auto priorityStore = std::make_shared<RecordingDecodedFrameCache>();
     ::datacodec::PlaybackSession prioritySession;
     if (!prioritySession.OpenSequence({
             .decodeSources = sequence.decodeSources,
             .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
             .assemblyFactory = std::make_shared<BlockingPlaybackAssemblyFactory>(blockingState),
-            .parallelTaskRunner = iGame::DataCodecTaskRunner(),
+            .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
             .decodedFrameCachePolicy = ::datacodec::DecodedFrameCachePolicy{
-                    .residentFrameLimit = 4u,
-                    .prefetchFrameCount = 1u,
+                    .prefetchEnabled = true,
             },
-            .decodedFrameCache = priorityStore,
     }, &error)) {
         std::cerr << error << '\n';
         return 1;
@@ -674,10 +580,13 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
             return 1;
         }
     }
-    auto currentFrameFuture = std::async(std::launch::async, [&prioritySession]() {
+    std::promise<void> userStarted;
+    auto userStartedFuture = userStarted.get_future();
+    auto currentFrameFuture = std::async(std::launch::async, [&prioritySession, &userStarted]() {
+        userStarted.set_value();
         return prioritySession.RequestFrame({.frameIndex = 1u});
     });
-    const auto userRequestEntered = priorityStore->WaitForFind(1u, std::chrono::seconds(2));
+    userStartedFuture.wait();
     {
         std::lock_guard<std::mutex> lock(blockingState->mutex);
         blockingState->released = true;
@@ -685,8 +594,13 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     blockingState->condition.notify_all();
     const auto priorityResult = currentFrameFuture.get();
     prioritySession.WaitForPrefetch();
-    if (!userRequestEntered || !priorityResult.success || priorityStore->Contains(3u)) {
-        std::cerr << "current frame request did not cancel the active prefetch\n";
+    if (!priorityResult.success) {
+        std::cerr << "pending foreground request did not complete after prefetch\n";
+        if (priorityResult.failure) {
+            std::cerr << priorityResult.failure->reason.data() << ": "
+                      << priorityResult.failure->message.data() << '\n';
+        }
+        for (const auto& message : priorityResult.messages) { std::cerr << message.text << '\n'; }
         return 1;
     }
 
@@ -696,11 +610,10 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
                         .decodeSources = sequence.decodeSources,
                         .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
                         .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
-                        .parallelTaskRunner = iGame::DataCodecTaskRunner(),
+                        .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
                         .decodedFrameCachePolicy =
                                 ::datacodec::DecodedFrameCachePolicy{
-                                        .residentFrameLimit = 4u,
-                                        .prefetchFrameCount = 1u,
+                                        .prefetchEnabled = true,
                                 },
                 },
                 &error)) {
@@ -756,11 +669,10 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
                         .decodeSources = sequence.decodeSources,
                         .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
                         .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
-                        .parallelTaskRunner = iGame::DataCodecTaskRunner(),
+                        .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
                         .decodedFrameCachePolicy =
                                 ::datacodec::DecodedFrameCachePolicy{
-                                        .residentFrameLimit = 4u,
-                                        .prefetchFrameCount = 0u,
+                                        .prefetchEnabled = false,
                                 },
                 },
                 &error)) {
@@ -797,62 +709,21 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     }
 
     session.Reset();
-    auto externalCache = std::make_shared<RecordingDecodedFrameCache>();
-    if (!session.OpenSequence(
-                {
-                        .decodeSources = sequence.decodeSources,
-                        .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
-                        .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
-                        .parallelTaskRunner = iGame::DataCodecTaskRunner(),
-                        .decodedFrameCachePolicy =
-                                ::datacodec::DecodedFrameCachePolicy{
-                                        .residentFrameLimit = 4u,
-                                        .prefetchFrameCount = 1u,
-                                },
-                        .decodedFrameCache = externalCache,
-                },
-                &error)) {
-        std::cerr << error << '\n';
-        return 1;
+    if (!session.OpenSequence({
+            .decodeSources = sequence.decodeSources,
+            .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
+            .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
+            .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
+        }, &error)) { return 1; }
+    auto retained = session.RequestFrame({.frameIndex = 2u});
+    if (!retained.success || !retained.frame) { return 1; }
+    const auto payload = retained.frame->Payload();
+    for (const auto index : {3u, 4u, 1u, 0u}) {
+        if (!session.RequestFrame({.frameIndex = index}).success ||
+            session.CachedDecodedFrameIndices().size() > 2u) { return 1; }
     }
-    auto externalFrame2 = session.RequestFrame({.frameIndex = 2u});
-    if (!externalFrame2.success || externalFrame2.frame == nullptr || !externalCache->Contains(2u) ||
-        externalCache->StoreCount(2u) != 1u) {
-        std::cerr << "external playback frame cache did not receive the requested frame\n";
-        return 1;
-    }
-    externalFrame2.frame.reset();
-    session.NotifyFramePresented(2u);
-    session.WaitForPrefetch();
-    if (!externalCache->Contains(3u)) {
-        std::cerr << "external playback frame cache did not receive the prefetched frame\n";
-        return 1;
-    }
-    const auto externalFrame3 = session.RequestFrame({.frameIndex = 3u});
-    if (!externalFrame3.success || !externalFrame3.decodedFrameCacheHit ||
-        externalFrame3.frame == nullptr ||
-        externalCache->StoreCount(3u) != 1u) {
-        std::cerr << "external playback frame cache was not used for a cache hit\n";
-        return 1;
-    }
-    const auto retainedPayload = externalFrame3.frame->Payload();
-    for (const auto frameIndex: {4u, 1u, 0u}) {
-        const auto result = session.RequestFrame({.frameIndex = frameIndex});
-        if (!result.success || iGame::DataObjectFromDecodedFrame(result.frame) == nullptr) {
-            std::cerr << "external playback frame cache request sequence failed\n";
-            return 1;
-        }
-    }
-    if (externalCache->Statistics().residentFrames != 5u) {
-        std::cerr << "DataCodec replaced the external cache retention policy\n";
-        return 1;
-    }
-    const auto clearCountBefore = externalCache->ClearCount();
     session.ClearDecodedFrameCache();
-    if (externalCache->ClearCount() <= clearCountBefore ||
-        externalCache->Statistics().residentFrames != 0u ||
-        externalFrame3.frame->Payload() != retainedPayload) {
-        std::cerr << "external playback frame cache lifetime or clear contract failed\n";
+    if (!session.CachedDecodedFrameIndices().empty() || retained.frame->Payload() != payload) {
         return 1;
     }
 
@@ -868,18 +739,12 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     }
     auto firstReadTimeFrames = reader->GetOutput()->PeekTimeFrames();
     firstReadTimeFrames->DisableCache();
-    const auto cacheStatisticsBeforeReload =
-        ::datacodec::DefaultDecodeCacheRuntime()->DefaultFrameCache()->Statistics();
     reader = nullptr;
     firstReadTimeFrames = nullptr;
     auto reloadedReader = iGame::IGDCReader::New();
     reloadedReader->SetFilePath(writtenPaths.back());
     const auto reloadSucceeded = reloadedReader->Execute();
-    const auto cacheStatisticsAfterReload =
-        ::datacodec::DefaultDecodeCacheRuntime()->DefaultFrameCache()->Statistics();
-    if (!reloadSucceeded || reloadedReader->GetOutput() == nullptr ||
-        cacheStatisticsAfterReload.hits != cacheStatisticsBeforeReload.hits ||
-        cacheStatisticsAfterReload.stores != cacheStatisticsBeforeReload.stores) {
+    if (!reloadSucceeded || reloadedReader->GetOutput() == nullptr) {
         std::cerr << "single-frame reload unexpectedly used the default decoded-frame cache\n";
         return 1;
     }
@@ -923,24 +788,32 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     if (firstSelectedMetadata == nullptr || secondSelectedMetadata == nullptr ||
         firstSelectedMetadata->GetElement(1) != "1" ||
         secondSelectedMetadata->GetElement(1) != "4" ||
-        !selectedTimeFrames->GetTargetTimeFrame(0u).GetISCached() ||
+        selectedTimeFrames->GetTargetTimeFrame(0u).GetISCached() ||
         selectedTimeFrames->GetTargetTimeFrame(1u).GetISCached() ||
-        selectedTimeFrames->GetCurrentCacheCount() == 0u) {
-        std::cerr << "IGDCReader did not bind the sparse playback provider\n";
+        !selectedTimeFrames->CachedFrameIndices().empty() ||
+        selectedTimeFrames->GetCurrentCacheCount() == 0u ||
+        selectedTimeFrames->GetCurrentCacheCount() > 2u) {
+        std::cerr << "IGDCReader must delegate sparse frame retention to the bounded DataCodec cache\n";
         return 1;
     }
     selectedTimeFrames->NotifyFramePresented(0u);
     selectedTimeFrames->EnableCache(2u);
-    const auto externallyCachedFrame = selectedTimeFrames->GetTargetTimeFrameData(1u);
-    if (externallyCachedFrame.empty() ||
-        !selectedTimeFrames->GetTargetTimeFrame(1u).GetISCached() ||
+    const auto delegatedFrame = selectedTimeFrames->GetTargetTimeFrameData(1u);
+    if (delegatedFrame.empty() ||
+        selectedTimeFrames->GetTargetTimeFrame(1u).GetISCached() ||
+        !selectedTimeFrames->CachedFrameIndices().empty() ||
         selectedTimeFrames->GetCurrentCacheCount() == 0u) {
-        std::cerr << "StreamingData did not retain the delegated frame\n";
+        std::cerr << "StreamingData must obtain delegated frames without creating a second owning cache\n";
         return 1;
     }
     selectedTimeFrames->ClearCache();
     if (selectedTimeFrames->GetCurrentCacheCount() != 0u) {
-        std::cerr << "StreamingData provider did not clear the DataCodec frame store\n";
+        std::cerr << "StreamingData did not clear its displayed cache count\n";
+        return 1;
+    }
+    const auto replayedFrame = selectedTimeFrames->GetTargetTimeFrameData(1u);
+    if (replayedFrame != delegatedFrame || !selectedTimeFrames->CachedFrameIndices().empty()) {
+        std::cerr << "host cache clearing must preserve the independently retained DataCodec frame\n";
         return 1;
     }
     std::error_code removeError;

@@ -24,7 +24,6 @@ enum class PackageFieldEncodingMode : std::uint8_t {
 struct PackageFieldEncodingParams {
     PackageFieldEncodingMode mode{PackageFieldEncodingMode::Zstd};
     int zstdLevel{3};
-    std::size_t workerCount{4u};
 };
 
 struct EncodePipelineControlParams {

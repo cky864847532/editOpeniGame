@@ -124,12 +124,10 @@ struct RemapProviders {
 };
 
 struct BuildOptions {
+    DataCodecExecutionResources& resources;
     WritableRemapProviderFactory providerFactory{};
     bytestore::ByteStoreSession* byteStoreSession{nullptr};
-    resource::ActiveByteBudget* scratchBudget{nullptr};
-    std::size_t mortonLeafBudgetBytes{mortonremap::kMortonDefaultLeafBudgetBytes};
-    std::size_t mortonRunBufferBytes{mortonremap::kMortonRunBufferBytes};
-    bool useMemoryScratchStore{false};
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 template<typename TGetter>
@@ -137,14 +135,18 @@ inline bool BuildPointMortonRemapProviders(
     const std::size_t pointCount,
     TGetter&& reader,
     RemapProviders& result,
-    std::string* error = nullptr,
-    const BuildOptions& remapOptions = {}) {
+    std::string* error,
+    const BuildOptions& remapOptions) {
     result = {};
 
     float minValues[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
     float maxValues[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
     float value[3]{0.0f, 0.0f, 0.0f};
-    for (std::size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+    auto phase = WaitForHeavyPhase(remapOptions.resources);
+    if (!phase || !mortonremap::RunMortonRanges(remapOptions.resources, *phase, pointCount,
+            [&](std::size_t first, std::size_t end) {
+    for (std::size_t pointIndex = first; pointIndex < end; ++pointIndex) {
+        if (remapOptions.resources.Stopped()) { return false; }
         if (!reader(pointIndex, value, error)) {
             return false;
         }
@@ -153,6 +155,9 @@ inline bool BuildPointMortonRemapProviders(
             maxValues[axisIndex] = std::max(maxValues[axisIndex], value[axisIndex]);
         }
     }
+    return true;
+    })) { return false; }
+    phase.reset();
 
     float extent = 0.0f;
     extent = std::max(extent, maxValues[0] - minValues[0]);
@@ -161,21 +166,20 @@ inline bool BuildPointMortonRemapProviders(
     const float scale = extent == 0.0f ? 0.0f : 1.0f / extent;
 
     mortonremap::MortonRemapResult remapResult;
-    mortonremap::MortonRemapOptions options;
+    mortonremap::MortonRemapOptions options{.resources = remapOptions.resources};
     options.resourcePrefix = "point_remap.morton";
     options.providerFactory = remapOptions.providerFactory;
     options.byteStoreSession = remapOptions.byteStoreSession;
-    options.scratchBudget = remapOptions.scratchBudget;
-    options.leafBudgetBytes = remapOptions.mortonLeafBudgetBytes;
-    options.runBufferBytes = remapOptions.mortonRunBufferBytes;
+    options.recordCapacitySamples = remapOptions.recordCapacitySamples;
     options.buildInverse = true;
-    options.useMemoryScratchStore = remapOptions.useMemoryScratchStore;
     bool readFailed = false;
     std::string readError;
     const auto keyGetter = [&](const std::size_t pointIndex) {
         float localValue[3]{0.0f, 0.0f, 0.0f};
         if (!reader(pointIndex, localValue, &readError)) {
             readFailed = true;
+            remapOptions.resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                "point-key-read", "BuildPointMortonRemapProviders", readError));
             return std::uint32_t{0u};
         }
         return BuildMortonKey(localValue, minValues, scale);
@@ -197,8 +201,8 @@ inline bool BuildPointMortonRemapProviders(
     const float* positions,
     const std::size_t pointCount,
     RemapProviders& result,
-    std::string* error = nullptr,
-    const BuildOptions& remapOptions = {}) {
+    std::string* error,
+    const BuildOptions& remapOptions) {
     result = {};
     if (positions == nullptr) {
         return validation::AssignError(error, "point positions are null");
@@ -220,8 +224,8 @@ inline bool BuildPointMortonRemapProviders(
 inline bool BuildPointMortonRemapProviders(
     const NumericArrayView& geometry,
     RemapProviders& result,
-    std::string* error = nullptr,
-    const BuildOptions& remapOptions = {}) {
+    std::string* error,
+    const BuildOptions& remapOptions) {
     result = {};
     const auto pointCount = geometry.tupleCount;
     if (!geometry.IsValid()) {

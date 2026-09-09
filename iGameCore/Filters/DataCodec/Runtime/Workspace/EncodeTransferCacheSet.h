@@ -25,11 +25,6 @@ enum class EncodeTransferCacheState : std::uint8_t {
 class EncodeTransferCacheSet {
 public:
     void Clear() {
-        for (auto& record : m_transferCaches) {
-            if (record.transferCache != nullptr) {
-                record.transferCache->Release();
-            }
-        }
         m_transferCaches.clear();
         m_readyFlags.clear();
     }
@@ -37,7 +32,6 @@ public:
     void AbortAll() {
         for (auto& record : m_transferCaches) {
             if (record.transferCache != nullptr) {
-                record.transferCache->Release();
                 record.transferCache.reset();
             }
         }
@@ -68,25 +62,12 @@ public:
     [[nodiscard]] EncodeTransferUnit& TransferCache(const std::size_t index) { return m_transferCaches.at(index); }
     [[nodiscard]] const EncodeTransferUnit& TransferCache(const std::size_t index) const { return m_transferCaches.at(index); }
 
-    void PublishTransferCacheBytes(
-        const std::size_t index,
-        std::vector<std::uint8_t> bytes,
-        const EncodedFieldCodecType codecType) {
-        PublishTransferCache(
-            index,
-            std::make_shared<bytestore::VectorByteSource>(std::move(bytes)),
-            codecType);
-    }
-
     void PublishTransferCache(
         const std::size_t index,
         std::shared_ptr<bytestore::IByteSource> transferCache,
         const EncodedFieldCodecType codecType) {
         MarkPending(index);
         auto& record = TransferCache(index);
-        if (record.transferCache != nullptr) {
-            record.transferCache->Release();
-        }
         record.schedule.codecType = codecType;
         record.schedule.rawSize = transferCache != nullptr ? transferCache->ByteSizeHint() : 0u;
         record.schedule.compressionType = EncodedFieldCompressionType::None;

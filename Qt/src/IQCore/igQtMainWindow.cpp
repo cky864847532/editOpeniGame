@@ -33,6 +33,7 @@
 #include <IQComponents/igQtModelDialogWidget.h>
 #include <IQComponents/igQtProgressBarWidget.h>
 #include <IQCore/igQtDataCodecDecodeSettings.h>
+#include <IQWidgets/igQtDataCodecResourceControls.h>
 #include <IQCore/igQtFileLoader.h>
 #include <IQCore/igQtOpenGLWidgetManager.h>
 #include <IQWidgets/ColorManager/igQtColorManagerWidget.h>
@@ -1997,10 +1998,9 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
         QStringLiteral("解压设置"));
     connect(dataCodecDecodeSettingsAction, &QAction::triggered, this, [this](bool) {
         static igQtChromeFramelessDialog* dialog = nullptr;
-        static QComboBox* performanceCombo = nullptr;
+        static igQtDataCodecResourceControls* resourceControls = nullptr;
         static QCheckBox* onDemandAttributes = nullptr;
         static QCheckBox* decodedResultCache = nullptr;
-        static QSpinBox* decodedResultCacheFrameLimit = nullptr;
         static QCheckBox* outputDecodeLogFile = nullptr;
         if (dialog == nullptr) {
             dialog = new igQtChromeFramelessDialog(this);
@@ -2008,7 +2008,8 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
             dialog->setMaximizeEnabled(false);
             dialog->setOpaqueShell(true);
             dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-            dialog->setFixedSize(360, 276);
+            dialog->setMinimumSize(420, 350);
+            dialog->resize(460, 380);
 
             auto* panel = new QWidget(dialog->contentHost());
             panel->setObjectName(QStringLiteral("DataCodecDecodeSettingsPanel"));
@@ -2024,7 +2025,7 @@ QLabel, QCheckBox {
     color: #d4d4d4;
     font-size: 12px;
 }
-QComboBox, QSpinBox {
+QComboBox, QSpinBox, QDoubleSpinBox {
     min-height: 28px;
     max-height: 28px;
     background: #1e1e1e;
@@ -2034,7 +2035,7 @@ QComboBox, QSpinBox {
     padding: 0 8px;
     font-size: 12px;
 }
-QComboBox:focus, QSpinBox:focus {
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border-color: #26a29c;
 }
 QComboBox::drop-down {
@@ -2078,16 +2079,7 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
             layout->setContentsMargins(16, 12, 16, 12);
             layout->setHorizontalSpacing(12);
             layout->setVerticalSpacing(10);
-            performanceCombo = new QComboBox(panel);
-            performanceCombo->addItem(
-                QStringLiteral("时间优先"),
-                static_cast<int>(::datacodec::DataCodecDecodeTier::Fast));
-            performanceCombo->addItem(
-                QStringLiteral("平衡"),
-                static_cast<int>(::datacodec::DataCodecDecodeTier::Balanced));
-            performanceCombo->addItem(
-                QStringLiteral("内存优先"),
-                static_cast<int>(::datacodec::DataCodecDecodeTier::LowMemory));
+            resourceControls = new igQtDataCodecResourceControls(panel);
 
             onDemandAttributes = new QCheckBox(
                 QStringLiteral("按需解压属性场"),
@@ -2099,21 +2091,15 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
                 panel);
             decodedResultCache->setToolTip(
                 QStringLiteral("保留完成解码的帧，重复载入或动画回放可直接复用"));
-            decodedResultCacheFrameLimit = new QSpinBox(panel);
-            decodedResultCacheFrameLimit->setRange(1, 10);
-            decodedResultCacheFrameLimit->setSuffix(QStringLiteral(" 帧"));
-            decodedResultCacheFrameLimit->setToolTip(
-                QStringLiteral("完整解码结果 LRU 最多保留的帧数"));
             outputDecodeLogFile = new QCheckBox(
                 QStringLiteral("输出解码日志文件"),
                 panel);
             outputDecodeLogFile->setToolTip(
                 QStringLiteral("在 IGC 文件所在目录创建解码日志目录"));
 
-            layout->addRow(QStringLiteral("性能模式"), performanceCombo);
+            layout->addRow(resourceControls);
             layout->addRow(QString(), onDemandAttributes);
             layout->addRow(QString(), decodedResultCache);
-            layout->addRow(QStringLiteral("缓存帧数"), decodedResultCacheFrameLimit);
             layout->addRow(QString(), outputDecodeLogFile);
 
             auto* buttons = new QDialogButtonBox(
@@ -2127,34 +2113,22 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
 
             connect(buttons, &QDialogButtonBox::accepted, dialog, []() {
                 igQtDataCodecDecodeSettingsStore::Save({
-                    .performanceTier = static_cast<::datacodec::DataCodecDecodeTier>(
-                        performanceCombo->currentData().toInt()),
+                    .resources = resourceControls->Params(),
                     .decodeAttributesOnDemand = onDemandAttributes->isChecked(),
                     .enableDecodedResultCache = decodedResultCache->isChecked(),
-                    .decodedResultCacheFrameLimit = static_cast<std::size_t>(
-                        decodedResultCacheFrameLimit->value()),
                     .outputDecodeLogFile = outputDecodeLogFile->isChecked(),
                 });
                 dialog->close();
             });
             connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
-            connect(decodedResultCache, &QCheckBox::toggled, dialog,
-                [](const bool enabled) {
-                    decodedResultCacheFrameLimit->setEnabled(enabled);
-                });
             dialog->setContentWidget(panel);
             registerSynchronizedToolWindow(dialog);
         }
 
         const auto settings = igQtDataCodecDecodeSettingsStore::Load();
-        const auto tierIndex = performanceCombo->findData(
-            static_cast<int>(settings.performanceTier));
-        performanceCombo->setCurrentIndex(tierIndex >= 0 ? tierIndex : 0);
+        resourceControls->SetParams(settings.resources);
         onDemandAttributes->setChecked(settings.decodeAttributesOnDemand);
         decodedResultCache->setChecked(settings.enableDecodedResultCache);
-        decodedResultCacheFrameLimit->setValue(
-            static_cast<int>(settings.decodedResultCacheFrameLimit));
-        decodedResultCacheFrameLimit->setEnabled(settings.enableDecodedResultCache);
         outputDecodeLogFile->setChecked(settings.outputDecodeLogFile);
         showSynchronizedToolWindow(dialog);
     });

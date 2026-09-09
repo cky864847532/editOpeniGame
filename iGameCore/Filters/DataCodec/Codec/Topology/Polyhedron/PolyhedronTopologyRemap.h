@@ -293,17 +293,13 @@ inline bool BuildPolyhedronCellRangeMortonRemapProviderFromSource(
         return true;
     }
 
-    mortonremap::MortonRemapOptions remapOptions;
+    mortonremap::MortonRemapOptions remapOptions{.resources = options.resources};
     remapOptions.resourcePrefix = "cell_remap.polyhedron.range_morton";
     remapOptions.progressCallback = options.progressCallback;
-    remapOptions.resourceCallback = options.resourceCallback;
+    remapOptions.recordCapacitySamples = options.recordCapacitySamples;
     remapOptions.providerFactory = options.providerFactory;
     remapOptions.byteStoreSession = options.byteStoreSession;
-    remapOptions.scratchBudget = options.scratchBudget;
-    remapOptions.leafBudgetBytes = options.mortonLeafBudgetBytes;
-    remapOptions.runBufferBytes = options.mortonRunBufferBytes;
     remapOptions.buildInverse = false;
-    remapOptions.useMemoryScratchStore = options.useMemoryScratchStore;
 
     mortonremap::MortonRemapResult result;
     try {
@@ -352,9 +348,14 @@ inline bool BuildPolyhedronCellRangeMortonRemapProvider(
     std::shared_ptr<IRemapProvider>& orderProvider,
     std::string* error = nullptr) {
     PolyhedronCellRangeSource source;
-    if (!source.Initialize(adapter, error)) {
-        orderProvider.reset();
-        return false;
+    {
+        auto phase = WaitForHeavyPhase(options.resources);
+        if (!phase || !RunTerminalWork(options.resources, *phase, [&](WorkerContext&) {
+                return source.Initialize(adapter, error);
+            })) {
+            orderProvider.reset();
+            return false;
+        }
     }
     return BuildPolyhedronCellRangeMortonRemapProviderFromSource(
         source,

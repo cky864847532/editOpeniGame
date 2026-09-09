@@ -15,9 +15,12 @@
 namespace datacodec {
 namespace numericarray {
 
+struct NumericArrayBlockCapacitySamples;
+
 struct NumericArrayBlockParams : public NumericArrayLayout {
     const NumericArrayRegionControlParams* regionControl{nullptr};
     const std::vector<RegionRun>* regionRuns{nullptr};
+    NumericArrayBlockCapacitySamples* capacitySamples{nullptr};
 };
 
 inline NumericArrayBlockParams MakeNumericArrayBlockParams(const NumericArrayLayout& layout) {

@@ -2,7 +2,6 @@
 
 #include "DataCodec/Filter/Adapter/iGameDecodedFrameAttributeDataSource.h"
 #include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
-#include "DataCodec/Filter/Adapter/iGameStreamingFrameCacheAdapter.h"
 #include "DataCodec/Filter/Playback/iGameDataCodecStreamingFrameProvider.h"
 #include "DataCodec/Runtime/Record/RunRecordSubmit.h"
 #include "iGameDrawObject.h"
@@ -29,7 +28,7 @@ void AddFrameSequenceDecodeMessage(
         .text = std::move(text),
     };
     ::datacodec::SubmitRunMessage(runRecordSink, message);
-    result.messages.push_back(std::move(message));
+    AppendRetainedTelemetryMessage(result.messages, message);
 }
 
 } // 匿名命名空间
@@ -64,35 +63,8 @@ FrameSequenceDecodeResult DecodeFrameSequence(const FrameSequenceDecodeRequest& 
         metadata->AddElement(std::to_string(source->frameIndex));
         timeFrames->AddTimeStep(source->timeValue, metadata, StreamingType::IGCFramePackage);
     }
-    if (!request.decodedFrameCachePolicy.enabled && request.decodedFrameCache == nullptr) {
-        // 低内存输入缓存模式不让StreamingData额外驻留完整帧
-        timeFrames->DisableCache();
-    } else if (request.decodedFrameCachePolicy.residentFrameLimit > 0u) {
-        timeFrames->EnableCache(static_cast<unsigned int>(
-            request.decodedFrameCachePolicy.residentFrameLimit - 1u));
-    } else {
-        timeFrames->EnableCache(std::numeric_limits<unsigned int>::max());
-    }
-
-    auto decodedFrameCache = request.decodedFrameCache;
-    if (decodedFrameCache == nullptr && request.decodedFrameCachePolicy.enabled) {
-        std::unordered_map<std::uint32_t, unsigned int> frameOrdinals;
-        frameOrdinals.reserve(request.selectedFrameOrder.size());
-        for (std::size_t ordinal = 0u; ordinal < request.selectedFrameOrder.size(); ++ordinal) {
-            frameOrdinals.emplace(
-                request.selectedFrameOrder[ordinal],
-                static_cast<unsigned int>(ordinal));
-        }
-        std::unordered_map<std::uint32_t, ::datacodec::DecodeSourceIdentity> frameIdentities;
-        frameIdentities.reserve(request.decodeSources.size());
-        for (const auto& source : request.decodeSources) {
-            frameIdentities.emplace(source.frameIndex, source.sourceIdentity);
-        }
-        decodedFrameCache = std::make_shared<iGameStreamingFrameCacheAdapter>(
-            timeFrames.GetPointer(),
-            std::move(frameOrdinals),
-            std::move(frameIdentities));
-    }
+    // 完整帧由 DataCodec 根缓存留存，宿主只保留当前展示结果
+    timeFrames->DisableCache();
 
     auto playback = std::make_shared<::datacodec::PlaybackSession>();
     std::string openError;
@@ -104,11 +76,9 @@ FrameSequenceDecodeResult DecodeFrameSequence(const FrameSequenceDecodeRequest& 
             .executionOptions = request.executionOptions,
             .configurationSource = request.configurationSource,
             .language = request.language,
-            .parallelTaskRunner = request.parallelTaskRunner,
+            .resources = request.resources,
             .decodedFrameCachePolicy = request.decodedFrameCachePolicy,
-            .decodedFrameCache = std::move(decodedFrameCache),
             .encodedInputCachePolicy = request.encodedInputCachePolicy,
-            .encodedInputCache = request.encodedInputCache,
             .loadAllAvailableAttributes = request.loadAllAvailableAttributes,
         }, &openError)) {
         AddFrameSequenceDecodeMessage(

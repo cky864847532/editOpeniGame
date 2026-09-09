@@ -2,6 +2,8 @@
 #define DATACODEC_CODEC_REFERENCE_ATTRIBUTEREFERENCESCHEDULEBUILDER_H
 
 #include "DataCodec/Codec/Reference/AttributeReferenceSchedule.h"
+#include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Codec/Reference/IntraFieldReference.h"
 #include "DataCodec/Codec/NumericArray/IntegerResidualCodec.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayReader.h"
@@ -56,48 +58,57 @@ inline bool IsAttributeReferenceSampleFieldEligible(
         codec == IntraFieldReferenceCodec::Wavelet;
 }
 
+template<class T>
+inline bool CreateAttributeReferenceArray(
+    bytestore::ByteStoreSession& session, const std::size_t count, const char* label,
+    std::shared_ptr<bytestore::MemoryStore>& owner, std::span<T>& values, std::string* error) {
+    owner.reset();
+    values = {};
+    std::size_t bytes = 0u;
+    if (!validation::CheckedMulSizeT(count, sizeof(T), bytes, label, error)) { return false; }
+    owner = std::static_pointer_cast<bytestore::MemoryStore>(
+        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, bytes, label, error));
+    if (!owner) { return false; }
+    const auto storage = owner->WritableBytes();
+    if (storage.size() != bytes || (bytes != 0u &&
+            reinterpret_cast<std::uintptr_t>(storage.data()) % alignof(T) != 0u)) {
+        return validation::AssignError(error, "reference schedule array is not aligned complete storage");
+    }
+    values = {reinterpret_cast<T*>(storage.data()), count};
+    return true;
+}
+
 inline bool BuildAttributeReferenceSampleIndices(
-    const ParamSize elementCountParam,
-    const std::size_t requestedSampleCount,
-    std::vector<std::size_t>& indices,
-    std::string* error = nullptr) {
-    indices.clear();
+    const ParamSize elementCountParam, const std::size_t requestedSampleCount,
+    std::span<std::size_t>& indices, std::string* error = nullptr) {
     std::size_t elementCount = 0u;
     if (!TryParamSizeToSizeT(elementCountParam, elementCount)) {
-        return validation::AssignError(
-            error,
-            "attribute reference sample element count exceeds this platform size limit");
+        return validation::AssignError(error, "attribute reference sample element count exceeds this platform size limit");
     }
-    if (elementCount == 0u) {
-        return true;
+    const auto sampleCount = std::min(elementCount, std::max<std::size_t>(1u, requestedSampleCount));
+    if (indices.size() != sampleCount) {
+        return validation::AssignError(error, "attribute sample index storage does not match its admitted capacity");
     }
-    const auto sampleCount = std::min(
-        elementCount,
-        std::max<std::size_t>(1u, requestedSampleCount));
-    indices.reserve(sampleCount);
     if (sampleCount == elementCount) {
-        for (std::size_t index = 0u; index < elementCount; ++index) {
-            indices.push_back(index);
-        }
+        for (std::size_t i = 0u; i < elementCount; ++i) { indices[i] = i; }
         return true;
     }
-    if (sampleCount == 1u) {
-        indices.push_back(0u);
-        return true;
-    }
+    if (sampleCount == 1u) { indices[0u] = 0u; return true; }
     const auto lastIndex = static_cast<long double>(elementCount - 1u);
     const auto denominator = static_cast<long double>(sampleCount - 1u);
-    for (std::size_t index = 0u; index < sampleCount; ++index) {
+    for (std::size_t i = 0u; i < sampleCount; ++i) {
         const auto resolved = static_cast<std::size_t>(std::llround(
-            lastIndex * static_cast<long double>(index) / denominator));
-        indices.push_back(std::min(resolved, elementCount - 1u));
+            lastIndex * static_cast<long double>(i) / denominator));
+        indices[i] = std::min(resolved, elementCount - 1u);
     }
-    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    const auto last = std::unique(indices.begin(), indices.end());
+    indices = indices.first(static_cast<std::size_t>(last - indices.begin()));
     return true;
 }
 
 struct AttributeReferenceFieldSample {
-    std::vector<std::uint8_t> bytes;
+    std::shared_ptr<bytestore::MemoryStore> owner;
+    std::span<std::uint8_t> bytes;
     std::size_t tupleCount{0u};
     std::size_t componentCount{0u};
     std::size_t valueSize{0u};
@@ -106,75 +117,51 @@ struct AttributeReferenceFieldSample {
 struct AttributeReferenceSampleGroup {
     std::size_t representativeFieldIndex{0u};
     std::vector<std::size_t> fieldIndices;
-    std::vector<std::size_t> sampleIndices;
 };
 
-inline bool BuildAttributeReferenceFieldSample(
-    const AttrStorageParams& meta,
-    const numericarray::NumericArraySource& source,
-    const std::vector<std::size_t>& sampleIndices,
-    ScratchByteBufferPool& scratchBytePool,
-    AttributeReferenceFieldSample& sample,
-    std::string* error = nullptr) {
+inline bool PrepareAttributeReferenceFieldSample(
+    const AttrStorageParams& meta, const std::size_t sampleCount, bytestore::ByteStoreSession& session,
+    AttributeReferenceFieldSample& sample, std::string* error) {
     sample = {};
-    std::size_t valueSize = 0u;
-    if (!TryParamSizeToSizeT(NumericArrayValueSize(meta), valueSize)) {
-        return validation::AssignError(
-            error,
-            "attribute reference sample value size exceeds this platform size limit");
+    if (!TryParamSizeToSizeT(NumericArrayValueSize(meta), sample.valueSize)) {
+        return validation::AssignError(error, "attribute reference sample value size exceeds this platform size limit");
     }
-    const auto componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0));
-    std::size_t tupleBytes = 0u;
-    std::size_t sampleByteCount = 0u;
-    if (!validation::CheckedMulSizeT(
-            componentCount,
-            valueSize,
-            tupleBytes,
-            "attribute reference sample tuple bytes",
-            error) ||
-        !validation::CheckedMulSizeT(
-            sampleIndices.size(),
-            tupleBytes,
-            sampleByteCount,
-            "attribute reference sample bytes",
-            error)) {
-        return false;
-    }
+    sample.componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0));
+    sample.tupleCount = sampleCount;
+    std::size_t tupleBytes = 0u, sampleBytes = 0u;
+    if (!validation::CheckedMulSizeT(sample.componentCount, sample.valueSize, tupleBytes,
+            "attribute reference sample tuple bytes", error) ||
+        !validation::CheckedMulSizeT(sampleCount, tupleBytes, sampleBytes,
+            "attribute reference sample bytes", error)) { return false; }
+    return CreateAttributeReferenceArray(session, sampleBytes, "attribute_reference_sample",
+        sample.owner, sample.bytes, error);
+}
+
+inline bool ReadAttributeReferenceFieldSample(
+    const numericarray::NumericArraySource& source, const std::span<const std::size_t> sampleIndices,
+    ScratchByteBufferPool& scratchBytePool, AttributeReferenceFieldSample& sample, std::string* error) {
     numericarray::NumericArrayReader reader;
-    if (!numericarray::BuildNumericArrayReader(source, reader, error)) {
-        return false;
+    if (!numericarray::BuildNumericArrayReader(source, reader, error)) { return false; }
+    const auto tupleBytes = sample.componentCount * sample.valueSize;
+    if (tupleBytes == 0u || sample.tupleCount != sampleIndices.size()) {
+        return validation::AssignError(error, "attribute reference sample layout is not prepared");
     }
-    sample.bytes.reserve(sampleByteCount);
+    const auto windowCount = std::max<std::size_t>(1u, kIoWindowBytes / tupleBytes);
     std::size_t cursor = 0u;
     while (cursor < sampleIndices.size()) {
         const auto runStart = sampleIndices[cursor];
         std::size_t runCount = 1u;
-        while (cursor + runCount < sampleIndices.size() &&
-               sampleIndices[cursor + runCount] == runStart + runCount) {
-            ++runCount;
+        while (runCount < windowCount && cursor + runCount < sampleIndices.size() &&
+               sampleIndices[cursor + runCount] == runStart + runCount) { ++runCount; }
+        ScratchByteBuffer range;
+        if (!reader.ReadElements(runStart, runCount, scratchBytePool, range, error)) { return false; }
+        if (range.Span().size() != runCount * tupleBytes) {
+            return validation::AssignError(error, "attribute sample read returned an invalid byte count");
         }
-        ScratchByteBuffer rangeBytes;
-        if (!reader.ReadElements(
-                runStart,
-                runCount,
-                scratchBytePool,
-                rangeBytes,
-                error)) {
-            return false;
-        }
-        sample.bytes.insert(
-            sample.bytes.end(),
-            rangeBytes.Bytes().begin(),
-            rangeBytes.Bytes().end());
+        std::memcpy(sample.bytes.data() + cursor * tupleBytes, range.Span().data(), range.Span().size());
         cursor += runCount;
     }
-    if (sample.bytes.size() != sampleByteCount) {
-        return validation::AssignError(error, "attribute reference sample byte size does not match");
-    }
-    sample.tupleCount = sampleIndices.size();
-    sample.componentCount = componentCount;
-    sample.valueSize = valueSize;
-    return true;
+    return sample.owner->Seal(error);
 }
 
 template<typename TValue>
@@ -400,7 +387,8 @@ inline bool BuildAttributeIntraFieldReferenceSchedule(
     const std::vector<std::size_t>& metaIndices,
     const std::vector<std::uint8_t>& referenceAllowed,
     const AttrReferenceControlParams& dependency,
-    ScratchByteBufferPool& scratchBytePool,
+    DataCodecExecutionResources& resources,
+    bytestore::ByteStoreSession& byteStoreSession,
     EncodeAttributeReferenceSchedule& schedule,
     std::string* error = nullptr) {
     const auto attrCount = metas.size();
@@ -450,75 +438,78 @@ inline bool BuildAttributeIntraFieldReferenceSchedule(
             AttributeReferenceSampleGroup group;
             group.representativeFieldIndex = fieldIndex;
             group.fieldIndices.push_back(fieldIndex);
-            if (!BuildAttributeReferenceSampleIndices(
-                    metas[fieldIndex].elementCount,
-                    dependency.intraField.sampleCount,
-                    group.sampleIndices,
-                    error)) {
-                return false;
-            }
             sampleGroups.push_back(std::move(group));
             continue;
         }
         groupIt->fieldIndices.push_back(fieldIndex);
     }
 
-    std::vector<AttributeReferenceFieldSample> fieldSamples(attrCount);
+    auto phase = WaitForHeavyPhase(resources);
+    if (!phase) { return false; }
+    std::shared_ptr<bytestore::MemoryStore> edgeOwner;
+    std::span<IntraFieldEdge> edges;
+    if (!CreateAttributeReferenceArray(byteStoreSession, 0u, "attribute_reference_edges",
+            edgeOwner, edges, error)) { return false; }
     for (const auto& group : sampleGroups) {
-        if (group.fieldIndices.size() < 2u) {
-            continue;
+        if (group.fieldIndices.size() < 2u) { continue; }
+        if (resources.Stopped()) { return false; }
+        std::size_t elementCount = 0u;
+        if (!TryParamSizeToSizeT(metas[group.representativeFieldIndex].elementCount, elementCount)) {
+            return validation::AssignError(error, "attribute sample domain exceeds this platform size limit");
         }
-        for (const auto fieldIndex : group.fieldIndices) {
-            if (!BuildAttributeReferenceFieldSample(
-                    metas[fieldIndex],
-                    sources[fieldIndex],
-                    group.sampleIndices,
-                    scratchBytePool,
-                    fieldSamples[fieldIndex],
-                    error)) {
-                return false;
-            }
-        }
-    }
+        const auto sampleCapacity = std::min(elementCount,
+            std::max<std::size_t>(1u, dependency.intraField.sampleCount));
+        std::shared_ptr<bytestore::MemoryStore> indexOwner;
+        std::span<std::size_t> sampleIndices;
+        if (!CreateAttributeReferenceArray(byteStoreSession, sampleCapacity, "attribute_sample_indices",
+                indexOwner, sampleIndices, error)) { return false; }
+        if (!RunTerminalWork(resources, *phase, [&](WorkerContext&) {
+                return BuildAttributeReferenceSampleIndices(elementCount, dependency.intraField.sampleCount,
+                    sampleIndices, error);
+            })) { return false; }
+        if (!indexOwner->Seal(error)) { return false; }
 
-    std::vector<IntraFieldEdge> edges;
-    for (const auto& group : sampleGroups) {
-        if (group.fieldIndices.size() < 2u) {
-            continue;
+        std::vector<AttributeReferenceFieldSample> fieldSamples(group.fieldIndices.size());
+        for (std::size_t local = 0u; local < group.fieldIndices.size(); ++local) {
+            if (!PrepareAttributeReferenceFieldSample(metas[group.fieldIndices[local]], sampleIndices.size(),
+                    byteStoreSession, fieldSamples[local], error)) { return false; }
         }
-        for (const auto child : group.fieldIndices) {
-            if (referenceAllowed[child] == 0u) {
-                continue;
-            }
-            for (const auto parent : group.fieldIndices) {
-                if (parent == child) {
-                    continue;
+        if (!RunTerminalWork(resources, *phase, [&](WorkerContext& worker) {
+                for (std::size_t local = 0u; local < group.fieldIndices.size(); ++local) {
+                    if (worker.StopToken().stop_requested() ||
+                        !ReadAttributeReferenceFieldSample(sources[group.fieldIndices[local]], sampleIndices,
+                            worker.Scratch(), fieldSamples[local], error)) { return false; }
                 }
-                double sampleScore = 0.0;
-                std::string localError;
-                if (!ComputeAttributeReferenceSampleScore(
-                        metas[child],
-                        dependency.intraField.codec,
-                        fieldSamples[child],
-                        fieldSamples[parent],
-                        sampleScore,
-                        &localError)) {
-                    return validation::AssignError(
-                        error,
-                        "failed to score intra-field reference samples: " + localError);
+                for (std::size_t childLocal = 0u; childLocal < group.fieldIndices.size(); ++childLocal) {
+                    const auto child = group.fieldIndices[childLocal];
+                    if (referenceAllowed[child] == 0u) { continue; }
+                    for (std::size_t parentLocal = 0u; parentLocal < group.fieldIndices.size(); ++parentLocal) {
+                        if (worker.StopToken().stop_requested()) { return false; }
+                        const auto parent = group.fieldIndices[parentLocal];
+                        if (parent == child) { continue; }
+                        double score = 0.0;
+                        if (!ComputeAttributeReferenceSampleScore(metas[child], dependency.intraField.codec,
+                                fieldSamples[childLocal], fieldSamples[parentLocal], score, error)) { return false; }
+                        if (dependency.intraField.selectionMode != ReferenceSelectionMode::Forced &&
+                            score < minimumSampleScore) { continue; }
+                        const IntraFieldEdge edge{.parent = parent, .child = child, .score = score};
+                        // Append 直接预约真实增长容量，旧新存储并存由同一根容量事务覆盖
+                        if (!edgeOwner->Append({reinterpret_cast<const std::uint8_t*>(&edge), sizeof(edge)}, error)) {
+                            return false;
+                        }
+                    }
                 }
-                if (dependency.intraField.selectionMode != ReferenceSelectionMode::Forced &&
-                    sampleScore < minimumSampleScore) {
-                    continue;
-                }
-                edges.push_back(IntraFieldEdge{
-                    .parent = parent,
-                    .child = child,
-                    .score = sampleScore,
-                });
-            }
-        }
+                return true;
+            })) { return false; }
+        // 当前组的样本与索引在下一组准入前释放，真实候选边继续持有容量
     }
+    const auto edgeBytes = edgeOwner->WritableBytes();
+    if (edgeBytes.size() % sizeof(IntraFieldEdge) != 0u || (!edgeBytes.empty() &&
+            reinterpret_cast<std::uintptr_t>(edgeBytes.data()) % alignof(IntraFieldEdge) != 0u)) {
+        return validation::AssignError(error, "attribute reference edge storage has an invalid layout");
+    }
+    edges = {reinterpret_cast<IntraFieldEdge*>(edgeBytes.data()), edgeBytes.size() / sizeof(IntraFieldEdge)};
+    const bool selected = RunTerminalWork(resources, *phase, [&](WorkerContext&) {
     std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
         if (lhs.score != rhs.score) {
             return lhs.score > rhs.score;
@@ -556,6 +547,11 @@ inline bool BuildAttributeIntraFieldReferenceSchedule(
     if (!BuildIntraFieldRecordOrder(parentOf, noParent, schedule.topologyOrder, error)) {
         return false;
     }
+    return true;
+    });
+    if (!selected) { return false; }
+    edges = {};
+    edgeOwner.reset();
     schedule.initialized = true;
     return true;
 }

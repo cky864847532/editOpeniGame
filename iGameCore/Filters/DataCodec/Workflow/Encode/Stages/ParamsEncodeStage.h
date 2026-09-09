@@ -6,6 +6,8 @@
 #include "DataCodec/Runtime/Workspace/EncodeLeafWorkspace.h"
 #include "DataCodec/Runtime/Failure/EncodeFailureManagement.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 #include <cstdint>
 #include <memory>
@@ -41,6 +43,8 @@ public:
                 "params transfer cache layout was not initialized");
             return EncodeStageExecutionStatus::Failed;
         }
+        auto phase = WaitForHeavyPhase(context.resources);
+        if (!phase) { return EncodeStageExecutionStatus::Failed; }
         std::vector<std::uint8_t> paramsBytes;
         std::string error;
         RefreshAttributeDecodeScheduleHints(workspace.StorageParams());
@@ -53,9 +57,33 @@ public:
                 "failed to serialize params: " + error);
             return EncodeStageExecutionStatus::Failed;
         }
-        workspace.PublishTransferCacheBytes(
+        RecordVectorCapacitySample(context.runRecords, "params.encode.serialized_bytes", paramsBytes);
+        RecordCodecStorageParamsCapacity(context.runRecords, workspace.StorageParams());
+        auto params = workspace.ByteStoreSessionRef().CreateSizedStore(
+            bytestore::ByteStorePurpose::Ranged, paramsBytes.size(), "encoded_params", &error);
+        if (!params) {
+            FailEncodeStage(context, workspace, kTypeName, CodecErrorCode::EncodeFailure,
+                "failed to prepare params owner: " + error);
+            return EncodeStageExecutionStatus::Failed;
+        }
+        for (std::size_t offset = 0u; offset < paramsBytes.size();) {
+            const auto count = std::min<std::size_t>(kIoWindowBytes, paramsBytes.size() - offset);
+            if (context.resources.Stopped() || !params->WriteBytesAt(offset,
+                    std::span<const std::uint8_t>(paramsBytes).subspan(offset, count), &error)) {
+                FailEncodeStage(context, workspace, kTypeName, CodecErrorCode::EncodeFailure,
+                    "failed to write params owner: " + error);
+                return EncodeStageExecutionStatus::Failed;
+            }
+            offset += count;
+        }
+        if (!params->Seal(&error)) {
+            FailEncodeStage(context, workspace, kTypeName, CodecErrorCode::EncodeFailure,
+                "failed to seal params owner: " + error);
+            return EncodeStageExecutionStatus::Failed;
+        }
+        workspace.PublishTransferCache(
             workspace.TransferCacheLayout().params,
-            std::move(paramsBytes),
+            std::move(params),
             EncodedFieldCodecType::Params);
         return EncodeStageExecutionStatus::Completed;
     }

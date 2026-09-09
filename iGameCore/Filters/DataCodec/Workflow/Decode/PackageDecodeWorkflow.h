@@ -16,7 +16,7 @@
 #include "DataCodec/Workflow/Frame/FrameTopologyOwnership.h"
 #include "DataCodec/Workflow/Leaf/LeafDecodeExecutor.h"
 #include "DataCodec/Workflow/Session/DecodeSession.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Validation/Storage/StorageValidator.h"
 #include "DataCodec/Validation/Workflow/DecodeValidationLifecycle.h"
 
@@ -56,14 +56,21 @@ inline void AddDecodePackageMessage(
     DecodePackageResult& result,
     RunRecordEmitter& runRecords,
     const TelemetryMessageSeverity severity,
-    std::string origin,
-    std::string text) {
+    const std::string_view origin,
+    const std::string_view text) {
+    if (severity == TelemetryMessageSeverity::Error) {
+        if (!result.failure) {
+            result.failure = MakeCodecFailureRecord(
+                CodecErrorCode::DecodeFailure, "operation-failed", origin, text);
+        }
+        return;
+    }
     auto message = MakeDecodePackageMessage(
         severity,
-        std::move(origin),
-        std::move(text));
+        std::string(origin),
+        std::string(text));
     runRecords.AddMessage(message);
-    result.messages.push_back(std::move(message));
+    AppendRetainedTelemetryMessage(result.messages, message);
 }
 
 inline void SubmitDecodePackageProgress(
@@ -87,7 +94,7 @@ inline void SubmitDecodePackageProgress(
     IRunRecordSink* runRecordSink,
     RunRecordEmitter& packageRecords,
     DecodeSession& session,
-    const DataCodecExecutionResources& resources) {
+    DataCodecExecutionResources& resources) {
     DecodePackageResult result;
     if (request.stopToken.stop_requested()) {
         result.cancelled = true;
@@ -118,8 +125,9 @@ inline void SubmitDecodePackageProgress(
         .language = request.configuration.language,
         .runRecordSink = runRecordSink,
         .stopToken = request.stopToken,
-        .parallelTaskRunner = resources.parallelTaskRunner,
+        .resources = &resources,
     });
+    result.failure = decodeResult.failure;
     if (request.stopToken.stop_requested()) {
         result.cancelled = true;
         return result;
@@ -133,7 +141,8 @@ inline void SubmitDecodePackageProgress(
     const DecodePackageRequest& request,
     RunRecordEmitter& packageRecords,
     IRunRecordSink* leafRunRecordSink,
-    const DataCodecExecutionResources& resources) {
+    DataCodecExecutionResources& resources,
+    DecodeSession* runSession) {
     DecodePackageResult result;
     result.inputBytes = request.inputReader == nullptr ? 0u : request.inputReader->ByteSize();
 
@@ -144,7 +153,7 @@ inline void SubmitDecodePackageProgress(
             0u,
             result.inputBytes,
             leafPackage,
-            &readError)) {
+            &readError, resources.StopToken())) {
         AddDecodePackageMessage(
             result,
             packageRecords,
@@ -155,7 +164,7 @@ inline void SubmitDecodePackageProgress(
     }
 
     DecodeSession localSession;
-    auto& session = request.session != nullptr ? *request.session : localSession;
+    auto& session = runSession != nullptr ? *runSession : localSession;
     result = DecodeLeafPackage(
         leafPackage,
         request,
@@ -172,7 +181,8 @@ inline void SubmitDecodePackageProgress(
     const DecodePackageRequest& request,
     RunRecordEmitter& packageRecords,
     IRunRecordSink* leafRunRecordSink,
-    const DataCodecExecutionResources& resources) {
+    DataCodecExecutionResources& resources,
+    DecodeSession* runSession) {
     DecodePackageResult result;
     result.decodedFramePackage = true;
     result.inputBytes = request.inputReader == nullptr ? 0u : request.inputReader->ByteSize();
@@ -191,7 +201,7 @@ inline void SubmitDecodePackageProgress(
         return result;
     }
     DecodeSession localDecodeSession;
-    auto& decodeSession = request.session != nullptr ? *request.session : localDecodeSession;
+    auto& decodeSession = runSession != nullptr ? *runSession : localDecodeSession;
     std::string assemblyError;
     if (!decodeSession.BeginFramePackage(
             framePackage,
@@ -263,7 +273,7 @@ inline void SubmitDecodePackageProgress(
                 leaf.leafPackageByteOffset,
                 leaf.leafPackageByteSize,
                 leafPackage,
-                &readError)) {
+                &readError, resources.StopToken())) {
             AddDecodePackageMessage(
                 result,
                 packageRecords,
@@ -313,7 +323,12 @@ inline void SubmitDecodePackageProgress(
             packageRecords,
             decodeSession,
             resources);
-        AppendDecodePackageMessages(result.messages, leafResult.messages);
+        if (leafResult.failure && !result.failure) {
+            result.failure = leafResult.failure;
+        }
+        if (leafResult.success) {
+            AppendDecodePackageMessages(result.messages, leafResult.messages);
+        }
         if (leafResult.cancelled || request.stopToken.stop_requested()) {
             result.cancelled = true;
             decodeSession.AbortFramePackage();
@@ -369,7 +384,8 @@ inline void SubmitDecodePackageProgress(
     const DecodePackageRequest& request,
     RunRecordEmitter& packageRecords,
     IRunRecordSink* leafRunRecordSink,
-    const DataCodecExecutionResources& resources) {
+    DataCodecExecutionResources& resources,
+    DecodeSession* runSession) {
     if (request.stopToken.stop_requested()) {
         DecodePackageResult result;
         result.cancelled = true;
@@ -394,12 +410,13 @@ inline void SubmitDecodePackageProgress(
             request,
             packageRecords,
             leafRunRecordSink,
-            resources);
+            resources,
+            runSession);
     }
 
     PackageInspection packageInspection;
     std::string headerError;
-    if (!InspectPackage(*request.inputReader, packageInspection, &headerError)) {
+    if (!InspectPackage(*request.inputReader, packageInspection, &headerError, resources.StopToken())) {
         DecodePackageResult result;
         result.inputBytes = request.inputReader->ByteSize();
         AddDecodePackageMessage(
@@ -415,7 +432,7 @@ inline void SubmitDecodePackageProgress(
     if (packageInspection.format == PackageBinaryFormat::FramePackage) {
         FramePackage framePackage;
         std::string frameReadError;
-        if (!FramePackageIO::ReadMetadata(*request.inputReader, framePackage, &frameReadError)) {
+        if (!FramePackageIO::ReadMetadata(*request.inputReader, framePackage, &frameReadError, resources.StopToken())) {
             DecodePackageResult result;
             result.inputBytes = request.inputReader->ByteSize();
             AddDecodePackageMessage(
@@ -431,14 +448,16 @@ inline void SubmitDecodePackageProgress(
             request,
             packageRecords,
             leafRunRecordSink,
-            resources);
+            resources,
+            runSession);
     }
     if (packageInspection.format == PackageBinaryFormat::LeafPackage) {
         return DecodeLeafByteRange(
             request,
             packageRecords,
             leafRunRecordSink,
-            resources);
+            resources,
+            runSession);
     }
 
     DecodePackageResult result;
@@ -454,7 +473,8 @@ inline void SubmitDecodePackageProgress(
 
 [[nodiscard]] inline DecodePackageResult ExecutePackageDecodeWorkflow(
     const DecodePackageRequest& request,
-    const DataCodecExecutionResources& resources = {}) {
+    DataCodecExecutionResources& resources,
+    DecodeSession* runSession) {
     RunRecordDispatcher recordDispatcher;
     recordDispatcher.AddSink(request.runRecordSink);
     if (!request.outputSinks.Empty()) {
@@ -485,76 +505,63 @@ inline void SubmitDecodePackageProgress(
         {},
         packageRecords.RunId());
 
-    ByteRangePrefetchResult prefetchResult;
-    const auto appendPrefetchWarning = [
-        &prefetchResult,
-        &packageRecords](DecodePackageResult& result) {
-        if (!prefetchResult.IsError()) { return; }
-        AddDecodePackageMessage(
-            result,
-            packageRecords,
-            TelemetryMessageSeverity::Warning,
-            kPackageDecodeWorkflowOrigin,
-            prefetchResult.error.empty()
-                ? "input range prefetch failed"
-                : prefetchResult.error);
-    };
-    const auto abortSessionOnFailure = [&request]() noexcept {
-        if (request.session == nullptr) {
+    const auto abortSessionOnFailure = [runSession]() noexcept {
+        if (runSession == nullptr) {
             return;
         }
         try {
-            request.session->AbortFramePackage();
+            runSession->AbortFramePackage();
         } catch (...) {
         }
     };
     DecodePackageResult result;
     try {
-        if (request.inputReader != nullptr &&
-            request.attributeSelection == AttributeSelectionMode::AllAvailable &&
-            request.configuration.execution.enableFullInputPrefetch) {
-            prefetchResult = request.inputReader->PrefetchRange(
-                0u,
-                request.inputReader->ByteSize());
-        }
         result = ExecutePackageDecodeWorkflowUnchecked(
             request,
             packageRecords,
             &leafRunRecords,
-            resources);
-        appendPrefetchWarning(result);
+            resources,
+            runSession);
     } catch (const std::bad_alloc&) {
+        if (!result.failure) {
+            result.failure = MakeCodecFailureRecord(
+                CodecErrorCode::DecodeFailure, "allocation-failed", kPackageDecodeWorkflowOrigin,
+                "memory allocation failed");
+        }
+        result.success = false;
         abortSessionOnFailure();
-        result.inputBytes = request.inputReader == nullptr ? 0u : request.inputReader->ByteSize();
-        AddDecodePackageMessage(
-            result,
-            packageRecords,
-            TelemetryMessageSeverity::Error,
-            kPackageDecodeWorkflowOrigin,
-            "DataCodec package decode failed because memory allocation was rejected");
-        appendPrefetchWarning(result);
     } catch (const std::exception& exception) {
+        if (!result.failure) {
+            result.failure = MakeCodecFailureRecord(
+                CodecErrorCode::DecodeFailure, "exception", kPackageDecodeWorkflowOrigin, exception.what());
+        }
+        result.success = false;
         abortSessionOnFailure();
-        result.inputBytes = request.inputReader == nullptr ? 0u : request.inputReader->ByteSize();
-        AddDecodePackageMessage(
-            result,
-            packageRecords,
-            TelemetryMessageSeverity::Error,
-            kPackageDecodeWorkflowOrigin,
-            std::string("DataCodec package decode failed: ") + exception.what());
-        appendPrefetchWarning(result);
     } catch (...) {
+        if (!result.failure) {
+            result.failure = MakeCodecFailureRecord(
+                CodecErrorCode::DecodeFailure, "unknown-exception", kPackageDecodeWorkflowOrigin,
+                "unknown exception");
+        }
+        result.success = false;
         abortSessionOnFailure();
-        result.inputBytes = request.inputReader == nullptr ? 0u : request.inputReader->ByteSize();
-        AddDecodePackageMessage(
-            result,
-            packageRecords,
-            TelemetryMessageSeverity::Error,
-            kPackageDecodeWorkflowOrigin,
-            "DataCodec package decode failed with an unknown exception");
-        appendPrefetchWarning(result);
     }
 
+    if (!result.success) {
+        if (!result.failure) {
+            result.failure = MakeCodecFailureRecord(
+                CodecErrorCode::DecodeFailure, result.cancelled ? "cancelled" : "operation-failed",
+                kPackageDecodeWorkflowOrigin, result.cancelled ? "decode cancelled" : "decode did not complete",
+                result.cancelled);
+        }
+        packageRecords.TryEndFailedRun(*result.failure, RunEndRecord{
+            .success = false,
+            .elapsedMs = callback::ElapsedMilliseconds(runStart),
+            .inputBytes = result.inputBytes,
+        });
+        result.messages = packageRecords.TakeMessages();
+        return result;
+    }
     packageRecords.SubmitProgress(
         RunProgressPhase::Finish,
         1.0,

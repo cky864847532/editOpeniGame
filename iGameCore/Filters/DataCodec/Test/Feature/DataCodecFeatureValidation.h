@@ -10,7 +10,6 @@
 #include "DataCodec/Validation/Filter/FilterCommitValidator.h"
 #include "DataCodec/Validation/Geometry/GeometryValidator.h"
 #include "DataCodec/Validation/Policy/ValidationRuleIndex.h"
-#include "DataCodec/Validation/Runtime/RuntimeValidator.h"
 #include "DataCodec/Validation/Storage/StorageValidator.h"
 #include "DataCodec/Validation/Topology/TopologyValidator.h"
 #include "DataCodec/Validation/Workflow/DecodeValidationLifecycle.h"
@@ -33,7 +32,7 @@ namespace datacodec::test {
         !validation::StorageValidator::ValidateDecodeInput(nullptr),
         "validation.storage.invalid",
         "storage validator accepted a null reader");
-    MemoryByteRangeReader preambleReader(std::vector<std::uint8_t>(6u));
+    MemoryByteRangeReader preambleReader(std::make_shared<const std::vector<std::uint8_t>>(6u));
     Require(
         result,
         static_cast<bool>(validation::StorageValidator::ValidateDecodeInput(&preambleReader)),
@@ -64,6 +63,7 @@ namespace datacodec::test {
     finiteParams.geomParams.dimension = 1;
     finiteParams.geomParams.dataType = DataType::Float32;
     bytestore::ByteStoreSession geometryStoreSession;
+    geometryStoreSession.BindStorage(std::make_shared<resource::ResidentByteBudget>(1024u), true);
     DecodedGeometryCache finiteGeometry;
     std::string finiteError;
     const std::array<float, 2u> finiteGeometryValues{1.0f, 2.0f};
@@ -71,8 +71,6 @@ namespace datacodec::test {
         2u,
         1u,
         geometryStoreSession,
-        DecodeStorageMode::Memory,
-        sizeof(finiteGeometryValues),
         &finiteError) &&
         finiteGeometry.bytes->WriteBytesAt(
             0u,
@@ -92,6 +90,7 @@ namespace datacodec::test {
         finiteError.empty() ? "geometry finite validator rejected finite values" : finiteError);
 
     bytestore::ByteStoreSession nonFiniteGeometryStoreSession;
+    nonFiniteGeometryStoreSession.BindStorage(std::make_shared<resource::ResidentByteBudget>(1024u), true);
     DecodedGeometryCache nonFiniteGeometry;
     const std::array<float, 2u> nonFiniteGeometryValues{
         1.0f,
@@ -101,8 +100,6 @@ namespace datacodec::test {
         2u,
         1u,
         nonFiniteGeometryStoreSession,
-        DecodeStorageMode::Memory,
-        sizeof(nonFiniteGeometryValues),
         &finiteError) &&
         nonFiniteGeometry.bytes->WriteBytesAt(
             0u,
@@ -178,12 +175,13 @@ namespace datacodec::test {
     finiteAttributeParams.attrParams[0].elementCount = 2u;
     finiteAttributeParams.attrParams[0].dimension = 1;
     finiteAttributeParams.attrParams[0].dataType = DataType::Float32;
+    bytestore::ByteStoreSession attributeSession;
+    attributeSession.BindStorage(std::make_shared<resource::ResidentByteBudget>(1024u), true);
     DecodedAttributeCacheSet finiteAttributes;
     const std::array<float, 2u> finiteAttributeValues{3.0f, 4.0f};
-    const auto finiteAttributesReady = finiteAttributes.InitializeOwned(
+    const auto finiteAttributesReady = finiteAttributes.Initialize(
         finiteAttributeParams,
-        sizeof(finiteAttributeValues),
-        DecodeStorageMode::Memory,
+        attributeSession,
         &finiteError) &&
         finiteAttributes.BeginAttribute(0u, finiteAttributeParams.attrParams[0], &finiteError) &&
         finiteAttributes.WriteAttributeRange(
@@ -209,10 +207,9 @@ namespace datacodec::test {
         3.0f,
         std::numeric_limits<float>::infinity(),
     };
-    const auto nonFiniteAttributesReady = nonFiniteAttributes.InitializeOwned(
+    const auto nonFiniteAttributesReady = nonFiniteAttributes.Initialize(
         finiteAttributeParams,
-        sizeof(nonFiniteAttributeValues),
-        DecodeStorageMode::Memory,
+        attributeSession,
         &finiteError) &&
         nonFiniteAttributes.BeginAttribute(0u, finiteAttributeParams.attrParams[0], &finiteError) &&
         nonFiniteAttributes.WriteAttributeRange(
@@ -231,24 +228,6 @@ namespace datacodec::test {
             std::span<const std::size_t>(attrIndices)),
         "validation.attribute.finite.invalid",
         "attribute finite validator accepted a non-finite value");
-
-    auto controls = MakeDefaultDecodeControlParams();
-    Require(
-        result,
-        static_cast<bool>(validation::RuntimeValidator::ValidateDecodeConfiguration(
-            controls,
-            DataCodecRuntimeProfile::Native)),
-        "validation.runtime.valid",
-        "runtime validator rejected default controls");
-    controls.resourceBudget.activeWindowMiB = 1u;
-    controls.resourceBudget.accessWindowMiB = 2u;
-    Require(
-        result,
-        !validation::RuntimeValidator::ValidateDecodeConfiguration(
-            controls,
-            DataCodecRuntimeProfile::Native),
-        "validation.runtime.invalid",
-        "runtime validator accepted an invalid window budget");
 
     Require(
         result,

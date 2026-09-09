@@ -22,6 +22,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <span>
 #include <string>
@@ -36,11 +37,14 @@ inline bool ResolveDecodedBlockBytes(
     const AttrStorageParams& meta,
     const ParsedNumericArrayBlock& block,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    numericarray::NumericArrayCompressorState* compressorState = nullptr,
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
+    params.capacitySamples = capacitySamples;
     if (block.header.mode == NumericArrayBlockMode::LayeredResidual) {
         return numericarray::ResolveDecodedLayeredResidualNumericArrayBlockBytes(
             params,
@@ -51,7 +55,7 @@ inline bool ResolveDecodedBlockBytes(
             block.regionLayers,
             block.bytes,
             decodedBytes,
-            error);
+            error, compressorState);
     }
     return numericarray::ResolveDecodedNumericArrayBlockBytes(
         params,
@@ -61,7 +65,7 @@ inline bool ResolveDecodedBlockBytes(
         block.componentLayouts,
         block.bytes,
         decodedBytes,
-        error);
+        error, compressorState);
 }
 
 inline bool TryFindReferenceAttrIndex(
@@ -93,19 +97,6 @@ inline bool EnsureTemporalReferencesDecoded(
     const AttrStorageParams& targetMeta,
     TReferenceDecoder& referenceDecoder,
     std::string* error = nullptr);
-
-inline ParsedNumericArrayBlock MakeParsedBlockView(const numericarray::NumericArrayBlockPayload& block) {
-    ParsedNumericArrayBlock parsed;
-    parsed.header = block.header;
-    parsed.backgroundCompressor = block.backgroundCompressor;
-    parsed.backgroundEncodedByteLength = block.backgroundEncodedByteLength;
-    parsed.componentLayouts = block.componentLayouts;
-    parsed.regionLayers = block.regionLayers;
-    parsed.alpha = block.alpha;
-    parsed.beta = block.beta;
-    parsed.bytes = block.bytes.Span();
-    return parsed;
-}
 
 struct AttributePayloadRange {
     std::size_t attrIndex{0u};
@@ -387,13 +378,14 @@ inline bool WriteDecodedAttributeBlock(
         return validation::AssignError(error, "attribute block decoded range exceeds field size");
     }
 
-    return attributes.WriteAttributeRange(
-        attrIndex,
-        static_cast<std::size_t>(header.elementOffset),
-        static_cast<std::size_t>(header.elementCount),
-        decodedBlockBytes.data(),
-        decodedBlockBytes.size(),
-        error);
+    const auto windowCount = std::max<std::size_t>(1u, kIoWindowBytes / std::max<std::size_t>(tupleBytes, 1u));
+    for (std::size_t offset = 0u; offset < header.elementCount;) {
+        const auto count = std::min<std::size_t>(windowCount, header.elementCount - offset);
+        if (!attributes.WriteAttributeRange(attrIndex, header.elementOffset + offset, count,
+                decodedBlockBytes.data() + offset * tupleBytes, count * tupleBytes, error)) { return false; }
+        offset += count;
+    }
+    return true;
 }
 
 struct AttributeReferenceRangeObservation {
@@ -630,13 +622,6 @@ struct AttributeDecodeTimingDetail {
     std::size_t layeredResidualBlocks{0u};
     std::size_t regionLayerCount{0u};
     std::size_t componentLayoutCount{0u};
-    ParamSize estimatedDecodeCost{0u};
-    ParamSize criticalPathCost{0u};
-    double readyOffsetMs{0.0};
-    double startOffsetMs{0.0};
-    double finishOffsetMs{0.0};
-    double readyWaitMs{0.0};
-    std::size_t workerIndex{kInvalidParallelWorkerIndex};
     double elapsedMs{0.0};
     double payloadBlockReadMs{0.0};
     double ordinaryDecodeMs{0.0};
@@ -658,7 +643,6 @@ struct AttributeDecodeTimingDetail {
     ParamSize predictorShiftedCopyBytes{0u};
     ParamSize waveletLowBlobBytes{0u};
     ParamSize waveletHighBlobBytes{0u};
-    ParamSize waveletPeakTemporaryDoubleBytes{0u};
     ParamSize cacheWriteBytes{0u};
     std::size_t temporalKeyFieldCacheHits{0u};
     std::size_t temporalKeyFieldCacheMisses{0u};
@@ -688,7 +672,6 @@ struct AttributeDecodeWorkBreakdown {
     ParamSize predictorShiftedCopyBytes{0u};
     ParamSize waveletLowBlobBytes{0u};
     ParamSize waveletHighBlobBytes{0u};
-    ParamSize waveletPeakTemporaryDoubleBytes{0u};
     ParamSize cacheWriteBytes{0u};
     std::size_t temporalKeyFieldCacheHits{0u};
     std::size_t temporalKeyFieldCacheMisses{0u};
@@ -753,37 +736,10 @@ inline bool IsTemporalReferenceFieldCached(
         attributeKeyFrameReference->store->Complete(referenceAttrIndex);
 }
 
-inline ParamSize AttributeDecodeRuntimeCostForScheduling(const AttrStorageParams& meta) noexcept {
-    const auto rawBytes = NumericArrayRawValueBytes(meta);
-    auto cost = EstimateAttributeDecodeCost(meta);
-    cost = SaturatingParamSizeAdd(cost, rawBytes);
-    if (NumericArrayValueSize(meta) >= 8u || meta.dataType == DataType::Float64) {
-        cost = SaturatingParamSizeAdd(cost, rawBytes);
-    } else {
-        cost = SaturatingParamSizeAdd(cost, rawBytes / 2u);
-    }
-    if (meta.dimension > 1) {
-        cost = SaturatingParamSizeAdd(cost, rawBytes / 2u);
-    }
-    if (meta.elementCount >= 1024u * 1024u) {
-        cost = SaturatingParamSizeAdd(
-            cost,
-            SaturatingParamSizeMultiply(
-                meta.elementCount,
-                std::max<ParamSize>(NumericArrayValueSize(meta), 1u)));
-    }
-    return cost;
-}
-
 inline AttributeDecodeTimingDetail BuildAttributeDecodeTimingDetail(
     const std::size_t attrIndex,
     const AttrStorageParams& meta,
     const double elapsedMs,
-    const double readyOffsetMs,
-    const double startOffsetMs,
-    const double finishOffsetMs,
-    const double readyWaitMs,
-    const std::size_t workerIndex,
     const AttributeDecodeWorkBreakdown& workBreakdown = {}) {
     AttributeDecodeTimingDetail detail;
     detail.attrIndex = attrIndex;
@@ -794,13 +750,6 @@ inline AttributeDecodeTimingDetail BuildAttributeDecodeTimingDetail(
     detail.binaryCount = meta.binaryCount;
     detail.dimension = meta.dimension;
     detail.valueSize = NumericArrayValueSize(meta);
-    detail.estimatedDecodeCost = AttributeDecodeRuntimeCostForScheduling(meta);
-    detail.criticalPathCost = std::max(meta.decodeScheduleHint.criticalPathCost, detail.estimatedDecodeCost);
-    detail.readyOffsetMs = readyOffsetMs;
-    detail.startOffsetMs = startOffsetMs;
-    detail.finishOffsetMs = finishOffsetMs;
-    detail.readyWaitMs = readyWaitMs;
-    detail.workerIndex = workerIndex;
     detail.elapsedMs = elapsedMs;
     detail.payloadBlockReadMs = workBreakdown.payloadBlockReadMs;
     detail.ordinaryDecodeMs = workBreakdown.ordinaryDecodeMs;
@@ -822,7 +771,6 @@ inline AttributeDecodeTimingDetail BuildAttributeDecodeTimingDetail(
     detail.predictorShiftedCopyBytes = workBreakdown.predictorShiftedCopyBytes;
     detail.waveletLowBlobBytes = workBreakdown.waveletLowBlobBytes;
     detail.waveletHighBlobBytes = workBreakdown.waveletHighBlobBytes;
-    detail.waveletPeakTemporaryDoubleBytes = workBreakdown.waveletPeakTemporaryDoubleBytes;
     detail.cacheWriteBytes = workBreakdown.cacheWriteBytes;
     detail.temporalKeyFieldCacheHits = workBreakdown.temporalKeyFieldCacheHits;
     detail.temporalKeyFieldCacheMisses = workBreakdown.temporalKeyFieldCacheMisses;
@@ -873,105 +821,22 @@ struct AttributeDecodeData {
     DecodedAttributeReference* attributeKeyFrameReference{nullptr};
 };
 
-struct AttributeDecodeSchedule {
-    std::size_t workerCount{1u};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
-};
-
 struct AttributeDecodeCache {
     const CacheResources& cacheResources;
     bytestore::ByteStoreSession& byteStoreSession;
     DecodedAttributeCacheSet& attributes;
-    std::uint64_t attributeMemoryCacheLimitBytes{0u};
-    DecodeStorageMode attributeCacheStorageMode{DecodeStorageMode::Managed};
 };
 
 struct AttributeDecodeContext {
+    callback::CapacityCallback recordCapacitySamples;
     AttributeDecodeTimingCallback timingCallback;
 };
 
 struct AttributePayloadDecodeRuntime {
     AttributeDecodeData data;
-    AttributeDecodeSchedule schedule;
     AttributeDecodeCache cache;
     AttributeDecodeContext context;
 };
-
-struct AttributeStreamDecodeRuntime {
-    AttributeDecodeData data;
-    AttributeDecodeCache cache;
-};
-
-inline ParamSize AttributeDecodeEstimatedCostForScheduling(const AttrStorageParams& meta) noexcept {
-    const auto storedCost = meta.decodeScheduleHint.estimatedDecodeCost != 0u
-        ? meta.decodeScheduleHint.estimatedDecodeCost
-        : EstimateAttributeDecodeCost(meta);
-    return std::max(storedCost, AttributeDecodeRuntimeCostForScheduling(meta));
-}
-
-inline ParamSize AttributeDecodeCriticalCostForScheduling(const AttrStorageParams& meta) noexcept {
-    return std::max(
-        meta.decodeScheduleHint.criticalPathCost,
-        AttributeDecodeEstimatedCostForScheduling(meta));
-}
-
-inline ParamSize AttributeDecodeReadyWaitBoostCost(const double readyWaitMs) noexcept {
-    constexpr double kAgingStartMs = 2000.0;
-    constexpr double kAgingCostPerMs = 16.0 * 1024.0;
-    constexpr double kAgingCapMs = 3000.0;
-    if (readyWaitMs <= kAgingStartMs) {
-        return 0u;
-    }
-    const auto effectiveWaitMs = std::min(readyWaitMs - kAgingStartMs, kAgingCapMs);
-    return static_cast<ParamSize>(effectiveWaitMs * kAgingCostPerMs);
-}
-
-inline bool AttributeDecodeSchedulePriorityLess(
-    const CodecStorageParams& storageParams,
-    const std::size_t leftIndex,
-    const std::size_t rightIndex) noexcept {
-    const auto& left = storageParams.attrParams[leftIndex];
-    const auto& right = storageParams.attrParams[rightIndex];
-    const auto leftCriticalCost = AttributeDecodeCriticalCostForScheduling(left);
-    const auto rightCriticalCost = AttributeDecodeCriticalCostForScheduling(right);
-    if (leftCriticalCost != rightCriticalCost) {
-        return leftCriticalCost < rightCriticalCost;
-    }
-    const auto leftOwnCost = AttributeDecodeEstimatedCostForScheduling(left);
-    const auto rightOwnCost = AttributeDecodeEstimatedCostForScheduling(right);
-    if (leftOwnCost != rightOwnCost) {
-        return leftOwnCost < rightOwnCost;
-    }
-    if (left.binaryCount != right.binaryCount) {
-        return left.binaryCount < right.binaryCount;
-    }
-    const auto leftRawBytes = NumericArrayRawValueBytes(left);
-    const auto rightRawBytes = NumericArrayRawValueBytes(right);
-    if (leftRawBytes != rightRawBytes) {
-        return leftRawBytes < rightRawBytes;
-    }
-    return leftIndex > rightIndex;
-}
-
-inline bool AttributeDecodeDynamicSchedulePriorityLess(
-    const CodecStorageParams& storageParams,
-    const std::size_t leftIndex,
-    const std::size_t rightIndex,
-    const double leftReadyWaitMs,
-    const double rightReadyWaitMs) noexcept {
-    const auto& left = storageParams.attrParams[leftIndex];
-    const auto& right = storageParams.attrParams[rightIndex];
-    const auto leftScore = SaturatingParamSizeAdd(
-        AttributeDecodeCriticalCostForScheduling(left),
-        AttributeDecodeReadyWaitBoostCost(leftReadyWaitMs));
-    const auto rightScore = SaturatingParamSizeAdd(
-        AttributeDecodeCriticalCostForScheduling(right),
-        AttributeDecodeReadyWaitBoostCost(rightReadyWaitMs));
-    if (leftScore != rightScore) {
-        return leftScore < rightScore;
-    }
-    return AttributeDecodeSchedulePriorityLess(storageParams, leftIndex, rightIndex);
-}
 
 inline bool ResolveAttributeIntraParents(
     const CodecStorageParams& storageParams,
@@ -998,230 +863,270 @@ inline bool ResolveAttributeIntraParents(
     return true;
 }
 
+struct AttributeDecodedBlock {
+    std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
+    NumericArrayBlockHeader header;
+    ScratchByteBuffer bytes;
+    AttributeDecodeWorkBreakdown work;
+};
+
+inline void AccumulateAttributeDecodeWork(
+    AttributeDecodeWorkBreakdown& total, const AttributeDecodeWorkBreakdown& block) noexcept {
+    total.payloadBlockReadMs += block.payloadBlockReadMs;
+    total.ordinaryDecodeMs += block.ordinaryDecodeMs;
+    total.referenceResolveMs += block.referenceResolveMs;
+    total.temporalKeyReferenceEnsureMs += block.temporalKeyReferenceEnsureMs;
+    total.referenceRangeResolveMs += block.referenceRangeResolveMs;
+    total.referenceDecodeMs += block.referenceDecodeMs;
+    total.affineReferenceDecodeMs += block.affineReferenceDecodeMs;
+    total.waveletReferenceDecodeMs += block.waveletReferenceDecodeMs;
+    total.predictorReferenceDecodeMs += block.predictorReferenceDecodeMs;
+    total.cacheWriteMs += block.cacheWriteMs;
+    total.ordinaryDecodedBytes = SaturatingParamSizeAdd(total.ordinaryDecodedBytes, block.ordinaryDecodedBytes);
+    total.referenceDecodedBytes = SaturatingParamSizeAdd(total.referenceDecodedBytes, block.referenceDecodedBytes);
+    total.referenceBytesRead = SaturatingParamSizeAdd(total.referenceBytesRead, block.referenceBytesRead);
+    total.intraReferenceWorksetBytes = SaturatingParamSizeAdd(total.intraReferenceWorksetBytes, block.intraReferenceWorksetBytes);
+    total.temporalReferenceWorksetBytes = SaturatingParamSizeAdd(total.temporalReferenceWorksetBytes, block.temporalReferenceWorksetBytes);
+    total.resampledReferenceWorksetBytes = SaturatingParamSizeAdd(total.resampledReferenceWorksetBytes, block.resampledReferenceWorksetBytes);
+    total.predictorRangeStagingBytes = SaturatingParamSizeAdd(total.predictorRangeStagingBytes, block.predictorRangeStagingBytes);
+    total.predictorShiftedCopyBytes = SaturatingParamSizeAdd(total.predictorShiftedCopyBytes, block.predictorShiftedCopyBytes);
+    total.waveletLowBlobBytes = SaturatingParamSizeAdd(total.waveletLowBlobBytes, block.waveletLowBlobBytes);
+    total.waveletHighBlobBytes = SaturatingParamSizeAdd(total.waveletHighBlobBytes, block.waveletHighBlobBytes);
+    total.cacheWriteBytes = SaturatingParamSizeAdd(total.cacheWriteBytes, block.cacheWriteBytes);
+    total.temporalKeyFieldCacheHits = SaturatingParamSizeAdd(total.temporalKeyFieldCacheHits, block.temporalKeyFieldCacheHits);
+    total.temporalKeyFieldCacheMisses = SaturatingParamSizeAdd(total.temporalKeyFieldCacheMisses, block.temporalKeyFieldCacheMisses);
+    total.predictorZeroOffsetBlocks = SaturatingParamSizeAdd(total.predictorZeroOffsetBlocks, block.predictorZeroOffsetBlocks);
+    total.predictorContinuousShiftBlocks = SaturatingParamSizeAdd(total.predictorContinuousShiftBlocks, block.predictorContinuousShiftBlocks);
+    total.predictorBoundaryClampBlocks = SaturatingParamSizeAdd(total.predictorBoundaryClampBlocks, block.predictorBoundaryClampBlocks);
+}
+
+inline bool ComputeAttributeDecodedBlock(
+    const CodecStorageParams& storageParams, const AttrStorageParams& meta,
+    const DecodedAttributeCacheSet& attributes, DecodedAttributeReference* attributeKeyFrameReference,
+    const numericarray::NumericArrayBlockPayload& input, AttributeDecodedBlock& output,
+    WorkerContext& worker, const bool collectTiming, std::string* error) {
+    const auto block = numericarray::MakeParsedBlockView(input);
+    output.header = input.header;
+    output.bytes = worker.Scratch().Acquire(0u);
+    auto& decodedBlockBytes = output.bytes.Bytes();
+    auto* capacitySamples = output.capacitySamples ? &*output.capacitySamples : nullptr;
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(numericarray::NumericBufferSample::EncodedInput, input.bytes.Bytes());
+    }
+    auto* workBreakdown = collectTiming ? &output.work : nullptr;
+    if (UsesNonReferenceCodec(block)) {
+        const auto decodeStart = callback::StartTiming(workBreakdown != nullptr);
+        if (!ResolveDecodedBlockBytes(meta, block, decodedBlockBytes, error, &worker.NumericCompressor(), capacitySamples)) {
+            return false;
+        }
+        if (workBreakdown != nullptr) {
+            workBreakdown->ordinaryDecodeMs += callback::ElapsedMilliseconds(decodeStart);
+            workBreakdown->ordinaryDecodedBytes = SaturatingParamSizeAdd(
+                workBreakdown->ordinaryDecodedBytes,
+                static_cast<ParamSize>(decodedBlockBytes.size()));
+        }
+    } else {
+        const ScratchByteBuffer* referenceBytes = nullptr;
+        ScratchByteBuffer intraReferenceBytes;
+        ScratchByteBuffer resampledReferenceBytes;
+        ScratchByteBuffer shiftedPredictorBlockBytes;
+        std::size_t referenceElementOffset = 0u;
+        const auto referenceResolveStart = callback::StartTiming(workBreakdown != nullptr);
+        if (block.header.referenceKind == NumericArrayReferenceKind::IntraArray) {
+            const auto parentIndex = static_cast<std::size_t>(block.header.localParentFieldIndex);
+            if (parentIndex >= storageParams.attrParams.size() || !attributes.Complete(parentIndex)) {
+                return validation::AssignError(error, "attribute intra-field parent is not decoded");
+            }
+        }
+        AttributeReferenceRangeObservation rangeObservation;
+        const auto referenceRangeResolveStart = callback::StartTiming(workBreakdown != nullptr);
+        if (!ResolveReferenceBytesForBlock(
+                storageParams,
+                attributes,
+                block,
+                meta,
+                attributeKeyFrameReference,
+                worker.Scratch(),
+                referenceBytes,
+                intraReferenceBytes,
+                resampledReferenceBytes,
+                shiftedPredictorBlockBytes,
+                referenceElementOffset,
+                &rangeObservation,
+                error)) {
+            return false;
+        }
+        if (capacitySamples != nullptr) {
+            capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, intraReferenceBytes.Bytes());
+            capacitySamples->Observe(numericarray::NumericBufferSample::ReferenceResampled, resampledReferenceBytes.Bytes());
+            capacitySamples->Observe(numericarray::NumericBufferSample::ReferenceShifted, shiftedPredictorBlockBytes.Bytes());
+        }
+        if (workBreakdown != nullptr) {
+            workBreakdown->referenceResolveMs += callback::ElapsedMilliseconds(referenceResolveStart);
+            workBreakdown->referenceRangeResolveMs +=
+                callback::ElapsedMilliseconds(referenceRangeResolveStart);
+            workBreakdown->referenceBytesRead = SaturatingParamSizeAdd(
+                workBreakdown->referenceBytesRead,
+                static_cast<ParamSize>(referenceBytes->Span().size()));
+            AccumulateAttributeReferenceRangeObservation(*workBreakdown, rangeObservation);
+        }
+
+        const auto* codec = ResolveNumericArrayReferenceCodec(block.header.codecId);
+        if (codec == nullptr) {
+            return validation::AssignError(error, "unsupported attribute reference codec");
+        }
+        const auto referenceDecodeStart = callback::StartTiming(workBreakdown != nullptr);
+        NumericArrayReferenceCodecDecodeTelemetry codecTelemetry;
+        if (!codec->DecodeBlock(
+                NumericArrayReferenceCodecDecodeInput{
+                    .meta = meta,
+                    .block = block,
+                    .referenceBytes = referenceBytes->Span(),
+                    .referenceElementOffset = referenceElementOffset,
+                    .telemetry = workBreakdown != nullptr ? &codecTelemetry : nullptr,
+                    .compressorState = &worker.NumericCompressor(),
+                    .capacitySamples = capacitySamples,
+                },
+                decodedBlockBytes,
+                error)) {
+            return false;
+        }
+        if (workBreakdown != nullptr) {
+            const auto referenceDecodeMs = callback::ElapsedMilliseconds(referenceDecodeStart);
+            workBreakdown->referenceDecodeMs += referenceDecodeMs;
+            switch (block.header.codecId) {
+                case NumericArrayReferenceCodecId::Affine:
+                    workBreakdown->affineReferenceDecodeMs += referenceDecodeMs;
+                    break;
+                case NumericArrayReferenceCodecId::Wavelet:
+                    workBreakdown->waveletReferenceDecodeMs += referenceDecodeMs;
+                    break;
+                case NumericArrayReferenceCodecId::Predictor:
+                    workBreakdown->predictorReferenceDecodeMs += referenceDecodeMs;
+                    break;
+                case NumericArrayReferenceCodecId::NonReference:
+                default:
+                    break;
+            }
+            workBreakdown->referenceDecodedBytes = SaturatingParamSizeAdd(
+                workBreakdown->referenceDecodedBytes,
+                static_cast<ParamSize>(decodedBlockBytes.size()));
+            workBreakdown->waveletLowBlobBytes = SaturatingParamSizeAdd(
+                workBreakdown->waveletLowBlobBytes,
+                codecTelemetry.waveletLowBlobBytes);
+            workBreakdown->waveletHighBlobBytes = SaturatingParamSizeAdd(
+                workBreakdown->waveletHighBlobBytes,
+                codecTelemetry.waveletHighBlobBytes);
+        }
+    }
+
+    return true;
+}
+
 template<typename TPayloadBacking, typename TReferenceDecoder>
 inline bool DecodeSingleAttributeRangeToCache(
-    const CodecStorageParams& storageParams,
-    const CacheResources& runtime,
-    DecodedAttributeCacheSet& attributes,
-    DecodedAttributeReference* attributeKeyFrameReference,
-    const TPayloadBacking& payloadBacking,
-    const AttributePayloadRange& payloadRange,
-    TReferenceDecoder& referenceDecoder,
-    AttributeDecodeWorkBreakdown* workBreakdown = nullptr,
-    std::string* error = nullptr) {
+    const CodecStorageParams& storageParams, const CacheResources& runtime,
+    DecodedAttributeCacheSet& attributes, DecodedAttributeReference* attributeKeyFrameReference,
+    const TPayloadBacking& payloadBacking, const AttributePayloadRange& payloadRange,
+    TReferenceDecoder& referenceDecoder, AttributeDecodeWorkBreakdown* workBreakdown = nullptr,
+    std::string* error = nullptr, const callback::CapacityCallback& recordCapacitySamples = {}) {
     if (payloadRange.attrIndex >= storageParams.attrParams.size()) {
         return validation::AssignError(error, "attribute payload range index is out of range");
     }
     const auto& meta = storageParams.attrParams[payloadRange.attrIndex];
-    if (payloadRange.byteCount != static_cast<std::uint64_t>(meta.binaryCount)) {
-        return validation::AssignError(error, "attribute payload range size does not match metadata");
+    const auto backingBytes = AttributePayloadBackingByteSize(payloadBacking);
+    if (payloadRange.byteCount != meta.binaryCount || payloadRange.offset > backingBytes ||
+        payloadRange.byteCount > backingBytes - payloadRange.offset) {
+        return validation::AssignError(error, "attribute payload range does not match its backing and metadata");
     }
-    const auto backingByteSize = AttributePayloadBackingByteSize(payloadBacking);
-    if (payloadRange.offset > backingByteSize ||
-        payloadRange.byteCount > backingByteSize - payloadRange.offset) {
-        return validation::AssignError(error, "attribute payload range exceeds backing bytes");
-    }
-    if (!attributes.BeginAttribute(payloadRange.attrIndex, meta, error)) {
-        return false;
-    }
-
-    if (payloadRange.byteCount == 0u) {
-        if (meta.elementCount != 0u) {
-            return validation::AssignError(error, "attribute payload is empty for a non-empty field");
-        }
-        return attributes.EndAttribute(payloadRange.attrIndex, error);
-    }
-
-    if (meta.blockLayouts.empty()) {
-        return validation::AssignError(error, "attribute params are missing block layout metadata");
-    }
-
+    numericarray::NumericArrayBlockParams params;
+    if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) { return false; }
     AttributePayloadRangeStream stream(payloadBacking, payloadRange.offset, payloadRange.byteCount);
-    std::uint64_t decodedElements = 0u;
-    for (const auto& blockLayout : meta.blockLayouts) {
-        numericarray::NumericArrayBlockPayload ownedBlock;
-        const auto blockReadStart = callback::StartTiming(workBreakdown != nullptr);
-        if (!numericarray::ReadNumericArrayBlockPayload(
-                stream,
-                static_cast<std::size_t>(std::max(meta.dimension, 0)),
-                blockLayout,
-                runtime,
-                ownedBlock,
-                error)) {
-            return false;
+    numericarray::NumericDecodeCursor<AttributePayloadRangeStream> cursor{stream, params, meta.blockLayouts, runtime};
+    if (!cursor.Prepare(error)) { return false; }
+    std::uint64_t payloadBytes = 0u;
+    bool needsTemporal = false;
+    for (const auto& layout : meta.blockLayouts) {
+        if (!validation::CheckedAddU64(payloadBytes, layout.encodedByteLength, payloadBytes,
+                "attribute block payload bytes", error)) { return false; }
+        needsTemporal |= layout.referenceKind == NumericArrayReferenceKind::TemporalKeyFrame;
+        if (layout.referenceKind == NumericArrayReferenceKind::IntraArray &&
+            !attributes.Complete(layout.localParentFieldIndex)) {
+            return validation::AssignError(error, "attribute intra-field parent must be complete before block admission");
         }
+    }
+    if (payloadBytes != payloadRange.byteCount) {
+        return validation::AssignError(error, "attribute block payload sizes do not cover the field");
+    }
+    // 前驱准备先于目标 Begin 与块准入，禁止计算任务等待同池解码依赖
+    if (needsTemporal) {
+        if (attributeKeyFrameReference == nullptr) {
+            return validation::AssignError(error, "attribute temporal reference is missing");
+        }
+        const auto start = callback::StartTiming(workBreakdown != nullptr);
+        const bool cached = IsTemporalReferenceFieldCached(attributeKeyFrameReference, meta);
+        if (!EnsureTemporalReferencesDecoded(attributeKeyFrameReference, meta, referenceDecoder, error)) { return false; }
         if (workBreakdown != nullptr) {
-            workBreakdown->payloadBlockReadMs += callback::ElapsedMilliseconds(blockReadStart);
-        }
-        if (stream.Position() > payloadRange.byteCount) {
-            return validation::AssignError(error, "attribute decode consumed bytes beyond payload");
-        }
-        const auto block = MakeParsedBlockView(ownedBlock);
-        if (block.header.elementCount == 0u ||
-            block.header.elementOffset != decodedElements ||
-            decodedElements > meta.elementCount ||
-            block.header.elementCount > meta.elementCount - decodedElements) {
-            return validation::AssignError(error, "attribute block range is not contiguous");
-        }
-
-        std::vector<std::uint8_t> decodedBlockBytes;
-        if (UsesNonReferenceCodec(block)) {
-            const auto decodeStart = callback::StartTiming(workBreakdown != nullptr);
-            if (!ResolveDecodedBlockBytes(meta, block, decodedBlockBytes, error)) {
-                return false;
-            }
-            if (workBreakdown != nullptr) {
-                workBreakdown->ordinaryDecodeMs += callback::ElapsedMilliseconds(decodeStart);
-                workBreakdown->ordinaryDecodedBytes = SaturatingParamSizeAdd(
-                    workBreakdown->ordinaryDecodedBytes,
-                    static_cast<ParamSize>(decodedBlockBytes.size()));
-            }
-        } else {
-            const ScratchByteBuffer* referenceBytes = nullptr;
-            ScratchByteBuffer intraReferenceBytes;
-            ScratchByteBuffer resampledReferenceBytes;
-            ScratchByteBuffer shiftedPredictorBlockBytes;
-            std::size_t referenceElementOffset = 0u;
-            const auto referenceResolveStart = callback::StartTiming(workBreakdown != nullptr);
-            if (block.header.referenceKind == NumericArrayReferenceKind::TemporalKeyFrame) {
-                const auto temporalKeyReferenceEnsureStart = callback::StartTiming(workBreakdown != nullptr);
-                const auto temporalKeyFieldCached =
-                    IsTemporalReferenceFieldCached(attributeKeyFrameReference, meta);
-                if (workBreakdown != nullptr) {
-                    if (temporalKeyFieldCached) {
-                        ++workBreakdown->temporalKeyFieldCacheHits;
-                    } else {
-                        ++workBreakdown->temporalKeyFieldCacheMisses;
-                    }
-                }
-                if (!EnsureTemporalReferencesDecoded(
-                        attributeKeyFrameReference,
-                        meta,
-                        referenceDecoder,
-                        error)) {
-                    return false;
-                }
-                if (workBreakdown != nullptr) {
-                    workBreakdown->temporalKeyReferenceEnsureMs +=
-                        callback::ElapsedMilliseconds(temporalKeyReferenceEnsureStart);
-                }
-            }
-            if (block.header.referenceKind == NumericArrayReferenceKind::IntraArray) {
-                const auto parentIndex = static_cast<std::size_t>(block.header.localParentFieldIndex);
-                if (parentIndex >= storageParams.attrParams.size() || !attributes.Complete(parentIndex)) {
-                    return validation::AssignError(error, "attribute intra-field parent is not decoded");
-                }
-            }
-            AttributeReferenceRangeObservation rangeObservation;
-            const auto referenceRangeResolveStart = callback::StartTiming(workBreakdown != nullptr);
-            if (!ResolveReferenceBytesForBlock(
-                    storageParams,
-                    attributes,
-                    block,
-                    meta,
-                    attributeKeyFrameReference,
-                    runtime.scratchBytePool,
-                    referenceBytes,
-                    intraReferenceBytes,
-                    resampledReferenceBytes,
-                    shiftedPredictorBlockBytes,
-                    referenceElementOffset,
-                    &rangeObservation,
-                    error)) {
-                return false;
-            }
-            if (workBreakdown != nullptr) {
-                workBreakdown->referenceResolveMs += callback::ElapsedMilliseconds(referenceResolveStart);
-                workBreakdown->referenceRangeResolveMs +=
-                    callback::ElapsedMilliseconds(referenceRangeResolveStart);
-                workBreakdown->referenceBytesRead = SaturatingParamSizeAdd(
-                    workBreakdown->referenceBytesRead,
-                    static_cast<ParamSize>(referenceBytes->Span().size()));
-                AccumulateAttributeReferenceRangeObservation(*workBreakdown, rangeObservation);
-            }
-
-            const auto* codec = ResolveNumericArrayReferenceCodec(block.header.codecId);
-            if (codec == nullptr) {
-                return validation::AssignError(error, "unsupported attribute reference codec");
-            }
-            const auto referenceDecodeStart = callback::StartTiming(workBreakdown != nullptr);
-            NumericArrayReferenceCodecDecodeTelemetry codecTelemetry;
-            if (!codec->DecodeBlock(
-                    NumericArrayReferenceCodecDecodeInput{
-                        .meta = meta,
-                        .block = block,
-                        .referenceBytes = referenceBytes->Span(),
-                        .referenceElementOffset = referenceElementOffset,
-                        .telemetry = workBreakdown != nullptr ? &codecTelemetry : nullptr,
-                    },
-                    decodedBlockBytes,
-                    error)) {
-                return false;
-            }
-            if (workBreakdown != nullptr) {
-                const auto referenceDecodeMs = callback::ElapsedMilliseconds(referenceDecodeStart);
-                workBreakdown->referenceDecodeMs += referenceDecodeMs;
-                switch (block.header.codecId) {
-                    case NumericArrayReferenceCodecId::Affine:
-                        workBreakdown->affineReferenceDecodeMs += referenceDecodeMs;
-                        break;
-                    case NumericArrayReferenceCodecId::Wavelet:
-                        workBreakdown->waveletReferenceDecodeMs += referenceDecodeMs;
-                        break;
-                    case NumericArrayReferenceCodecId::Predictor:
-                        workBreakdown->predictorReferenceDecodeMs += referenceDecodeMs;
-                        break;
-                    case NumericArrayReferenceCodecId::NonReference:
-                    default:
-                        break;
-                }
-                workBreakdown->referenceDecodedBytes = SaturatingParamSizeAdd(
-                    workBreakdown->referenceDecodedBytes,
-                    static_cast<ParamSize>(decodedBlockBytes.size()));
-                workBreakdown->waveletLowBlobBytes = SaturatingParamSizeAdd(
-                    workBreakdown->waveletLowBlobBytes,
-                    codecTelemetry.waveletLowBlobBytes);
-                workBreakdown->waveletHighBlobBytes = SaturatingParamSizeAdd(
-                    workBreakdown->waveletHighBlobBytes,
-                    codecTelemetry.waveletHighBlobBytes);
-                workBreakdown->waveletPeakTemporaryDoubleBytes = std::max(
-                    workBreakdown->waveletPeakTemporaryDoubleBytes,
-                    codecTelemetry.waveletPeakTemporaryDoubleBytes);
-            }
-        }
-
-        const auto writeStart = callback::StartTiming(workBreakdown != nullptr);
-        if (!WriteDecodedAttributeBlock(
-                attributes,
-                payloadRange.attrIndex,
-                meta,
-                block.header,
-                std::span<const std::uint8_t>(decodedBlockBytes.data(), decodedBlockBytes.size()),
-                error)) {
-            return false;
-        }
-        if (workBreakdown != nullptr) {
-            workBreakdown->cacheWriteMs += callback::ElapsedMilliseconds(writeStart);
-            workBreakdown->cacheWriteBytes = SaturatingParamSizeAdd(
-                workBreakdown->cacheWriteBytes,
-                static_cast<ParamSize>(decodedBlockBytes.size()));
-        }
-        if (!validation::CheckedAddU64(
-                decodedElements,
-                block.header.elementCount,
-                decodedElements,
-                "attribute decoded element count",
-                error)) {
-            return false;
+            workBreakdown->temporalKeyReferenceEnsureMs += callback::ElapsedMilliseconds(start);
+            workBreakdown->temporalKeyFieldCacheHits += cached ? 1u : 0u;
+            workBreakdown->temporalKeyFieldCacheMisses += cached ? 0u : 1u;
         }
     }
-    if (decodedElements != meta.elementCount) {
-        return validation::AssignError(error, "attribute decoded blocks did not cover the full field");
-    }
-    if (stream.Position() != payloadRange.byteCount) {
-        return validation::AssignError(error, "attribute decode consumed an unexpected payload size");
-    }
-    return attributes.EndAttribute(payloadRange.attrIndex, error);
+    auto& root = runtime.Run();
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase || !attributes.BeginAttribute(payloadRange.attrIndex, meta, error)) { return false; }
+    struct FieldGuard {
+        DecodedAttributeCacheSet& fields;
+        std::size_t index;
+        ~FieldGuard() { if (!fields.Complete(index)) { fields.ReleaseFieldBytes(index); } }
+    } guard{attributes, payloadRange.attrIndex};
+    if (params.elementCount == 0u) { return attributes.EndAttribute(payloadRange.attrIndex, error); }
+    ParamSize committed = 0u;
+    phase.reset();
+    return RunOrderedBlocks<numericarray::NumericArrayBlockPayload, AttributeDecodedBlock>(
+        root, [&] { return cursor.HasMore(); },
+        [&](numericarray::NumericArrayBlockPayload& input) {
+            const auto start = callback::StartTiming(workBreakdown != nullptr);
+            if (!cursor.ReadNext(input, error)) { return false; }
+            if (workBreakdown != nullptr) { workBreakdown->payloadBlockReadMs += callback::ElapsedMilliseconds(start); }
+            return true;
+        },
+        [&](const numericarray::NumericArrayBlockPayload& input, AttributeDecodedBlock& output, WorkerContext& worker) {
+            std::string localError;
+            if (recordCapacitySamples) { output.capacitySamples.emplace(); }
+            if (!ComputeAttributeDecodedBlock(storageParams, meta, attributes, attributeKeyFrameReference,
+                    input, output, worker, workBreakdown != nullptr, &localError)) {
+                root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+                    "attribute-block-decode", "ComputeAttributeDecodedBlock", localError));
+                return false;
+            }
+            return true;
+        },
+        [&](AttributeDecodedBlock& output) {
+            if (output.header.elementOffset != committed) {
+                return validation::AssignError(error, "attribute commit range is not contiguous");
+            }
+            const auto start = callback::StartTiming(workBreakdown != nullptr);
+            if (!WriteDecodedAttributeBlock(attributes, payloadRange.attrIndex, meta,
+                    output.header, output.bytes.Span(), error)) { return false; }
+            if (workBreakdown != nullptr) {
+                AccumulateAttributeDecodeWork(*workBreakdown, output.work);
+                workBreakdown->cacheWriteMs += callback::ElapsedMilliseconds(start);
+                workBreakdown->cacheWriteBytes = SaturatingParamSizeAdd(
+                    workBreakdown->cacheWriteBytes, output.bytes.Span().size());
+            }
+            if (output.capacitySamples && recordCapacitySamples) {
+                output.capacitySamples->Observe(numericarray::NumericBufferSample::Output, output.bytes.Bytes());
+                try { recordCapacitySamples(output.capacitySamples->values); }
+                catch (...) { root.RecordDiagnosticExportFailure(); }
+            }
+            committed += output.header.elementCount;
+            if (committed != meta.elementCount) { return true; }
+            if (stream.Position() != payloadRange.byteCount) {
+                return validation::AssignError(error, "attribute decode consumed an unexpected payload size");
+            }
+            return attributes.EndAttribute(payloadRange.attrIndex, error);
+        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::AttributeDecode); });
 }
 
 template<typename TPayloadBacking, typename TReferenceDecoder>
@@ -1241,8 +1146,6 @@ inline bool DecodeAttributePayloadRangesToCache(
         !attributes.Initialize(
             storageParams,
             byteStoreSession,
-            decodeRuntime.cache.attributeMemoryCacheLimitBytes,
-            decodeRuntime.cache.attributeCacheStorageMode,
             error)) {
         return false;
     }
@@ -1275,6 +1178,8 @@ inline bool DecodeAttributePayloadRangesToCache(
         }
     }
 
+    std::vector<std::size_t> executionOrder;
+    executionOrder.reserve(attrCount);
     std::vector<std::uint8_t> required(attrCount, 0u);
     std::vector<std::uint8_t> visiting(attrCount, 0u);
     std::function<bool(std::size_t)> requireAttribute;
@@ -1296,6 +1201,7 @@ inline bool DecodeAttributePayloadRangesToCache(
         }
         visiting[attrIndex] = 0u;
         required[attrIndex] = 1u;
+        executionOrder.push_back(attrIndex);
         return true;
     };
     for (const auto attrIndex : targetAttrIndices) {
@@ -1304,424 +1210,25 @@ inline bool DecodeAttributePayloadRangesToCache(
         }
     }
 
-    std::vector<std::vector<std::size_t>> dependents(attrCount);
-    std::vector<std::size_t> remainingDependencies(attrCount, 0u);
-    std::size_t workCount = 0u;
-    for (std::size_t attrIndex = 0; attrIndex < attrCount; ++attrIndex) {
-        if (required[attrIndex] == 0u || attributes.Complete(attrIndex)) {
-            continue;
-        }
-        ++workCount;
-        for (const auto parentIndex : parentsByAttr[attrIndex]) {
-            if (!attributes.Complete(parentIndex)) {
-                ++remainingDependencies[attrIndex];
-                dependents[parentIndex].push_back(attrIndex);
-            }
-        }
-    }
-    if (workCount == 0u) {
-        return true;
-    }
-
-    const auto resolvedWorkerCount = ResolveParallelTaskCount(
-        workCount,
-        decodeRuntime.schedule.parallelTaskRunner,
-        decodeRuntime.schedule.workerCount);
-    InlineParallelTaskRunner inlineRunner;
-    IParallelTaskRunner* runner = resolvedWorkerCount > 1u
-        ? decodeRuntime.schedule.parallelTaskRunner
-        : &inlineRunner;
-    auto taskGroup = runner->CreateGroup();
-    if (taskGroup == nullptr) {
-        return validation::AssignError(error, "attribute decode task group is unavailable");
-    }
-
-    const auto scheduleOriginTime = callback::Now();
-    std::vector<callback::PhaseTimePoint> readyTimes(attrCount, scheduleOriginTime);
-    const auto millisecondsSinceOrigin = [&](const callback::PhaseTimePoint timePoint) {
-        return callback::ElapsedMilliseconds(scheduleOriginTime, timePoint);
-    };
-    const auto millisecondsBetween = [](
-        const callback::PhaseTimePoint begin,
-        const callback::PhaseTimePoint end) {
-        return callback::ElapsedMilliseconds(begin, end);
-    };
-
-    std::vector<std::uint8_t> scheduled(attrCount, 0u);
-    std::vector<std::size_t> readyQueue;
-    readyQueue.reserve(attrCount);
-    std::size_t completedCount = 0u;
-    std::size_t inFlightCount = 0u;
-    std::atomic<std::uint8_t> failed{0u};
-    std::mutex schedulerMutex;
-    std::mutex errorMutex;
-    std::string firstError;
-    std::function<void(std::size_t)> submitAttribute;
     const bool collectTiming = static_cast<bool>(timingCallback);
-
-    const auto pushReadyLocked = [&](const std::size_t attrIndex) {
-        if (scheduled[attrIndex] != 0u) {
-            return;
+    for (const auto attrIndex : executionOrder) {
+        if (attributes.Complete(attrIndex)) { continue; }
+        if (cacheResources.Run().Stopped()) { return false; }
+        AttributeDecodeWorkBreakdown work;
+        const auto start = callback::StartTiming(collectTiming);
+        if (!DecodeSingleAttributeRangeToCache(storageParams, cacheResources, attributes, attributeKeyFrameReference,
+                payloadBacking, rangeByAttr[attrIndex], referenceDecoder, collectTiming ? &work : nullptr, error,
+                decodeRuntime.context.recordCapacitySamples)) {
+            return false;
         }
-        scheduled[attrIndex] = 1u;
-        readyTimes[attrIndex] = callback::Now();
-        readyQueue.push_back(attrIndex);
-    };
-    const auto popBestReadyLocked = [&]() -> std::size_t {
-        const auto now = callback::Now();
-        auto best = std::max_element(
-            readyQueue.begin(),
-            readyQueue.end(),
-            [&](const std::size_t left, const std::size_t right) {
-                return AttributeDecodeDynamicSchedulePriorityLess(
-                    storageParams,
-                    left,
-                    right,
-                    millisecondsBetween(readyTimes[left], now),
-                    millisecondsBetween(readyTimes[right], now));
-            });
-        const auto attrIndex = *best;
-        readyQueue.erase(best);
-        return attrIndex;
-    };
-    const auto collectReadyWorkLocked = [&]() {
-        std::vector<std::size_t> readyAttrs;
-        while (failed.load(std::memory_order_acquire) == 0u &&
-               inFlightCount < resolvedWorkerCount &&
-               !readyQueue.empty()) {
-            readyAttrs.push_back(popBestReadyLocked());
-            ++inFlightCount;
+        if (collectTiming) {
+            timingCallback(BuildAttributeDecodeTimingDetail(attrIndex, storageParams.attrParams[attrIndex],
+                callback::ElapsedMilliseconds(start), work));
         }
-        return readyAttrs;
-    };
-    submitAttribute = [&](const std::size_t attrIndex) {
-        taskGroup->Submit([&, attrIndex]() {
-            if (failed.load(std::memory_order_acquire) != 0u) {
-                return;
-            }
-            const auto& meta = storageParams.attrParams[attrIndex];
-            const auto startTime = callback::StartTiming(collectTiming);
-            const auto workerIndex = collectTiming ? CurrentParallelWorkerIndex() : 0u;
-            AttributeDecodeWorkBreakdown workBreakdown;
-            std::string localError;
-            if (!DecodeSingleAttributeRangeToCache(
-                    storageParams,
-                    cacheResources,
-                    attributes,
-                    attributeKeyFrameReference,
-                    payloadBacking,
-                    rangeByAttr[attrIndex],
-                    referenceDecoder,
-                    collectTiming ? &workBreakdown : nullptr,
-                    &localError)) {
-                failed.store(1u, std::memory_order_release);
-                std::lock_guard<std::mutex> lock(errorMutex);
-                if (firstError.empty()) {
-                    firstError = meta.name.empty()
-                        ? localError
-                        : meta.name + ": " + localError;
-                }
-                return;
-            }
-            if (timingCallback) {
-                const auto finishTime = callback::Now();
-                const auto readyTime = readyTimes[attrIndex];
-                timingCallback(BuildAttributeDecodeTimingDetail(
-                    attrIndex,
-                    meta,
-                    millisecondsBetween(startTime, finishTime),
-                    millisecondsSinceOrigin(readyTime),
-                    millisecondsSinceOrigin(startTime),
-                    millisecondsSinceOrigin(finishTime),
-                    millisecondsBetween(readyTime, startTime),
-                    workerIndex,
-                    workBreakdown));
-            }
-
-            std::vector<std::size_t> newlyReady;
-            {
-                std::lock_guard<std::mutex> lock(schedulerMutex);
-                if (inFlightCount > 0u) {
-                    --inFlightCount;
-                }
-                ++completedCount;
-                for (const auto dependentIndex : dependents[attrIndex]) {
-                    if (remainingDependencies[dependentIndex] > 0u) {
-                        --remainingDependencies[dependentIndex];
-                    }
-                    if (remainingDependencies[dependentIndex] == 0u &&
-                        scheduled[dependentIndex] == 0u) {
-                        pushReadyLocked(dependentIndex);
-                    }
-                }
-                newlyReady = collectReadyWorkLocked();
-            }
-            for (const auto readyIndex : newlyReady) {
-                submitAttribute(readyIndex);
-            }
-        });
-    };
-
-    std::vector<std::size_t> initialReadyAttrs;
-    {
-        std::lock_guard<std::mutex> lock(schedulerMutex);
-        for (std::size_t attrIndex = 0; attrIndex < attrCount; ++attrIndex) {
-            if (required[attrIndex] != 0u &&
-                !attributes.Complete(attrIndex) &&
-                remainingDependencies[attrIndex] == 0u) {
-                pushReadyLocked(attrIndex);
-            }
-        }
-        initialReadyAttrs = collectReadyWorkLocked();
-    }
-    if (initialReadyAttrs.empty()) {
-        return validation::AssignError(error, "attribute decode scheduler detected a dependency cycle");
-    }
-    for (const auto attrIndex : initialReadyAttrs) {
-        submitAttribute(attrIndex);
-    }
-    taskGroup->Wait();
-    if (failed.load(std::memory_order_acquire) != 0u) {
-        std::lock_guard<std::mutex> lock(errorMutex);
-        return validation::AssignError(
-            error,
-            firstError.empty() ? "attribute decode failed" : firstError);
-    }
-    if (completedCount != workCount) {
-        return validation::AssignError(error, "attribute decode scheduler did not complete all requested fields");
     }
     for (const auto attrIndex : targetAttrIndices) {
         if (attrIndex >= attrCount || !attributes.Complete(attrIndex)) {
             return validation::AssignError(error, "requested attribute was not decoded");
-        }
-    }
-    return true;
-}
-
-template<typename TStream, typename TReferenceDecoder>
-inline bool DecodeAttributeToCache(
-    AttributeStreamDecodeRuntime& decodeRuntime,
-    TStream& stream,
-    const std::span<const std::size_t> targetAttrIndices,
-    TReferenceDecoder& referenceDecoder,
-    std::string* error = nullptr) {
-    const auto& storageParams = decodeRuntime.data.storageParams;
-    auto* attributeKeyFrameReference = decodeRuntime.data.attributeKeyFrameReference;
-    const auto& cacheResources = decodeRuntime.cache.cacheResources;
-    auto& byteStoreSession = decodeRuntime.cache.byteStoreSession;
-    auto& attributes = decodeRuntime.cache.attributes;
-    if (!attributes.IsInitialized() &&
-        !attributes.Initialize(storageParams, byteStoreSession, error)) {
-        return false;
-    }
-    std::uint64_t scratchPeakBytes = 0u;
-    const auto updateScratchPeak = [&scratchPeakBytes](const auto&... buffers) {
-        std::uint64_t currentBytes = 0u;
-        ((currentBytes = validation::SaturatingAddU64(
-            currentBytes,
-            static_cast<std::uint64_t>(buffers.capacity()))), ...);
-        scratchPeakBytes = std::max(scratchPeakBytes, currentBytes);
-    };
-
-    std::vector<std::size_t> payloadOrder;
-    if (!ResolveAttributePayloadOrder(storageParams, payloadOrder, error)) {
-        return false;
-    }
-    const auto attrCount = storageParams.attrParams.size();
-    std::vector<std::vector<std::size_t>> parentsByAttr(attrCount);
-    for (std::size_t attrIndex = 0u; attrIndex < attrCount; ++attrIndex) {
-        if (!ResolveAttributeIntraParents(storageParams, attrIndex, parentsByAttr[attrIndex], error)) {
-            return false;
-        }
-    }
-    std::vector<std::uint8_t> required(attrCount, 0u);
-    std::vector<std::uint8_t> visiting(attrCount, 0u);
-    std::function<bool(std::size_t)> requireAttribute;
-    requireAttribute = [&](const std::size_t attrIndex) {
-        if (attrIndex >= attrCount) {
-            return validation::AssignError(error, "attribute target index is out of range");
-        }
-        if (required[attrIndex] != 0u) {
-            return true;
-        }
-        if (visiting[attrIndex] != 0u) {
-            return validation::AssignError(error, "attribute dependency graph contains a cycle");
-        }
-        visiting[attrIndex] = 1u;
-        for (const auto parentIndex : parentsByAttr[attrIndex]) {
-            if (!requireAttribute(parentIndex)) {
-                return false;
-            }
-        }
-        visiting[attrIndex] = 0u;
-        required[attrIndex] = 1u;
-        return true;
-    };
-    for (const auto attrIndex : targetAttrIndices) {
-        if (!requireAttribute(attrIndex)) {
-            return false;
-        }
-    }
-
-    std::vector<std::uint8_t> seen(attrCount, 0u);
-    for (const auto attrIndex : payloadOrder) {
-        const auto& meta = storageParams.attrParams[attrIndex];
-        const auto payloadBytes = static_cast<std::uint64_t>(meta.binaryCount);
-        const auto begin = stream.Position();
-        if (!validation::CanAddU64(begin, payloadBytes)) {
-            validation::AssignError(error, "attribute payload range exceeds stream address space");
-            return false;
-        }
-        const auto end = begin + payloadBytes;
-        if (required[attrIndex] == 0u || attributes.Complete(attrIndex)) {
-            if (!stream.Skip(payloadBytes, error)) {
-                return false;
-            }
-            seen[attrIndex] = attributes.Complete(attrIndex) ? 1u : 0u;
-            continue;
-        }
-        if (!attributes.BeginAttribute(attrIndex, meta, error)) {
-            return false;
-        }
-
-        if (payloadBytes == 0u) {
-            if (meta.elementCount != 0u) {
-                return validation::AssignError(error, "attribute payload is empty for a non-empty field");
-            }
-            if (!attributes.EndAttribute(attrIndex, error)) {
-                return false;
-            }
-            seen[attrIndex] = 1u;
-            continue;
-        }
-
-        if (meta.blockLayouts.empty()) {
-            return validation::AssignError(error, "attribute params are missing block layout metadata");
-        }
-        std::uint64_t decodedElements = 0u;
-        for (const auto& blockLayout : meta.blockLayouts) {
-            numericarray::NumericArrayBlockPayload ownedBlock;
-            if (!numericarray::ReadNumericArrayBlockPayload(
-                    stream,
-                    static_cast<std::size_t>(std::max(meta.dimension, 0)),
-                    blockLayout,
-                    cacheResources,
-                    ownedBlock,
-                    error)) {
-                return false;
-            }
-            if (stream.Position() > end) {
-                return validation::AssignError(error, "attribute decode consumed bytes beyond payload");
-            }
-            const auto block = MakeParsedBlockView(ownedBlock);
-            if (block.header.elementCount == 0u ||
-                block.header.elementOffset != decodedElements ||
-                decodedElements > meta.elementCount ||
-                block.header.elementCount > meta.elementCount - decodedElements) {
-                return validation::AssignError(error, "attribute block range is not contiguous");
-            }
-
-            std::vector<std::uint8_t> decodedBlockBytes;
-            if (UsesNonReferenceCodec(block)) {
-                if (!ResolveDecodedBlockBytes(meta, block, decodedBlockBytes, error)) {
-                    return false;
-                }
-                updateScratchPeak(decodedBlockBytes);
-            } else {
-                const ScratchByteBuffer* referenceBytes = nullptr;
-                ScratchByteBuffer intraReferenceBytes;
-                ScratchByteBuffer resampledReferenceBytes;
-                ScratchByteBuffer shiftedPredictorBlockBytes;
-                std::size_t referenceElementOffset = 0u;
-                if (block.header.referenceKind == NumericArrayReferenceKind::TemporalKeyFrame &&
-                    !EnsureTemporalReferencesDecoded(
-                        attributeKeyFrameReference,
-                        meta,
-                        referenceDecoder,
-                        error)) {
-                    return false;
-                }
-                if (block.header.referenceKind == NumericArrayReferenceKind::IntraArray) {
-                    const auto parentIndex = static_cast<std::size_t>(block.header.localParentFieldIndex);
-                    if (parentIndex >= seen.size() || seen[parentIndex] == 0u) {
-                        return validation::AssignError(
-                            error,
-                            "attribute intra-field parent is not decoded in topology order");
-                    }
-                }
-                if (!ResolveReferenceBytesForBlock(
-                        storageParams,
-                        attributes,
-                        block,
-                        meta,
-                        attributeKeyFrameReference,
-                        cacheResources.scratchBytePool,
-                        referenceBytes,
-                        intraReferenceBytes,
-                        resampledReferenceBytes,
-                        shiftedPredictorBlockBytes,
-                        referenceElementOffset,
-                        nullptr,
-                        error)) {
-                    return false;
-                }
-
-                const auto* codec = ResolveNumericArrayReferenceCodec(block.header.codecId);
-                if (codec == nullptr) {
-                    return validation::AssignError(error, "unsupported attribute reference codec");
-                }
-                if (!codec->DecodeBlock(
-                        NumericArrayReferenceCodecDecodeInput{
-                            .meta = meta,
-                            .block = block,
-                            .referenceBytes = referenceBytes->Span(),
-                            .referenceElementOffset = referenceElementOffset,
-                        },
-                        decodedBlockBytes,
-                        error)) {
-                    return false;
-                }
-                updateScratchPeak(
-                    intraReferenceBytes.Bytes(),
-                    resampledReferenceBytes.Bytes(),
-                    shiftedPredictorBlockBytes.Bytes(),
-                    decodedBlockBytes);
-            }
-
-            if (!WriteDecodedAttributeBlock(
-                    attributes,
-                    attrIndex,
-                    meta,
-                    block.header,
-                    std::span<const std::uint8_t>(decodedBlockBytes.data(), decodedBlockBytes.size()),
-                    error)) {
-                return false;
-            }
-            if (!validation::CheckedAddU64(
-                    decodedElements,
-                    block.header.elementCount,
-                    decodedElements,
-                    "attribute decoded element count",
-                    error)) {
-                return false;
-            }
-        }
-        if (decodedElements != meta.elementCount) {
-            return validation::AssignError(error, "attribute decoded blocks did not cover the full field");
-        }
-
-        if (!attributes.EndAttribute(attrIndex, error)) {
-            return false;
-        }
-        if (stream.Position() != end) {
-            return validation::AssignError(error, "attribute decode consumed an unexpected payload size");
-        }
-        seen[attrIndex] = 1u;
-    }
-
-    for (const auto attrIndex : targetAttrIndices) {
-        if (attrIndex >= attrCount || !attributes.Complete(attrIndex)) {
-            return validation::AssignError(error, "requested attribute reference was not decoded");
         }
     }
     return true;

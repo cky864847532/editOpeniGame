@@ -19,8 +19,7 @@ namespace datacodec {
 class AttributeReferenceDecodeHelper {
 public:
     explicit AttributeReferenceDecodeHelper(const CacheResources& parentRuntime)
-        : m_accessWindowBytes(parentRuntime.accessWindowBytes),
-          m_activeWindowBytes(parentRuntime.activeWindowBytes) {}
+        : m_cacheResources(parentRuntime) {}
 
     bool operator()(
         DecodedAttributeReference& reference,
@@ -43,21 +42,22 @@ public:
             return validation::AssignError(error, "encoded attribute reference field is missing");
         }
 
-        CacheResources cacheResources;
-        cacheResources.Configure(m_accessWindowBytes, m_activeWindowBytes);
-        decodefield::FieldDecodeStreamReader reader;
-        if (!decodefield::OpenLeafPackageFieldDecodeStream(*field, cacheResources, reader, error)) {
-            return false;
-        }
-        decodefield::FieldDecodeByteStream stream(reader);
-
+        const auto& cacheResources = m_cacheResources;
         if (reference.store == nullptr) {
             reference.store = std::make_shared<DecodedAttributeCacheSet>();
         }
         if (reference.byteStoreSession == nullptr) {
             reference.byteStoreSession = std::make_shared<bytestore::ByteStoreSession>();
         }
-        decodeimpl::detail::AttributeStreamDecodeRuntime decodeRuntime{
+        reference.byteStoreSession->BindRun(cacheResources.Run());
+        struct StorageBindingGuard {
+            bytestore::ByteStoreSession& session;
+            ~StorageBindingGuard() { session.UnbindRun(); }
+        } storageBinding{*reference.byteStoreSession};
+        std::shared_ptr<bytestore::IByteSource> payload;
+        if (!decodefield::PrepareLeafPackageFieldPayload(*field, cacheResources,
+                *reference.byteStoreSession, payload, error)) { return false; }
+        decodeimpl::detail::AttributePayloadDecodeRuntime decodeRuntime{
             .data = decodeimpl::detail::AttributeDecodeData{
                 .storageParams = reference.reference.storageParams,
                 .attributeKeyFrameReference = nullptr,
@@ -69,9 +69,9 @@ public:
             },
         };
         const std::array<std::size_t, 1u> targetIndices{referenceAttrIndex};
-        if (!decodeimpl::detail::DecodeAttributeToCache(
+        if (!decodeimpl::detail::DecodeAttributePayloadRangesToCache(
                 decodeRuntime,
-                stream,
+                *payload,
                 targetIndices,
                 *this,
                 error)) {
@@ -85,8 +85,7 @@ public:
     }
 
 private:
-    std::size_t m_accessWindowBytes{kDefaultDecodeAccessWindowBytes};
-    std::uint64_t m_activeWindowBytes{kDefaultDecodeActiveWindowBytes};
+    const CacheResources& m_cacheResources;
 };
 
 } // namespace datacodec

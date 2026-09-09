@@ -50,6 +50,7 @@ bool IGDCAttributeDataSource::Open(const std::string& filePath, std::string* err
         .controlParams = &definition.controlParams,
         .executionOptions = &definition.execution,
         .configurationSource = &definition.source,
+        .resources = DataCodecIOSettings::GetDefaultDecodeResources(),
         .runRecordSink = MakeiGameDataCodecOutputRecordSink(
             {},
             {},

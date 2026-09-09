@@ -5,7 +5,7 @@
 #include "DataCodec/Runtime/Workspace/EncodeLeafWorkspace.h"
 #include "DataCodec/Runtime/Failure/EncodeFailureManagement.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
-#include "DataCodec/Workflow/Encode/Stages/EncodeStageCallbacks.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 #include "DataCodec/Codec/Remap/CellRemapBuilder.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyRemap.h"
 
@@ -18,18 +18,14 @@ inline cellremap::BuildOptions MakeCellRemapOptions(
     EncodeContext& context,
     EncodeLeafWorkspace& workspace,
     const IRemapProvider* pointInverse,
-    WritableRemapProviderFactory providerFactory,
-    const bool useMemoryRemap) {
+    WritableRemapProviderFactory providerFactory) {
     return cellremap::BuildOptions{
+        .resources = context.resources,
         .pointInverse = pointInverse,
         .providerFactory = std::move(providerFactory),
         .byteStoreSession = &workspace.ByteStoreSessionRef(),
-        .scratchBudget = &workspace.CacheResourcesRef().remapScratchBudget,
-        .mortonLeafBudgetBytes = workspace.ResourceBudget().RemapMortonLeafBytes(),
-        .mortonRunBufferBytes = workspace.ResourceBudget().RemapMortonRunBufferBytes(),
-        .useMemoryScratchStore = useMemoryRemap,
         .progressCallback = {},
-        .resourceCallback = MakeEncodeResourceCallback(context),
+        .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
     };
 }
 
@@ -37,13 +33,8 @@ class CellRemapStage final : public EncodeStage {
 public:
     static constexpr std::string_view kTypeName = "CellSpatialPartition";
 
-    explicit CellRemapStage(const EncodeStorageMode storageMode)
-        : m_storageMode(storageMode) {}
-
     const char* Name() const override {
-        return m_storageMode == EncodeStorageMode::Memory
-            ? "CellSpatialPartition.MortonMemory"
-            : "CellSpatialPartition.MortonManaged";
+        return "CellSpatialPartition.Morton";
     }
 
     // 构建拓扑和单元属性共享的单元重排映射状态
@@ -71,12 +62,9 @@ public:
             return EncodeStageExecutionStatus::Failed;
         }
         auto& byteStoreSession = workspace.ByteStoreSessionRef();
-        const bool useMemoryRemap =
-            workspace.ResourceBudget().RemapEncodeStorageMode() == EncodeStorageMode::Memory;
         const auto providerFactory = MakeStoreBackedWritableRemapProviderFactory(
             byteStoreSession,
-            "cell_remap",
-            useMemoryRemap);
+            "cell_remap");
         // Cell Remap 消费明确的 Point Order Source
         const auto pointInverse = workspace.PointInverseOrderSource().Handle();
         if (context.adapter->IsPolyhedronMesh()) {
@@ -88,8 +76,7 @@ public:
                         context,
                         workspace,
                         pointInverse.get(),
-                        providerFactory,
-                        useMemoryRemap),
+                        providerFactory),
                     cellOrderProvider,
                     &cellRangeError)) {
                 FailEncodeStage(
@@ -130,8 +117,7 @@ public:
                     context,
                     workspace,
                     pointInverse.get(),
-                    providerFactory,
-                    useMemoryRemap),
+                    providerFactory),
                 orderProvider,
                 &providerError)) {
             FailEncodeStage(
@@ -154,8 +140,6 @@ public:
         return EncodeStageExecutionStatus::Completed;
     }
 
-private:
-    EncodeStorageMode m_storageMode{EncodeStorageMode::Managed};
 };
 
 } // namespace datacodec

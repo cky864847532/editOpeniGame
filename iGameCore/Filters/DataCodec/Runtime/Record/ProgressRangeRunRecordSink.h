@@ -49,7 +49,7 @@ public:
                     if (mapped.run.parentRunId == 0u) {
                         mapped.run.parentRunId = m_parentRunId;
                     }
-                    m_downstream->Submit(RunRecord{std::move(mapped)});
+                    Forward(RunRecord{std::move(mapped)});
                     return;
                 }
                 if (const auto* end = std::get_if<RunEndRecord>(&record)) {
@@ -57,11 +57,11 @@ public:
                     if (mapped.run.parentRunId == 0u) {
                         mapped.run.parentRunId = m_parentRunId;
                     }
-                    m_downstream->Submit(RunRecord{std::move(mapped)});
+                    Forward(RunRecord{std::move(mapped)});
                     return;
                 }
             }
-            m_downstream->Submit(record);
+            Forward(record);
             return;
         }
 
@@ -80,10 +80,14 @@ public:
                     (mapped.language == DataCodecLanguage::English ? ": " : "：") +
                     mapped.text;
         }
-        m_downstream->Submit(RunRecord{std::move(mapped)});
+        Forward(RunRecord{std::move(mapped)});
     }
 
 private:
+    void Forward(const RunRecord& record) noexcept {
+        if (!m_downstream->TrySubmit(record)) { RecordExportFailure(); }
+    }
+
     IRunRecordSink* m_downstream{nullptr};
     double m_begin{0.0};
     double m_end{1.0};

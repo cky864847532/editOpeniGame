@@ -242,6 +242,7 @@ iGameDataCodecReportFileSink::WriteReportFile(
         report.content.data(),
         static_cast<std::streamsize>(report.content.size()));
     output.flush();
+    output.close();
     if (!output) {
         return {
             .success = false,

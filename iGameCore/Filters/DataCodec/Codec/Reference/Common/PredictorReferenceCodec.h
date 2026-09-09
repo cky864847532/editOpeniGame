@@ -52,6 +52,9 @@ inline NumericArrayReferenceEncodeResult PreparePredictorReferenceBlockTyped(
     const auto* referenceValues = reinterpret_cast<const TValue*>(input.referenceBytes.data());
     prepared.deltaRawBytes = input.AcquireScratch(deltaRawByteCount);
     auto& deltaRaw = prepared.deltaRawBytes.Bytes();
+    if (input.capacitySamples != nullptr) {
+        input.capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePreparedDelta, deltaRaw);
+    }
     double maximumArithmeticError = 0.0;
     for (std::size_t valueIndex = 0; valueIndex < valueCount; ++valueIndex) {
         const auto delta = static_cast<TValue>(
@@ -146,9 +149,12 @@ inline NumericArrayReferenceEncodeResult EncodePreparedPredictorReferenceBlockTy
             deltaBytes,
             bytesCodec,
             &fields.componentLayouts,
-            error)) {
+            error, input.compressorState, input.capacitySamples)) {
         output = {};
         return NumericArrayReferenceEncodeResult::Failed();
+    }
+    if (input.capacitySamples != nullptr) {
+        input.capacitySamples->Observe(numericarray::NumericBufferSample::ReferenceCandidate, deltaBytes);
     }
 
     output.header = NumericArrayBlockHeader{
@@ -266,7 +272,8 @@ public:
         const NumericArrayReferenceCodecDecodeInput& input,
         std::vector<std::uint8_t>& decodedBlockBytes,
         std::string* error = nullptr) const override {
-        if (!DecodeNumericArrayReferenceValueBytes(input.meta, input.block, decodedBlockBytes, error)) {
+        if (!DecodeNumericArrayReferenceValueBytes(input.meta, input.block, decodedBlockBytes,
+                error, input.compressorState, input.capacitySamples)) {
             return false;
         }
         if (input.meta.dataType == DataType::Float32 && NumericArrayValueSize(input.meta) == sizeof(float)) {

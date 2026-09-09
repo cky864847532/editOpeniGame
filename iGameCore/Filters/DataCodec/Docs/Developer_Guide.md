@@ -287,7 +287,7 @@ DataCodec 对外只有两个入口，均为单次同步调用：
 
 **属性**：`BeginAttribute(attrIndex, meta)`（按元数据创建数组）、`WriteAttributeRange(attrIndex, offset, count, data, byteSize)`（按范围写入原始字节）、`EndAttribute(attrIndex)`（挂接并恢复语义角色）。
 
-**能力声明**：`SupportsConcurrentAttributeRangeWrites()`（不同属性的 range 是否可并发写入）、`SupportsAttributeDecodeStore()` / `CreateAttributeDecodeStore`（是否允许 DataCodec 把解码缓存直接放入原生属性存储）。声明决定解码流水线的并行与写入策略。
+**能力声明**：`SupportsAttributeDecodeStore()` / `CreateAttributeDecodeStore` 表示是否允许 DataCodec 把解码缓存直接放入原生属性存储。属性提交的 Begin、范围写入与 End 统一由 driver 串行执行，完整字段按固定 I/O 窗口复制。
 
 **收尾**：`Commit()`（校验并提交结果）、`TakeOutput` 类方法（调用方取回对象）、`ResetOutput()` / `Abort()`（清理半成品，失败路径保证恰好调用一次）。
 

@@ -1,116 +1,58 @@
 #ifndef DATACODEC_RUNTIME_CACHE_LRUCACHEINDEX_H
 #define DATACODEC_RUNTIME_CACHE_LRUCACHEINDEX_H
 
-#include "DataCodec/Validation/Common/DataCodecValidation.h"
-
-#include <algorithm>
-#include <cstdint>
+#include <cstddef>
 #include <list>
 #include <optional>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace datacodec {
 
-// 仅维护LRU顺序和驻留字节账本，条目内容由具体缓存持有
+// 仅维护条目数与 LRU 顺序，数组容量由唯一数据 owner 持有
 template<typename Key, typename Hash>
 class LruCacheIndex final {
 public:
-    void Configure(const std::size_t entryLimit, const std::uint64_t residentLimitBytes) noexcept {
-        m_entryLimit = entryLimit;
-        m_residentLimitBytes = residentLimitBytes;
-    }
+    void Configure(const std::size_t entryLimit) noexcept { m_entryLimit = entryLimit; }
 
     void Touch(const Key& key) {
-        const auto iterator = m_records.find(key);
-        if (iterator == m_records.end()) { return; }
-        m_order.splice(m_order.begin(), m_order, iterator->second.orderIterator);
-        iterator->second.orderIterator = m_order.begin();
+        const auto found = m_records.find(key);
+        if (found != m_records.end()) { m_order.splice(m_order.begin(), m_order, found->second); }
     }
 
-    void InsertOrAssign(
-        const Key& key,
-        const std::uint64_t residentBytes,
-        const bool mostRecent = true) {
-        const auto iterator = m_records.find(key);
-        if (iterator != m_records.end()) {
-            m_residentBytes = iterator->second.residentBytes >= m_residentBytes
-                ? 0u
-                : m_residentBytes - iterator->second.residentBytes;
-            iterator->second.residentBytes = residentBytes;
-            m_residentBytes = validation::SaturatingAddU64(m_residentBytes, residentBytes);
+    void InsertOrAssign(const Key& key, const bool mostRecent = true) {
+        if (m_records.contains(key)) {
             if (mostRecent) { Touch(key); }
-        } else {
-            if (mostRecent) {
-                m_order.push_front(key);
-                m_records.emplace(key, Record{residentBytes, m_order.begin()});
-            } else {
-                m_order.push_back(key);
-                auto position = m_order.end();
-                --position;
-                m_records.emplace(key, Record{residentBytes, position});
-            }
-            m_residentBytes = validation::SaturatingAddU64(m_residentBytes, residentBytes);
+            return;
         }
-        m_peakResidentBytes = std::max(m_peakResidentBytes, m_residentBytes);
+        const auto position = mostRecent ? m_order.insert(m_order.begin(), key) : m_order.insert(m_order.end(), key);
+        try { m_records.emplace(key, position); }
+        catch (...) { m_order.erase(position); throw; }
     }
 
     void Erase(const Key& key) noexcept {
-        const auto iterator = m_records.find(key);
-        if (iterator == m_records.end()) { return; }
-        m_residentBytes = iterator->second.residentBytes >= m_residentBytes
-            ? 0u
-            : m_residentBytes - iterator->second.residentBytes;
-        m_order.erase(iterator->second.orderIterator);
-        m_records.erase(iterator);
+        const auto found = m_records.find(key);
+        if (found == m_records.end()) { return; }
+        m_order.erase(found->second);
+        m_records.erase(found);
     }
 
-    void Clear() noexcept {
-        m_records.clear();
-        m_order.clear();
-        m_residentBytes = 0u;
-    }
-
-    [[nodiscard]] bool OverBudget() const noexcept {
-        const bool entryLimitExceeded = m_entryLimit != 0u && m_records.size() > m_entryLimit;
-        const bool residentLimitExceeded =
-            m_residentLimitBytes != 0u && m_residentBytes > m_residentLimitBytes;
-        return entryLimitExceeded || residentLimitExceeded;
-    }
-
-    [[nodiscard]] bool CanAdmitSingle(const std::uint64_t residentBytes) const noexcept {
-        return (m_entryLimit == 0u || m_entryLimit >= 1u) &&
-            (m_residentLimitBytes == 0u || residentBytes <= m_residentLimitBytes);
-    }
-
+    void Clear() noexcept { m_records.clear(); m_order.clear(); }
+    [[nodiscard]] bool OverBudget() const noexcept { return m_records.size() > m_entryLimit; }
+    [[nodiscard]] bool CanAdmitSingle() const noexcept { return m_entryLimit != 0u; }
+    [[nodiscard]] const Key* LeastRecentlyUsedKey() const noexcept { return m_order.empty() ? nullptr : &m_order.back(); }
     [[nodiscard]] std::optional<Key> LeastRecentlyUsed() const {
         if (m_order.empty()) { return std::nullopt; }
         return m_order.back();
     }
-
-    [[nodiscard]] std::vector<Key> LeastRecentlyUsedOrder() const {
-        return {m_order.rbegin(), m_order.rend()};
-    }
-
+    [[nodiscard]] std::vector<Key> LeastRecentlyUsedOrder() const { return {m_order.rbegin(), m_order.rend()}; }
     [[nodiscard]] std::size_t Size() const noexcept { return m_records.size(); }
-    [[nodiscard]] std::uint64_t ResidentBytes() const noexcept { return m_residentBytes; }
-    [[nodiscard]] std::uint64_t PeakResidentBytes() const noexcept { return m_peakResidentBytes; }
 
 private:
-    struct Record {
-        std::uint64_t residentBytes{0u};
-        typename std::list<Key>::iterator orderIterator;
-    };
-
-    std::size_t m_entryLimit{0u};
-    std::uint64_t m_residentLimitBytes{0u};
-    std::uint64_t m_residentBytes{0u};
-    std::uint64_t m_peakResidentBytes{0u};
+    std::size_t m_entryLimit{1u};
     std::list<Key> m_order;
-    std::unordered_map<Key, Record, Hash> m_records;
+    std::unordered_map<Key, typename std::list<Key>::iterator, Hash> m_records;
 };
 
-} // namespace datacodec
-
+} // DataCodec 命名空间
 #endif

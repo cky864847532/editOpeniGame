@@ -1,9 +1,8 @@
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
+#include "DataCodec/Workflow/Session/CodecRunEntry.h"
 #include "DataCodec/Runtime/Output/DataCodecOutputRouter.h"
 #include "DataCodec/Runtime/Record/RunRecordDispatcher.h"
 
-#include "DataCodec/Runtime/Record/RunRecordEmitter.h"
-#include "DataCodec/Runtime/Record/RunRecordTimestamp.h"
 #include "DataCodec/Workflow/Frame/FrameEncodeExecutor.h"
 #include "DataCodec/Workflow/Leaf/LeafEncodeExecutor.h"
 
@@ -128,38 +127,11 @@ bool ResolveEncodeAttributeTargets(
 }
 
 EncodeResult MakeEncodeEntryFailure(
-    const EncodeRequest& request,
-    std::string code,
-    std::string text) {
-    TelemetryMessageRecord message{
-        .severity = TelemetryMessageSeverity::Error,
-        .origin = "DataCodecEncodeEntry",
-        .code = std::move(code),
-        .text = std::move(text),
-    };
-    RunRecordDispatcher outputRecords;
-    outputRecords.AddSink(request.runRecordSink);
-    if (!request.outputSinks.Empty()) {
-        outputRecords.AddSink(std::make_shared<DataCodecOutputRouter>(request.outputSinks));
-    }
-    RunRecordEmitter records;
-    records.Reset(
-        RunRecordInfo{
-            .generatedAtUtc = runrecorddetail::MakeTimestampUtc(),
-            .runKind = TelemetryRunKind::Encode,
-            .objectName = !request.input.objectName.empty()
-                ? request.input.objectName
-                : request.input.rootName,
-            .leafPath = request.input.leafPath,
-            .meshType = request.input.meshType,
-            .language = request.configuration.language,
-        },
-        &outputRecords);
-    records.BeginRun();
-    records.AddMessage(message);
-    records.EndRun(RunEndRecord{.success = false});
+    const CodecErrorCode code,
+    const std::string_view reason,
+    const std::string_view text) noexcept {
     EncodeResult result;
-    result.messages.push_back(std::move(message));
+    result.failure = MakeCodecFailureRecord(code, reason, "DataCodecEncodeEntry", text);
     return result;
 }
 
@@ -168,6 +140,7 @@ EncodeResult MakeLeafEncodeResult(
     const EncodePackageKind packageKind) {
     EncodeResult output;
     output.success = result.success;
+    output.failure = result.failure;
     output.hasEncodedOutput = result.hasEncodedOutput;
     output.encodedBytes = std::move(result.encodedBytes);
     output.encodedByteCount = result.encodedByteCount;
@@ -185,6 +158,7 @@ EncodeResult MakeFrameEncodeResult(
     const std::size_t leafCount) {
     EncodeResult output;
     output.success = result.success;
+    output.failure = result.failure;
     output.hasEncodedOutput = result.hasEncodedOutput;
     output.encodedBytes = std::move(result.encodedBytes);
     output.encodedByteCount = result.encodedByteCount;
@@ -198,14 +172,7 @@ EncodeResult MakeFrameEncodeResult(
 
 } // 匿名命名空间
 
-EncodeResult Encode(const EncodeRequest& request) {
-    const auto resolvedResources = ResolveDataCodecExecutionResources(
-        request.executionResources);
-    RunRecordDispatcher outputRecords;
-    outputRecords.AddSink(request.runRecordSink);
-    if (!request.outputSinks.Empty()) {
-        outputRecords.AddSink(std::make_shared<DataCodecOutputRouter>(request.outputSinks));
-    }
+EncodeResult EncodeInRun(const EncodeRequest& request, DataCodecExecutionResources& resources) try {
     const auto packageKind = request.output.packageKind;
     const auto outputSinkEntry = std::get_if<IByteRangeOutput*>(&request.output.target);
     const auto leafAdapterEntry = std::get_if<IEncodeAdapter*>(&request.input.adapter);
@@ -220,7 +187,7 @@ EncodeResult Encode(const EncodeRequest& request) {
         (packageKind == EncodePackageKind::FramePackage && !hasBlockTreeAdapter) ||
         (outputSinkEntry != nullptr && outputSink == nullptr)) {
         return MakeEncodeEntryFailure(
-            request,
+            CodecErrorCode::InvalidInput,
             "encode.request.contract",
             "encode request contains an invalid input or output combination");
     }
@@ -234,15 +201,18 @@ EncodeResult Encode(const EncodeRequest& request) {
             attributeTargets,
             attributeSelectionError)) {
         return MakeEncodeEntryFailure(
-            request,
+            CodecErrorCode::InvalidInput,
             "encode.attribute-selection",
-            std::move(attributeSelectionError));
+            attributeSelectionError);
     }
 
-    auto runtimeConfiguration = request.configuration;
-    CodecControlParamsFactory::ApplyEncodeRuntimeConstraint(
-        runtimeConfiguration,
-        runtimeConfiguration.source.runtimeProfile);
+    RunRecordDispatcher outputRecords;
+    outputRecords.AddSink(request.runRecordSink);
+    if (!request.outputSinks.Empty()) {
+        outputRecords.AddSink(std::make_shared<DataCodecOutputRouter>(request.outputSinks));
+    }
+
+    const auto& runtimeConfiguration = request.configuration;
 
     if (blockTreeAdapter != nullptr) {
         const auto leafCount = blockTreeAdapter->GetLeafRecords().size();
@@ -260,14 +230,12 @@ EncodeResult Encode(const EncodeRequest& request) {
                 .runRecordSink = &outputRecords,
                 .outputSink = outputSink,
                 .attributeTargets = std::span<const AttributeTarget>(attributeTargets),
-                .enableParallelStages = runtimeConfiguration.execution.enableParallelStages,
-                .parallelTaskRunner = resolvedResources.parallelTaskRunner,
-            }),
+            }, resources),
             packageKind,
             leafCount);
     }
 
-    EncodeContext context;
+    EncodeContext context(resources);
     context.adapter = leafAdapter;
     context.objectName = request.input.objectName;
     context.meshType = request.input.meshType;
@@ -285,10 +253,45 @@ EncodeResult Encode(const EncodeRequest& request) {
             .language = runtimeConfiguration.language,
             .runRecordSink = &outputRecords,
             .outputSink = outputSink,
-            .enableParallelStages = runtimeConfiguration.execution.enableParallelStages,
-            .parallelTaskRunner = resolvedResources.parallelTaskRunner,
         }),
         packageKind);
+} catch (const std::bad_alloc&) {
+    return MakeEncodeEntryFailure(
+        CodecErrorCode::EncodeFailure, "allocation-failed", "memory allocation failed");
+} catch (const std::exception& exception) {
+    return MakeEncodeEntryFailure(
+        CodecErrorCode::EncodeFailure, "entry-exception", exception.what());
+} catch (...) {
+    return MakeEncodeEntryFailure(
+        CodecErrorCode::EncodeFailure, "entry-exception", "unknown exception");
+}
+
+EncodeResult Encode(const EncodeRequest& request) try {
+    const auto leaf = std::get_if<IEncodeAdapter*>(&request.input.adapter);
+    const auto tree = std::get_if<IBlockTreeAdapter*>(&request.input.adapter);
+    if ((leaf == nullptr || *leaf == nullptr) && (tree == nullptr || *tree == nullptr)) {
+        return MakeEncodeEntryFailure(CodecErrorCode::InvalidInput, "encode.request.contract", "encode input is unavailable");
+    }
+    DataCodecExecutionResources resources(request.resources);
+    if (!resources.BeginRun()) {
+        EncodeResult result;
+        result.failure = resources.FirstFailure();
+        return result;
+    }
+    auto result = EncodeInRun(request, resources);
+    if (result.failure) { resources.RecordFailure(*result.failure); }
+    if (!result.success || resources.Stopped()) { resources.CancelAndWaitRun(); }
+    if (!resources.EndRun() || resources.FirstFailure()) {
+        result.success = false;
+        result.failure = resources.FirstFailure();
+    }
+    return result;
+} catch (const std::bad_alloc&) {
+    return MakeEncodeEntryFailure(CodecErrorCode::EncodeFailure, "allocation-failed", "memory allocation failed");
+} catch (const std::exception& error) {
+    return MakeEncodeEntryFailure(CodecErrorCode::EncodeFailure, "entry-exception", error.what());
+} catch (...) {
+    return MakeEncodeEntryFailure(CodecErrorCode::EncodeFailure, "entry-exception", "unknown exception");
 }
 
 } // namespace datacodec

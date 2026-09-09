@@ -2,7 +2,7 @@
 #define iGameWasmDataCodecBridge_h
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
-#include "DataCodec/API/Adapter/IEncodedInputCache.h"
+#include "DataCodec/Runtime/Cache/EncodedInputTypes.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
 #include "DataCodec/Filter/Adapter/iGamePreparedSurfaceDecodeAdapter.h"
 #include "DataCodec/Runtime/Cache/DecodedFrameLruCache.h"
@@ -27,10 +27,9 @@ struct iGameWasmDataCodecDecodeRequest {
     ::datacodec::DecodeSourceIdentity sourceIdentity;
     bool enableReuseCache{true};
     std::optional<bool> enableEncodedInputCache;
-    std::optional<bool> enableFullInputPrefetch;
     iGameWasmTopologyOutputMode topologyOutputMode{
         iGameWasmTopologyOutputMode::CommitToAdapter};
-    std::shared_ptr<::datacodec::IParallelTaskRunner> parallelTaskRunner;
+    ::datacodec::CodecResourceParams resources;
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink;
 };
 
@@ -46,14 +45,11 @@ struct iGameWasmDataCodecDecodeResult {
     ::datacodec::EncodedInputCacheStats encodedInputCacheStatsAfter;
     bool cacheIdentityAvailable{false};
     bool encodedInputCacheEnabled{false};
-    bool fullInputPrefetchEnabled{false};
+    bool diagnosticsIncomplete{false};
     std::string timingDetail;
     std::string surfaceSummary;
     std::string error;
 };
-
-[[nodiscard]] std::shared_ptr<::datacodec::IParallelTaskRunner>
-MakeiGameWasmDataCodecTaskRunner();
 
 [[nodiscard]] std::future<void> SubmitiGameWasmDataCodecTask(
     std::function<void()> task);
@@ -77,11 +73,11 @@ MakeiGameWasmDataCodecTaskRunner();
     iGameWasmTopologyOutputMode topologyOutputMode =
         iGameWasmTopologyOutputMode::CommitToAdapter,
     std::optional<bool> enableEncodedInputCache = {},
-    std::optional<bool> enableFullInputPrefetch = {},
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
     ::datacodec::DecodeSourceIdentity sourceIdentity = {});
 
 [[nodiscard]] iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecMemory(
+    std::shared_ptr<const void> inputOwner,
     std::span<const std::uint8_t> bytes,
     bool enableReuseCache = true,
     iGameWasmTopologyOutputMode topologyOutputMode =
@@ -95,7 +91,6 @@ MakeiGameWasmDataCodecTaskRunner();
     iGameWasmTopologyOutputMode topologyOutputMode =
         iGameWasmTopologyOutputMode::CommitToAdapter,
     std::optional<bool> enableEncodedInputCache = {},
-    std::optional<bool> enableFullInputPrefetch = {},
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {});
 
 IGAME_NAMESPACE_END

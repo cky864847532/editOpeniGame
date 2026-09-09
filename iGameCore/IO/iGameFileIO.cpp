@@ -470,11 +470,11 @@ DataObject::Pointer FileIO::ReadVTPFromMemory(const void* data, size_t size) {
     return FinalizeLoadedObject(result, "Imported VTP");
 }
 
-DataObject::Pointer FileIO::ReadIGCFromMemory(const void* data, size_t size) {
-    if (data == nullptr || size == 0) return nullptr;
+DataObject::Pointer FileIO::ReadIGCFromMemory(std::shared_ptr<const void> owner, const void* data, size_t size) {
+    if (owner == nullptr || data == nullptr || size == 0) return nullptr;
 
     IGDCReader::Pointer reader = IGDCReader::New();
-    reader->SetMemoryBuffer(data, size);
+    reader->SetMemoryInput(std::move(owner), {static_cast<const std::uint8_t*>(data), size});
     if (!reader->Execute()) { return nullptr; }
 
     auto result = reader->GetOutput();

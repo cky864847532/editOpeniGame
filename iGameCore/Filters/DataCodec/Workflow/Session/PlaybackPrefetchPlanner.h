@@ -19,17 +19,17 @@ enum class PlaybackDirection : std::uint8_t {
 
 class PlaybackPrefetchPlanner final {
 public:
-    void Configure(std::vector<std::uint32_t> frameOrder, const std::size_t prefetchFrames) {
+    void Configure(std::vector<std::uint32_t> frameOrder, const bool enabled) {
         m_frameOrder = std::move(frameOrder);
-        m_prefetchFrames = prefetchFrames;
+        m_enabled = enabled;
         m_ordinals.clear();
         for (std::size_t ordinal = 0u; ordinal < m_frameOrder.size(); ++ordinal) {
             m_ordinals.emplace(m_frameOrder[ordinal], ordinal);
         }
     }
 
-    void SetPrefetchFrameCount(const std::size_t prefetchFrames) noexcept {
-        m_prefetchFrames = prefetchFrames;
+    void SetEnabled(const bool enabled) noexcept {
+        m_enabled = enabled;
     }
 
     [[nodiscard]] std::vector<std::uint32_t> Plan(
@@ -37,7 +37,7 @@ public:
         const PlaybackDirection direction) const {
         std::vector<std::uint32_t> frames;
         const auto iterator = m_ordinals.find(currentFrame);
-        if (iterator == m_ordinals.end() || m_prefetchFrames == 0u) { return frames; }
+        if (iterator == m_ordinals.end() || !m_enabled) { return frames; }
         std::unordered_set<std::uint32_t> seen;
         const auto ordinal = iterator->second;
         if (direction == PlaybackDirection::Forward) {
@@ -46,7 +46,7 @@ public:
             AppendBackward(ordinal, frames, seen);
         } else {
             AppendForward(ordinal, frames, seen);
-            AppendBackward(ordinal, frames, seen);
+            if (frames.empty()) { AppendBackward(ordinal, frames, seen); }
         }
         return frames;
     }
@@ -57,7 +57,7 @@ private:
         std::vector<std::uint32_t>& frames,
         std::unordered_set<std::uint32_t>& seen) const {
         for (std::size_t offset = 1u;
-             offset <= m_prefetchFrames && ordinal + offset < m_frameOrder.size();
+             offset <= 1u && ordinal + offset < m_frameOrder.size();
              ++offset) {
             const auto frame = m_frameOrder[ordinal + offset];
             if (seen.insert(frame).second) { frames.push_back(frame); }
@@ -68,7 +68,7 @@ private:
         const std::size_t ordinal,
         std::vector<std::uint32_t>& frames,
         std::unordered_set<std::uint32_t>& seen) const {
-        for (std::size_t offset = 1u; offset <= m_prefetchFrames && offset <= ordinal; ++offset) {
+        for (std::size_t offset = 1u; offset <= 1u && offset <= ordinal; ++offset) {
             const auto frame = m_frameOrder[ordinal - offset];
             if (seen.insert(frame).second) { frames.push_back(frame); }
         }
@@ -76,7 +76,7 @@ private:
 
     std::vector<std::uint32_t> m_frameOrder;
     std::unordered_map<std::uint32_t, std::size_t> m_ordinals;
-    std::size_t m_prefetchFrames{1u};
+    bool m_enabled{true};
 };
 
 } // namespace datacodec

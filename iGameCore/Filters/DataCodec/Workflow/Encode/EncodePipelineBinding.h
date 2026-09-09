@@ -61,16 +61,9 @@ struct EncodePipelineDescriptor {
     PackageFieldEncodingParams packageFields;
 };
 
-struct EncodePipelineExecutionProfile {
-    EncodeResourceBudgetControlParams resourceBudget;
-    bool enableParallelStages{true};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
-};
-
 struct EncodePipelineBinding {
     EncodePipelineDescriptor descriptor;
     const CodecControlParams* algorithmParams{nullptr};
-    EncodePipelineExecutionProfile executionProfile;
 };
 
 [[nodiscard]] inline bool UsesPointSpatialPartition(
@@ -146,8 +139,9 @@ struct EncodePipelineBinding {
 inline bool ValidateEncodePipelineDescriptor(
     const EncodePipelineDescriptor& descriptor,
     std::string* error = nullptr) {
-    if (descriptor.packageFields.workerCount == 0u) {
-        return validation::AssignError(error, "package field worker count must be positive");
+    if (descriptor.packageFields.mode != PackageFieldEncodingMode::Raw &&
+        descriptor.packageFields.mode != PackageFieldEncodingMode::Zstd) {
+        return validation::AssignError(error, "unsupported package field encoding mode");
     }
     return true;
 }
@@ -155,15 +149,6 @@ inline bool ValidateEncodePipelineDescriptor(
 inline bool ValidateEncodeAlgorithmParams(
     const CodecControlParams& params,
     std::string* error = nullptr) {
-    if (!ValidateEncodeResourceBudgetControlParams(params.resourceBudget, error)) {
-        return false;
-    }
-    if (params.spatialBlockPolicy.pointElementCount == 0u ||
-        params.spatialBlockPolicy.cellElementCount == 0u) {
-        return validation::AssignError(
-            error,
-            "spatial block element counts must be positive");
-    }
     if (params.attrReference.intraField.selectionMode == ReferenceSelectionMode::Forced &&
         params.attrReference.intraField.codec == IntraFieldReferenceCodec::Disabled) {
         return validation::AssignError(
@@ -189,7 +174,6 @@ inline bool ResolveEncodePipelineBinding(
     const IEncodeAdapter& adapter,
     const CodecControlParams& params,
     const EncodePipelineControlParams& pipelineControl,
-    const EncodePipelineExecutionProfile& executionProfile,
     EncodePipelineBinding& binding,
     std::string* error = nullptr,
     const EncodePipelineOutputKind outputKind = EncodePipelineOutputKind::LeafPackage,
@@ -205,16 +189,11 @@ inline bool ResolveEncodePipelineBinding(
         binding = {};
         return false;
     }
-    if (executionProfile.enableParallelStages && executionProfile.parallelTaskRunner == nullptr) {
-        binding = {};
-        return validation::AssignError(error, "parallel DataCodec encode requires a task runner");
-    }
 
     // Binding 只在执行前解析一次，Pipeline 不再重新推导并比较内部生成的配置
     binding = EncodePipelineBinding{
         .descriptor = descriptor,
         .algorithmParams = &params,
-        .executionProfile = executionProfile,
     };
     return true;
 }

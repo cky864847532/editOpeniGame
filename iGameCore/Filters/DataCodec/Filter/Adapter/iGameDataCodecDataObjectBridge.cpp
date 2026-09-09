@@ -2,6 +2,7 @@
 #include "DataCodec/Filter/Adapter/iGameDecodeAdapter.h"
 #include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
 #include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
+#include "DataCodec/Workflow/Session/CodecRunEntry.h"
 #include "DataCodec/Runtime/Record/RunRecordSubmit.h"
 #include "DataCodec/Storage/FramePackage/FramePackageIO.h"
 #include "DataCodec/Storage/Package/PackageBinaryHeader.h"
@@ -54,7 +55,7 @@ void AddDataObjectBridgeMessage(
         std::move(origin),
         std::move(text));
     ::datacodec::SubmitRunMessage(runRecordSink, message);
-    result.messages.push_back(std::move(message));
+    AppendRetainedTelemetryMessage(result.messages, message);
 }
 
 [[nodiscard]] DataCodecDataObjectDecodeResult MakeDecodeFailureResult(
@@ -95,77 +96,6 @@ void AddDataObjectBridgeMessage(
     return result;
 }
 
-class DataObjectDecodeCachePayload final : public ::datacodec::IDecodedFramePayload {
-public:
-    explicit DataObjectDecodeCachePayload(DataObject::Pointer output)
-        : m_output(std::move(output)) {}
-
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-        return m_output != nullptr
-            ? static_cast<std::uint64_t>(m_output->GetRealMemorySize())
-            : 0u;
-    }
-
-private:
-    DataObject::Pointer m_output;
-};
-
-class DataObjectDecodeCacheLease final : public ::datacodec::DecodedFrameLease {
-public:
-    DataObjectDecodeCacheLease(
-        const std::uint32_t frameIndex,
-        DataObject::Pointer output,
-        std::shared_ptr<void> state,
-        const std::uint64_t stateResidentBytes)
-        : m_frameIndex(frameIndex),
-          m_payload(std::make_shared<DataObjectDecodeCachePayload>(std::move(output))),
-          m_state(std::move(state)),
-          m_stateResidentBytes(stateResidentBytes) {}
-
-    [[nodiscard]] std::uint32_t FrameIndex() const noexcept override { return m_frameIndex; }
-    [[nodiscard]] ::datacodec::IDecodedFramePayload::Pointer Payload() const noexcept override {
-        return m_payload;
-    }
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-        return ::datacodec::validation::SaturatingAddU64(
-            m_payload != nullptr ? m_payload->ResidentSizeHint() : 0u,
-            m_stateResidentBytes);
-    }
-    [[nodiscard]] const std::shared_ptr<void>& State() const noexcept { return m_state; }
-
-private:
-    std::uint32_t m_frameIndex{0u};
-    ::datacodec::IDecodedFramePayload::Pointer m_payload;
-    std::shared_ptr<void> m_state;
-    std::uint64_t m_stateResidentBytes{0u};
-};
-
-[[nodiscard]] bool ResolveFrameCacheKey(
-    ::datacodec::IByteRangeReader& inputReader,
-    const bool loadAllAvailableAttributes,
-    ::datacodec::DecodedFrameKey& key,
-    std::string* error = nullptr) {
-    ::datacodec::PackageInspection inspection;
-    if (!::datacodec::InspectPackage(inputReader, inspection, error)) {
-        return false;
-    }
-    std::uint32_t frameIndex = 0u;
-    if (inspection.format == ::datacodec::PackageBinaryFormat::FramePackage) {
-        ::datacodec::FramePackage framePackage;
-        if (!::datacodec::FramePackageIO::ReadMetadata(inputReader, framePackage, error)) {
-            return false;
-        }
-        frameIndex = framePackage.frameIndex;
-    }
-    key = ::datacodec::DecodedFrameKey{
-        .source = std::move(inspection.sourceIdentity),
-        .frameIndex = frameIndex,
-        .resultIdentity = std::string("igame.data-object.decode-session.v1:") +
-            (loadAllAvailableAttributes ? "all-attributes" : "base-frame"),
-    };
-    return true;
-}
-
 } // namespace
 
 struct DataCodecDataObjectDecodeSession::Impl {
@@ -180,8 +110,8 @@ struct DataCodecDataObjectDecodeSession::Impl {
     iGameDecodeAdapter initialLeafAdapter;
     iGameFramePackageDecodeAssembly frameAssembly;
     std::shared_ptr<::datacodec::IByteRangeReader> inputReader;
-    std::shared_ptr<::datacodec::IEncodedInputCache> encodedInputCache;
-    std::shared_ptr<::datacodec::DecodeCacheRuntime> cacheRuntime;
+    std::shared_ptr<::datacodec::EncodedInputLruCache> encodedInputCache;
+    ::datacodec::DecodeCacheRuntime* cacheRuntime{nullptr};
     DataObject::Pointer output;
     ::datacodec::DecodeControlParams controlParams{
         ::datacodec::MakeDefaultDecodeControlParams()};
@@ -190,7 +120,7 @@ struct DataCodecDataObjectDecodeSession::Impl {
     ::datacodec::DataCodecDecodeConfigurationSource configurationSource;
     ::datacodec::DataCodecLanguage language{
         ::datacodec::DataCodecLanguage::SimplifiedChinese};
-    ::datacodec::DataCodecExecutionResources executionResources;
+    std::shared_ptr<::datacodec::DataCodecExecutionResources> executionResources;
     std::uint64_t inputBytes{0u};
     std::map<NativeAttributeKey, int> nativeAttributeIndices;
     std::map<PreparedAttributeKey, std::unique_ptr<iGameDecodeAdapter>> preparedAttributeAdapters;
@@ -221,7 +151,7 @@ struct DataCodecDataObjectDecodeSession::Impl {
         frameAssembly.AbortFramePackage();
         inputReader.reset();
         encodedInputCache.reset();
-        cacheRuntime.reset();
+        cacheRuntime = nullptr;
         output = nullptr;
         inputBytes = 0u;
         nativeAttributeIndices.clear();
@@ -239,6 +169,18 @@ DataCodecDataObjectDecodeSession::~DataCodecDataObjectDecodeSession() = default;
 DataCodecDataObjectDecodeSession::DataCodecDataObjectDecodeSession(DataCodecDataObjectDecodeSession&&) noexcept = default;
 DataCodecDataObjectDecodeSession& DataCodecDataObjectDecodeSession::operator=(DataCodecDataObjectDecodeSession&&) noexcept = default;
 
+::datacodec::DecodedFrameCacheStats DataCodecDataObjectDecodeSession::DecodedCacheStatistics() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    return m_impl->cacheRuntime ? m_impl->cacheRuntime->DefaultFrameCache()->Statistics()
+                              : ::datacodec::DecodedFrameCacheStats{};
+}
+
+::datacodec::EncodedInputCacheStats DataCodecDataObjectDecodeSession::InputCacheStatistics() const {
+    std::lock_guard<std::recursive_mutex> lock(m_impl->mutex);
+    return m_impl->cacheRuntime ? m_impl->cacheRuntime->DefaultEncodedInputCache()->Statistics()
+                              : ::datacodec::EncodedInputCacheStats{};
+}
+
 DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::Open(
     const DataCodecDataObjectDecodeRequest& request) {
     Reset();
@@ -246,88 +188,23 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::Open(
     if (request.inputReader == nullptr) {
         return MakeDecodeFailureResult(request, "DataCodec decode session requires an input reader");
     }
-    ::datacodec::AssertValidDecodedFrameCachePolicy(request.decodedFrameCachePolicy);
-    ::datacodec::AssertValidEncodedInputCachePolicy(request.encodedInputCachePolicy);
 
     try {
-        const auto cacheRuntime = request.cacheRuntime != nullptr
-            ? request.cacheRuntime
-            : ::datacodec::DefaultDecodeCacheRuntime();
-        const bool usingDefaultFrameCache =
-            request.decodedFrameCache == nullptr && request.decodedFrameCachePolicy.enabled;
-        const auto frameCache = request.decodedFrameCache != nullptr
-            ? request.decodedFrameCache
-            : usingDefaultFrameCache
-                ? std::static_pointer_cast<::datacodec::IDecodedFrameCache>(
-                    cacheRuntime->DefaultFrameCache())
-                : std::shared_ptr<::datacodec::IDecodedFrameCache>{};
-        std::optional<::datacodec::DecodedFrameKey> frameCacheKey;
-        if (frameCache != nullptr) {
-            ::datacodec::DecodedFrameKey resolvedKey;
-            std::string cacheKeyError;
-            if (!ResolveFrameCacheKey(
-                    *request.inputReader,
-                    request.loadAllAvailableAttributes,
-                    resolvedKey,
-                    &cacheKeyError)) {
-                return MakeDecodeFailureResult(
-                    request,
-                    cacheKeyError.empty() ? "DataCodec frame cache package inspection failed" : cacheKeyError);
-            }
-            frameCacheKey = std::move(resolvedKey);
-            const auto lookup = frameCache->Find(
-                *frameCacheKey,
-                ::datacodec::DecodedFrameAccessKind::UserRequest);
-            if (lookup.IsError()) {
-                return MakeDecodeFailureResult(
-                    request,
-                    lookup.error.empty() ? "DataCodec decoded frame cache lookup failed" : lookup.error);
-            }
-            if (lookup.IsHit()) {
-                const auto cached = std::dynamic_pointer_cast<DataObjectDecodeCacheLease>(lookup.value);
-                if (cached == nullptr || cached->State() == nullptr) {
-                    return MakeDecodeFailureResult(request, "DataCodec decoded frame cache returned an invalid lease");
-                }
-                const auto cachedImpl = std::static_pointer_cast<Impl>(cached->State());
-                if (cachedImpl == nullptr) {
-                    return MakeDecodeFailureResult(request, "DataCodec decoded frame cache returned an invalid state");
-                }
-                std::lock_guard<std::recursive_mutex> cachedLock(cachedImpl->mutex);
-                if (!cachedImpl->open || cachedImpl->output == nullptr) {
-                    return MakeDecodeFailureResult(request, "DataCodec decoded frame cache returned a closed state");
-                }
-                cachedImpl->inputReader = request.inputReader;
-                cachedImpl->inputBytes = request.inputReader->ByteSize();
-                m_impl = cachedImpl;
-                return DataCodecDataObjectDecodeResult{
-                    .success = true,
-                    .decodedFrameCacheHit = true,
-                    .output = m_impl->output,
-                    .inputBytes = m_impl->inputBytes,
-                };
-            }
-        }
-        if (usingDefaultFrameCache) {
-            cacheRuntime->DefaultFrameCache()->Configure(
-                request.decodedFrameCachePolicy.residentFrameLimit,
-                request.decodedFrameCachePolicy.residentLimitBytes);
-        }
+        m_impl->executionResources = std::make_shared<::datacodec::DataCodecExecutionResources>(request.resources);
+        const auto resources = m_impl->executionResources;
+        ::datacodec::CodecRunScope run(*resources);
+        if (!run) { return MakeDecodeFailureResult(request, "DataCodec request could not start"); }
+        std::stop_callback stopCallback(request.stopToken, [resources] { resources->RequestStop(); });
+        auto* cacheRuntime = &resources->Caches();
         auto inputReader = request.inputReader;
         m_impl->cacheRuntime = cacheRuntime;
-        if (request.encodedInputCache != nullptr) {
-            m_impl->encodedInputCache = request.encodedInputCache;
-        } else if (request.encodedInputCachePolicy.enabled) {
-            m_impl->cacheRuntime->DefaultEncodedInputCache()->Configure(
-                request.encodedInputCachePolicy.residentInputLimit,
-                request.encodedInputCachePolicy.residentLimitBytes);
-            m_impl->encodedInputCache = m_impl->cacheRuntime->DefaultEncodedInputCache();
+        if (request.encodedInputCachePolicy.enabled) {
+            m_impl->encodedInputCache = cacheRuntime->DefaultEncodedInputCache();
         }
-        if (m_impl->encodedInputCache != nullptr && request.inputSourceIdentity.IsStable() &&
-            !(request.encodedInputCachePolicy.residentLimitBytes != 0u &&
-              inputReader->ByteSize() > request.encodedInputCachePolicy.residentLimitBytes &&
-              inputReader->RetainAllBytes() == nullptr)) {
+        if (m_impl->encodedInputCache != nullptr && request.inputSourceIdentity.IsStable()) {
             std::string inputCacheError;
             const auto bytes = m_impl->cacheRuntime->EncodedInputLoader().Load(
+                *resources,
                 m_impl->encodedInputCache,
                 request.inputSourceIdentity,
                 inputReader,
@@ -341,7 +218,7 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::Open(
                         ? "DataCodec decode session failed to retain encoded input"
                         : inputCacheError);
             }
-            inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(bytes);
+            inputReader = bytes;
         }
         m_impl->inputReader = std::move(inputReader);
         m_impl->inputBytes = request.inputReader->ByteSize();
@@ -355,10 +232,7 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::Open(
             ? *request.configurationSource
             : ::datacodec::DataCodecDecodeConfigurationSource{};
         m_impl->language = request.language;
-        m_impl->executionResources =
-            ::datacodec::ResolveDataCodecExecutionResources(request.executionResources);
-
-        auto decodeResult = ::datacodec::DecodePackage({
+        auto decodeResult = ::datacodec::DecodePackageInRun({
             .inputReader = m_impl->inputReader,
             .leafAdapter = &m_impl->initialLeafAdapter,
             .frameAssembly = &m_impl->frameAssembly,
@@ -376,10 +250,11 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::Open(
                 .language = m_impl->language,
             },
             .runRecordSink = request.runRecordSink,
-            .session = &m_impl->session,
-            .executionResources = m_impl->executionResources,
             .stopToken = request.stopToken,
-        });
+        }, *resources, &m_impl->session);
+        if (decodeResult.failure) { resources->RecordFailure(*decodeResult.failure); }
+        decodeResult.success = run.Finish(decodeResult.success);
+        if (resources->FirstFailure()) { decodeResult.failure = resources->FirstFailure(); }
         m_impl->decodedFramePackage = decodeResult.decodedFramePackage;
         m_impl->output = decodeResult.decodedFramePackage
             ? m_impl->frameAssembly.Output()
@@ -392,24 +267,6 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::Open(
         if (!result.success) {
             m_impl->Reset();
             return result;
-        }
-        if (frameCache != nullptr && frameCacheKey.has_value()) {
-            const auto storeResult = frameCache->Store(
-                *frameCacheKey,
-                std::make_shared<DataObjectDecodeCacheLease>(
-                    m_impl->session.OutputFrameIndex().value_or(frameCacheKey->frameIndex),
-                    m_impl->output,
-                    std::static_pointer_cast<void>(m_impl),
-                    m_impl->session.ResidentSizeHint()),
-                ::datacodec::DecodedFrameAccessKind::UserRequest);
-            if (storeResult.IsError()) {
-                m_impl->Reset();
-                return MakeDecodeFailureResult(
-                    request,
-                    storeResult.error.empty()
-                        ? "DataCodec decoded frame cache store failed"
-                        : storeResult.error);
-            }
         }
 
         return result;
@@ -471,6 +328,9 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::RequestAttribu
         groupedTargets[{target.frameIndex, target.blockPath}].push_back(target);
     }
 
+    const auto resources = m_impl->executionResources;
+    ::datacodec::CodecRunScope run(*resources);
+    if (!run) { return result; }
     result.success = true;
     for (const auto& [key, targets] : groupedTargets) {
         if (request.stopToken.stop_requested()) {
@@ -537,12 +397,9 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::RequestAttribu
             .language = m_impl->language,
             .runRecordSink = request.runRecordSink.get(),
             .stopToken = request.stopToken,
-            .parallelTaskRunner = m_impl->executionResources.parallelTaskRunner,
+            .resources = resources.get(),
         });
-        result.messages.insert(
-            result.messages.end(),
-            leafResult.messages.begin(),
-            leafResult.messages.end());
+        AppendRetainedTelemetryMessages(result.messages, leafResult.messages);
         if (!leafResult.success) {
             result.success = false;
             break;
@@ -561,6 +418,7 @@ DataCodecDataObjectDecodeResult DataCodecDataObjectDecodeSession::RequestAttribu
             m_impl->preparedAttributeAdapters.erase(preparedKey);
         }
     }
+    result.success = run.Finish(result.success);
     return result;
 }
 

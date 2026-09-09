@@ -3,11 +3,10 @@
 
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
-#include "DataCodec/Storage/ByteIO/ByteRange.h"
-#include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowBudget.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Storage/ByteIO/ByteRange.h"
+#include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -39,7 +38,7 @@ public:
     SegmentedBinaryObject(const SegmentedBinaryObject&) = delete;
     SegmentedBinaryObject& operator=(const SegmentedBinaryObject&) = delete;
 
-    ~SegmentedBinaryObject() override { Release(); }
+    ~SegmentedBinaryObject() override = default;
 
     bool AddSegment(
         std::shared_ptr<IByteSource> source,
@@ -164,7 +163,6 @@ public:
                 return false;
             }
             if (m_replayMode == ByteSourceConsumptionMode::OneShot && segment.source != nullptr) {
-                segment.source->Release();
                 segment.source.reset();
             }
         }
@@ -174,78 +172,41 @@ public:
         return true;
     }
 
-    bool CopyTo(
-        IByteRangeOutput& output,
-        const std::size_t windowBytes = kDefaultEncodeAccessWindowBytes,
-        std::string* error = nullptr) {
-        ScratchByteBufferPool scratchBytePool;
-        window::WindowBudget windowBudget(static_cast<std::uint64_t>(
-            std::max<std::size_t>(windowBytes, 1u)));
-        return CopyTo(output, windowBudget, scratchBytePool, windowBytes, error);
-    }
-
-    bool CopyTo(
-        IByteRangeOutput& output,
-        window::WindowBudget& windowBudget,
-        ScratchByteBufferPool& scratchBytePool,
-        const std::size_t windowBytes,
-        std::string* error = nullptr) {
-        if (!CanRead()) {
-            return validation::AssignError(error, "segmented binary object is not readable for byte range copy");
-        }
-        const auto resolvedWindowBytes = std::max<std::size_t>(windowBytes, 1u);
-        std::uint64_t objectOffset = 0u;
-        for (auto& segment : m_segments) {
-            std::uint64_t segmentReadOffset = 0u;
-            while (segmentReadOffset < segment.byteSize) {
-                const auto currentBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
-                    segment.byteSize - segmentReadOffset,
-                    static_cast<std::uint64_t>(resolvedWindowBytes)));
-                auto lease = windowBudget.Acquire(currentBytes);
-                auto scratch = scratchBytePool.Acquire(currentBytes);
-                auto buffer = scratch.Span();
-                if (!segment.source->Read(segmentReadOffset, buffer, error) ||
-                    !output.WriteAt(
-                        objectOffset,
-                        std::span<const std::uint8_t>(buffer.data(), buffer.size()),
-                        error)) {
-                    return false;
+    [[nodiscard]] bool Materialize(DataCodecExecutionResources& run, EncodedBuffer& bytes,
+                                   std::string* error = nullptr) {
+        bytes = {};
+        if (!CanRead()) { return validation::AssignError(error, "segmented object is not readable"); }
+        auto phase = WaitForHeavyPhase(run);
+        if (!phase) { return false; }
+        MemoryByteRangeOutput output(run);
+        KnownStorageOwners coexist;
+        for (const auto& segment : m_segments) { coexist.Add(segment.source.get()); }
+        // 完整目标先取得容量，成功后才允许一次性分段被消费
+        if (!output.PrepareExactSize(m_byteSize, error, coexist.Entries())) { return false; }
+        class MaterializeWriter final : public IByteWriter {
+        public:
+            MaterializeWriter(MemoryByteRangeOutput& output, DataCodecExecutionResources& run)
+                : m_output(output), m_run(run) {}
+            bool Write(std::span<const std::uint8_t> data, std::string* error) override {
+                while (!data.empty()) {
+                    if (m_run.Stopped()) { return validation::AssignError(error, "materialization was stopped"); }
+                    const auto count = std::min<std::size_t>(data.size(), kIoWindowBytes);
+                    if (!m_output.WriteAt(m_offset, data.first(count), error)) { return false; }
+                    m_offset += count;
+                    data = data.subspan(count);
                 }
-                segmentReadOffset += currentBytes;
-                objectOffset += currentBytes;
+                return true;
             }
-            if (m_replayMode == ByteSourceConsumptionMode::OneShot && segment.source != nullptr) {
-                segment.source->Release();
-                segment.source.reset();
-            }
-        }
-        if (!output.Finalize(m_byteSize, error)) {
-            return false;
-        }
-        if (m_replayMode == ByteSourceConsumptionMode::OneShot) {
-            m_consumed = true;
-        }
+            std::uint64_t ByteSizeHint() const noexcept override { return m_offset; }
+        private:
+            MemoryByteRangeOutput& m_output;
+            DataCodecExecutionResources& m_run;
+            std::uint64_t m_offset{0u};
+        } writer(output, run);
+        if (!CopyTo(writer, error) || writer.ByteSizeHint() != m_byteSize ||
+            !output.Finalize(m_byteSize, error)) { return false; }
+        bytes = output.TakeBytes();
         return true;
-    }
-
-    [[nodiscard]] bool Materialize(std::vector<std::uint8_t>& bytes, std::string* error = nullptr) const {
-        if (m_byteSize > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            return validation::AssignError(error, "segmented binary object exceeds local address space");
-        }
-        bytes.resize(static_cast<std::size_t>(m_byteSize));
-        return Read(0u, std::span<std::uint8_t>(bytes.data(), bytes.size()), error);
-    }
-
-    void Release() noexcept override {
-        for (auto& segment : m_segments) {
-            if (segment.source != nullptr) {
-                segment.source->Release();
-                segment.source.reset();
-            }
-        }
-        std::vector<Segment>().swap(m_segments);
-        m_byteSize = 0u;
-        m_consumed = true;
     }
 
 private:

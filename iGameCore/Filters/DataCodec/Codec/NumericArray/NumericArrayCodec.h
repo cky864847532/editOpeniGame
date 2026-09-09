@@ -10,7 +10,6 @@
 #include <cstring>
 #include <exception>
 #include <limits>
-#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -18,6 +17,8 @@
 
 #include <libpressio.h>
 namespace datacodec::numericarray {
+
+class NumericArrayCompressorState;
 
 class NumericArrayEncode {
 public:
@@ -28,13 +29,15 @@ public:
         const NumericArrayBufferView& input,
         const CompressorConfig& compressor,
         NumericArrayEncodedBytes& output,
-        std::string* error = nullptr);
+        std::string* error = nullptr,
+        NumericArrayCompressorState* compressorState = nullptr);
 
     static bool CompressSegments(
         const NumericArrayBufferView& input,
         const std::vector<NumericArraySegmentSpec>& segments,
         std::vector<NumericArrayCompressedSegment>& output,
-        std::string* error = nullptr);
+        std::string* error = nullptr,
+        NumericArrayCompressorState* compressorState = nullptr);
 };
 
 class NumericArrayDecode {
@@ -47,12 +50,14 @@ public:
         const NumericArrayBufferLayout& layout,
         const CompressorConfig& compressor,
         const MutableNumericArrayBufferView& output,
-        std::string* error = nullptr);
+        std::string* error = nullptr,
+        NumericArrayCompressorState* compressorState = nullptr);
 
     static bool DecompressSegments(
         const std::vector<NumericArrayCompressedSegment>& input,
         const MutableNumericArrayBufferView& output,
-        std::string* error = nullptr);
+        std::string* error = nullptr,
+        NumericArrayCompressorState* compressorState = nullptr);
 };
 
 namespace detail::numericarraycodec {
@@ -230,8 +235,12 @@ inline bool ConfigureCompressor(
     }
 
     for (const auto& option : config.options) {
+        if (option.first == "pressio:nthreads" || option.first == "sz3:openmp") { continue; }
         pressio_options_set_double(options.get(), option.first.c_str(), option.second);
     }
+    // 块级并行由根执行器控制，库内线程选项按实际类型固定写入
+    pressio_options_set_uinteger(options.get(), "pressio:nthreads", std::uint32_t{1u});
+    pressio_options_set_bool(options.get(), "sz3:openmp", false);
 
     const auto rc = pressio_compressor_set_options(compressor, options.get());
     if (rc > 0) {
@@ -253,6 +262,7 @@ inline void AppendDoubleBitsToKey(std::string& key, const double value) {
 inline std::string MakeCompressorCacheKey(const CompressorConfig& config) {
     std::string key;
     for (const auto& option : config.options) {
+        if (option.first == "pressio:nthreads" || option.first == "sz3:openmp") { continue; }
         key.append(option.first);
         key.push_back('\0');
         AppendDoubleBitsToKey(key, option.second);
@@ -260,11 +270,14 @@ inline std::string MakeCompressorCacheKey(const CompressorConfig& config) {
     return key;
 }
 
-class ThreadLocalCompressorCache final {
+} // namespace detail::numericarraycodec
+
+class NumericArrayCompressorState final {
 public:
     pressio_compressor* Resolve(
         const CompressorConfig& compressorConfig,
         std::string* error) {
+        using namespace detail::numericarraycodec;
         if (!m_library) {
             m_library.reset(pressio_instance());
             if (!m_library) {
@@ -273,11 +286,14 @@ public:
             }
         }
 
-        const auto key = MakeCompressorCacheKey(compressorConfig);
-        const auto cached = m_compressors.find(key);
-        if (cached != m_compressors.end()) {
-            return cached->second.get();
+        auto key = MakeCompressorCacheKey(compressorConfig);
+        if (m_compressor && key == m_key) {
+            // 解码会更新 SZ3 的工作配置，每次调用前重新应用当前精度和串行规则
+            if (!ConfigureCompressor(m_compressor.get(), compressorConfig, error)) { return nullptr; }
+            return m_compressor.get();
         }
+        m_compressor.reset();
+        m_key.clear();
 
         CompressorHandle compressor(
             pressio_get_compressor(m_library.get(), kNumericArrayCompressorId));
@@ -288,36 +304,27 @@ public:
         if (!ConfigureCompressor(compressor.get(), compressorConfig, error)) {
             return nullptr;
         }
-        auto* compressorPtr = compressor.get();
-        m_compressors.emplace(key, std::move(compressor));
-        return compressorPtr;
+        m_key = std::move(key);
+        m_compressor = std::move(compressor);
+        return m_compressor.get();
     }
 
 private:
-    LibraryHandle m_library;
-    std::map<std::string, CompressorHandle> m_compressors;
+    detail::numericarraycodec::LibraryHandle m_library;
+    std::string m_key;
+    detail::numericarraycodec::CompressorHandle m_compressor;
 };
 
-inline pressio_compressor* ResolveThreadLocalCompressor(
-    const CompressorConfig& compressorConfig,
-    std::string* error) {
-#if defined(_WIN32) && defined(__clang__)
-    // Windows Clang 的线程退出阶段无法安全析构包含 libpressio 句柄的 TLS 对象
-    // 缓存随工作线程保留到进程结束以避免 TLS 析构访问已释放内存
-    thread_local auto* cache = new ThreadLocalCompressorCache();
-    return cache->Resolve(compressorConfig, error);
-#else
-    thread_local ThreadLocalCompressorCache cache;
-    return cache.Resolve(compressorConfig, error);
-#endif
-}
+namespace detail::numericarraycodec {
 
 inline bool CompressWithLibPressio(
     const NumericArrayBufferView& input,
     const CompressorConfig& compressorConfig,
     NumericArrayEncodedBytes& bytes,
-    std::string* error) {
-    auto* compressor = ResolveThreadLocalCompressor(compressorConfig, error);
+    std::string* error,
+    NumericArrayCompressorState* compressorState) {
+    NumericArrayCompressorState localState;
+    auto* compressor = (compressorState ? *compressorState : localState).Resolve(compressorConfig, error);
     if (!compressor) {
         return false;
     }
@@ -375,20 +382,11 @@ inline bool DecompressWithLibPressio(
     const NumericArrayBufferLayout& layout,
     const CompressorConfig& compressorConfig,
     void* output,
-    std::string* error) {
-    LibraryHandle library(pressio_instance());
-    if (!library) {
-        validation::AssignError(error, "libpressio failed to create a library instance");
-        return false;
-    }
-
-    CompressorHandle compressor(pressio_get_compressor(library.get(), kNumericArrayCompressorId));
+    std::string* error,
+    NumericArrayCompressorState* compressorState) {
+    NumericArrayCompressorState localState;
+    auto* compressor = (compressorState ? *compressorState : localState).Resolve(compressorConfig, error);
     if (!compressor) {
-        validation::AssignError(error, "libpressio could not find compressor sz3");
-        return false;
-    }
-
-    if (!ConfigureCompressor(compressor.get(), compressorConfig, error)) {
         return false;
     }
 
@@ -416,7 +414,7 @@ inline bool DecompressWithLibPressio(
 
     int rc = 0;
     try {
-        rc = pressio_compressor_decompress(compressor.get(), inputData.get(), outputData.get());
+        rc = pressio_compressor_decompress(compressor, inputData.get(), outputData.get());
     } catch (const std::exception& exception) {
         validation::AssignError(
             error,
@@ -427,7 +425,7 @@ inline bool DecompressWithLibPressio(
         return false;
     }
     if (rc > 0) {
-        const char* message = pressio_compressor_error_msg(compressor.get());
+        const char* message = pressio_compressor_error_msg(compressor);
         validation::AssignError(error, message != nullptr ? message : "libpressio decompression failed");
         return false;
     }
@@ -449,7 +447,8 @@ inline bool NumericArrayEncode::Compress(
     const NumericArrayBufferView& input,
     const CompressorConfig& compressor,
     NumericArrayEncodedBytes& output,
-    std::string* error) {
+    std::string* error,
+    NumericArrayCompressorState* compressorState) {
     output.Reset();
     if (!detail::numericarraycodec::ValidateInputView(input, error)) {
         return false;
@@ -459,7 +458,7 @@ inline bool NumericArrayEncode::Compress(
         return true;
     }
 
-    return detail::numericarraycodec::CompressWithLibPressio(input, compressor, output, error);
+    return detail::numericarraycodec::CompressWithLibPressio(input, compressor, output, error, compressorState);
 }
 
 inline bool NumericArrayDecode::IsAvailable() {
@@ -475,7 +474,8 @@ inline bool NumericArrayDecode::Decompress(
     const NumericArrayBufferLayout& layout,
     const CompressorConfig& compressor,
     const MutableNumericArrayBufferView& output,
-    std::string* error) {
+    std::string* error,
+    NumericArrayCompressorState* compressorState) {
     if (!detail::numericarraycodec::ValidateLayout(layout, error)) {
         return false;
     }
@@ -494,14 +494,15 @@ inline bool NumericArrayDecode::Decompress(
         return output.layout.ByteCount() == 0;
     }
 
-    return detail::numericarraycodec::DecompressWithLibPressio(input, layout, compressor, output.data, error);
+    return detail::numericarraycodec::DecompressWithLibPressio(input, layout, compressor, output.data, error, compressorState);
 }
 
 inline bool NumericArrayEncode::CompressSegments(
     const NumericArrayBufferView& input,
     const std::vector<NumericArraySegmentSpec>& segments,
     std::vector<NumericArrayCompressedSegment>& output,
-    std::string* error) {
+    std::string* error,
+    NumericArrayCompressorState* compressorState) {
     output.clear();
     if (!detail::numericarraycodec::ValidateInputView(input, error)) {
         return false;
@@ -521,7 +522,8 @@ inline bool NumericArrayEncode::CompressSegments(
                 segmentView,
                 segment.compressor,
                 compressed,
-                error)) {
+                error,
+                compressorState)) {
             output.clear();
             return false;
         }
@@ -539,7 +541,8 @@ inline bool NumericArrayEncode::CompressSegments(
 inline bool NumericArrayDecode::DecompressSegments(
     const std::vector<NumericArrayCompressedSegment>& input,
     const MutableNumericArrayBufferView& output,
-    std::string* error) {
+    std::string* error,
+    NumericArrayCompressorState* compressorState) {
     if (!detail::numericarraycodec::ValidateOutputView(output, error)) {
         return false;
     }
@@ -554,7 +557,8 @@ inline bool NumericArrayDecode::DecompressSegments(
                 segment.layout,
                 segment.compressor,
                 detail::numericarraycodec::SliceBufferView(output, segment.elementOffset, segment.layout.elementCount),
-                error)) {
+                error,
+                compressorState)) {
             return false;
         }
     }

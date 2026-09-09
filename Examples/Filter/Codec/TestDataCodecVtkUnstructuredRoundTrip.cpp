@@ -258,7 +258,7 @@ void PrintMessages(const std::vector<::datacodec::TelemetryMessageRecord>& messa
 }
 
 bool VerifyIgameDecode(
-    const std::shared_ptr<const std::vector<std::uint8_t>>& encodedBytes,
+    const std::shared_ptr<const ::datacodec::EncodedBuffer>& encodedBytes,
     vtkUnstructuredGrid* source,
     const ::datacodec::DataCodecDecodePackageConfigurationParams& configuration,
     std::string* error) {
@@ -269,7 +269,6 @@ bool VerifyIgameDecode(
         .leafAdapter = &adapter,
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = configuration,
-        .executionResources = {},
     });
     if (!result.success) {
         std::ostringstream message;
@@ -364,10 +363,8 @@ int main(const int argc, char** argv) {
             ::datacodec::EncodePackageKind::LeafPackage),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = ::datacodec::MakeEncodeConfigurationParams({
-            .tier = ::datacodec::DataCodecEncodeTier::Balanced,
             .enableCompressionEnhancement = false,
         }),
-        .executionResources = {},
     });
     if (!encodeResult.success || !encodeResult.hasEncodedOutput) {
         std::cerr << "DataCodec VTK encode failed\n";
@@ -375,9 +372,9 @@ int main(const int argc, char** argv) {
         return 1;
     }
 
-    auto encodedBytes = std::make_shared<const std::vector<std::uint8_t>>(
+    auto encodedBytes = std::make_shared<const ::datacodec::EncodedBuffer>(
         std::move(encodeResult.encodedBytes));
-    if (!WriteBinaryFile(encodedFile, *encodedBytes, &error)) {
+    if (!WriteBinaryFile(encodedFile, encodedBytes->span(), &error)) {
         std::cerr << error << '\n';
         return 1;
     }
@@ -386,7 +383,6 @@ int main(const int argc, char** argv) {
     auto inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(encodedBytes);
     vtk_datacodec_example::VtkDataCodecDecodeAdapter decodeAdapter;
     const auto decodeConfiguration = ::datacodec::MakeDecodeConfigurationParams({
-        .tier = ::datacodec::DataCodecDecodeTier::Balanced,
         .validationProfile = ::datacodec::DataCodecDecodeValidationProfile::Required,
     });
     auto decodeResult = ::datacodec::DecodePackage({
@@ -394,7 +390,6 @@ int main(const int argc, char** argv) {
         .leafAdapter = &decodeAdapter,
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = decodeConfiguration.PackageConfiguration(),
-        .executionResources = {},
     });
     if (!decodeResult.success) {
         std::cerr << "DataCodec VTK decode failed\n";

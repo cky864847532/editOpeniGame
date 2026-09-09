@@ -2,243 +2,282 @@
 #define DATACODEC_STORAGE_BYTEIO_BYTEBUDGET_H
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <optional>
-#include <stdexcept>
+#include <source_location>
+#include <span>
+#include <string_view>
+#include <type_traits>
 #include <utility>
+#include "DataCodec/Common/DataCodecError.h"
 
 namespace datacodec {
+class DataCodecExecutionResources;
+namespace bytestore { class MemoryStore; }
 namespace resource {
 
-struct ActiveByteBudgetStats {
-    std::uint64_t maxActiveBytes{0u};
-    std::uint64_t activeBytes{0u};
-    std::uint64_t peakActiveBytes{0u};
-    std::uint64_t peakRequestedBytes{0u};
-    std::uint64_t acquireCount{0u};
-    std::uint64_t waitCount{0u};
-    std::uint64_t totalWaitNanoseconds{0u};
+
+struct CapacitySnapshot {
+    std::uint64_t limitBytes{0u};
+    std::uint64_t reservedBytes{0u};
+    std::uint64_t peakReservedBytes{0u};
 };
 
-struct ResidentByteBudgetStats {
-    std::uint64_t limitBytes{0u};
-    std::uint64_t residentBytes{0u};
-    std::uint64_t peakResidentBytes{0u};
+struct StorageAllocationSnapshot {
+    std::uint64_t scopeId{0u};
+    std::chrono::steady_clock::time_point capturedAt{};
+    std::uint64_t liveBytes{0u};
+    std::uint64_t peakLiveBytes{0u};
+    std::uint64_t liveArrayCount{0u};
+    std::uint64_t allocationCount{0u};
+    std::uint64_t failedAllocationCount{0u};
 };
+
+enum class StorageOwnerPurpose : std::uint8_t { Unspecified, Ranged, Contiguous, Appendable, Optional };
+
+struct StorageOwnerTag {
+    std::uint64_t id{0u};
+    StorageOwnerPurpose purpose{StorageOwnerPurpose::Unspecified};
+    std::array<char, 48u> label{};
+    std::array<char, 64u> file{};
+    std::uint_least32_t line{0u};
+    bool textTruncated{false};
+};
+
+struct StorageOwnerDescription {
+    StorageOwnerTag owner;
+    std::uint64_t capacityBytes{0u};
+    std::chrono::steady_clock::time_point capturedAt{};
+};
+
+// 拒绝时在同一容量锁内填写，已有 owner 的容量是调用点取样值
+struct CapacityRejection {
+    std::chrono::steady_clock::time_point checkedAt{};
+    std::uint64_t requestedBytes{0u};
+    std::uint64_t reservedBytes{0u};
+    std::uint64_t limitBytes{0u};
+    StorageOwnerTag requester;
+    std::array<StorageOwnerDescription, 16u> owners{};
+    std::size_t ownerCount{0u};
+    bool ownerListTruncated{false};
+};
+static_assert(std::is_trivially_copyable_v<CapacityRejection>);
 
 class ResidentByteBudget final {
-public:
-    explicit ResidentByteBudget(
-        const std::uint64_t limitBytes = std::numeric_limits<std::uint64_t>::max()) noexcept
-        : m_limitBytes(std::max<std::uint64_t>(limitBytes, 1u)) {}
-
-    void Reset(
-        const std::uint64_t limitBytes = std::numeric_limits<std::uint64_t>::max()) noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_limitBytes = std::max<std::uint64_t>(limitBytes, 1u);
-        m_residentBytes = 0u;
-        m_peakResidentBytes = 0u;
-    }
-
-    [[nodiscard]] bool TryReserve(const std::uint64_t bytes) noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (bytes > m_limitBytes - std::min(m_residentBytes, m_limitBytes)) {
-            return false;
+    struct State {
+        explicit State(const std::uint64_t limit) noexcept : limitBytes(limit) {
+            static std::atomic_uint64_t nextScopeId{0u};
+            allocated.scopeId = nextScopeId.fetch_add(1u, std::memory_order_relaxed) + 1u;
         }
-        m_residentBytes += bytes;
-        m_peakResidentBytes = std::max(m_peakResidentBytes, m_residentBytes);
-        return true;
-    }
+        std::mutex mutex;
+        std::uint64_t limitBytes;
+        std::uint64_t reservedBytes{0u};
+        std::uint64_t peakReservedBytes{0u};
+        std::uint64_t nextOwnerId{0u};
+        // 实际数组事件使用独立锁，容量准入和控制器从不读取审计值
+        std::mutex allocationMutex;
+        StorageAllocationSnapshot allocated;
+    };
 
-    void Release(const std::uint64_t bytes) noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_residentBytes = bytes >= m_residentBytes ? 0u : m_residentBytes - bytes;
-    }
-
-    [[nodiscard]] ResidentByteBudgetStats SnapshotStats() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return ResidentByteBudgetStats{
-            .limitBytes = m_limitBytes,
-            .residentBytes = m_residentBytes,
-            .peakResidentBytes = m_peakResidentBytes,
-        };
-    }
-
-private:
-    mutable std::mutex m_mutex;
-    std::uint64_t m_limitBytes{std::numeric_limits<std::uint64_t>::max()};
-    std::uint64_t m_residentBytes{0u};
-    std::uint64_t m_peakResidentBytes{0u};
-};
-
-class ActiveByteBudget final {
 public:
+    class AllocatedArray final {
+    public:
+        AllocatedArray() = default;
+        AllocatedArray(const AllocatedArray&) = delete;
+        AllocatedArray& operator=(const AllocatedArray&) = delete;
+        AllocatedArray(AllocatedArray&& other) noexcept
+            : m_state(std::move(other.m_state)), m_array(std::move(other.m_array)),
+              m_size(std::exchange(other.m_size, 0u)) {}
+        AllocatedArray& operator=(AllocatedArray&& other) noexcept {
+            if (this != &other) {
+                reset();
+                m_state = std::move(other.m_state);
+                m_array = std::move(other.m_array);
+                m_size = std::exchange(other.m_size, 0u);
+            }
+            return *this;
+        }
+        ~AllocatedArray() { reset(); }
+        std::uint8_t* get() const noexcept { return m_array.get(); }
+        bool operator==(std::nullptr_t) const noexcept { return m_array == nullptr; }
+        void reset() noexcept {
+            auto state = std::move(m_state);
+            if (!state) { return; }
+            std::lock_guard lock(state->allocationMutex);
+            m_array.reset();
+            state->allocated.liveBytes -= std::exchange(m_size, 0u);
+            --state->allocated.liveArrayCount;
+        }
+    private:
+        friend class ResidentByteBudget;
+        AllocatedArray(std::shared_ptr<State> state, std::unique_ptr<std::uint8_t[]> array,
+                       const std::uint64_t size) noexcept
+            : m_state(std::move(state)), m_array(std::move(array)), m_size(size) {}
+        std::shared_ptr<State> m_state;
+        std::unique_ptr<std::uint8_t[]> m_array;
+        std::uint64_t m_size{0u};
+    };
+
     class Lease final {
     public:
         Lease() = default;
-        Lease(ActiveByteBudget* budget, const std::uint64_t bytes) noexcept
-            : m_budget(budget),
-              m_bytes(bytes) {}
-
         Lease(const Lease&) = delete;
         Lease& operator=(const Lease&) = delete;
-
-        Lease(Lease&& other) noexcept {
-            MoveFrom(std::move(other));
-        }
+        Lease(Lease&& other) noexcept
+            : m_state(std::move(other.m_state)), m_bytes(std::exchange(other.m_bytes, 0u)),
+              m_owner(std::exchange(other.m_owner, {})) {}
 
         Lease& operator=(Lease&& other) noexcept {
             if (this != &other) {
-                Release();
-                MoveFrom(std::move(other));
+                Reset();
+                m_state = std::move(other.m_state);
+                m_bytes = std::exchange(other.m_bytes, 0u);
+                m_owner = std::exchange(other.m_owner, {});
             }
             return *this;
         }
 
-        ~Lease() { Release(); }
+        ~Lease() { Reset(); }
 
-        void Release() noexcept {
-            if (m_budget != nullptr) {
-                m_budget->Release(m_bytes);
-                m_budget = nullptr;
-                m_bytes = 0u;
+        void Reset() noexcept {
+            auto state = std::move(m_state);
+            if (state == nullptr) {
+                return;
             }
+            std::lock_guard<std::mutex> lock(state->mutex);
+            assert(m_bytes <= state->reservedBytes);
+            state->reservedBytes -= std::exchange(m_bytes, 0u);
         }
 
         [[nodiscard]] std::uint64_t Bytes() const noexcept { return m_bytes; }
-        [[nodiscard]] explicit operator bool() const noexcept { return m_budget != nullptr; }
+        [[nodiscard]] const StorageOwnerTag& Owner() const noexcept { return m_owner; }
+        [[nodiscard]] explicit operator bool() const noexcept { return m_state != nullptr; }
 
     private:
-        void MoveFrom(Lease&& other) noexcept {
-            m_budget = other.m_budget;
-            m_bytes = other.m_bytes;
-            other.m_budget = nullptr;
-            other.m_bytes = 0u;
-        }
-
-        ActiveByteBudget* m_budget{nullptr};
+        friend class ResidentByteBudget;
+        Lease(std::shared_ptr<State> state, const std::uint64_t bytes, StorageOwnerTag owner) noexcept
+            : m_state(std::move(state)), m_bytes(bytes), m_owner(owner) {}
+        std::shared_ptr<State> m_state;
         std::uint64_t m_bytes{0u};
+        StorageOwnerTag m_owner;
     };
 
-    explicit ActiveByteBudget(
-        const std::uint64_t maxActiveBytes = 1u,
-        const bool collectTiming = false) noexcept {
-        Reset(maxActiveBytes, collectTiming);
+    explicit ResidentByteBudget(const std::uint64_t limitBytes)
+        : m_state(std::make_shared<State>(limitBytes)) {}
+
+    ResidentByteBudget(const ResidentByteBudget&) = delete;
+    ResidentByteBudget& operator=(const ResidentByteBudget&) = delete;
+
+    [[nodiscard]] StorageOwnerTag NewOwner(
+        const StorageOwnerPurpose purpose = StorageOwnerPurpose::Unspecified,
+        const std::string_view label = "store",
+        const std::source_location site = std::source_location::current()) noexcept {
+        StorageOwnerTag owner;
+        owner.purpose = purpose;
+        owner.textTruncated = failuredetail::CopyText(owner.label, label);
+        const std::string_view file(site.file_name());
+        const auto separator = file.find_last_of("/\\");
+        owner.textTruncated |= failuredetail::CopyText(owner.file,
+            separator == std::string_view::npos ? file : file.substr(separator + 1u));
+        owner.line = site.line();
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        owner.id = ++m_state->nextOwnerId;
+        return owner;
     }
 
-    void Reset(
-        const std::uint64_t maxActiveBytes = 1u,
-        const bool collectTiming = false) noexcept {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_maxActiveBytes = std::max<std::uint64_t>(maxActiveBytes, 1u);
-            m_collectTiming = collectTiming;
-            m_activeBytes = 0u;
-            m_peakActiveBytes = 0u;
-            m_peakRequestedBytes = 0u;
-            m_acquireCount = 0u;
-            m_waitCount = 0u;
-            m_totalWaitNanoseconds = 0u;
-        }
-        m_condition.notify_all();
+    [[nodiscard]] std::optional<Lease> TryReserve(const std::uint64_t bytes,
+        CapacityRejection* rejection = nullptr, StorageOwnerTag owner = {},
+        std::span<const StorageOwnerDescription> coexist = {}) noexcept {
+        return TryReserveGrowth(bytes, bytes, rejection, owner, coexist);
     }
 
-    [[nodiscard]] Lease Acquire(const std::uint64_t requestedBytes) {
-        const auto bytes = std::max<std::uint64_t>(requestedBytes, 1u);
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_peakRequestedBytes = std::max(m_peakRequestedBytes, bytes);
-        if (bytes > m_maxActiveBytes) {
-            throw std::length_error("active byte budget request exceeds its configured limit");
-        }
-        const auto shouldWait = !CanAcquireLocked(bytes);
-        const auto waitStart = std::chrono::steady_clock::now();
-        m_condition.wait(lock, [this, bytes]() {
-            return CanAcquireLocked(bytes);
-        });
-        if (shouldWait) {
-            ++m_waitCount;
-            if (m_collectTiming) {
-                m_totalWaitNanoseconds += static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - waitStart).count());
+    [[nodiscard]] std::optional<Lease> TryReserveGrowth(const std::uint64_t requiredBytes,
+        const std::uint64_t preferredBytes, CapacityRejection* rejection = nullptr,
+        StorageOwnerTag owner = {}, std::span<const StorageOwnerDescription> coexist = {}) noexcept {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        if (owner.id == 0u) { owner.id = ++m_state->nextOwnerId; }
+        if (requiredBytes != 0u &&
+            (m_state->reservedBytes > m_state->limitBytes ||
+             requiredBytes > m_state->limitBytes - m_state->reservedBytes)) {
+            if (rejection != nullptr) {
+                *rejection = {};
+                rejection->checkedAt = std::chrono::steady_clock::now();
+                rejection->requestedBytes = requiredBytes;
+                rejection->reservedBytes = m_state->reservedBytes;
+                rejection->limitBytes = m_state->limitBytes;
+                rejection->requester = owner;
+                rejection->ownerCount = std::min(coexist.size(), rejection->owners.size());
+                rejection->ownerListTruncated = coexist.size() > rejection->owners.size();
+                std::copy_n(coexist.begin(), rejection->ownerCount, rejection->owners.begin());
             }
-        }
-        ++m_acquireCount;
-        m_activeBytes += bytes;
-        m_peakActiveBytes = std::max(m_peakActiveBytes, m_activeBytes);
-        return Lease(this, bytes);
-    }
-
-    [[nodiscard]] std::optional<Lease> TryAcquire(const std::uint64_t requestedBytes) {
-        const auto bytes = std::max<std::uint64_t>(requestedBytes, 1u);
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_peakRequestedBytes = std::max(m_peakRequestedBytes, bytes);
-        if (!CanAcquireLocked(bytes)) {
             return std::nullopt;
         }
-        ++m_acquireCount;
-        m_activeBytes += bytes;
-        m_peakActiveBytes = std::max(m_peakActiveBytes, m_activeBytes);
-        return Lease(this, bytes);
+        const auto remaining = m_state->reservedBytes <= m_state->limitBytes
+            ? m_state->limitBytes - m_state->reservedBytes : 0u;
+        const auto bytes = std::min(std::max(requiredBytes, preferredBytes), remaining);
+        m_state->reservedBytes += bytes;
+        m_state->peakReservedBytes = std::max(m_state->peakReservedBytes, m_state->reservedBytes);
+        return Lease(m_state, bytes, owner);
     }
 
-    [[nodiscard]] std::uint64_t ActiveBytes() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_activeBytes;
-    }
-
-    [[nodiscard]] std::uint64_t PeakActiveBytes() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_peakActiveBytes;
-    }
-
-    [[nodiscard]] std::uint64_t MaxActiveBytes() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_maxActiveBytes;
-    }
-
-    [[nodiscard]] ActiveByteBudgetStats SnapshotStats() const noexcept {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return ActiveByteBudgetStats{
-            .maxActiveBytes = m_maxActiveBytes,
-            .activeBytes = m_activeBytes,
-            .peakActiveBytes = m_peakActiveBytes,
-            .peakRequestedBytes = m_peakRequestedBytes,
-            .acquireCount = m_acquireCount,
-            .waitCount = m_waitCount,
-            .totalWaitNanoseconds = m_totalWaitNanoseconds,
+    [[nodiscard]] CapacitySnapshot Snapshot() const noexcept {
+        std::lock_guard<std::mutex> lock(m_state->mutex);
+        return CapacitySnapshot{
+            .limitBytes = m_state->limitBytes,
+            .reservedBytes = m_state->reservedBytes,
+            .peakReservedBytes = m_state->peakReservedBytes,
         };
     }
 
+    [[nodiscard]] bool Owns(const Lease& lease) const noexcept {
+        return lease.m_state == m_state;
+    }
+
 private:
-    [[nodiscard]] bool CanAcquireLocked(const std::uint64_t bytes) const noexcept {
-        return bytes <= m_maxActiveBytes &&
-            m_activeBytes <= m_maxActiveBytes - bytes;
+    friend class datacodec::bytestore::MemoryStore;
+    [[nodiscard]] AllocatedArray Allocate(const Lease& lease) {
+        if (!Owns(lease) || lease.Bytes() == 0u ||
+            lease.Bytes() > std::numeric_limits<std::size_t>::max()) { return {}; }
+        std::lock_guard lock(m_state->allocationMutex);
+        std::unique_ptr<std::uint8_t[]> array;
+        try { array.reset(new (std::nothrow) std::uint8_t[static_cast<std::size_t>(lease.Bytes())]); }
+        catch (...) { ++m_state->allocated.failedAllocationCount; throw; }
+        if (!array) { ++m_state->allocated.failedAllocationCount; return {}; }
+        auto& allocated = m_state->allocated;
+        allocated.liveBytes += lease.Bytes();
+        allocated.peakLiveBytes = std::max(allocated.peakLiveBytes, allocated.liveBytes);
+        ++allocated.liveArrayCount;
+        ++allocated.allocationCount;
+        return AllocatedArray(m_state, std::move(array), lease.Bytes());
     }
 
-    void Release(const std::uint64_t bytes) noexcept {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_activeBytes = bytes >= m_activeBytes ? 0u : m_activeBytes - bytes;
-        }
-        m_condition.notify_all();
+public:
+    [[nodiscard]] StorageAllocationSnapshot AllocatedStorage() const noexcept {
+        std::lock_guard lock(m_state->allocationMutex);
+        auto snapshot = m_state->allocated;
+        snapshot.capturedAt = std::chrono::steady_clock::now();
+        return snapshot;
     }
 
-    std::uint64_t m_maxActiveBytes{1u};
-    bool m_collectTiming{false};
-    mutable std::mutex m_mutex;
-    std::condition_variable m_condition;
-    std::uint64_t m_activeBytes{0u};
-    std::uint64_t m_peakActiveBytes{0u};
-    std::uint64_t m_peakRequestedBytes{0u};
-    std::uint64_t m_acquireCount{0u};
-    std::uint64_t m_waitCount{0u};
-    std::uint64_t m_totalWaitNanoseconds{0u};
+private:
+    friend class datacodec::DataCodecExecutionResources;
+
+    // 根执行对象依次取得执行锁和容量锁后统一发布目标
+    void SetLimitLocked(const std::uint64_t limitBytes) noexcept {
+        m_state->limitBytes = limitBytes;
+    }
+
+    std::shared_ptr<State> m_state;
 };
+
 
 } // namespace resource
 } // namespace datacodec

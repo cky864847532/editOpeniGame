@@ -366,15 +366,12 @@
         };
         const decodedFrameCacheOverride = readOptionalBoolean('decodedFrameCache');
         const encodedInputCacheOverride = readOptionalBoolean('encodedInputCache');
-        const fullInputPrefetchOverride = readOptionalBoolean('fullInputPrefetch');
         const dataCodecCacheExperimentEnabled =
             decodedFrameCacheOverride !== null ||
-            encodedInputCacheOverride !== null ||
-            fullInputPrefetchOverride !== null;
+            encodedInputCacheOverride !== null;
         const dataCodecCacheExperiment = {
             decodedFrameCache: decodedFrameCacheOverride ?? !singleFrameBenchmarkMode,
             encodedInputCache: encodedInputCacheOverride ?? false,
-            fullInputPrefetch: fullInputPrefetchOverride ?? !singleFrameBenchmarkMode,
         };
         const dataCodecMemoryObservation = {
             peakLinearMemoryBytes: 0,
@@ -1051,7 +1048,7 @@
                     const buildInfo = JSON.parse(api.getBuildInfoJson());
                     log(`[Build] page=${expectedWasmBuild.buildId}/${expectedWasmBuild.memoryProfile} runtime=${buildInfo.buildId}/${buildInfo.memoryProfile} surfacePrebuild=${Boolean(buildInfo.webSurfacePrebuild)} singleFrameBenchmark=${singleFrameBenchmarkMode}`);
                     if (dataCodecCacheExperimentEnabled) {
-                        log(`[Benchmark] decoded-frame-cache=${dataCodecCacheExperiment.decodedFrameCache ? 1 : 0} encoded-input-cache=${dataCodecCacheExperiment.encodedInputCache ? 1 : 0} full-input-prefetch=${dataCodecCacheExperiment.fullInputPrefetch ? 1 : 0}`);
+                        log(`[Benchmark] decoded-frame-cache=${dataCodecCacheExperiment.decodedFrameCache ? 1 : 0} encoded-input-cache=${dataCodecCacheExperiment.encodedInputCache ? 1 : 0}`);
                     }
                     if (buildInfo.buildId !== expectedWasmBuild.buildId ||
                         buildInfo.memoryProfile !== expectedWasmBuild.memoryProfile ||
@@ -2371,7 +2368,7 @@
                         const modelId = await Module.ccall(
                             'igameLoadIgcBrowserFile',
                             'number',
-                            ['number', 'number', 'string', 'number', 'number', 'number', 'number'],
+                            ['number', 'number', 'string', 'number', 'number', 'number'],
                             [
                                 fileId,
                                 file.size,
@@ -2379,7 +2376,6 @@
                                 replaceExisting,
                                 reuseCacheEnabled,
                                 dataCodecCacheExperiment.encodedInputCache ? 1 : 0,
-                                dataCodecCacheExperiment.fullInputPrefetch ? 1 : 0,
                             ],
                             { async: true });
                         const elapsed = performance.now() - loadStart;
@@ -2585,8 +2581,7 @@
                                 sourceName,
                                 replaceExisting,
                                 dataCodecCacheExperiment.decodedFrameCache,
-                                dataCodecCacheExperiment.encodedInputCache,
-                                dataCodecCacheExperiment.fullInputPrefetch);
+                                dataCodecCacheExperiment.encodedInputCache);
                             if (!submitted) {
                                 throw new Error(`decode submit failed: ${api.getLastErrorJson()}`);
                             }

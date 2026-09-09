@@ -8,6 +8,7 @@
 #include "DataCodec/Runtime/Failure/DecodeFailureManagement.h"
 #include "DataCodec/Workflow/Decode/Stages/FieldDecodeInput.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 #include <span>
 #include <string>
@@ -70,6 +71,7 @@ public:
                 "failed to read params bytes: " + error);
             return;
         }
+        RecordVectorCapacitySample(context.runRecords, "params.decode.serialized_bytes", field);
         CodecStorageParams storageParams;
         CodecErrorCode paramsErrorCode = CodecErrorCode::PipelineFailure;
         if (!DeserializeCodecStorageParams(field, storageParams, &error, &paramsErrorCode)) {
@@ -81,6 +83,7 @@ public:
                 "failed to parse params: " + error);
             return;
         }
+        RecordCodecStorageParamsCapacity(context.runRecords, storageParams);
         std::string adapterError;
         if (!context.adapter->SetMeshType(storageParams.meshType, &adapterError)) {
             FailDecodeStage(

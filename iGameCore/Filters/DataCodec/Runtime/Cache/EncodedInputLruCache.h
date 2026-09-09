@@ -1,8 +1,9 @@
 #ifndef DATACODEC_RUNTIME_CACHE_ENCODEDINPUTLRUCACHE_H
 #define DATACODEC_RUNTIME_CACHE_ENCODEDINPUTLRUCACHE_H
 
-#include "DataCodec/API/Adapter/IEncodedInputCache.h"
+#include "DataCodec/Runtime/Cache/EncodedInputTypes.h"
 #include "DataCodec/Runtime/Cache/LruCacheIndex.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 #include <cstddef>
 #include <mutex>
@@ -13,13 +14,14 @@
 
 namespace datacodec {
 
-class EncodedInputLruCache final : public IEncodedInputCache {
+class EncodedInputLruCache final {
 public:
-    void Configure(const std::size_t inputLimit, const std::uint64_t residentLimitBytes) {
+    explicit EncodedInputLruCache(DataCodecExecutionResources* run = nullptr) noexcept : m_run(run) {}
+    void Configure(const std::size_t inputLimit) {
         std::vector<EncodedInputBuffer> evicted;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_index.Configure(inputLimit, residentLimitBytes);
+            m_index.Configure(inputLimit);
             PruneLocked({}, evicted);
             RefreshStatsLocked();
         }
@@ -27,7 +29,7 @@ public:
 
     [[nodiscard]] EncodedInputCacheLookupResult Find(
         const DecodeSourceIdentity& source,
-        const EncodedInputAccessKind accessKind) override {
+        const EncodedInputAccessKind accessKind) {
         std::vector<EncodedInputBuffer> evicted;
         EncodedInputBuffer input;
         {
@@ -65,7 +67,7 @@ public:
     [[nodiscard]] CacheStoreResult Store(
         const DecodeSourceIdentity& source,
         EncodedInputBuffer input,
-        const EncodedInputAccessKind accessKind) override {
+        const EncodedInputAccessKind accessKind) {
         if (!source.IsStable() || input == nullptr) {
             std::lock_guard<std::mutex> lock(m_mutex);
             ++m_stats.storeErrors;
@@ -75,7 +77,7 @@ public:
         bool stored = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_index.CanAdmitSingle(static_cast<std::uint64_t>(input->size()))) {
+            if (!m_index.CanAdmitSingle() || (m_run && !m_run->OptionalRetentionAllowed())) {
                 ++m_stats.storeRejections;
                 return CacheStoreResult::RejectedByPolicy();
             }
@@ -88,7 +90,6 @@ public:
             }
             m_index.InsertOrAssign(
                 source,
-                static_cast<std::uint64_t>(m_inputs.at(source)->size()),
                 accessKind == EncodedInputAccessKind::UserRequest);
             ++m_stats.stores;
             PruneLocked(source, evicted);
@@ -115,7 +116,7 @@ public:
         return CacheStoreResult::Stored();
     }
 
-    void InvalidateSource(const DecodeSourceIdentity& source) override {
+    void InvalidateSource(const DecodeSourceIdentity& source) {
         std::vector<EncodedInputBuffer> released;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -132,12 +133,32 @@ public:
         }
     }
 
-    [[nodiscard]] EncodedInputCacheStats Statistics() const override {
+    [[nodiscard]] EncodedInputCacheStats Statistics() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_stats;
     }
 
+    // 仅解除一个可选缓存引用，数据仍可由活跃消费者持有
+    bool TrimOne() {
+        EncodedInputBuffer released;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto* key = m_index.LeastRecentlyUsedKey();
+            if (key == nullptr) { return false; }
+            const auto found = m_inputs.find(*key);
+            if (found != m_inputs.end()) {
+                released = std::move(found->second);
+                m_inputs.erase(found);
+            }
+            m_index.Erase(*key);
+            ++m_stats.evictions;
+            RefreshStatsLocked();
+        }
+        return true;
+    }
+
 private:
+    DataCodecExecutionResources* m_run{nullptr};
     void PruneLocked(
         const std::optional<DecodeSourceIdentity>& protectedSource,
         std::vector<EncodedInputBuffer>& evicted) {
@@ -149,7 +170,6 @@ private:
                 m_index.Erase(candidate);
                 continue;
             }
-            if (iterator->second.use_count() > 1u) { continue; }
             evicted.push_back(std::move(iterator->second));
             m_inputs.erase(iterator);
             m_index.Erase(candidate);
@@ -159,8 +179,6 @@ private:
 
     void RefreshStatsLocked() noexcept {
         m_stats.residentInputs = m_index.Size();
-        m_stats.residentBytes = m_index.ResidentBytes();
-        m_stats.peakResidentBytes = m_index.PeakResidentBytes();
     }
 
     mutable std::mutex m_mutex;

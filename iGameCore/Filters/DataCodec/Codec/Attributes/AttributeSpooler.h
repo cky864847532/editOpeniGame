@@ -46,7 +46,7 @@ public:
         std::iota(m_recordOrder.begin(), m_recordOrder.end(), 0u);
     }
 
-    ~AttributeSpooler() override { Release(); }
+    ~AttributeSpooler() override = default;
 
     bool SetRecordOrder(std::vector<std::size_t> recordOrder, std::string* error = nullptr) {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -303,23 +303,6 @@ public:
         return true;
     }
 
-    void Release() noexcept override {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        for (auto& source : m_sources) {
-            if (source != nullptr) {
-                source->Release();
-                source.reset();
-            }
-        }
-        for (auto& ready : m_ready) {
-            ready.store(kRecordAborted, std::memory_order_release);
-            ready.notify_all();
-        }
-        m_knownByteSize.store(0u, std::memory_order_release);
-        m_finalByteSize.store(0u, std::memory_order_release);
-        m_consumed = true;
-    }
-
 private:
     bool BuildRecordSnapshot(
         std::vector<RecordSnapshot>& records,
@@ -372,7 +355,6 @@ private:
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto& source : m_sources) {
             if (source != nullptr) {
-                source->Release();
                 source.reset();
             }
         }

@@ -31,26 +31,20 @@ using datacodec::test::LeafPackageMutationKindName;
 using datacodec::test::Require;
 using datacodec::test::TestResult;
 
-struct FailureRecord {
-    std::string origin;
-    CodecErrorCode code{CodecErrorCode::PipelineFailure};
-    std::string message;
-};
-
 struct FailureTestContext {
-    std::optional<FailureRecord> firstFailure;
+    std::optional<CodecFailureRecord> firstFailure;
     int cleanupCount{0};
 
     bool RecordFailure(
         const std::string_view origin,
         const CodecErrorCode code,
-        const std::string_view message) {
+        const std::string_view message) noexcept {
+        return RecordFailure(MakeCodecFailureRecord(code, "operation-failed", origin, message));
+    }
+
+    bool RecordFailure(const CodecFailureRecord& record) noexcept {
         if (!firstFailure.has_value()) {
-            firstFailure = FailureRecord{
-                .origin = std::string(origin),
-                .code = code,
-                .message = std::string(message),
-            };
+            firstFailure = record;
             return true;
         }
         return false;
@@ -84,8 +78,10 @@ inline void RequireReadFailure(
     const std::string& check) {
     LeafPackage decoded;
     std::string error;
-    const bool read = LeafPackageIO::ReadFromMemory(
-        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+    auto owner = std::make_shared<const std::vector<std::uint8_t>>(bytes);
+    auto reader = std::make_shared<MemoryByteRangeReader>(owner);
+    const bool read = LeafPackageIO::ReadFromByteRange(
+        reader, 0u, reader->ByteSize(),
         decoded,
         &error);
     Require(result, !read, check, "malformed leaf package should be rejected");
@@ -191,7 +187,7 @@ inline bool TestFailureManagementStopsAndRecords() {
     Require(result, workspace.StopRequested(), "failure.workspace", "workspace should be stopped after failure");
     Require(
         result,
-        context.firstFailure.has_value() && context.firstFailure->origin == "MalformedInput",
+        context.firstFailure.has_value() && std::string_view(context.firstFailure->origin.data()) == "MalformedInput",
         "failure.origin",
         "failure origin should be preserved");
     Require(
@@ -201,7 +197,7 @@ inline bool TestFailureManagementStopsAndRecords() {
         "failure code should be preserved");
     Require(
         result,
-        context.firstFailure.has_value() && context.firstFailure->message == "invalid leaf package descriptor",
+        context.firstFailure.has_value() && std::string_view(context.firstFailure->message.data()) == "invalid leaf package descriptor",
         "failure.message",
         "failure message should be preserved");
 
@@ -224,7 +220,7 @@ inline bool TestFailureScopeCatchesAndCleans() {
         Require(result, workspace.StopRequested(), "failureScope.workspace", "scope should request stop");
         Require(
             result,
-            context.firstFailure.has_value() && context.firstFailure->origin == "MalformedStage",
+            context.firstFailure.has_value() && std::string_view(context.firstFailure->origin.data()) == "MalformedStage",
             "failureScope.origin",
             "scope should preserve throwing stage origin");
         scope.CleanupIfFailed();
@@ -270,7 +266,7 @@ inline bool TestFailureScopeCleansExplicitFalse() {
             result,
             !context.HasFailure(),
             "failureScope.explicitFalseRecord",
-            "explicit false should not require a synthetic failure record");
+            "explicit false should preserve the caller's error/status propagation");
     }
 
     Require(

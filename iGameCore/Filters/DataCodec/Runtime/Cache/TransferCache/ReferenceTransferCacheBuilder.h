@@ -2,12 +2,13 @@
 #define DATACODEC_RUNTIME_CACHE_TRANSFERCACHE_REFERENCETRANSFERCACHEBUILDER_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowBudget.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockFormat.h"
 #include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
 #include "DataCodec/Codec/Reference/NumericArrayReferenceBytes.h"
 #include "DataCodec/Codec/Reference/ReferenceCodec.h"
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/ReferenceControlParams.h"
 
@@ -18,10 +19,13 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <variant>
+#include <type_traits>
 namespace datacodec {
 namespace numericarrayreference {
 
@@ -35,19 +39,12 @@ struct NumericArrayReferenceSourceData {
     }
 };
 
-using NumericArrayReferenceStagingStoreFactory = std::function<std::shared_ptr<bytestore::IByteStore>(
-    const std::string&,
-    std::uint64_t,
-    std::string*)>;
-
 struct NumericArrayReferenceTransferControl {
     double affineBlockRSquared{0.95};
     TemporalPredictorControlParams predictor;
     ReferenceSelectionMode selectionMode{ReferenceSelectionMode::Auto};
     ReferenceAutoSelectionStrategy autoSelectionStrategy{
         ReferenceAutoSelectionStrategy::Exact};
-    std::uint32_t spatialBlockElementCount{262144u};
-    ScratchByteQuotaAcquire acquireScratchQuota;
     std::function<bool(
         const NumericArrayStorageParams&,
         std::span<const std::uint8_t>,
@@ -59,15 +56,7 @@ struct NumericArrayReferenceTransferControl {
         NumericArrayReferenceKind,
         std::uint16_t,
         std::int32_t&,
-        std::string*)> selectPredictorOffset;
-    NumericArrayReferenceStagingStoreFactory createStagingStore;
-    bool useMemoryStaging{false};
-    bool useMemoryTransferCache{false};
-};
-
-struct StagedNumericArrayReferenceBytes {
-    std::shared_ptr<bytestore::IByteStore> store;
-    std::span<const std::uint8_t> bytes;
+        std::string*, numericarray::NumericArrayCompressorState*)> selectPredictorOffset;
 };
 
 struct OrdinaryNumericArrayEncodedBlock {
@@ -105,7 +94,6 @@ inline bool BuildUniformNumericArrayTupleSample(
     const std::size_t tupleBytes,
     const std::size_t sampleElementCount,
     ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
     ScratchByteBuffer& sample,
     std::string* error = nullptr) {
     sample.Release();
@@ -134,8 +122,7 @@ inline bool BuildUniformNumericArrayTupleSample(
     }
     const auto requestedBytes = static_cast<std::uint64_t>(sampleByteCount);
     sample = scratchBytePool.Acquire(
-        sampleByteCount,
-        acquireScratchQuota ? acquireScratchQuota(requestedBytes) : ScratchByteQuotaLease{});
+        sampleByteCount);
     auto& sampleBytes = sample.Bytes();
     for (std::size_t sampleIndex = 0u; sampleIndex < sampleElementCount; ++sampleIndex) {
         const auto sourceIndex = sampleElementCount == 1u
@@ -160,13 +147,16 @@ inline bool BuildOrdinaryNumericArrayEncodedBlock(
     const std::span<const std::uint8_t> currentBytes,
     ScratchByteBufferPool& scratchBytePool,
     OrdinaryNumericArrayEncodedBlock& block,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    numericarray::NumericArrayCompressorState* compressorState = nullptr,
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
     block = {};
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
     NumericArrayBytesCodec bytesCodec{NumericArrayBytesCodec::NumericArrayCodec};
+    params.capacitySamples = capacitySamples;
     std::vector<NumericArrayComponentLayoutParams> componentLayouts;
     if (!numericarray::ResolveEncodedNumericArrayBlockBytes(
             params,
@@ -177,8 +167,11 @@ inline bool BuildOrdinaryNumericArrayEncodedBlock(
             bytesCodec,
             error,
             &scratchBytePool,
-            &componentLayouts)) {
+            &componentLayouts, compressorState)) {
         return false;
+    }
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(numericarray::NumericBufferSample::OrdinaryCandidate, block.bytes);
     }
     if (block.bytes.size() > static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
         return validation::AssignError(error, "ordinary numeric array block exceeds current block format");
@@ -220,160 +213,338 @@ inline bool ValidateIntegerReferenceCodecAndLayout(
     return true;
 }
 
-inline bool PrepareStagedNumericArrayBytes(
-    std::shared_ptr<bytestore::IByteStore> store,
-    const std::uint64_t expectedBytes,
-    StagedNumericArrayReferenceBytes& staged,
-    std::string* error = nullptr) {
-    staged = {};
-    if (store == nullptr) {
-        return validation::AssignError(error, "numeric array reference staging store is null");
-    }
-    if (store->ByteSizeHint() != expectedBytes) {
-        return validation::AssignError(error, "numeric array reference staging byte size mismatch");
-    }
-    std::span<const std::uint8_t> bytes;
-    const auto contiguousStatus = store->PrepareContiguousBytes(bytes, error);
-    if (contiguousStatus == ContiguousViewStatus::Error) {
-        return false;
-    }
-    if (contiguousStatus == ContiguousViewStatus::Unavailable) {
-        return validation::AssignError(
-            error,
-            "numeric array reference staging store does not provide contiguous bytes");
-    }
-    if (bytes.size() != expectedBytes) {
-        return validation::AssignError(error, "numeric array reference contiguous staging byte size mismatch");
-    }
-    staged.store = std::move(store);
-    staged.bytes = bytes;
-    return true;
+
+struct ReferenceEncodeBlockInput {
+    std::uint32_t elementOffset{0u};
+    std::uint32_t elementCount{0u};
+    ScratchByteBuffer current;
+    ScratchByteBuffer reference;
+    std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
+};
+
+struct ReferenceEncodeBlockOutput {
+    std::variant<OrdinaryNumericArrayEncodedBlock, NumericArrayReferenceEncodedBlock> block;
+    NumericArrayBlockLayoutParams layout;
+    std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
+    std::optional<numericarray::NumericArrayBlockCapacitySamples> probeCapacitySamples;
+};
+
+inline void ObserveReferenceCandidateCapacity(
+    numericarray::NumericArrayBlockCapacitySamples* samples,
+    const NumericArrayReferenceEncodedBlock& block) noexcept {
+    if (samples == nullptr) { return; }
+    std::visit([&](const auto& fields) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(fields)>, WaveletReferenceBlockFields>) {
+            samples->Observe(numericarray::NumericBufferSample::ReferenceCandidate, fields.waveletBytes.Bytes());
+        } else {
+            samples->Observe(numericarray::NumericBufferSample::ReferenceCandidate, fields.deltaBytes.Bytes());
+        }
+    }, block.fields);
 }
 
-inline bool StageNumericArrayReaderRange(
-    const numericarray::NumericArrayReader& reader,
-    const std::uint64_t elementOffset,
-    const std::uint64_t elementCount,
-    ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
-    bytestore::ByteStoreSession& byteStoreSession,
-    const NumericArrayReferenceStagingStoreFactory& createStagingStore,
-    const bool useMemoryStaging,
-    const std::string& label,
-    const std::size_t accessWindowBytes,
-    StagedNumericArrayReferenceBytes& staged,
-    std::string* error = nullptr) {
-    staged = {};
-    const auto tupleBytes = reader.ElementBytes();
-    if (tupleBytes == 0u) {
-        return validation::AssignError(error, "numeric array reference staging requires a non-empty tuple layout");
-    }
-    if (!validation::CanMulU64(elementCount, tupleBytes)) {
-        validation::AssignError(error, "numeric array reference staging byte size exceeds addressable range");
-        return false;
-    }
-    const auto expectedBytes = elementCount * static_cast<std::uint64_t>(tupleBytes);
-    auto store = createStagingStore
-        ? createStagingStore(label, expectedBytes, error)
-        : bytestore::CreateByteStore(byteStoreSession, label, useMemoryStaging, error);
-    if (store == nullptr) {
-        if (error != nullptr && error->empty()) {
-            validation::AssignError(error, "failed to create numeric array reference staging store");
-        }
-        return false;
-    }
-    const auto resolvedWindowBytes = std::max<std::size_t>(accessWindowBytes, tupleBytes);
-    const auto elementsPerWindow = std::max<std::uint64_t>(
-        1u,
-        static_cast<std::uint64_t>(resolvedWindowBytes / tupleBytes));
-    std::uint64_t localOffset = 0u;
-    while (localOffset < elementCount) {
-        const auto localCount = std::min<std::uint64_t>(
-            elementsPerWindow,
-            elementCount - localOffset);
-        ScratchByteBuffer windowBytes;
-        if (!reader.ReadElements(
-                elementOffset + localOffset,
-                localCount,
-                scratchBytePool,
-                acquireScratchQuota,
-                windowBytes,
-                error)) {
-            return false;
-        }
-        if (!store->Append(windowBytes.Span(), error)) {
-            return false;
-        }
-        localOffset += localCount;
-    }
-    return PrepareStagedNumericArrayBytes(std::move(store), expectedBytes, staged, error);
-}
-
-inline bool StageNumericArrayPredictorReferenceBlock(
+inline bool ComputeReferenceEncodeBlock(
+    const NumericArrayStorageParams& meta, const CompressorConfig& defaultCompressor,
+    const NumericArrayReferenceSourceData& referenceData,
     const numericarray::NumericArrayReader& referenceReader,
-    const NumericArrayStorageParams& referenceMeta,
-    const NumericArrayStorageParams& targetMeta,
-    const std::uint64_t elementOffset,
-    const std::uint64_t elementCount,
-    const std::int32_t predictorOffset,
-    ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteQuotaAcquire& acquireScratchQuota,
-    bytestore::ByteStoreSession& byteStoreSession,
-    const NumericArrayReferenceStagingStoreFactory& createStagingStore,
-    const bool useMemoryStaging,
-    const std::string& label,
-    const std::size_t accessWindowBytes,
-    StagedNumericArrayReferenceBytes& staged,
-    std::string* error = nullptr) {
-    staged = {};
-    const auto tupleBytes = static_cast<std::size_t>(std::max(targetMeta.dimension, 0)) *
-        static_cast<std::size_t>(NumericArrayValueSize(targetMeta));
-    if (tupleBytes == 0u) {
-        return validation::AssignError(error, "numeric array predictor staging requires a non-empty tuple layout");
+    const NumericArrayReferenceCodecId codecId, const NumericArrayReferenceTransferControl& control,
+    const ReferenceEncodeBlockInput& input, ReferenceEncodeBlockOutput& output,
+    ScratchByteBufferPool& scratchBytePool, std::string* error,
+    numericarray::NumericArrayCompressorState* compressorState) {
+    auto* capacitySamples = output.capacitySamples ? &*output.capacitySamples : nullptr;
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(numericarray::NumericBufferSample::Raw, input.current.Bytes());
+        capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, input.reference.Bytes());
     }
-    if (!validation::CanMulU64(elementCount, tupleBytes)) {
-        validation::AssignError(error, "numeric array predictor staging byte size exceeds addressable range");
-        return false;
-    }
-    const auto expectedBytes = elementCount * static_cast<std::uint64_t>(tupleBytes);
-    auto store = createStagingStore
-        ? createStagingStore(label, expectedBytes, error)
-        : bytestore::CreateByteStore(byteStoreSession, label, useMemoryStaging, error);
-    if (store == nullptr) {
-        if (error != nullptr && error->empty()) {
-            validation::AssignError(error, "failed to create numeric array predictor staging store");
+    const auto* codec = ResolveNumericArrayReferenceCodec(codecId);
+    if (codec == nullptr) { return validation::AssignError(error, "unsupported numeric array reference codec id"); }
+    const auto referenceKind = ToNumericArrayReferenceKind(referenceData.candidate.scope);
+    const auto localParentFieldIndex = referenceData.candidate.localParentFieldIndex;
+    const auto elementOffset = static_cast<std::size_t>(input.elementOffset);
+    const auto localElementCount = static_cast<std::size_t>(input.elementCount);
+    const auto blockElementOffset = input.elementOffset;
+    const auto blockElementCount = input.elementCount;
+    const auto& currentStaged = input.current;
+    const auto tupleBytes = localElementCount == 0u ? 0u : currentStaged.Span().size() / localElementCount;
+    std::string referenceError;
+    std::int32_t predictorOffset = 0;
+    ScratchByteBuffer predictorStaged;
+    const auto& referenceStaged = codecId == NumericArrayReferenceCodecId::Predictor
+        ? predictorStaged : input.reference;
+    if (codecId == NumericArrayReferenceCodecId::Predictor) {
+        if (control.selectPredictorOffset &&
+            !control.selectPredictorOffset(
+                meta,
+                currentStaged.Span(),
+                referenceReader,
+                referenceData.meta,
+                scratchBytePool,
+                blockElementOffset,
+                blockElementCount,
+                referenceKind,
+                localParentFieldIndex,
+                predictorOffset,
+                &referenceError,
+                compressorState)) {
+            return validation::AssignError(
+                error,
+                "reference predictor selection failed: " + referenceError);
         }
-        return false;
-    }
-    const auto resolvedWindowBytes = std::max<std::size_t>(accessWindowBytes, tupleBytes);
-    const auto elementsPerWindow = std::max<std::uint64_t>(
-        1u,
-        static_cast<std::uint64_t>(resolvedWindowBytes / tupleBytes));
-    std::uint64_t localOffset = 0u;
-    while (localOffset < elementCount) {
-        const auto localCount = std::min<std::uint64_t>(
-            elementsPerWindow,
-            elementCount - localOffset);
-        ScratchByteBuffer windowBytes;
         if (!BuildNumericArrayPredictorReferenceBlockBytes(
                 referenceReader,
-                referenceMeta,
-                targetMeta,
+                referenceData.meta,
+                meta,
                 scratchBytePool,
-                acquireScratchQuota,
-                static_cast<std::size_t>(elementOffset + localOffset),
-                static_cast<std::size_t>(localCount),
+                elementOffset,
+                localElementCount,
                 predictorOffset,
-                windowBytes,
+                predictorStaged,
+                &referenceError)) {
+            return validation::AssignError(
+                error,
+                "reference predictor staging failed: " + referenceError);
+        }
+    }
+    if (!ValidateNumericArrayRawByteSpan(
+            meta,
+            referenceStaged.Span(),
+            localElementCount,
+            "reference numeric array spatial block",
+            &referenceError)) {
+        return validation::AssignError(
+            error,
+            "reference spatial block validation failed: " + referenceError);
+    }
+
+    if (capacitySamples != nullptr && codecId == NumericArrayReferenceCodecId::Predictor) {
+        capacitySamples->Observe(numericarray::NumericBufferSample::ReferenceShifted, predictorStaged.Bytes());
+    }
+    const NumericArrayReferenceCodecEncodeInput fullReferenceInput{
+        .meta = meta,
+        .defaultCompressor = defaultCompressor,
+        .scratchBytePool = scratchBytePool,
+        .control = NumericArrayReferenceCodecControl{
+            .affineBlockRSquared = control.affineBlockRSquared,
+        },
+        .currentBytes = currentStaged.Span(),
+        .referenceBytes = referenceStaged.Span(),
+        .elementOffset = blockElementOffset,
+        .elementCount = blockElementCount,
+        .componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0)),
+        .referenceKind = referenceKind,
+        .localParentFieldIndex = localParentFieldIndex,
+        .predictorOffset = predictorOffset,
+        .compressorState = compressorState,
+        .capacitySamples = capacitySamples,
+    };
+
+    NumericArrayReferencePreparedBlock preparedReference;
+    const auto prepareResult = codec->PrepareBlock(
+        fullReferenceInput,
+        preparedReference,
+        &referenceError);
+    if (prepareResult.IsFailed()) {
+        return validation::AssignError(
+            error,
+            "reference spatial block preparation failed: " + referenceError);
+    }
+
+    const auto publishOrdinaryBlock = [&](OrdinaryNumericArrayEncodedBlock& block) {
+        output.layout = std::move(block.layout);
+        output.block = std::move(block);
+        return true;
+    };
+    const auto publishReferenceBlock = [&](
+        NumericArrayReferenceEncodedBlock& block, NumericArrayBlockLayoutParams& layout) {
+        output.layout = std::move(layout);
+        output.block = std::move(block);
+        return true;
+    };
+    const auto buildFullOrdinary = [&](OrdinaryNumericArrayEncodedBlock& block) {
+        return BuildOrdinaryNumericArrayEncodedBlock(
+            meta,
+            defaultCompressor,
+            blockElementOffset,
+            blockElementCount,
+            currentStaged.Span(),
+            scratchBytePool,
+            block,
+            error, compressorState, capacitySamples);
+    };
+    const auto buildFullReference = [&](NumericArrayReferenceEncodedBlock& block) {
+        referenceError.clear();
+        const auto result = codec->EncodePreparedBlock(
+            fullReferenceInput,
+            preparedReference,
+            block,
+            &referenceError);
+        if (result.IsFailed()) {
+            return validation::AssignError(
+                error,
+                "reference spatial block encoding failed: " + referenceError);
+        }
+        if (result.IsRejected()) {
+            return validation::AssignError(
+                error,
+                "prepared reference spatial block was unexpectedly rejected");
+        }
+        ObserveReferenceCandidateCapacity(capacitySamples, block);
+        return true;
+    };
+
+    if (prepareResult.IsRejected()) {
+        if (control.selectionMode == ReferenceSelectionMode::Forced) {
+            return validation::AssignError(
+                error,
+                std::string("forced reference spatial block was rejected: ") +
+                    NumericArrayReferenceRejectReasonName(prepareResult.rejectReason));
+        }
+        OrdinaryNumericArrayEncodedBlock ordinaryBlock;
+        if (!buildFullOrdinary(ordinaryBlock) || !publishOrdinaryBlock(ordinaryBlock)) {
+            return false;
+        }
+        return true;
+    }
+
+    if (control.selectionMode == ReferenceSelectionMode::Forced) {
+        NumericArrayReferenceEncodedBlock referenceBlock;
+        if (!buildFullReference(referenceBlock)) {
+            return false;
+        }
+        auto referenceLayout = MakeNumericArrayReferenceBlockLayout(referenceBlock);
+        if (!publishReferenceBlock(referenceBlock, referenceLayout)) {
+            return false;
+        }
+        return true;
+    }
+
+    bool useReference = false;
+    const bool useBoundedProbe =
+        control.autoSelectionStrategy == ReferenceAutoSelectionStrategy::BoundedProbe &&
+        referenceKind == NumericArrayReferenceKind::IntraArray &&
+        localElementCount > kReferenceProbeElementCount;
+
+    OrdinaryNumericArrayEncodedBlock ordinaryBlock;
+    NumericArrayReferenceEncodedBlock referenceBlock;
+    NumericArrayBlockLayoutParams referenceLayout;
+    if (!useBoundedProbe) {
+        if (!buildFullOrdinary(ordinaryBlock) || !buildFullReference(referenceBlock)) {
+            return false;
+        }
+        referenceLayout = MakeNumericArrayReferenceBlockLayout(referenceBlock);
+        useReference = EstimateNumericArrayBlockStoredBytes(referenceLayout) <
+            EstimateNumericArrayBlockStoredBytes(ordinaryBlock.layout);
+    } else {
+        // 探测与完整候选可能同时存活，使用独立取样身份
+        if (capacitySamples != nullptr) { output.probeCapacitySamples.emplace(); }
+        auto* probeSamples = output.probeCapacitySamples ? &*output.probeCapacitySamples : nullptr;
+        ScratchByteBuffer currentSample;
+        ScratchByteBuffer referenceSample;
+        if (!BuildUniformNumericArrayTupleSample(
+                currentStaged.Span(),
+                localElementCount,
+                tupleBytes,
+                kReferenceProbeElementCount,
+                scratchBytePool,
+                currentSample,
+                error) ||
+            !BuildUniformNumericArrayTupleSample(
+                referenceStaged.Span(),
+                localElementCount,
+                tupleBytes,
+                kReferenceProbeElementCount,
+                scratchBytePool,
+                referenceSample,
                 error)) {
             return false;
         }
-        if (!store->Append(windowBytes.Span(), error)) {
+
+        if (probeSamples != nullptr) {
+            probeSamples->Observe(numericarray::NumericBufferSample::Raw, currentSample.Bytes());
+            probeSamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, referenceSample.Bytes());
+        }
+        OrdinaryNumericArrayEncodedBlock ordinaryProbe;
+        if (!BuildOrdinaryNumericArrayEncodedBlock(
+                meta,
+                defaultCompressor,
+                blockElementOffset,
+                static_cast<std::uint32_t>(kReferenceProbeElementCount),
+                currentSample.Span(),
+                scratchBytePool,
+                ordinaryProbe,
+                error, compressorState, probeSamples)) {
             return false;
         }
-        localOffset += localCount;
+        const NumericArrayReferenceCodecEncodeInput probeInput{
+            .meta = meta,
+            .defaultCompressor = defaultCompressor,
+            .scratchBytePool = scratchBytePool,
+            .control = NumericArrayReferenceCodecControl{
+                .affineBlockRSquared = control.affineBlockRSquared,
+            },
+            .currentBytes = currentSample.Span(),
+            .referenceBytes = referenceSample.Span(),
+            .elementOffset = blockElementOffset,
+            .elementCount = static_cast<std::uint32_t>(kReferenceProbeElementCount),
+            .componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0)),
+            .referenceKind = referenceKind,
+            .localParentFieldIndex = localParentFieldIndex,
+            .predictorOffset = predictorOffset,
+            .compressorState = compressorState,
+            .capacitySamples = probeSamples,
+        };
+        NumericArrayReferencePreparedBlock probePreparedReference;
+        referenceError.clear();
+        const auto probePrepareResult = codec->PrepareBlock(
+            probeInput,
+            probePreparedReference,
+            &referenceError);
+        if (probePrepareResult.IsFailed()) {
+            return validation::AssignError(
+                error,
+                "reference probe preparation failed: " + referenceError);
+        }
+        NumericArrayReferenceEncodedBlock referenceProbe;
+        if (probePrepareResult.IsEncoded()) {
+            referenceError.clear();
+            const auto probeResult = codec->EncodePreparedBlock(
+                probeInput,
+                probePreparedReference,
+                referenceProbe,
+                &referenceError);
+            if (probeResult.IsFailed()) {
+                return validation::AssignError(
+                    error,
+                    "reference probe encoding failed: " + referenceError);
+            }
+            if (probeResult.IsRejected()) {
+                return validation::AssignError(
+                    error,
+                    "prepared reference probe was unexpectedly rejected");
+            }
+            ObserveReferenceCandidateCapacity(probeSamples, referenceProbe);
+            const auto probeLayout = MakeNumericArrayReferenceBlockLayout(referenceProbe);
+            useReference = EstimateNumericArrayBlockStoredBytes(probeLayout) <
+                EstimateNumericArrayBlockStoredBytes(ordinaryProbe.layout);
+        }
+
+        if (useReference) {
+            if (!buildFullReference(referenceBlock)) {
+                return false;
+            }
+            referenceLayout = MakeNumericArrayReferenceBlockLayout(referenceBlock);
+        } else if (!buildFullOrdinary(ordinaryBlock)) {
+            return false;
+        }
     }
-    return PrepareStagedNumericArrayBytes(std::move(store), expectedBytes, staged, error);
+
+    if (useReference) {
+        if (!publishReferenceBlock(referenceBlock, referenceLayout)) {
+            return false;
+        }
+    } else if (!publishOrdinaryBlock(ordinaryBlock)) {
+        return false;
+    }
+    return true;
 }
 
 inline bool BuildNumericArrayReferenceTransferCache(
@@ -383,449 +554,118 @@ inline bool BuildNumericArrayReferenceTransferCache(
     const NumericArrayReferenceSourceData& referenceData,
     const NumericArrayReferenceCodecId codecId,
     const NumericArrayReferenceTransferControl& control,
-    ScratchByteBufferPool& scratchBytePool,
-    window::WindowBudget& windowBudget,
-    const std::size_t windowBytes,
+    DataCodecExecutionResources& resources,
     std::shared_ptr<bytestore::IByteSource>& transferCache,
     bytestore::ByteStoreSession& byteStoreSession,
     std::vector<NumericArrayBlockLayoutParams>* blockLayouts = nullptr,
     std::string* error = nullptr,
-    const std::string& storeLabel = "numeric_array_reference_transfer") {
+    const std::string& storeLabel = "numeric_array_reference_transfer",
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
     transferCache.reset();
-    if (blockLayouts != nullptr) {
-        blockLayouts->clear();
-    }
-    numericarray::NumericArrayReader currentReader;
-    numericarray::NumericArrayReader referenceReader;
+    if (blockLayouts != nullptr) { blockLayouts->clear(); }
+    numericarray::NumericArrayReader currentReader, referenceReader;
     if (!numericarray::BuildNumericArrayReader(currentSource, currentReader, error) ||
-        !numericarray::BuildNumericArrayReader(referenceData.source, referenceReader, error)) {
-        return false;
+        !numericarray::BuildNumericArrayReader(referenceData.source, referenceReader, error) ||
+        !ValidateIntegerReferenceCodecAndLayout(meta, referenceData.meta, codecId, error)) { return false; }
+    const auto elementCount = currentReader.source.layout.elementCount;
+    if (elementCount > std::numeric_limits<std::uint32_t>::max() || meta.elementCount != elementCount ||
+        referenceData.meta.elementCount != meta.elementCount ||
+        referenceReader.source.layout.elementCount != meta.elementCount) {
+        return validation::AssignError(error, "reference numeric arrays must share a valid spatial domain");
     }
-    if (!ValidateIntegerReferenceCodecAndLayout(meta, referenceData.meta, codecId, error)) {
-        return false;
+    std::size_t valueSize = 0u, tupleBytes = 0u;
+    if (!TryParamSizeToSizeT(NumericArrayValueSize(meta), valueSize) ||
+        !validation::CheckedMulSizeT(static_cast<std::size_t>(std::max(meta.dimension, 0)), valueSize,
+            tupleBytes, "reference tuple bytes", error)) { return false; }
+    if (elementCount != 0u && (tupleBytes == 0u || currentReader.ElementBytes() != tupleBytes)) {
+        return validation::AssignError(error, "current numeric array tuple size does not match metadata");
     }
-    if (referenceData.meta.elementCount != meta.elementCount) {
-        return validation::AssignError(
-            error,
-            "reference numeric array does not share the current spatial block domain");
+    if (ResolveNumericArrayReferenceCodec(codecId) == nullptr) {
+        return validation::AssignError(error, "unsupported numeric array reference codec id");
     }
-
-    auto bodyTransferCache = bytestore::CreateAppendableByteStore(
-        byteStoreSession,
-        storeLabel,
-        control.useMemoryTransferCache,
-        error);
-    if (bodyTransferCache == nullptr) {
+    // reference 读取使用已准备的数据视图，源文件分块不参与当前编码批次选择
+    auto phase = WaitForHeavyPhase(resources);
+    if (!phase) { return false; }
+    auto bodyTransferCache = bytestore::CreateAppendableByteStore(byteStoreSession, storeLabel, error);
+    if (!bodyTransferCache) { return false; }
+    if (elementCount == 0u) {
+        if (!bodyTransferCache->Seal(error)) { return false; }
+        transferCache = std::move(bodyTransferCache);
+        return true;
+    }
+    bytestore::AppendableByteStoreWriter writer(bodyTransferCache, resources);
+    std::size_t nextOffset = 0u, committedElements = 0u;
+    phase.reset();
+    resources.SetWorkType({.path = ResourceWorkPath::ReferenceEncode,
+        .codec = static_cast<std::uint32_t>(codecId),
+        .scalar = static_cast<std::uint32_t>(currentReader.source.layout.dataType),
+        .components = static_cast<std::uint32_t>(meta.dimension),
+        .blockElements = numericarray::kSpatialBlockElementCount,
+        .referencePath = static_cast<std::uint32_t>(codecId)});
+    const bool success = RunOrderedBlocks<ReferenceEncodeBlockInput, ReferenceEncodeBlockOutput>(
+        resources,
+        [&] { return nextOffset < elementCount; },
+        [&](ReferenceEncodeBlockInput& block) {
+            block.elementOffset = static_cast<std::uint32_t>(nextOffset);
+            block.elementCount = static_cast<std::uint32_t>(std::min<std::size_t>(
+                numericarray::kSpatialBlockElementCount, elementCount - nextOffset));
+            if (recordCapacitySamples) { block.capacitySamples.emplace(); }
+            const auto sample = [&](const numericarray::NumericBufferSample kind) -> BufferCapacitySample* {
+                return block.capacitySamples ? &block.capacitySamples->values[static_cast<std::size_t>(kind)] : nullptr;
+            };
+            if (!currentReader.ReadElements(nextOffset, block.elementCount, resources.Scratch(), block.current, error,
+                    sample(numericarray::NumericBufferSample::ReaderOrder)) ||
+                !ValidateNumericArrayRawByteSpan(meta, block.current.Span(), block.elementCount,
+                    "current numeric array spatial block", error)) { return false; }
+            if (codecId != NumericArrayReferenceCodecId::Predictor &&
+                !referenceReader.ReadElements(nextOffset, block.elementCount, resources.Scratch(), block.reference, error,
+                    sample(numericarray::NumericBufferSample::ReferenceReaderOrder))) {
+                return false;
+            }
+            nextOffset += block.elementCount;
+            return true;
+        },
+        [&](const ReferenceEncodeBlockInput& block, ReferenceEncodeBlockOutput& output, WorkerContext& worker) {
+            std::string localError;
+            output.capacitySamples = block.capacitySamples;
+            if (!ComputeReferenceEncodeBlock(meta, defaultCompressor, referenceData, referenceReader, codecId,
+                    control, block, output, worker.Scratch(), &localError, &worker.NumericCompressor())) {
+                resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                    "reference-block-encode", "ComputeReferenceEncodeBlock", localError));
+                return false;
+            }
+            return true;
+        },
+        [&](ReferenceEncodeBlockOutput& output) {
+            if (output.layout.elementOffset != committedElements ||
+                output.layout.elementCount > elementCount - committedElements) {
+                return validation::AssignError(error, "reference block does not match the next commit range");
+            }
+            const bool written = std::visit([&](const auto& block) {
+                using Block = std::decay_t<decltype(block)>;
+                if constexpr (std::is_same_v<Block, OrdinaryNumericArrayEncodedBlock>) {
+                    return WriteNumericArrayBlock(writer, block.header, {}, {}, block.bytes, error);
+                } else {
+                    return WriteNumericArrayReferenceEncodedBlock(writer, block, error);
+                }
+            }, output.block);
+            if (!written) { return false; }
+            if (output.capacitySamples && recordCapacitySamples) {
+                try { recordCapacitySamples(output.capacitySamples->values); }
+                catch (...) { resources.RecordDiagnosticExportFailure(); }
+            }
+            if (output.probeCapacitySamples && recordCapacitySamples) {
+                try { recordCapacitySamples(output.probeCapacitySamples->values); }
+                catch (...) { resources.RecordDiagnosticExportFailure(); }
+            }
+            committedElements += output.layout.elementCount;
+            if (blockLayouts != nullptr) { blockLayouts->push_back(std::move(output.layout)); }
+            return committedElements != elementCount || bodyTransferCache->Seal(error);
+        });
+    if (!success) {
         if (error != nullptr && error->empty()) {
-            validation::AssignError(error, "failed to create numeric array reference transfer cache");
+            validation::AssignError(error, "reference block flow failed");
         }
-        return false;
-    }
-
-    if (currentReader.source.layout.elementCount != 0u) {
-        const auto maxBlockElementCount =
-            static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max());
-        if (currentReader.source.layout.elementCount > maxBlockElementCount) {
-            return validation::AssignError(error, "numeric array element count exceeds uint32 field capacity");
-        }
-        std::size_t localMetaElementCount = 0u;
-        std::size_t localMetaValueSize = 0u;
-        if (!TryParamSizeToSizeT(meta.elementCount, localMetaElementCount) ||
-            !TryParamSizeToSizeT(NumericArrayValueSize(meta), localMetaValueSize)) {
-            return validation::AssignError(error, "current numeric array metadata exceeds this platform size limit");
-        }
-        if (currentReader.source.layout.elementCount != localMetaElementCount) {
-            return validation::AssignError(error, "current numeric array element count does not match metadata");
-        }
-        const auto tupleBytes = currentReader.ElementBytes();
-        const auto metaTupleBytes = static_cast<std::size_t>(std::max(meta.dimension, 0)) * localMetaValueSize;
-        if (tupleBytes == 0u || tupleBytes != metaTupleBytes) {
-            return validation::AssignError(error, "current numeric array tuple size does not match metadata");
-        }
-
-        const auto* codec = ResolveNumericArrayReferenceCodec(codecId);
-        if (codec == nullptr) {
-            return validation::AssignError(error, "unsupported numeric array reference codec id");
-        }
-        const auto referenceKind = ToNumericArrayReferenceKind(referenceData.candidate.scope);
-        const auto localParentFieldIndex = referenceData.candidate.localParentFieldIndex;
-        bytestore::AppendableByteStoreWriter transferWriter(bodyTransferCache);
-
-        const auto elementCount = currentReader.source.layout.elementCount;
-        std::vector<numericarray::SpatialBlockRange> spatialBlocks;
-        if (!numericarray::BuildSpatialBlockLayout(
-                elementCount,
-                control.spatialBlockElementCount,
-                spatialBlocks,
-                error)) {
-            return false;
-        }
-        if (!referenceData.meta.blockLayouts.empty()) {
-            if (referenceData.meta.blockLayouts.size() != spatialBlocks.size()) {
-                return validation::AssignError(
-                    error,
-                    "reference numeric array spatial block count does not match the current layout");
-            }
-            for (std::size_t blockIndex = 0u; blockIndex < spatialBlocks.size(); ++blockIndex) {
-                const auto& expected = spatialBlocks[blockIndex];
-                const auto& referenceLayout = referenceData.meta.blockLayouts[blockIndex];
-                if (referenceLayout.elementOffset != expected.elementOffset ||
-                    referenceLayout.elementCount != expected.elementCount) {
-                    return validation::AssignError(
-                        error,
-                        "reference numeric array spatial block range does not match the current layout");
-                }
-            }
-        }
-        for (const auto& spatialBlock : spatialBlocks) {
-            const auto elementOffset = static_cast<std::size_t>(spatialBlock.elementOffset);
-            const auto localElementCount = static_cast<std::size_t>(spatialBlock.elementCount);
-            const auto blockElementOffset = spatialBlock.elementOffset;
-            const auto blockElementCount = spatialBlock.elementCount;
-            std::size_t currentBlockLocalBytes = 0u;
-            if (!validation::CheckedMulSizeT(
-                    localElementCount,
-                    tupleBytes,
-                    currentBlockLocalBytes,
-                    "numeric array reference spatial block",
-                    error)) {
-                return false;
-            }
-            auto windowLease = windowBudget.Acquire(
-                validation::SaturatingMulU64(
-                    static_cast<std::uint64_t>(currentBlockLocalBytes),
-                    2u));
-            (void)windowLease;
-
-            StagedNumericArrayReferenceBytes currentStaged;
-            if (!StageNumericArrayReaderRange(
-                    currentReader,
-                    elementOffset,
-                    localElementCount,
-                    scratchBytePool,
-                    control.acquireScratchQuota,
-                    byteStoreSession,
-                    control.createStagingStore,
-                    control.useMemoryStaging,
-                    storeLabel + "_current_" + std::to_string(elementOffset),
-                    windowBytes,
-                    currentStaged,
-                    error) ||
-                !ValidateNumericArrayRawByteSpan(
-                    meta,
-                    currentStaged.bytes,
-                    localElementCount,
-                    "current numeric array spatial block",
-                    error)) {
-                return false;
-            }
-
-            std::string referenceError;
-            std::int32_t predictorOffset = 0;
-            StagedNumericArrayReferenceBytes referenceStaged;
-            const auto referenceLabel = storeLabel + "_reference_" + std::to_string(elementOffset);
-            if (codecId == NumericArrayReferenceCodecId::Predictor) {
-                if (control.selectPredictorOffset &&
-                    !control.selectPredictorOffset(
-                        meta,
-                        currentStaged.bytes,
-                        referenceReader,
-                        referenceData.meta,
-                        scratchBytePool,
-                        blockElementOffset,
-                        blockElementCount,
-                        referenceKind,
-                        localParentFieldIndex,
-                        predictorOffset,
-                        &referenceError)) {
-                    return validation::AssignError(
-                        error,
-                        "reference predictor selection failed: " + referenceError);
-                }
-                if (!StageNumericArrayPredictorReferenceBlock(
-                        referenceReader,
-                        referenceData.meta,
-                        meta,
-                        blockElementOffset,
-                        blockElementCount,
-                        predictorOffset,
-                        scratchBytePool,
-                        control.acquireScratchQuota,
-                        byteStoreSession,
-                        control.createStagingStore,
-                        control.useMemoryStaging,
-                        referenceLabel,
-                        windowBytes,
-                        referenceStaged,
-                        &referenceError)) {
-                    return validation::AssignError(
-                        error,
-                        "reference predictor staging failed: " + referenceError);
-                }
-            } else if (!StageNumericArrayReaderRange(
-                    referenceReader,
-                    elementOffset,
-                    localElementCount,
-                    scratchBytePool,
-                    control.acquireScratchQuota,
-                    byteStoreSession,
-                    control.createStagingStore,
-                    control.useMemoryStaging,
-                    referenceLabel,
-                    windowBytes,
-                    referenceStaged,
-                    &referenceError)) {
-                return validation::AssignError(
-                    error,
-                    "reference spatial block staging failed: " + referenceError);
-            }
-            if (!ValidateNumericArrayRawByteSpan(
-                    meta,
-                    referenceStaged.bytes,
-                    localElementCount,
-                    "reference numeric array spatial block",
-                    &referenceError)) {
-                return validation::AssignError(
-                    error,
-                    "reference spatial block validation failed: " + referenceError);
-            }
-
-            const NumericArrayReferenceCodecEncodeInput fullReferenceInput{
-                .meta = meta,
-                .defaultCompressor = defaultCompressor,
-                .scratchBytePool = scratchBytePool,
-                .acquireScratchQuota = control.acquireScratchQuota,
-                .control = NumericArrayReferenceCodecControl{
-                    .affineBlockRSquared = control.affineBlockRSquared,
-                },
-                .currentBytes = currentStaged.bytes,
-                .referenceBytes = referenceStaged.bytes,
-                .elementOffset = blockElementOffset,
-                .elementCount = blockElementCount,
-                .componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0)),
-                .referenceKind = referenceKind,
-                .localParentFieldIndex = localParentFieldIndex,
-                .predictorOffset = predictorOffset,
-            };
-
-            NumericArrayReferencePreparedBlock preparedReference;
-            const auto prepareResult = codec->PrepareBlock(
-                fullReferenceInput,
-                preparedReference,
-                &referenceError);
-            if (prepareResult.IsFailed()) {
-                return validation::AssignError(
-                    error,
-                    "reference spatial block preparation failed: " + referenceError);
-            }
-
-            const auto writeOrdinaryBlock = [&](OrdinaryNumericArrayEncodedBlock& block) {
-                if (!WriteNumericArrayBlock(
-                        transferWriter,
-                        block.header,
-                        {},
-                        {},
-                        std::span<const std::uint8_t>(block.bytes.data(), block.bytes.size()),
-                        error)) {
-                    return false;
-                }
-                if (blockLayouts != nullptr) {
-                    blockLayouts->push_back(std::move(block.layout));
-                }
-                return true;
-            };
-            const auto writeReferenceBlock = [&](
-                NumericArrayReferenceEncodedBlock& block,
-                NumericArrayBlockLayoutParams& layout) {
-                if (!WriteNumericArrayReferenceEncodedBlock(transferWriter, block, error)) {
-                    return false;
-                }
-                if (blockLayouts != nullptr) {
-                    blockLayouts->push_back(std::move(layout));
-                }
-                return true;
-            };
-            const auto buildFullOrdinary = [&](OrdinaryNumericArrayEncodedBlock& block) {
-                return BuildOrdinaryNumericArrayEncodedBlock(
-                    meta,
-                    defaultCompressor,
-                    blockElementOffset,
-                    blockElementCount,
-                    currentStaged.bytes,
-                    scratchBytePool,
-                    block,
-                    error);
-            };
-            const auto buildFullReference = [&](NumericArrayReferenceEncodedBlock& block) {
-                referenceError.clear();
-                const auto result = codec->EncodePreparedBlock(
-                    fullReferenceInput,
-                    preparedReference,
-                    block,
-                    &referenceError);
-                if (result.IsFailed()) {
-                    return validation::AssignError(
-                        error,
-                        "reference spatial block encoding failed: " + referenceError);
-                }
-                if (result.IsRejected()) {
-                    return validation::AssignError(
-                        error,
-                        "prepared reference spatial block was unexpectedly rejected");
-                }
-                return true;
-            };
-
-            if (prepareResult.IsRejected()) {
-                if (control.selectionMode == ReferenceSelectionMode::Forced) {
-                    return validation::AssignError(
-                        error,
-                        std::string("forced reference spatial block was rejected: ") +
-                            NumericArrayReferenceRejectReasonName(prepareResult.rejectReason));
-                }
-                OrdinaryNumericArrayEncodedBlock ordinaryBlock;
-                if (!buildFullOrdinary(ordinaryBlock) || !writeOrdinaryBlock(ordinaryBlock)) {
-                    return false;
-                }
-                continue;
-            }
-
-            if (control.selectionMode == ReferenceSelectionMode::Forced) {
-                NumericArrayReferenceEncodedBlock referenceBlock;
-                if (!buildFullReference(referenceBlock)) {
-                    return false;
-                }
-                auto referenceLayout = MakeNumericArrayReferenceBlockLayout(referenceBlock);
-                if (!writeReferenceBlock(referenceBlock, referenceLayout)) {
-                    return false;
-                }
-                continue;
-            }
-
-            bool useReference = false;
-            const bool useBoundedProbe =
-                control.autoSelectionStrategy == ReferenceAutoSelectionStrategy::BoundedProbe &&
-                referenceKind == NumericArrayReferenceKind::IntraArray &&
-                localElementCount > kReferenceProbeElementCount;
-
-            OrdinaryNumericArrayEncodedBlock ordinaryBlock;
-            NumericArrayReferenceEncodedBlock referenceBlock;
-            NumericArrayBlockLayoutParams referenceLayout;
-            if (!useBoundedProbe) {
-                if (!buildFullOrdinary(ordinaryBlock) || !buildFullReference(referenceBlock)) {
-                    return false;
-                }
-                referenceLayout = MakeNumericArrayReferenceBlockLayout(referenceBlock);
-                useReference = EstimateNumericArrayBlockStoredBytes(referenceLayout) <
-                    EstimateNumericArrayBlockStoredBytes(ordinaryBlock.layout);
-            } else {
-                ScratchByteBuffer currentSample;
-                ScratchByteBuffer referenceSample;
-                if (!BuildUniformNumericArrayTupleSample(
-                        currentStaged.bytes,
-                        localElementCount,
-                        tupleBytes,
-                        kReferenceProbeElementCount,
-                        scratchBytePool,
-                        control.acquireScratchQuota,
-                        currentSample,
-                        error) ||
-                    !BuildUniformNumericArrayTupleSample(
-                        referenceStaged.bytes,
-                        localElementCount,
-                        tupleBytes,
-                        kReferenceProbeElementCount,
-                        scratchBytePool,
-                        control.acquireScratchQuota,
-                        referenceSample,
-                        error)) {
-                    return false;
-                }
-
-                OrdinaryNumericArrayEncodedBlock ordinaryProbe;
-                if (!BuildOrdinaryNumericArrayEncodedBlock(
-                        meta,
-                        defaultCompressor,
-                        blockElementOffset,
-                        static_cast<std::uint32_t>(kReferenceProbeElementCount),
-                        currentSample.Span(),
-                        scratchBytePool,
-                        ordinaryProbe,
-                        error)) {
-                    return false;
-                }
-                const NumericArrayReferenceCodecEncodeInput probeInput{
-                    .meta = meta,
-                    .defaultCompressor = defaultCompressor,
-                    .scratchBytePool = scratchBytePool,
-                    .acquireScratchQuota = control.acquireScratchQuota,
-                    .control = NumericArrayReferenceCodecControl{
-                        .affineBlockRSquared = control.affineBlockRSquared,
-                    },
-                    .currentBytes = currentSample.Span(),
-                    .referenceBytes = referenceSample.Span(),
-                    .elementOffset = blockElementOffset,
-                    .elementCount = static_cast<std::uint32_t>(kReferenceProbeElementCount),
-                    .componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0)),
-                    .referenceKind = referenceKind,
-                    .localParentFieldIndex = localParentFieldIndex,
-                    .predictorOffset = predictorOffset,
-                };
-                NumericArrayReferencePreparedBlock probePreparedReference;
-                referenceError.clear();
-                const auto probePrepareResult = codec->PrepareBlock(
-                    probeInput,
-                    probePreparedReference,
-                    &referenceError);
-                if (probePrepareResult.IsFailed()) {
-                    return validation::AssignError(
-                        error,
-                        "reference probe preparation failed: " + referenceError);
-                }
-                NumericArrayReferenceEncodedBlock referenceProbe;
-                if (probePrepareResult.IsEncoded()) {
-                    referenceError.clear();
-                    const auto probeResult = codec->EncodePreparedBlock(
-                        probeInput,
-                        probePreparedReference,
-                        referenceProbe,
-                        &referenceError);
-                    if (probeResult.IsFailed()) {
-                        return validation::AssignError(
-                            error,
-                            "reference probe encoding failed: " + referenceError);
-                    }
-                    if (probeResult.IsRejected()) {
-                        return validation::AssignError(
-                            error,
-                            "prepared reference probe was unexpectedly rejected");
-                    }
-                    const auto probeLayout = MakeNumericArrayReferenceBlockLayout(referenceProbe);
-                    useReference = EstimateNumericArrayBlockStoredBytes(probeLayout) <
-                        EstimateNumericArrayBlockStoredBytes(ordinaryProbe.layout);
-                }
-
-                if (useReference) {
-                    if (!buildFullReference(referenceBlock)) {
-                        return false;
-                    }
-                    referenceLayout = MakeNumericArrayReferenceBlockLayout(referenceBlock);
-                } else if (!buildFullOrdinary(ordinaryBlock)) {
-                    return false;
-                }
-            }
-
-            if (useReference) {
-                if (!writeReferenceBlock(referenceBlock, referenceLayout)) {
-                    return false;
-                }
-            } else if (!writeOrdinaryBlock(ordinaryBlock)) {
-                return false;
-            }
-        }
-    }
-
-    if (!bodyTransferCache->Seal(error)) {
         return false;
     }
     transferCache = std::move(bodyTransferCache);

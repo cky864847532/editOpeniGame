@@ -28,7 +28,7 @@ inline bool ResolveEncodedNumericArrayComponentBytes(
     const std::span<const std::uint8_t> rawBytes,
     NumericArrayEncodedBytes& encodedBytes,
     NumericArrayBytesCodec& bytesCodec,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, NumericArrayCompressorState* compressorState = nullptr) {
     encodedBytes.Reset();
     bytesCodec = NumericArrayBytesCodec::RawBytes;
     if (!ValidateNumericArrayBlockParams(params, error)) {
@@ -79,7 +79,7 @@ inline bool ResolveEncodedNumericArrayComponentBytes(
             },
             compressor,
             compressed,
-            &compressError)) {
+            &compressError, compressorState)) {
         return validation::AssignError(
             error,
             compressError.empty()
@@ -106,7 +106,8 @@ inline bool ResolveEncodedNumericArrayBlockBytes(
     NumericArrayBytesCodec& bytesCodec,
     std::string* error = nullptr,
     ScratchByteBufferPool* scratchBytePool = nullptr,
-    std::vector<NumericArrayComponentLayoutParams>* componentLayouts = nullptr) {
+    std::vector<NumericArrayComponentLayoutParams>* componentLayouts = nullptr,
+    NumericArrayCompressorState* compressorState = nullptr) {
     encodedBytes.clear();
     bytesCodec = NumericArrayBytesCodec::NumericArrayCodec;
     if (!ValidateNumericArrayBlockParams(params, error)) {
@@ -142,15 +143,16 @@ inline bool ResolveEncodedNumericArrayBlockBytes(
     }
 
     std::vector<EncodedNumericArrayComponentByteView> componentViews;
-    std::vector<ScratchByteBuffer> componentRawBuffers;
+    auto componentRaw = scratchBytePool->Acquire(componentByteCount);
     std::vector<NumericArrayEncodedBytes> componentEncodedBytes;
     componentViews.reserve(componentCount);
-    componentRawBuffers.reserve(componentCount);
     componentEncodedBytes.reserve(componentCount);
+    std::uint64_t ownedPayloadCapacity = 0u;
+    if (params.capacitySamples != nullptr) {
+        params.capacitySamples->Observe(NumericBufferSample::ComponentRaw, componentRaw.Bytes());
+    }
     for (std::size_t componentIndex = 0; componentIndex < componentCount; ++componentIndex) {
-        std::vector<std::uint8_t>* componentBytes = nullptr;
-        componentRawBuffers.push_back(scratchBytePool->Acquire(componentByteCount));
-        componentBytes = &componentRawBuffers.back().Bytes();
+        auto* componentBytes = &componentRaw.Bytes();
         std::fill(componentBytes->begin(), componentBytes->end(), 0u);
         for (std::size_t elementIndex = 0; elementIndex < static_cast<std::size_t>(elementCount); ++elementIndex) {
             std::memcpy(
@@ -168,8 +170,12 @@ inline bool ResolveEncodedNumericArrayBlockBytes(
                 std::span<const std::uint8_t>(componentBytes->data(), componentBytes->size()),
                 componentEncodedOwner,
                 componentBytesCodec,
-                error)) {
+                error, compressorState)) {
             return false;
+        }
+        if (params.capacitySamples != nullptr) {
+            ownedPayloadCapacity += componentEncodedOwner.OwnedCapacityBytes().value_or(0u);
+            params.capacitySamples->Observe(NumericBufferSample::ComponentOwnedPayloads, ownedPayloadCapacity);
         }
         componentViews.push_back(EncodedNumericArrayComponentByteView{
             .componentIndex = static_cast<std::uint32_t>(componentIndex),
@@ -178,11 +184,15 @@ inline bool ResolveEncodedNumericArrayBlockBytes(
         });
     }
 
-    return AppendNumericArrayComponentBundle(
+    const bool appended = AppendNumericArrayComponentBundle(
         encodedBytes,
         std::span<const EncodedNumericArrayComponentByteView>(componentViews.data(), componentViews.size()),
         componentLayouts,
         error);
+    if (params.capacitySamples != nullptr) {
+        params.capacitySamples->Observe(NumericBufferSample::Output, encodedBytes);
+    }
+    return appended;
 }
 
 template<typename TValue>
@@ -298,7 +308,7 @@ inline bool AddResidualComponentBytesInPlace(
 
 inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
     const NumericArrayBlockParams& params,
-    const NumericArrayRegionControlParams& regionControl,
+    const PreparedRegionPrecision& preparedPrecision,
     const std::uint32_t elementOffset,
     const std::uint32_t elementCount,
     const std::span<const std::uint8_t> rawBytes,
@@ -307,14 +317,12 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
     NumericArrayBytesCodec& bytesCodec,
     NumericArrayBlockLayoutParams& layout,
     std::string* error = nullptr,
-    ScratchByteBufferPool* scratchBytePool = nullptr) {
+    ScratchByteBufferPool* scratchBytePool = nullptr,
+    NumericArrayCompressorState* compressorState = nullptr) {
     encodedBytes.clear();
     bytesCodec = NumericArrayBytesCodec::NumericArrayCodec;
     layout = {};
     if (!ValidateNumericArrayBlockParams(params, error)) {
-        return false;
-    }
-    if (!ValidateRegionControlForEncode(regionControl, error)) {
         return false;
     }
     if (scratchBytePool == nullptr) {
@@ -331,10 +339,9 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
     LayeredResidualRegionPlan layeredPlan;
     if (!BuildNormalizedRegionPlansFromRegionRuns(
             regionRuns,
-            params.elementCount,
             elementOffset,
             elementCount,
-            regionControl,
+            preparedPrecision,
             layeredPlan,
             error)) {
         return false;
@@ -370,11 +377,6 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
     backgroundOwners.reserve(componentCount);
     backgroundViews.reserve(componentCount);
 
-    std::vector<NumericArrayRegionLayerLayoutParams> regionLayers;
-    regionLayers.reserve(layeredPlan.layers.size());
-    for (const auto& plan : layeredPlan.layers) {
-        regionLayers.push_back(MakeRegionLayerLayoutFromPlan(plan));
-    }
     std::vector<std::vector<NumericArrayEncodedBytes>> regionOwners(layeredPlan.layers.size());
     std::vector<std::vector<EncodedNumericArrayComponentByteView>> regionViews(layeredPlan.layers.size());
     for (std::size_t layerIndex = 0u; layerIndex < layeredPlan.layers.size(); ++layerIndex) {
@@ -382,9 +384,13 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
         regionViews[layerIndex].reserve(componentCount);
     }
 
+    auto componentRaw = scratchBytePool->Acquire(componentByteCount);
+    std::uint64_t ownedPayloadCapacity = 0u;
     for (std::size_t componentIndex = 0u; componentIndex < componentCount; ++componentIndex) {
-        auto componentRaw = scratchBytePool->Acquire(componentByteCount);
         auto& componentRawBytes = componentRaw.Bytes();
+        if (params.capacitySamples != nullptr) {
+            params.capacitySamples->Observe(NumericBufferSample::ComponentRaw, componentRawBytes);
+        }
         std::fill(componentRawBytes.begin(), componentRawBytes.end(), 0u);
         for (std::size_t elementIndex = 0u; elementIndex < static_cast<std::size_t>(elementCount); ++elementIndex) {
             std::memcpy(
@@ -403,7 +409,7 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
                 std::span<const std::uint8_t>(componentRawBytes.data(), componentRawBytes.size()),
                 backgroundOwner,
                 backgroundComponentCodec,
-                error)) {
+                error, compressorState)) {
             return false;
         }
         std::vector<std::uint8_t> baseDecodedComponent;
@@ -415,7 +421,7 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
                 backgroundComponentCodec,
                 backgroundOwner.Bytes(),
                 baseDecodedComponent,
-                error)) {
+                error, compressorState)) {
             return false;
         }
         backgroundViews.push_back(EncodedNumericArrayComponentByteView{
@@ -423,6 +429,11 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
             .bytesCodec = backgroundComponentCodec,
             .bytes = backgroundOwner.Bytes(),
         });
+        if (params.capacitySamples != nullptr) {
+            ownedPayloadCapacity += backgroundOwner.OwnedCapacityBytes().value_or(0u);
+            params.capacitySamples->Observe(NumericBufferSample::ComponentOwnedPayloads, ownedPayloadCapacity);
+            params.capacitySamples->Observe(NumericBufferSample::BaseDecoded, baseDecodedComponent);
+        }
 
         for (std::size_t layerIndex = 0u; layerIndex < layeredPlan.layers.size(); ++layerIndex) {
             const auto& plan = layeredPlan.layers[layerIndex];
@@ -459,6 +470,9 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
             if (!residualOk) {
                 return false;
             }
+            if (params.capacitySamples != nullptr) {
+                params.capacitySamples->Observe(NumericBufferSample::ResidualRaw, residualRawBytes);
+            }
             auto residualParams = params;
             residualParams.regionControl = nullptr;
             NumericArrayBytesCodec residualComponentCodec{NumericArrayBytesCodec::RawBytes};
@@ -471,7 +485,7 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
                     std::span<const std::uint8_t>(residualRawBytes.data(), residualRawBytes.size()),
                     residualOwner,
                     residualComponentCodec,
-                    error)) {
+                    error, compressorState)) {
                 return false;
             }
             std::vector<std::uint8_t> decodedResidualComponent;
@@ -483,8 +497,13 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
                     residualComponentCodec,
                     residualOwner.Bytes(),
                     decodedResidualComponent,
-                    error)) {
+                    error, compressorState)) {
                 return false;
+            }
+            if (params.capacitySamples != nullptr) {
+                ownedPayloadCapacity += residualOwner.OwnedCapacityBytes().value_or(0u);
+                params.capacitySamples->Observe(NumericBufferSample::ComponentOwnedPayloads, ownedPayloadCapacity);
+                params.capacitySamples->Observe(NumericBufferSample::ResidualDecoded, decodedResidualComponent);
             }
             const bool updateOk = params.dataType == DataType::Float32
                 ? AddResidualComponentBytesInPlace<float>(
@@ -521,9 +540,14 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
         return false;
     }
     encodedBytes.insert(encodedBytes.end(), backgroundBundleBytes.begin(), backgroundBundleBytes.end());
+    if (params.capacitySamples != nullptr) {
+        params.capacitySamples->Observe(NumericBufferSample::BundleScratch, backgroundBundleBytes);
+        params.capacitySamples->Observe(NumericBufferSample::Output, encodedBytes);
+    }
 
-    layout.regionLayers = std::move(regionLayers);
+    layout.regionLayers.reserve(layeredPlan.layers.size());
     for (std::size_t layerIndex = 0u; layerIndex < layeredPlan.layers.size(); ++layerIndex) {
+        layout.regionLayers.push_back(MakeRegionLayerLayoutFromPlan(std::move(layeredPlan.layers[layerIndex])));
         std::vector<std::uint8_t> residualBundleBytes;
         if (!AppendNumericArrayComponentBundle(
                 residualBundleBytes,
@@ -537,6 +561,11 @@ inline bool ResolveEncodedLayeredResidualNumericArrayBlockBytes(
         layout.regionLayers[layerIndex].residualEncodedByteLength =
             static_cast<ParamSize>(residualBundleBytes.size());
         encodedBytes.insert(encodedBytes.end(), residualBundleBytes.begin(), residualBundleBytes.end());
+        if (params.capacitySamples != nullptr) {
+            params.capacitySamples->Observe(NumericBufferSample::BundleScratch,
+                static_cast<std::uint64_t>(backgroundBundleBytes.capacity()) + residualBundleBytes.capacity());
+            params.capacitySamples->Observe(NumericBufferSample::Output, encodedBytes);
+        }
     }
 
     layout.mode = NumericArrayBlockMode::LayeredResidual;

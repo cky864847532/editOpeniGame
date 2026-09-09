@@ -8,6 +8,7 @@
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Runtime/Failure/FailureCleanable.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Codec/NumericArray/NumericArraySource.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackage.h"
 #include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
@@ -36,30 +37,6 @@ struct DecodeLeafWorkspace : IFailureCleanable {
     std::shared_ptr<DecodedTopologyCache> topology;
     bool topologyBorrowed{false};
 
-    void ConfigureCacheResources(
-        const std::size_t accessWindowBytes = kDefaultDecodeAccessWindowBytes,
-        const std::uint64_t activeWindowBytes = kDefaultDecodeActiveWindowBytes,
-        const std::size_t scratchRetainedBlockCount = 16u,
-        const std::size_t scratchRetainedBlockBytes = 64u * 1024u * 1024u,
-        const std::uint64_t scratchRetainedTotalBytes = 1024ull * 1024ull * 1024ull) {
-        m_cacheResources.Configure(
-            accessWindowBytes,
-            activeWindowBytes,
-            scratchRetainedBlockCount,
-            scratchRetainedBlockBytes,
-            scratchRetainedTotalBytes);
-    }
-
-    void InheritCacheResourceConfigFrom(const DecodeLeafWorkspace& parent) {
-        const auto& budget = parent.ResourceBudget();
-        ConfigureCacheResources(
-            parent.AccessWindowBytes(),
-            parent.ActiveWindowBytes(),
-            budget.ScratchRetainedBlockCount(),
-            budget.ScratchRetainedBlockBytes(),
-            budget.ScratchRetainedTotalBytes());
-    }
-
     [[nodiscard]] const CodecStorageParams& StorageParams() const noexcept { return m_storageParams; }
     void SetStorageParams(CodecStorageParams storageParams) noexcept {
         m_storageParams = std::move(storageParams);
@@ -69,73 +46,33 @@ struct DecodeLeafWorkspace : IFailureCleanable {
     [[nodiscard]] CacheResources& CacheResourcesRef() noexcept { return m_cacheResources; }
     [[nodiscard]] const CodecValidationPolicy& ValidationPolicy() const noexcept { return m_validationPolicy; }
     void SetValidationPolicy(CodecValidationPolicy policy) noexcept { m_validationPolicy = policy; }
-    [[nodiscard]] const DecodeResourceBudgetControlParams& ResourceBudget() const noexcept { return m_resourceBudget; }
-    void SetResourceBudget(DecodeResourceBudgetControlParams params) {
-        m_resourceBudget = std::move(params);
-        m_byteStoreSession.ConfigureResidentLimit(m_resourceBudget.ResidentLimitBytes());
-    }
     [[nodiscard]] bytestore::ByteStoreSession& ByteStoreSessionRef() noexcept { return m_byteStoreSession; }
     [[nodiscard]] const bytestore::ByteStoreSession& ByteStoreSessionRef() const noexcept { return m_byteStoreSession; }
-    [[nodiscard]] ScratchByteBufferPool& ScratchBytePool() noexcept { return m_cacheResources.scratchBytePool; }
-    [[nodiscard]] const ScratchByteBufferPool& ScratchBytePool() const noexcept { return m_cacheResources.scratchBytePool; }
-    [[nodiscard]] std::stop_token StopToken() const noexcept { return m_stopSource.get_token(); }
+    [[nodiscard]] ScratchByteBufferPool& ScratchBytePool() const { return m_cacheResources.ScratchBytePool(); }
+    [[nodiscard]] std::stop_token StopToken() const noexcept { return m_run ? m_run->StopToken() : std::stop_token{}; }
     [[nodiscard]] bool StopRequested() const noexcept {
-        return m_stopSource.stop_requested() || m_externalStopToken.stop_requested();
+        return m_run && m_run->Stopped();
     }
-    void RequestStop() noexcept { m_stopSource.request_stop(); }
-    void SetExternalStopToken(const std::stop_token stopToken) {
-        m_externalStopToken = stopToken;
-        ResetStopSource();
-    }
-    void ClearExternalStopToken() noexcept {
-        m_externalStopCallback.reset();
-        m_externalStopToken = {};
-    }
-    [[nodiscard]] window::WindowBudget& WindowBudgetRef() noexcept { return m_cacheResources.windowBudget; }
-    [[nodiscard]] const window::WindowBudget& WindowBudgetRef() const noexcept { return m_cacheResources.windowBudget; }
-    [[nodiscard]] std::size_t AccessWindowBytes() const noexcept { return m_cacheResources.accessWindowBytes; }
-    [[nodiscard]] std::uint64_t ActiveWindowBytes() const noexcept { return m_cacheResources.activeWindowBytes; }
+    void RequestStop() noexcept { if (m_run && !m_run->Stopped()) { m_run->RequestStop(); } }
     [[nodiscard]] bool MatchesLeafPackage(const LeafPackage* leafPackage) const noexcept {
         return m_leafPackage == leafPackage && leafPackage != nullptr;
     }
 
-    [[nodiscard]] bool PreparedAttributePayload(
-        const LeafPackageField* field,
-        std::shared_ptr<bytestore::IByteSource>& owner,
-        std::span<const std::uint8_t>& bytes) const noexcept {
-        if (field == nullptr || field != m_attributePayloadField || m_attributePayloadOwner == nullptr) {
-            owner.reset();
-            bytes = {};
-            return false;
-        }
-        owner = m_attributePayloadOwner;
-        bytes = m_attributePayloadBytes;
-        return true;
-    }
-
     void SetPreparedAttributePayload(
-        const LeafPackageField* field,
-        std::shared_ptr<bytestore::IByteSource> owner,
-        const std::span<const std::uint8_t> bytes) noexcept {
+        const LeafPackageField* field, std::shared_ptr<bytestore::IByteSource> owner) noexcept {
         m_attributePayloadField = field;
         m_attributePayloadOwner = std::move(owner);
-        m_attributePayloadBytes = bytes;
+    }
+
+    void ClearPreparedAttributePayload() noexcept {
+        m_attributePayloadField = nullptr;
+        m_attributePayloadOwner.reset();
     }
 
     void PrepareSupplementRun(
-        const CodecValidationPolicy validationPolicy,
-        const DecodeResourceBudgetControlParams resourceBudget) {
+        const CodecValidationPolicy validationPolicy) {
         m_failureCleanupCompleted.store(false, std::memory_order_release);
-        ResetStopSource();
         m_validationPolicy = validationPolicy;
-        m_resourceBudget = resourceBudget;
-        m_byteStoreSession.ConfigureResidentLimit(m_resourceBudget.ResidentLimitBytes());
-        ConfigureCacheResources(
-            m_resourceBudget.AccessWindowBytes(),
-            m_resourceBudget.ActiveWindowBytes(),
-            m_resourceBudget.ScratchRetainedBlockCount(),
-            m_resourceBudget.ScratchRetainedBlockBytes(),
-            m_resourceBudget.ScratchRetainedTotalBytes());
     }
 
     [[nodiscard]] bool HasField(const FieldType type, const std::size_t ordinal = 0u) const {
@@ -173,15 +110,11 @@ struct DecodeLeafWorkspace : IFailureCleanable {
 
     void Reset(const LeafPackage* leafPackage = nullptr) {
         m_failureCleanupCompleted.store(false, std::memory_order_release);
-        m_attributePayloadBytes = {};
         m_attributePayloadOwner.reset();
         m_attributePayloadField = nullptr;
-        ResetStopSource();
         m_storageParams = {};
         m_committedAttributes.clear();
         m_validationPolicy = {};
-        m_resourceBudget = {};
-        m_cacheResources.Clear();
         m_byteStoreSession.Reset();
         packageFields.Reset(leafPackage);
         geometry.Release();
@@ -202,10 +135,7 @@ struct DecodeLeafWorkspace : IFailureCleanable {
         m_storageParams = {};
         m_committedAttributes.clear();
         m_validationPolicy = {};
-        m_resourceBudget = {};
-        m_cacheResources.Clear();
         m_byteStoreSession.ReleaseAll();
-        m_attributePayloadBytes = {};
         m_attributePayloadOwner.reset();
         m_attributePayloadField = nullptr;
         packageFields.Clear();
@@ -220,31 +150,32 @@ struct DecodeLeafWorkspace : IFailureCleanable {
     }
 
 private:
-    using ExternalStopCallback = std::stop_callback<std::function<void()>>;
-
-    void ResetStopSource() {
-        m_externalStopCallback.reset();
-        m_stopSource = std::stop_source{};
-        if (m_externalStopToken.stop_possible()) {
-            m_externalStopCallback = std::make_unique<ExternalStopCallback>(
-                    m_externalStopToken,
-                    [this]() { m_stopSource.request_stop(); });
+    friend class RunBinding<DecodeLeafWorkspace>;
+    void BindRun(DataCodecExecutionResources& run) {
+        if (m_run) {
+            run.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
+                "workspace-already-bound", "DecodeLeafWorkspace", "workspace already belongs to an active run"), true);
+            throw std::logic_error("decode workspace already bound");
         }
+        m_byteStoreSession.BindRun(run);
+        m_cacheResources.BindRun(run);
+        m_run = &run;
+    }
+    void UnbindRun() noexcept {
+        m_byteStoreSession.UnbindRun();
+        m_cacheResources.UnbindRun();
+        m_run = nullptr;
     }
 
     CodecStorageParams m_storageParams;
     std::vector<std::uint8_t> m_committedAttributes;
     CodecValidationPolicy m_validationPolicy;
-    DecodeResourceBudgetControlParams m_resourceBudget;
     CacheResources m_cacheResources;
     bytestore::ByteStoreSession m_byteStoreSession;
     const LeafPackage* m_leafPackage{nullptr};
     const LeafPackageField* m_attributePayloadField{nullptr};
     std::shared_ptr<bytestore::IByteSource> m_attributePayloadOwner;
-    std::span<const std::uint8_t> m_attributePayloadBytes;
-    std::stop_source m_stopSource;
-    std::stop_token m_externalStopToken;
-    std::unique_ptr<ExternalStopCallback> m_externalStopCallback;
+    DataCodecExecutionResources* m_run{nullptr};
     std::atomic_bool m_failureCleanupCompleted{false};
 };
 

@@ -16,13 +16,9 @@ class CacheTopologyDecodeSink final : public topocodec::IConnectivityTopologyDec
 public:
     CacheTopologyDecodeSink(
         DecodedTopologyCache& topology,
-        bytestore::ByteStoreSession& byteStoreSession,
-        const std::uint64_t memoryCacheLimitBytes = 0u,
-        const DecodeStorageMode storageMode = DecodeStorageMode::Managed)
+        bytestore::ByteStoreSession& byteStoreSession)
         : m_topology(topology),
-          m_byteStoreSession(byteStoreSession),
-          m_memoryCacheLimitBytes(memoryCacheLimitBytes),
-          m_storageMode(storageMode) {}
+          m_byteStoreSession(byteStoreSession) {}
 
     bool BeginConnectivityTopology(
         const std::size_t cellCount,
@@ -38,8 +34,6 @@ public:
             hasCellTypes,
             hasCellPolynomialOrders,
             m_byteStoreSession,
-            m_memoryCacheLimitBytes,
-            m_storageMode,
             error);
     }
 
@@ -102,8 +96,6 @@ public:
 private:
     DecodedTopologyCache& m_topology;
     bytestore::ByteStoreSession& m_byteStoreSession;
-    std::uint64_t m_memoryCacheLimitBytes{0u};
-    DecodeStorageMode m_storageMode{DecodeStorageMode::Managed};
 };
 
 } // namespace datacodec::topology

@@ -2,16 +2,22 @@
 #define DATACODEC_CODEC_REMAP_COMMON_MORTONREMAPBUILDER_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
 #include "DataCodec/Codec/Remap/RemapProvider.h"
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,22 +28,19 @@ namespace mortonremap {
 
 inline constexpr std::uint32_t kMortonBucketMask16 = 0xffffu;
 inline constexpr std::size_t kMortonBucketCount16 = 1u << 16u;
-inline constexpr std::size_t kMortonDefaultLeafBudgetBytes = 256u * 1024u * 1024u;
+inline constexpr std::size_t kMortonLeafBytes = 8u * 1024u * 1024u;
 inline constexpr std::size_t kMortonRunRecordBytes = sizeof(std::uint16_t) + sizeof(IndexType);
-inline constexpr std::size_t kMortonRunBufferBytes = 8u * 1024u * 1024u;
+inline constexpr std::size_t kMortonRunBufferBytes = 1u * 1024u * 1024u;
 inline constexpr std::size_t kMortonHighBucketBufferBytes = 1024u;
 
 struct MortonRemapOptions {
+    DataCodecExecutionResources& resources;
     std::string resourcePrefix{"remap.morton"};
     std::function<void(double)> progressCallback{};
-    std::function<void(std::string_view, std::uint64_t)> resourceCallback{};
+    callback::CapacityCallback recordCapacitySamples;
     WritableRemapProviderFactory providerFactory{};
     bytestore::ByteStoreSession* byteStoreSession{nullptr};
-    resource::ActiveByteBudget* scratchBudget{nullptr};
-    std::size_t leafBudgetBytes{kMortonDefaultLeafBudgetBytes};
-    std::size_t runBufferBytes{kMortonRunBufferBytes};
     bool buildInverse{false};
-    bool useMemoryScratchStore{false};
 };
 
 struct MortonRemapResult {
@@ -59,61 +62,76 @@ struct MortonLowKeyLeaf {
 inline void InvokeProgress(
     const MortonRemapOptions& options,
     const double normalized) {
-    callback::InvokeProgress(options.progressCallback, normalized);
+    try { callback::InvokeProgress(options.progressCallback, normalized); }
+    catch (...) { options.resources.RecordDiagnosticExportFailure(); }
 }
 
-inline void InvokeResource(
-    const MortonRemapOptions& options,
-    const std::string_view suffix,
-    const std::uint64_t logicalBytes) {
-    const auto name = callback::MakeResourceName(options.resourcePrefix, suffix);
-    callback::InvokeResource(options.resourceCallback, name, logicalBytes);
-}
+enum class MortonArraySample : std::size_t {
+    Keyed,
+    Order,
+    HighCounts,
+    HighOffsets,
+    HighWriteOffsets,
+    SliceOffsets,
+    UsedBytes,
+    Scratch,
+    OrderedElements,
+    LowBuckets,
+    LowCounts,
+    LowOffsets,
+    TouchedLowBuckets,
+    Leaves,
+    RunReadWindow,
+    Count,
+};
 
-inline std::size_t ResolveLeafBudgetElements(const std::size_t budgetBytes) noexcept {
-    const auto safeBudget = budgetBytes == 0u ? kMortonDefaultLeafBudgetBytes : budgetBytes;
-    return std::max<std::size_t>(1u, safeBudget / (sizeof(IndexType) * 2u + sizeof(std::uint16_t)));
-}
+struct MortonCapacitySamples {
+    std::array<BufferCapacitySample, static_cast<std::size_t>(MortonArraySample::Count)> values{{
+        BufferCapacitySample{"morton.keyed"},
+        BufferCapacitySample{"morton.order_work"},
+        BufferCapacitySample{"morton.high_counts"},
+        BufferCapacitySample{"morton.high_offsets"},
+        BufferCapacitySample{"morton.high_write_offsets"},
+        BufferCapacitySample{"morton.slice_offsets"},
+        BufferCapacitySample{"morton.slice_used_bytes"},
+        BufferCapacitySample{"morton.scratch"},
+        BufferCapacitySample{"morton.ordered_elements"},
+        BufferCapacitySample{"morton.low_buckets"},
+        BufferCapacitySample{"morton.low_counts"},
+        BufferCapacitySample{"morton.low_offsets"},
+        BufferCapacitySample{"morton.touched_low_buckets"},
+        BufferCapacitySample{"morton.leaves"},
+        BufferCapacitySample{"morton.run_read_window"},
+    }};
 
-inline std::size_t ResolveRemapLeafBudgetBytes(const std::size_t requestedLeafBudgetBytes) noexcept {
-    if (requestedLeafBudgetBytes != 0u) {
-        return requestedLeafBudgetBytes;
+    template<class T>
+    void Observe(MortonArraySample kind, const T& storage) noexcept {
+        values[static_cast<std::size_t>(kind)].Observe(storage);
     }
-    return kMortonDefaultLeafBudgetBytes;
+};
+
+inline void EmitMortonSamples(const MortonRemapOptions& options,
+    const std::optional<MortonCapacitySamples>& samples) noexcept {
+    if (!samples || !options.recordCapacitySamples) { return; }
+    try { options.recordCapacitySamples(samples->values); }
+    catch (...) { options.resources.RecordDiagnosticExportFailure(); }
 }
 
-inline std::size_t ResolveRunBufferBytes(const std::size_t requestedRunBufferBytes) noexcept {
-    if (requestedRunBufferBytes != 0u) {
-        return requestedRunBufferBytes;
+// 分段由 driver 逐次提交，终端工作不等待同池子任务
+ template<class TWork>
+inline bool RunMortonRanges(DataCodecExecutionResources& root, const HeavyPhaseLease& phase,
+    const std::size_t count, TWork&& work) {
+    for (std::size_t first = 0u; first < count;) {
+        if (root.Stopped()) { return false; }
+        const auto end = first + std::min<std::size_t>(numericarray::kSpatialBlockElementCount, count - first);
+        if (!RunTerminalWork(root, phase, [&](WorkerContext&) { return work(first, end); })) { return false; }
+        first = end;
     }
-    return kMortonRunBufferBytes;
+    return true;
 }
 
-inline std::uint64_t EstimateMortonWorkspaceBytes(
-    const std::size_t elementCount,
-    const std::size_t leafBudgetBytes,
-    const std::size_t runBufferBytes = kMortonRunBufferBytes) noexcept {
-    const auto leafBudgetElements = ResolveLeafBudgetElements(leafBudgetBytes);
-    const auto bucketTables =
-        static_cast<std::uint64_t>(kMortonBucketCount16) *
-        static_cast<std::uint64_t>(sizeof(std::size_t)) * 4u;
-    const auto touchedBuckets =
-        static_cast<std::uint64_t>(kMortonBucketCount16) * sizeof(std::uint32_t);
-    const auto leafScratch =
-        static_cast<std::uint64_t>(leafBudgetElements) *
-        static_cast<std::uint64_t>(sizeof(IndexType) * 2u + sizeof(std::uint16_t));
-    const auto highBucketBuffers =
-        static_cast<std::uint64_t>(std::min<std::size_t>(elementCount, kMortonBucketCount16)) *
-        static_cast<std::uint64_t>(kMortonHighBucketBufferBytes);
-    const auto runBuffer =
-        static_cast<std::uint64_t>(ResolveRunBufferBytes(runBufferBytes));
-    return std::max<std::uint64_t>(
-        1u,
-        validation::SaturatingAddU64(
-            validation::SaturatingAddU64(bucketTables, touchedBuckets),
-            validation::SaturatingAddU64(
-                validation::SaturatingAddU64(leafScratch, highBucketBuffers),
-                runBuffer)));
+inline constexpr std::size_t ResolveLeafBudgetElements() noexcept {
+    return std::max<std::size_t>(1u, kMortonLeafBytes / (sizeof(IndexType) * 2u + sizeof(std::uint16_t)));
 }
 
 class RemapScratchRun final {
@@ -131,17 +149,7 @@ public:
     ~RemapScratchRun() { Release(); }
 
     [[nodiscard]] bool IsValid() const noexcept { return m_store != nullptr; }
-
-    bool ResizeRecords(const std::size_t recordCount, std::string* error = nullptr) {
-        std::uint64_t byteCount = 0u;
-        if (!ResolveByteRange(recordCount, 0u, byteCount, error)) {
-            return false;
-        }
-        if (m_store == nullptr) {
-            return validation::AssignError(error, "Morton scratch run store is missing");
-        }
-        return m_store->Resize(byteCount, error);
-    }
+    [[nodiscard]] const bytestore::IByteSource* ByteSource() const noexcept { return m_store.get(); }
 
     bool WriteRecordBytes(
         const std::size_t recordOffset,
@@ -173,24 +181,24 @@ public:
 
     void Release() noexcept {
         if (m_store != nullptr) {
-            m_store->Release();
             m_store.reset();
         }
     }
 
 private:
-    static bool ResolveByteRange(
+    bool ResolveByteRange(
         const std::size_t recordOffset,
         const std::size_t byteCount,
         std::uint64_t& byteOffset,
-        std::string* error) {
+        std::string* error) const {
         if (!validation::CanMulU64(static_cast<std::uint64_t>(recordOffset), kMortonRunRecordBytes)) {
             validation::AssignError(error, "Morton scratch run byte offset exceeds addressable size");
             return false;
         }
         byteOffset = static_cast<std::uint64_t>(recordOffset) * kMortonRunRecordBytes;
-        if (!validation::CanAddU64(byteOffset, static_cast<std::uint64_t>(byteCount))) {
-            validation::AssignError(error, "Morton scratch run byte range exceeds addressable size");
+        if (m_store == nullptr || byteOffset > m_store->ByteSizeHint() ||
+            byteCount > m_store->ByteSizeHint() - byteOffset) {
+            validation::AssignError(error, "Morton scratch run byte range exceeds its fixed size");
             return false;
         }
         return true;
@@ -201,49 +209,38 @@ private:
 
 class RemapScratchSpooler final {
 public:
-    explicit RemapScratchSpooler(
-        bytestore::ByteStoreSession& session,
-        const bool useMemoryStore = false)
-        : m_session(session),
-          m_useMemoryStore(useMemoryStore) {}
+    explicit RemapScratchSpooler(bytestore::ByteStoreSession& session)
+        : m_session(session) {}
 
     [[nodiscard]] RemapScratchRun CreateRun(
         const std::string_view label,
         const std::size_t recordCount,
-        std::string* error = nullptr) {
-        auto store = bytestore::CreateByteStore(
-            m_session,
-            std::string(label),
-            m_useMemoryStore,
-            error);
-        if (store == nullptr) {
+        std::string* error = nullptr,
+        std::span<const resource::StorageOwnerDescription> coexist = {}) {
+        std::size_t bytes = 0u;
+        if (!validation::CheckedMulSizeT(recordCount, kMortonRunRecordBytes, bytes,
+                "Morton run bytes", error)) {
             return {};
         }
-        RemapScratchRun run(std::move(store));
-        if (!run.ResizeRecords(recordCount, error)) {
-            return {};
-        }
-        return run;
+        return RemapScratchRun(m_session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
+            bytes, std::string(label), error, coexist));
     }
 
 private:
     bytestore::ByteStoreSession& m_session;
-    bool m_useMemoryStore{false};
 };
 
-inline void AppendRunRecord(
-    std::vector<std::uint8_t>& buffer,
+inline std::array<std::uint8_t, kMortonRunRecordBytes> EncodeRunRecord(
     const std::uint16_t lowKey,
-    const IndexType elementId) {
-    const auto offset = buffer.size();
-    buffer.resize(offset + kMortonRunRecordBytes);
-    buffer[offset] = static_cast<std::uint8_t>(lowKey & 0xffu);
-    buffer[offset + 1u] = static_cast<std::uint8_t>((lowKey >> 8u) & 0xffu);
+    const IndexType elementId) noexcept {
+    static_assert(sizeof(IndexType) == sizeof(std::uint32_t));
     const auto value = static_cast<std::uint32_t>(elementId);
-    buffer[offset + 2u] = static_cast<std::uint8_t>(value & 0xffu);
-    buffer[offset + 3u] = static_cast<std::uint8_t>((value >> 8u) & 0xffu);
-    buffer[offset + 4u] = static_cast<std::uint8_t>((value >> 16u) & 0xffu);
-    buffer[offset + 5u] = static_cast<std::uint8_t>((value >> 24u) & 0xffu);
+    return {static_cast<std::uint8_t>(lowKey & 0xffu),
+        static_cast<std::uint8_t>((lowKey >> 8u) & 0xffu),
+        static_cast<std::uint8_t>(value & 0xffu),
+        static_cast<std::uint8_t>((value >> 8u) & 0xffu),
+        static_cast<std::uint8_t>((value >> 16u) & 0xffu),
+        static_cast<std::uint8_t>((value >> 24u) & 0xffu)};
 }
 
 inline std::uint16_t DecodeRunLowKey(const std::uint8_t* record) noexcept {
@@ -261,38 +258,6 @@ inline IndexType DecodeRunElementId(const std::uint8_t* record) noexcept {
     return static_cast<IndexType>(value);
 }
 
-inline bool FlushHighBucketBuffer(
-    RemapScratchRun& output,
-    std::vector<std::uint8_t>& buffer,
-    std::vector<std::size_t>& highWriteOffsets,
-    const std::size_t highBucket,
-    std::string* error = nullptr) {
-    if (buffer.empty()) {
-        return true;
-    }
-    if (buffer.size() % kMortonRunRecordBytes != 0u) {
-        return validation::AssignError(error, "Morton high bucket buffer is not record aligned");
-    }
-    if (!output.WriteRecordBytes(
-            highWriteOffsets[highBucket],
-            std::span<const std::uint8_t>(buffer.data(), buffer.size()),
-            error)) {
-        return false;
-    }
-    highWriteOffsets[highBucket] += buffer.size() / kMortonRunRecordBytes;
-    buffer.clear();
-    return true;
-}
-
-inline std::uint64_t HighBuffersCapacityBytes(
-    const std::vector<std::vector<std::uint8_t>>& buffers) noexcept {
-    std::uint64_t totalBytes = VectorCapacityBytes(buffers);
-    for (const auto& buffer : buffers) {
-        totalBytes = validation::SaturatingAddU64(totalBytes, VectorCapacityBytes(buffer));
-    }
-    return totalBytes;
-}
-
 template<typename TKeyGetter>
 inline bool WriteHighBucketRun(
     const std::size_t elementCount,
@@ -300,29 +265,89 @@ inline bool WriteHighBucketRun(
     const std::vector<std::size_t>& highCounts,
     const std::vector<std::size_t>& highOffsets,
     std::vector<std::size_t>& highWriteOffsets,
-    RemapScratchSpooler& scratchSpooler,
+    bytestore::ByteStoreSession& session,
     RemapScratchRun& run,
     const MortonRemapOptions& options,
-    std::string* error = nullptr) {
+    const HeavyPhaseLease& phase,
+    std::string* error = nullptr,
+    const bytestore::IByteSource* keyCacheSource = nullptr) {
+    if (highCounts.size() != kMortonBucketCount16 || highOffsets.size() != kMortonBucketCount16) {
+        return validation::AssignError(error, "Morton high tables have an invalid size");
+    }
+    constexpr auto recordsPerSlice =
+        (kMortonHighBucketBufferBytes + kMortonRunRecordBytes - 1u) / kMortonRunRecordBytes;
+    std::vector<std::size_t> sliceOffsets(kMortonBucketCount16 + 1u, 0u);
+    std::vector<std::size_t> usedBytes(kMortonBucketCount16, 0u);
+    std::size_t totalRecords = 0u;
+    for (std::size_t bucket = 0u; bucket < kMortonBucketCount16; ++bucket) {
+        if (highOffsets[bucket] != totalRecords ||
+            !validation::CheckedAddSizeT(totalRecords, highCounts[bucket], totalRecords,
+                "Morton high record count", error)) {
+            return validation::AssignError(error, "Morton high offsets do not cover the record sequence");
+        }
+        std::size_t sliceBytes = 0u;
+        if (!validation::CheckedMulSizeT(std::min(highCounts[bucket], recordsPerSlice),
+                kMortonRunRecordBytes, sliceBytes, "Morton high slice", error) ||
+            !validation::CheckedAddSizeT(sliceOffsets[bucket], sliceBytes, sliceOffsets[bucket + 1u],
+                "Morton high slab", error)) {
+            return false;
+        }
+    }
+    if (totalRecords != elementCount) {
+        return validation::AssignError(error, "Morton high counts do not match the element count");
+    }
+    // 必要连续数组先完整准入，后续 run 独立确定后端
+    bytestore::KnownStorageOwners coexist;
+    coexist.Add(keyCacheSource);
+    auto slab = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous,
+        sliceOffsets.back(), "morton_high_slab", error, coexist.Entries());
+    if (!slab) { return false; }
+    std::optional<MortonCapacitySamples> samples;
+    if (options.recordCapacitySamples) {
+        samples.emplace();
+        samples->Observe(MortonArraySample::SliceOffsets, sliceOffsets);
+        samples->Observe(MortonArraySample::UsedBytes, usedBytes);
+    }
     const auto label = options.resourcePrefix.empty()
         ? std::string("remap_morton_high_run")
         : options.resourcePrefix + ".high_run";
-    run = scratchSpooler.CreateRun(label, elementCount, error);
+    RemapScratchSpooler scratchSpooler(session);
+    coexist.Add(slab.get());
+    run = scratchSpooler.CreateRun(label, elementCount, error, coexist.Entries());
     if (!run.IsValid()) {
         return validation::AssignError(error, "failed to open Morton high bucket run");
     }
 
     highWriteOffsets = highOffsets;
-    std::vector<std::vector<std::uint8_t>> highBuffers(kMortonBucketCount16);
+    const auto flush = [&](const std::size_t bucket) {
+        const auto bytes = usedBytes[bucket];
+        if (bytes == 0u) { return true; }
+        if (!run.WriteRecordBytes(highWriteOffsets[bucket],
+                slab->ContiguousBytes().subspan(sliceOffsets[bucket], bytes), error)) {
+            return false;
+        }
+        highWriteOffsets[bucket] += bytes / kMortonRunRecordBytes;
+        usedBytes[bucket] = 0u;
+        return true;
+    };
     const auto progressStep = std::max<std::size_t>(elementCount / 64u, 1u);
-    for (std::size_t elementIndex = 0; elementIndex < elementCount; ++elementIndex) {
+    if (!RunMortonRanges(options.resources, phase, elementCount, [&](std::size_t first, std::size_t end) {
+    for (std::size_t elementIndex = first; elementIndex < end; ++elementIndex) {
+        if (options.resources.Stopped()) { return false; }
         const auto key = keyGetter(elementIndex);
         const auto highBucket = static_cast<std::uint16_t>((key >> 16u) & kMortonBucketMask16);
         const auto lowKey = static_cast<std::uint16_t>(key & kMortonBucketMask16);
-        auto& buffer = highBuffers[highBucket];
-        AppendRunRecord(buffer, lowKey, static_cast<IndexType>(elementIndex));
-        if (buffer.size() >= kMortonHighBucketBufferBytes &&
-            !FlushHighBucketBuffer(run, buffer, highWriteOffsets, highBucket, error)) {
+        auto& used = usedBytes[highBucket];
+        if (highWriteOffsets[highBucket] - highOffsets[highBucket] + used / kMortonRunRecordBytes >=
+                highCounts[highBucket]) {
+            return validation::AssignError(error, "Morton key changed after the high-count pass");
+        }
+        const auto record = EncodeRunRecord(lowKey, static_cast<IndexType>(elementIndex));
+        if (!slab->WriteAt(sliceOffsets[highBucket] + used, record, error)) {
+            return false;
+        }
+        used += record.size();
+        if (used == sliceOffsets[highBucket + 1u] - sliceOffsets[highBucket] && !flush(highBucket)) {
             return false;
         }
 
@@ -333,9 +358,12 @@ inline bool WriteHighBucketRun(
         }
     }
 
-    InvokeResource(options, "high_bucket_buffers", HighBuffersCapacityBytes(highBuffers));
-    for (std::size_t highBucket = 0; highBucket < highBuffers.size(); ++highBucket) {
-        if (!FlushHighBucketBuffer(run, highBuffers[highBucket], highWriteOffsets, highBucket, error)) {
+    return true;
+    })) { return false; }
+
+    if (!RunTerminalWork(options.resources, phase, [&](WorkerContext&) {
+    for (std::size_t highBucket = 0; highBucket < kMortonBucketCount16; ++highBucket) {
+        if (options.resources.Stopped() || !flush(highBucket)) {
             return false;
         }
     }
@@ -346,6 +374,9 @@ inline bool WriteHighBucketRun(
         }
     }
     return true;
+    })) { return false; }
+    EmitMortonSamples(options, samples);
+    return true;
 }
 
 inline bool CountRunSegmentLowKeys(
@@ -355,15 +386,19 @@ inline bool CountRunSegmentLowKeys(
     const std::size_t runBufferBytes,
     std::vector<std::size_t>& lowCounts,
     std::vector<std::uint32_t>& touchedLowBuckets,
-    std::string* error = nullptr) {
+    DataCodecExecutionResources& root, const HeavyPhaseLease& phase,
+    std::string* error = nullptr, MortonCapacitySamples* samples = nullptr) {
     touchedLowBuckets.clear();
     const auto recordsPerRead = std::max<std::size_t>(1u, runBufferBytes / kMortonRunRecordBytes);
     std::vector<std::uint8_t> buffer(recordsPerRead * kMortonRunRecordBytes);
+    if (samples != nullptr) { samples->Observe(MortonArraySample::RunReadWindow, buffer); }
     std::size_t remaining = recordCount;
     std::size_t currentRecordOffset = recordBegin;
     while (remaining > 0u) {
+        if (root.Stopped()) { return false; }
         const auto currentRecords = std::min<std::size_t>(remaining, recordsPerRead);
         const auto currentBytes = currentRecords * kMortonRunRecordBytes;
+        if (!RunTerminalWork(root, phase, [&](WorkerContext&) {
         if (!run.ReadRecordBytes(
                 currentRecordOffset,
                 std::span<std::uint8_t>(buffer.data(), currentBytes),
@@ -378,6 +413,8 @@ inline bool CountRunSegmentLowKeys(
             }
             lowCounts[lowKey]++;
         }
+        return true;
+        })) { return false; }
         remaining -= currentRecords;
         currentRecordOffset += currentRecords;
     }
@@ -469,7 +506,8 @@ inline bool ReadRunSegmentLeaf(
     const std::size_t runBufferBytes,
     std::vector<IndexType>& scratch,
     std::vector<std::uint16_t>& lowBuckets,
-    std::string* error = nullptr) {
+    DataCodecExecutionResources& root, const HeavyPhaseLease& phase,
+    std::string* error = nullptr, MortonCapacitySamples* samples = nullptr) {
     scratch.clear();
     lowBuckets.clear();
     scratch.reserve(static_cast<std::size_t>(leaf.count));
@@ -477,11 +515,14 @@ inline bool ReadRunSegmentLeaf(
 
     const auto recordsPerRead = std::max<std::size_t>(1u, runBufferBytes / kMortonRunRecordBytes);
     std::vector<std::uint8_t> buffer(recordsPerRead * kMortonRunRecordBytes);
+    if (samples != nullptr) { samples->Observe(MortonArraySample::RunReadWindow, buffer); }
     std::size_t remaining = recordCount;
     std::size_t currentRecordOffset = recordBegin;
     while (remaining > 0u) {
+        if (root.Stopped()) { return false; }
         const auto currentRecords = std::min<std::size_t>(remaining, recordsPerRead);
         const auto currentBytes = currentRecords * kMortonRunRecordBytes;
+        if (!RunTerminalWork(root, phase, [&](WorkerContext&) {
         if (!run.ReadRecordBytes(
                 currentRecordOffset,
                 std::span<std::uint8_t>(buffer.data(), currentBytes),
@@ -497,6 +538,8 @@ inline bool ReadRunSegmentLeaf(
             lowBuckets.push_back(lowKey);
             scratch.push_back(DecodeRunElementId(record));
         }
+        return true;
+        })) { return false; }
         remaining -= currentRecords;
         currentRecordOffset += currentRecords;
     }
@@ -512,18 +555,22 @@ inline bool ReadRunSegmentSingleLowKeyChunk(
     const std::size_t maxCount,
     const std::size_t runBufferBytes,
     std::vector<IndexType>& scratch,
-    std::string* error = nullptr) {
+    DataCodecExecutionResources& root, const HeavyPhaseLease& phase,
+    std::string* error = nullptr, MortonCapacitySamples* samples = nullptr) {
     scratch.clear();
     scratch.reserve(maxCount);
     std::uint64_t skipped = 0u;
 
     const auto recordsPerRead = std::max<std::size_t>(1u, runBufferBytes / kMortonRunRecordBytes);
     std::vector<std::uint8_t> buffer(recordsPerRead * kMortonRunRecordBytes);
+    if (samples != nullptr) { samples->Observe(MortonArraySample::RunReadWindow, buffer); }
     std::size_t remaining = recordCount;
     std::size_t currentRecordOffset = recordBegin;
     while (remaining > 0u && scratch.size() < maxCount) {
+        if (root.Stopped()) { return false; }
         const auto currentRecords = std::min<std::size_t>(remaining, recordsPerRead);
         const auto currentBytes = currentRecords * kMortonRunRecordBytes;
+        if (!RunTerminalWork(root, phase, [&](WorkerContext&) {
         if (!run.ReadRecordBytes(
                 currentRecordOffset,
                 std::span<std::uint8_t>(buffer.data(), currentBytes),
@@ -542,6 +589,8 @@ inline bool ReadRunSegmentSingleLowKeyChunk(
             }
             scratch.push_back(DecodeRunElementId(record));
         }
+        return true;
+        })) { return false; }
         remaining -= currentRecords;
         currentRecordOffset += currentRecords;
     }
@@ -570,26 +619,32 @@ inline void BuildBufferedLeafOrder(
 struct MortonRemapOutput {
     IWritableRemapProvider* orderProvider{nullptr};
     IWritableRemapProvider* inverseProvider{nullptr};
-    std::size_t nextIndex{0};
+    DataCodecExecutionResources& root;
+    const HeavyPhaseLease& phase;
+    std::size_t nextIndex{0u};
 
     bool Append(std::span<const IndexType> order, std::string* error = nullptr) {
         if (orderProvider == nullptr) {
             return validation::AssignError(error, "Morton remap output provider is null");
         }
-        if (!orderProvider->AppendRange(order, error)) {
-            return false;
-        }
-        if (inverseProvider != nullptr) {
-            for (std::size_t index = 0; index < order.size(); ++index) {
-                if (!inverseProvider->WriteAt(
-                        static_cast<std::size_t>(order[index]),
-                        static_cast<IndexType>(nextIndex + index),
-                        error)) {
-                    return false;
+        constexpr std::size_t window = kIoWindowBytes / sizeof(IndexType);
+        for (std::size_t first = 0u; first < order.size();) {
+            if (root.Stopped()) { return false; }
+            const auto count = std::min(window, order.size() - first);
+            const auto values = order.subspan(first, count);
+            if (!RunTerminalWork(root, phase, [&](WorkerContext&) {
+                if (!orderProvider->AppendRange(values, error)) { return false; }
+                if (inverseProvider != nullptr) {
+                    for (std::size_t i = 0u; i < values.size(); ++i) {
+                        if (root.Stopped() || !inverseProvider->WriteAt(values[i],
+                                static_cast<IndexType>(nextIndex + i), error)) { return false; }
+                    }
                 }
-            }
+                return true;
+            })) { return false; }
+            nextIndex += count;
+            first += count;
         }
-        nextIndex += order.size();
         return true;
     }
 };
@@ -607,7 +662,7 @@ inline bool AppendRunSegmentByMortonKey(
     std::vector<std::size_t>& lowCounts,
     std::vector<std::size_t>& lowOffsets,
     std::vector<std::uint32_t>& touchedLowBuckets,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, MortonCapacitySamples* samples = nullptr) {
     auto fail = [&]() {
         ResetLowWorkspace(touchedLowBuckets, lowCounts, lowOffsets);
         return false;
@@ -620,11 +675,17 @@ inline bool AppendRunSegmentByMortonKey(
             runBufferBytes,
             lowCounts,
             touchedLowBuckets,
-            error)) {
+            output.root, output.phase,
+            error, samples)) {
         return fail();
     }
 
-    const auto leaves = BuildLowKeyLeaves(lowCounts, leafBudgetElements);
+    std::vector<MortonLowKeyLeaf> leaves;
+    if (!RunTerminalWork(output.root, output.phase, [&](WorkerContext&) {
+            leaves = BuildLowKeyLeaves(lowCounts, leafBudgetElements);
+            return true;
+        })) { return fail(); }
+    if (samples != nullptr) { samples->Observe(MortonArraySample::Leaves, leaves); }
     std::size_t outputOffset = 0u;
     for (const auto& leaf : leaves) {
         if (leaf.count == 0u) {
@@ -646,7 +707,8 @@ inline bool AppendRunSegmentByMortonKey(
                         currentCount,
                         runBufferBytes,
                         scratch,
-                        error)) {
+                        output.root, output.phase,
+                        error, samples)) {
                     return fail();
                 }
                 if (!output.Append(std::span<const IndexType>(scratch.data(), scratch.size()), error)) {
@@ -665,9 +727,11 @@ inline bool AppendRunSegmentByMortonKey(
                 runBufferBytes,
                 scratch,
                 lowBuckets,
-                error)) {
+                output.root, output.phase,
+                error, samples)) {
             return fail();
         }
+        if (!RunTerminalWork(output.root, output.phase, [&](WorkerContext&) {
         BuildBufferedLeafOrder(
             leaf,
             scratch,
@@ -675,6 +739,8 @@ inline bool AppendRunSegmentByMortonKey(
             lowCounts,
             lowOffsets,
             orderedElements);
+        return true;
+        })) { return fail(); }
         if (!output.Append(std::span<const IndexType>(orderedElements.data(), orderedElements.size()), error)) {
             return fail();
         }
@@ -687,94 +753,46 @@ inline bool AppendRunSegmentByMortonKey(
 
 template<typename TKeyGetter>
 inline bool BuildInMemoryMortonRemapProvider(
-    const std::size_t elementCount,
-    TKeyGetter&& keyGetter,
-    MortonRemapResult& result,
-    const MortonRemapOptions& options,
-    std::string* error) {
-    std::vector<MortonKeyedIndex> keyed;
-    keyed.reserve(elementCount);
-    for (std::size_t elementIndex = 0; elementIndex < elementCount; ++elementIndex) {
-        keyed.push_back(MortonKeyedIndex{
-            .key = keyGetter(elementIndex),
-            .index = static_cast<IndexType>(elementIndex),
-        });
+    const std::size_t elementCount, TKeyGetter&& keyGetter, MortonRemapResult& result,
+    const MortonRemapOptions& options, const HeavyPhaseLease& phase, std::string* error) {
+    auto provider = options.providerFactory(elementCount, false, options.resourcePrefix + ".order", error, {});
+    if (!provider) { return false; }
+    bytestore::KnownStorageOwners coexist;
+    if (const auto* stored = dynamic_cast<const RemapStoreProvider*>(provider.get())) {
+        coexist.Add(stored->ByteSource());
     }
-    std::stable_sort(
-        keyed.begin(),
-        keyed.end(),
-        [](const MortonKeyedIndex& lhs, const MortonKeyedIndex& rhs) {
-            if (lhs.key != rhs.key) {
-                return lhs.key < rhs.key;
-            }
-            return lhs.index < rhs.index;
-        });
-
-    std::vector<IndexType> order;
-    order.reserve(elementCount);
-    for (const auto& entry : keyed) {
-        order.push_back(entry.index);
-    }
-    InvokeResource(
-        options,
-        "in_memory_order",
-        VectorCapacityBytes(keyed) + VectorCapacityBytes(order));
-
-    const auto makeLabel = [&options](const std::string_view suffix) {
-        if (options.resourcePrefix.empty()) {
-            return std::string("remap_morton_") + std::string(suffix);
-        }
-        return options.resourcePrefix + "." + std::string(suffix);
-    };
-    const auto publishProvider = [&options, &makeLabel, error](
-        std::vector<IndexType>& values,
-        const std::string_view suffix,
-        std::shared_ptr<IRemapProvider>& target) -> bool {
-        if (!options.providerFactory) {
-            target = MakeVectorRemapProvider(std::move(values));
-            return true;
-        }
-        auto provider = options.providerFactory(
-            values.size(),
-            false,
-            makeLabel(suffix),
-            error);
-        if (provider == nullptr) {
-            if (error != nullptr && error->empty()) {
-                validation::AssignError(error, "failed to create in-memory Morton remap provider");
-            }
-            return false;
-        }
-        if (!provider->AppendRange(std::span<const IndexType>(values.data(), values.size()), error) ||
-            !provider->EndWrite(error)) {
-            provider->Release();
-            return false;
-        }
-        target = std::move(provider);
-        std::vector<IndexType>().swap(values);
-        return true;
-    };
-
+    std::shared_ptr<IWritableRemapProvider> inverse;
     if (options.buildInverse) {
-        std::vector<IndexType> inverse(elementCount);
-        for (std::size_t rank = 0; rank < order.size(); ++rank) {
-            inverse[static_cast<std::size_t>(order[rank])] = static_cast<IndexType>(rank);
-        }
-        InvokeResource(
-            options,
-            "in_memory_inverse",
-            VectorCapacityBytes(inverse));
-        if (!publishProvider(inverse, "inverse", result.inverseProvider)) {
-            return false;
-        }
+        inverse = options.providerFactory(elementCount, true, options.resourcePrefix + ".inverse", error, coexist.Entries());
+        if (!inverse) { return false; }
     }
-    if (!publishProvider(order, "order", result.orderProvider)) {
-        if (result.inverseProvider != nullptr) {
-            result.inverseProvider->Release();
-            result.inverseProvider.reset();
+    std::optional<MortonCapacitySamples> samples;
+    if (options.recordCapacitySamples) { samples.emplace(); }
+    std::vector<MortonKeyedIndex> keyed;
+    std::vector<IndexType> order;
+    if (!RunTerminalWork(options.resources, phase, [&](WorkerContext&) {
+        keyed.reserve(elementCount);
+        for (std::size_t i = 0u; i < elementCount; ++i) {
+            if (options.resources.Stopped()) { return false; }
+            keyed.push_back({keyGetter(i), static_cast<IndexType>(i)});
         }
-        return false;
+        std::stable_sort(keyed.begin(), keyed.end(), [](const auto& left, const auto& right) {
+            return left.key != right.key ? left.key < right.key : left.index < right.index;
+        });
+        order.reserve(elementCount);
+        for (const auto& entry : keyed) { order.push_back(entry.index); }
+        return true;
+    })) { return false; }
+    if (samples) {
+        samples->Observe(MortonArraySample::Keyed, keyed);
+        samples->Observe(MortonArraySample::Order, order);
     }
+    EmitMortonSamples(options, samples);
+    MortonRemapOutput output{provider.get(), inverse.get(), options.resources, phase};
+    if (!output.Append(order, error) || !provider->EndWrite(error) ||
+        (inverse && !inverse->EndRandomWrite(error))) { return false; }
+    result.orderProvider = std::move(provider);
+    result.inverseProvider = std::move(inverse);
     InvokeProgress(options, 1.0);
     return true;
 }
@@ -784,7 +802,7 @@ inline bool BuildMortonRemapProvider(
     const std::size_t elementCount,
     TKeyGetter&& keyGetter,
     MortonRemapResult& result,
-    const MortonRemapOptions& options = {},
+    const MortonRemapOptions& options,
     std::string* error = nullptr) {
     result = {};
     if (elementCount > static_cast<std::size_t>(std::numeric_limits<IndexType>::max())) {
@@ -798,75 +816,59 @@ inline bool BuildMortonRemapProvider(
         InvokeProgress(options, 1.0);
         return true;
     }
-    const auto resolvedLeafBudgetBytes = ResolveRemapLeafBudgetBytes(options.leafBudgetBytes);
-    const auto resolvedRunBufferBytes = ResolveRunBufferBytes(options.runBufferBytes);
-    const auto leafBudgetElements = ResolveLeafBudgetElements(resolvedLeafBudgetBytes);
-    if (elementCount <= leafBudgetElements) {
-        const auto keyedBytes = validation::SaturatingMulU64(
-            static_cast<std::uint64_t>(elementCount),
-            sizeof(MortonKeyedIndex));
-        const auto orderBytes = validation::SaturatingMulU64(
-            static_cast<std::uint64_t>(elementCount),
-            sizeof(IndexType) * (options.buildInverse ? 2u : 1u));
-        const auto inMemoryWorkBytes = validation::SaturatingAddU64(keyedBytes, orderBytes);
-        auto scratchLease = options.scratchBudget != nullptr
-            ? options.scratchBudget->Acquire(inMemoryWorkBytes)
-            : resource::ActiveByteBudget::Lease{};
-        return BuildInMemoryMortonRemapProvider(
-            elementCount,
-            std::forward<TKeyGetter>(keyGetter),
-            result,
-            options,
-            error);
-    }
     if (options.byteStoreSession == nullptr) {
         return validation::AssignError(error, "Morton remap requires a byte store session");
     }
     if (!options.providerFactory) {
         return validation::AssignError(error, "Morton remap requires a writable remap provider factory");
     }
+    auto phase = WaitForHeavyPhase(options.resources);
+    if (!phase) { return false; }
+    constexpr auto leafBudgetElements = ResolveLeafBudgetElements();
+    if (elementCount <= leafBudgetElements) {
+        return BuildInMemoryMortonRemapProvider(
+            elementCount,
+            std::forward<TKeyGetter>(keyGetter),
+            result,
+            options,
+            *phase,
+            error);
+    }
 
-    const auto remapWorkBytes = EstimateMortonWorkspaceBytes(
-        elementCount,
-        resolvedLeafBudgetBytes,
-        resolvedRunBufferBytes);
-    InvokeResource(options, "work_budget_requested", remapWorkBytes);
-    auto scratchLease = options.scratchBudget != nullptr
-        ? options.scratchBudget->Acquire(remapWorkBytes)
-        : resource::ActiveByteBudget::Lease{};
-    InvokeResource(options, "run_buffer_bytes", static_cast<std::uint64_t>(resolvedRunBufferBytes));
-
-    const auto keyCacheBytes = validation::SaturatingMulU64(
-        static_cast<std::uint64_t>(elementCount),
-        sizeof(std::uint32_t));
-    resource::ActiveByteBudget::Lease keyCacheLease;
-    bool useKeyCache = options.scratchBudget == nullptr;
-    if (options.scratchBudget != nullptr) {
-        auto lease = options.scratchBudget->TryAcquire(keyCacheBytes);
-        if (lease.has_value()) {
-            keyCacheLease = std::move(*lease);
-            useKeyCache = true;
+    std::size_t keyCacheBytes = 0u;
+    if (!validation::CheckedMulSizeT(elementCount, sizeof(std::uint32_t), keyCacheBytes,
+            "Morton key cache", error)) { return false; }
+    std::shared_ptr<bytestore::MemoryStore> keyCache;
+    if (options.resources.OptionalRetentionAllowed()) {
+        auto capacity = options.resources.StorageCapacity();
+        const auto tag = capacity->NewOwner(resource::StorageOwnerPurpose::Optional, "morton-key-cache");
+        resource::CapacityRejection rejection;
+        auto lease = capacity->TryReserve(keyCacheBytes, &rejection, tag);
+        if (!lease) { options.resources.RecordCapacityRejection(rejection, false); }
+        if (lease) {
+            // 获准后只申请一次，异常直接交给现有 failure 链
+            keyCache = options.byteStoreSession->CreateReservedMemoryStore(std::move(*lease), error);
+            if (!keyCache) { return false; }
         }
     }
-    std::vector<std::uint32_t> keyCache;
-    if (useKeyCache) {
-        keyCache.resize(elementCount);
-    }
-    InvokeResource(options, "key_cache", useKeyCache ? keyCacheBytes : 0u);
+    const bool useKeyCache = keyCache != nullptr;
 
+    std::optional<MortonCapacitySamples> samples;
+    if (options.recordCapacitySamples) { samples.emplace(); }
     std::vector<std::size_t> highCounts(kMortonBucketCount16, 0u);
     std::vector<std::size_t> highOffsets(kMortonBucketCount16, 0u);
     std::vector<std::size_t> highWriteOffsets(kMortonBucketCount16, 0u);
-    InvokeResource(
-        options,
-        "allocate_high_tables",
-        VectorCapacityBytes(highCounts) + VectorCapacityBytes(highOffsets) + VectorCapacityBytes(highWriteOffsets));
 
     const auto progressStep = std::max<std::size_t>(elementCount / 64u, 1u);
-    for (std::size_t elementIndex = 0; elementIndex < elementCount; ++elementIndex) {
+    if (!RunMortonRanges(options.resources, *phase, elementCount, [&](std::size_t first, std::size_t end) {
+    for (std::size_t elementIndex = first; elementIndex < end; ++elementIndex) {
+        if (options.resources.Stopped()) { return false; }
         const auto key = keyGetter(elementIndex);
         if (useKeyCache) {
-            keyCache[elementIndex] = key;
+            if (!keyCache->WriteAt(elementIndex * sizeof(key),
+                    std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(&key), sizeof(key)), error)) {
+                return false;
+            }
         }
         const auto highBucket = static_cast<std::uint16_t>((key >> 16u) & kMortonBucketMask16);
         highCounts[highBucket]++;
@@ -876,10 +878,8 @@ inline bool BuildMortonRemapProvider(
                 0.10 + 0.25 * (static_cast<double>(elementIndex + 1u) / static_cast<double>(elementCount)));
         }
     }
-    InvokeResource(
-        options,
-        "key_build",
-        VectorCapacityBytes(highCounts) + VectorCapacityBytes(highOffsets) + VectorCapacityBytes(highWriteOffsets));
+    return true;
+    })) { return false; }
 
     std::size_t maxHighBucketSize = 0u;
     std::size_t nonEmptyHighBuckets = 0u;
@@ -894,14 +894,14 @@ inline bool BuildMortonRemapProvider(
             maxHighBucketSize = std::max(maxHighBucketSize, bucketSize);
         }
     }
-    InvokeResource(options, "non_empty_high_buckets", static_cast<std::uint64_t>(nonEmptyHighBuckets));
-    InvokeResource(options, "max_high_bucket_size", static_cast<std::uint64_t>(maxHighBucketSize));
 
     auto& byteStoreSession = *options.byteStoreSession;
-    RemapScratchSpooler scratchSpooler(byteStoreSession, options.useMemoryScratchStore);
     RemapScratchRun highRun;
     const auto highRunKeyGetter = [&](const std::size_t elementIndex) {
-        return useKeyCache ? keyCache[elementIndex] : keyGetter(elementIndex);
+        if (!useKeyCache) { return keyGetter(elementIndex); }
+        std::uint32_t key = 0u;
+        std::memcpy(&key, keyCache->ContiguousBytes().data() + elementIndex * sizeof(key), sizeof(key));
+        return key;
     };
 
     if (!WriteHighBucketRun(
@@ -910,33 +910,26 @@ inline bool BuildMortonRemapProvider(
             highCounts,
             highOffsets,
             highWriteOffsets,
-            scratchSpooler,
+            byteStoreSession,
             highRun,
             options,
-            error)) {
+            *phase,
+            error, keyCache.get())) {
         return false;
     }
-    std::vector<std::uint32_t>().swap(keyCache);
-    keyCacheLease.Release();
+    keyCache.reset();
     InvokeProgress(options, 0.50);
-    InvokeResource(
-        options,
-        "radix_high",
-        VectorCapacityBytes(highCounts) + VectorCapacityBytes(highOffsets) + VectorCapacityBytes(highWriteOffsets));
 
+    if (samples) {
+        samples->Observe(MortonArraySample::HighCounts, highCounts);
+        samples->Observe(MortonArraySample::HighOffsets, highOffsets);
+        samples->Observe(MortonArraySample::HighWriteOffsets, highWriteOffsets);
+    }
+    EmitMortonSamples(options, samples);
     ReleaseVectorStorage(highWriteOffsets);
-    InvokeResource(
-        options,
-        "release_high_write_offsets",
-        VectorCapacityBytes(highCounts) + VectorCapacityBytes(highOffsets));
+    if (samples) { samples->Observe(MortonArraySample::HighWriteOffsets, highWriteOffsets); }
 
     const auto maxBufferedBucketSize = std::min<std::size_t>(maxHighBucketSize, leafBudgetElements);
-    InvokeResource(
-        options,
-        "low_leaf_budget",
-        static_cast<std::uint64_t>(leafBudgetElements * (sizeof(IndexType) * 2u + sizeof(std::uint16_t))));
-    InvokeResource(options, "leaf_budget_elements", static_cast<std::uint64_t>(leafBudgetElements));
-    InvokeResource(options, "max_buffered_bucket_size", static_cast<std::uint64_t>(maxBufferedBucketSize));
 
     std::vector<IndexType> scratch;
     scratch.reserve(maxBufferedBucketSize);
@@ -948,16 +941,16 @@ inline bool BuildMortonRemapProvider(
     std::vector<std::size_t> lowOffsets(kMortonBucketCount16, 0u);
     std::vector<std::uint32_t> touchedLowBuckets;
     touchedLowBuckets.reserve(std::min<std::size_t>(maxBufferedBucketSize, kMortonBucketCount16));
-    InvokeResource(
-        options,
-        "allocate_scratch",
-        VectorCapacityBytes(scratch) + VectorCapacityBytes(orderedElements) + VectorCapacityBytes(lowBuckets) +
-            VectorCapacityBytes(highCounts) + VectorCapacityBytes(highOffsets) + VectorCapacityBytes(lowCounts) +
-            VectorCapacityBytes(lowOffsets) + VectorCapacityBytes(touchedLowBuckets));
 
+    bytestore::KnownStorageOwners coexist;
+    coexist.Add(highRun.ByteSource());
     const auto makeWritableProvider = [&](const bool randomWrite, const char* label)
         -> std::shared_ptr<IWritableRemapProvider> {
-        return options.providerFactory(elementCount, randomWrite, label, error);
+        auto created = options.providerFactory(elementCount, randomWrite, label, error, coexist.Entries());
+        if (const auto* stored = dynamic_cast<const RemapStoreProvider*>(created.get())) {
+            coexist.Add(stored->ByteSource());
+        }
+        return created;
     };
 
     auto provider = makeWritableProvider(false, "order");
@@ -968,7 +961,6 @@ inline bool BuildMortonRemapProvider(
     if (options.buildInverse) {
         inverseProvider = makeWritableProvider(true, "inverse");
         if (inverseProvider == nullptr) {
-            provider->Release();
             return false;
         }
     }
@@ -976,6 +968,8 @@ inline bool BuildMortonRemapProvider(
     MortonRemapOutput output{
         .orderProvider = provider.get(),
         .inverseProvider = inverseProvider.get(),
+        .root = options.resources,
+        .phase = *phase,
         .nextIndex = 0u,
     };
 
@@ -997,7 +991,7 @@ inline bool BuildMortonRemapProvider(
                 bucketBegin,
                 bucketSize,
                 leafBudgetElements,
-                resolvedRunBufferBytes,
+                kMortonRunBufferBytes,
                 output,
                 scratch,
                 orderedElements,
@@ -1005,11 +999,7 @@ inline bool BuildMortonRemapProvider(
                 lowCounts,
                 lowOffsets,
                 touchedLowBuckets,
-                error)) {
-            provider->Release();
-            if (inverseProvider != nullptr) {
-                inverseProvider->Release();
-            }
+                error, samples ? &*samples : nullptr)) {
             return false;
         }
 
@@ -1022,25 +1012,22 @@ inline bool BuildMortonRemapProvider(
                      static_cast<double>(std::max<std::size_t>(nonEmptyHighBuckets, 1u))));
         }
     }
-    InvokeResource(
-        options,
-        "radix_low",
-        VectorCapacityBytes(scratch) + VectorCapacityBytes(orderedElements) + VectorCapacityBytes(lowBuckets) +
-            VectorCapacityBytes(highCounts) + VectorCapacityBytes(highOffsets) + VectorCapacityBytes(lowCounts) +
-            VectorCapacityBytes(lowOffsets) + VectorCapacityBytes(touchedLowBuckets));
-    InvokeResource(options, "spilled_high_buckets", static_cast<std::uint64_t>(spilledHighBuckets));
-    InvokeResource(options, "largest_spilled_bucket", static_cast<std::uint64_t>(largestSpilledBucket));
 
+    if (samples) {
+        samples->Observe(MortonArraySample::Scratch, scratch);
+        samples->Observe(MortonArraySample::OrderedElements, orderedElements);
+        samples->Observe(MortonArraySample::LowBuckets, lowBuckets);
+        samples->Observe(MortonArraySample::HighCounts, highCounts);
+        samples->Observe(MortonArraySample::HighOffsets, highOffsets);
+        samples->Observe(MortonArraySample::LowCounts, lowCounts);
+        samples->Observe(MortonArraySample::LowOffsets, lowOffsets);
+        samples->Observe(MortonArraySample::TouchedLowBuckets, touchedLowBuckets);
+    }
+    EmitMortonSamples(options, samples);
     if (!provider->EndWrite(error)) {
-        provider->Release();
-        if (inverseProvider != nullptr) {
-            inverseProvider->Release();
-        }
         return false;
     }
     if (inverseProvider != nullptr && !inverseProvider->EndRandomWrite(error)) {
-        provider->Release();
-        inverseProvider->Release();
         return false;
     }
 
@@ -1053,7 +1040,17 @@ inline bool BuildMortonRemapProvider(
     ReleaseVectorStorage(lowCounts);
     ReleaseVectorStorage(lowOffsets);
     ReleaseVectorStorage(touchedLowBuckets);
-    InvokeResource(options, "release_temp", 0u);
+    if (samples) {
+        samples->Observe(MortonArraySample::Scratch, scratch);
+        samples->Observe(MortonArraySample::OrderedElements, orderedElements);
+        samples->Observe(MortonArraySample::LowBuckets, lowBuckets);
+        samples->Observe(MortonArraySample::HighCounts, highCounts);
+        samples->Observe(MortonArraySample::HighOffsets, highOffsets);
+        samples->Observe(MortonArraySample::LowCounts, lowCounts);
+        samples->Observe(MortonArraySample::LowOffsets, lowOffsets);
+        samples->Observe(MortonArraySample::TouchedLowBuckets, touchedLowBuckets);
+    }
+    EmitMortonSamples(options, samples);
     InvokeProgress(options, 1.0);
 
     result.orderProvider = std::move(provider);
@@ -1061,7 +1058,7 @@ inline bool BuildMortonRemapProvider(
     return true;
 }
 
-} // namespace mortonremap
-} // namespace datacodec
+} // Morton 重排命名空间
+} // DataCodec 命名空间
 
 #endif

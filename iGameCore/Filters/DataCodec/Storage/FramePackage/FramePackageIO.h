@@ -288,27 +288,28 @@ public:
     static bool ReadMetadata(
         IByteRangeReader& reader,
         FramePackage& container,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        const std::stop_token stop = {}) {
         container = {};
         std::uint64_t offset = 0u;
         std::uint32_t magic = 0u;
         std::uint16_t version = 0u;
         std::uint8_t geometryTemporalRoleValue = 0u;
         std::uint8_t attributeTemporalRoleValue = 0u;
-        if (!ReadRangeScalar(reader, offset, magic, error) ||
+        if (!ReadRangeScalar(reader, offset, magic, error, stop) ||
             magic != framepackagewire::kFramePackageMagic ||
-            !ReadRangeScalar(reader, offset, version, error) ||
+            !ReadRangeScalar(reader, offset, version, error, stop) ||
             version != framepackagewire::kFramePackageVersion ||
-            !ReadRangeScalar(reader, offset, container.identity.high, error) ||
-            !ReadRangeScalar(reader, offset, container.identity.low, error) ||
+            !ReadRangeScalar(reader, offset, container.identity.high, error, stop) ||
+            !ReadRangeScalar(reader, offset, container.identity.low, error, stop) ||
             !container.identity.IsValid() ||
-            !ReadRangeScalar(reader, offset, container.frameIndex, error) ||
-            !ReadRangeScalar(reader, offset, container.timeValue, error) ||
-            !ReadRangeScalar(reader, offset, geometryTemporalRoleValue, error) ||
-            !ReadRangeScalar(reader, offset, container.geometryKeyFrameIndex, error) ||
-            !ReadRangeScalar(reader, offset, attributeTemporalRoleValue, error) ||
-            !ReadRangeScalar(reader, offset, container.attributeKeyFrameIndex, error) ||
-            !ReadRangeString(reader, offset, container.rootName, error)) {
+            !ReadRangeScalar(reader, offset, container.frameIndex, error, stop) ||
+            !ReadRangeScalar(reader, offset, container.timeValue, error, stop) ||
+            !ReadRangeScalar(reader, offset, geometryTemporalRoleValue, error, stop) ||
+            !ReadRangeScalar(reader, offset, container.geometryKeyFrameIndex, error, stop) ||
+            !ReadRangeScalar(reader, offset, attributeTemporalRoleValue, error, stop) ||
+            !ReadRangeScalar(reader, offset, container.attributeKeyFrameIndex, error, stop) ||
+            !ReadRangeString(reader, offset, container.rootName, error, stop)) {
             if (error != nullptr && error->empty()) {
                 if (magic != framepackagewire::kFramePackageMagic) {
                     *error = "frame package magic does not match";
@@ -335,7 +336,7 @@ public:
 
         std::uint32_t branchCount = 0u;
         constexpr std::uint64_t minBranchRecordBytes = detail::WireScalarSize<std::uint64_t>() * 2u;
-        if (!ReadRangeScalar(reader, offset, branchCount, error) ||
+        if (!ReadRangeScalar(reader, offset, branchCount, error, stop) ||
             !ValidateRangeRecordCount(
                 reader.ByteSize(),
                 offset,
@@ -349,8 +350,8 @@ public:
         container.branches.reserve(branchCount);
         for (std::uint32_t index = 0u; index < branchCount; ++index) {
             FramePackageBranchRecord branch;
-            if (!ReadRangeString(reader, offset, branch.path, error) ||
-                !ReadRangeString(reader, offset, branch.name, error)) {
+            if (!ReadRangeString(reader, offset, branch.path, error, stop) ||
+                !ReadRangeString(reader, offset, branch.name, error, stop)) {
                 container = {};
                 return false;
             }
@@ -362,7 +363,7 @@ public:
             detail::WireScalarSize<std::uint64_t>() * 4u +
             detail::WireScalarSize<std::uint32_t>() +
             detail::WireScalarSize<std::uint8_t>();
-        if (!ReadRangeScalar(reader, offset, leafCount, error) ||
+        if (!ReadRangeScalar(reader, offset, leafCount, error, stop) ||
             !ValidateRangeRecordCount(
                 reader.ByteSize(),
                 offset,
@@ -377,12 +378,12 @@ public:
         for (std::uint32_t index = 0u; index < leafCount; ++index) {
             FramePackageLeafRecord leaf;
             std::uint8_t topologyModeValue = 0u;
-            if (!ReadRangeString(reader, offset, leaf.path, error) ||
-                !ReadRangeString(reader, offset, leaf.name, error) ||
-                !ReadRangeScalar(reader, offset, leaf.ownerFrameIndex, error) ||
-                !ReadRangeScalar(reader, offset, topologyModeValue, error) ||
-                !ReadRangeScalar(reader, offset, leaf.leafPackageByteSize, error) ||
-                !ReadRangeScalar(reader, offset, leaf.leafPackageByteOffset, error) ||
+            if (!ReadRangeString(reader, offset, leaf.path, error, stop) ||
+                !ReadRangeString(reader, offset, leaf.name, error, stop) ||
+                !ReadRangeScalar(reader, offset, leaf.ownerFrameIndex, error, stop) ||
+                !ReadRangeScalar(reader, offset, topologyModeValue, error, stop) ||
+                !ReadRangeScalar(reader, offset, leaf.leafPackageByteSize, error, stop) ||
+                !ReadRangeScalar(reader, offset, leaf.leafPackageByteOffset, error, stop) ||
                 !ParseTopologyMode(topologyModeValue, leaf.topologyMode, error) ||
                 !ValidateLeafPackageRange(
                     reader.ByteSize(),
@@ -439,7 +440,7 @@ public:
     }
 
     static bool MakeFrameLeafPackageBytesWriter(
-        std::vector<std::uint8_t> leafPackageBytes,
+        EncodedBuffer leafPackageBytes,
         LeafPackageWriter& writer,
         std::string* error = nullptr) {
         if (leafPackageBytes.empty()) {
@@ -453,14 +454,18 @@ public:
             return validation::AssignError(error, "encoded leaf package identity is invalid");
         }
 
-        auto leafPackageBytesStorage = std::make_shared<std::vector<std::uint8_t>>(std::move(leafPackageBytes));
+        auto leafPackageBytesStorage = std::make_shared<const EncodedBuffer>(std::move(leafPackageBytes));
         writer = LeafPackageWriter{
             .leafPackageByteSize = static_cast<std::uint64_t>(leafPackageBytesStorage->size()),
             .identity = identity,
             .appendLeafPackage = [leafPackageBytesStorage](bytestore::IByteWriter& output, std::string* writeError) {
-                return output.Write(
-                    std::span<const std::uint8_t>(leafPackageBytesStorage->data(), leafPackageBytesStorage->size()),
-                    writeError);
+                const auto bytes = leafPackageBytesStorage->span();
+                for (std::size_t offset = 0u; offset < bytes.size();) {
+                    const auto count = std::min(kIoWindowBytes, bytes.size() - offset);
+                    if (!output.Write(bytes.subspan(offset, count), writeError)) { return false; }
+                    offset += count;
+                }
+                return true;
             },
         };
         return true;
@@ -469,7 +474,6 @@ public:
     static bool MakeFrameLeafPackageByteRangeWriter(
         std::shared_ptr<IByteRangeReader> leafPackageReader,
         LeafPackageWriter& writer,
-        const std::size_t windowBytes,
         std::string* error = nullptr) {
         if (leafPackageReader == nullptr) {
             return validation::AssignError(error, "leaf package byte range reader is missing");
@@ -492,17 +496,16 @@ public:
         writer = LeafPackageWriter{
             .leafPackageByteSize = leafPackageByteSize,
             .identity = identity,
-            .appendLeafPackage = [leafPackageReader, windowBytes](
+            .appendLeafPackage = [leafPackageReader](
                 bytestore::IByteWriter& output,
                 std::string* writeError) {
-                const auto resolvedWindowBytes = std::max<std::size_t>(windowBytes, 1u);
-                std::vector<std::uint8_t> buffer(resolvedWindowBytes, 0u);
+                std::vector<std::uint8_t> buffer(kIoWindowBytes, 0u);
                 std::uint64_t offset = 0u;
                 while (offset < leafPackageReader->ByteSize()) {
                     const auto currentBytes = static_cast<std::size_t>(
                         std::min<std::uint64_t>(
                             leafPackageReader->ByteSize() - offset,
-                            static_cast<std::uint64_t>(resolvedWindowBytes)));
+                            static_cast<std::uint64_t>(kIoWindowBytes)));
                     auto window = std::span<std::uint8_t>(buffer.data(), currentBytes);
                     if (!leafPackageReader->ReadAt(offset, window, writeError) ||
                         !output.Write(
@@ -518,7 +521,6 @@ public:
         return true;
     }
 
-private:
     static bool ComputeFramePackageByteSize(
         const FramePackage& container,
         const std::span<const LeafPackageWriter> leafPackageWriters,
@@ -538,6 +540,7 @@ private:
         return true;
     }
 
+private:
     [[nodiscard]] static PackageIdentity ComputeFramePackageIdentity(
         const FramePackage& container,
         const std::span<const LeafPackageWriter> leafPackageWriters,
@@ -577,14 +580,15 @@ private:
         IByteRangeReader& reader,
         std::uint64_t& offset,
         TValue& value,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        const std::stop_token stop = {}) {
         static_assert(detail::IsWireScalarValue<TValue>);
         using Storage = detail::WireStorageTypeT<TValue>;
         if (offset > reader.ByteSize() || sizeof(Storage) > reader.ByteSize() - offset) {
             return validation::AssignError(error, "unexpected end of frame package range while reading scalar");
         }
         std::array<std::uint8_t, sizeof(Storage)> bytes{};
-        if (!reader.ReadAt(offset, std::span<std::uint8_t>(bytes.data(), bytes.size()), error)) {
+        if (!reader.ReadAtCancellable(offset, std::span<std::uint8_t>(bytes.data(), bytes.size()), stop, error)) {
             return false;
         }
         Storage storage{};
@@ -600,9 +604,10 @@ private:
         IByteRangeReader& reader,
         std::uint64_t& offset,
         std::string& value,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        const std::stop_token stop = {}) {
         std::uint64_t byteCount = 0u;
-        if (!ReadRangeScalar(reader, offset, byteCount, error)) {
+        if (!ReadRangeScalar(reader, offset, byteCount, error, stop)) {
             return false;
         }
         std::size_t localByteCount = 0u;
@@ -612,11 +617,12 @@ private:
         }
         value.resize(localByteCount);
         if (localByteCount != 0u &&
-            !reader.ReadAt(
+            !reader.ReadAtCancellable(
                 offset,
                 std::span<std::uint8_t>(
                     reinterpret_cast<std::uint8_t*>(value.data()),
                     value.size()),
+                stop,
                 error)) {
             value.clear();
             return false;
@@ -885,7 +891,7 @@ inline bool MakeFrameLeafPackageWriter(
 }
 
 inline bool MakeFrameLeafPackageBytesWriter(
-    std::vector<std::uint8_t> leafPackageBytes,
+    EncodedBuffer leafPackageBytes,
     FramePackageIO::LeafPackageWriter& writer,
     std::string* error = nullptr) {
     return FramePackageIO::MakeFrameLeafPackageBytesWriter(std::move(leafPackageBytes), writer, error);

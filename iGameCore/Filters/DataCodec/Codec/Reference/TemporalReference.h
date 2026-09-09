@@ -155,7 +155,7 @@ inline bool EvaluateTemporalPredictorOffsetForBlock(
     const TemporalPredictorSearchStrategy strategy,
     const std::int32_t predictorOffset,
     TemporalPredictorOffsetSearchResult& result,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     result = {};
     result.offset = predictorOffset;
     if (currentBytes.size() != predictorBytes.size() || componentCount == 0u) {
@@ -225,7 +225,7 @@ inline bool EvaluateTemporalPredictorOffsetForBlock(
                 encoded,
                 header.bytesCodec,
                 error,
-                &scratchBytePool)) {
+                &scratchBytePool, nullptr, compressorState)) {
             return false;
         }
         std::size_t compressedBytes = 0u;

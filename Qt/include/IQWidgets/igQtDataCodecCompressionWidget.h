@@ -18,13 +18,14 @@
 #include <vector>
 
 namespace datacodec {
-enum class DataCodecEncodeTier;
+struct CodecResourceParams;
 struct CodecControlParams;
 struct CompressorConfig;
 }
 
 namespace datacodec::log {
-struct AdapterSignatureOrderSet;
+struct RemapOrderSnapshot;
+using AdapterSignatureOrderSet = RemapOrderSnapshot;
 }
 
 class QCheckBox;
@@ -41,6 +42,7 @@ class QPushButton;
 class QScrollArea;
 class QSpinBox;
 class QVBoxLayout;
+class igQtDataCodecResourceControls;
 
 class igQtDataCodecHistogramWidget : public QWidget {
 public:
@@ -232,9 +234,8 @@ private:
     void refreshStats();
     void refreshPredictionControls();
     void refreshPerformanceControls();
-    void applyPerformanceTierDefaults();
     void persistPerformanceSettings() const;
-    [[nodiscard]] ::datacodec::DataCodecEncodeTier selectedPerformanceTier() const;
+    [[nodiscard]] ::datacodec::CodecResourceParams selectedResources() const;
     bool hasNumericFields() const;
     bool hasSelectedFields() const;
     std::vector<::datacodec::AttributeTarget> selectedAttributeTargets() const;
@@ -327,7 +328,7 @@ private:
 
     QLineEdit* m_outputPathEdit{nullptr};
     QPushButton* m_outputPathButton{nullptr};
-    QComboBox* m_performanceCombo{nullptr};
+    igQtDataCodecResourceControls* m_resourceControls{nullptr};
     QCheckBox* m_compressionEnhancementCheck{nullptr};
     QSpinBox* m_zstdLevelSpin{nullptr};
     QWidget* m_gopControlRow{nullptr};

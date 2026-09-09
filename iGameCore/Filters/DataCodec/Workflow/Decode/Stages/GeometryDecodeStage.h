@@ -8,6 +8,7 @@
 #include "DataCodec/Runtime/Workspace/DecodeLeafWorkspace.h"
 #include "DataCodec/Workflow/Decode/Stages/FieldDecodeInput.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 #include <algorithm>
 #include <string>
@@ -72,31 +73,11 @@ inline void DecodeGeometryField(
             .byteStoreSession = workspace.ByteStoreSessionRef(),
             .geometry = workspace.geometry,
             .referenceCache = context.currentGeometryReferenceCache,
-            .geometryCacheStorageMode = workspace.ResourceBudget().GeometryDecodeCacheStorageMode(),
-            .geometryMemoryCacheLimitBytes = workspace.ResourceBudget().GeometryDecodeMemoryCacheLimitBytes(),
-            .geometryReferenceCacheStorageMode =
-                workspace.ResourceBudget().GeometryDecodeReferenceCacheStorageMode(),
-            .geometryMemoryReferenceLimitBytes =
-                workspace.ResourceBudget().GeometryDecodeMemoryReferenceLimitBytes(),
         },
+        .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
     };
-    if (meta.codecType == EncodedFieldCodecType::NumericArrayBlocks) {
-        result = DecodeNumericArrayGeometryField(
-            decodeRuntime,
-            stream);
-    } else if (meta.codecType == EncodedFieldCodecType::Delta) {
-        const auto* keyFrameReference = context.geometryKeyFrameReference;
-        decodeRuntime.data.keyFrameReference = keyFrameReference;
-        result = DecodeReferenceGeometryField(
-            decodeRuntime,
-            stream);
-    } else {
-        result = GeometryDecodeResult{
-            .success = false,
-            .code = CodecErrorCode::InvalidInput,
-            .message = "only accepts numeric-array or reference geometry",
-        };
-    }
+    decodeRuntime.data.keyFrameReference = context.geometryKeyFrameReference;
+    result = DecodeGeometryBlocks(decodeRuntime, stream);
 
     if (!result) {
         FailDecodeStage(

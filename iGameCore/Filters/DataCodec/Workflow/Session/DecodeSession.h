@@ -6,6 +6,7 @@
 #include "DataCodec/Workflow/Leaf/LeafDecodeExecutor.h"
 #include "DataCodec/Workflow/Session/DataCodecReferenceState.h"
 #include "DataCodec/Runtime/Cache/DecodeReferenceCache.h"
+#include "DataCodec/Runtime/Cache/DecodeCacheRuntime.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -39,10 +40,10 @@ public:
         }
     }
 
-    void ConfigureReferenceCache(
-        std::shared_ptr<DecodeReferenceCache> cache,
-        FrameIdentityMap frameIdentities) {
-        m_referenceCache = std::move(cache);
+    void ConfigureReferences(
+        DataCodecExecutionResources& resources,
+        std::shared_ptr<const FrameIdentityMap> frameIdentities) {
+        m_referenceCache = resources.Caches().ReferenceCache();
         m_frameIdentities = std::move(frameIdentities);
     }
 
@@ -68,19 +69,23 @@ public:
 
         m_frameAssembly = &frameAssembly;
         m_frameBegun = true;
-        m_activeFramePackage = framePackage;
+        m_activeFramePackage = ActiveFrameMetadata{
+            framePackage.frameIndex, framePackage.geometryTemporalRole, framePackage.geometryKeyFrameIndex,
+            framePackage.attributeTemporalRole, framePackage.attributeKeyFrameIndex};
         m_outputFrameIndex = framePackage.frameIndex;
 
-        auto branches = framePackage.branches;
+        std::vector<const FramePackageBranchRecord*> branches;
+        branches.reserve(framePackage.branches.size());
+        for (const auto& branch : framePackage.branches) { branches.push_back(&branch); }
         std::sort(
             branches.begin(),
             branches.end(),
             [](const auto& left, const auto& right) {
-                return std::count(left.path.begin(), left.path.end(), '/') <
-                    std::count(right.path.begin(), right.path.end(), '/');
+                return std::count(left->path.begin(), left->path.end(), '/') <
+                    std::count(right->path.begin(), right->path.end(), '/');
         });
         for (const auto& branch : branches) {
-            if (!frameAssembly.AddBranch(branch, error)) {
+            if (!frameAssembly.AddBranch(*branch, error)) {
                 AssignDefaultError(error, "failed to add frame package branch");
                 AbortFramePackage();
                 return false;
@@ -148,17 +153,13 @@ public:
                     !statePointer->workspace->attributes.Initialize(
                         statePointer->workspace->StorageParams(),
                         statePointer->workspace->ByteStoreSessionRef(),
-                        statePointer->workspace->ResourceBudget().AttributeDecodeMemoryCacheLimitBytes(),
-                        statePointer->workspace->ResourceBudget().AttributeDecodeCacheStorageMode(),
                         &referenceError)) {
                     result.success = false;
-                    result.messages.push_back(TelemetryMessageRecord{
-                        .severity = TelemetryMessageSeverity::Error,
-                        .origin = "DecodeSession",
-                        .text = referenceError.empty()
+                    result.failure = MakeCodecFailureRecord(
+                        CodecErrorCode::DecodeFailure, "operation-failed", "DecodeSession",
+                        referenceError.empty()
                             ? "failed to initialize lazy attribute reference store"
-                            : std::move(referenceError),
-                    });
+                            : std::string_view(referenceError));
                 }
             }
             if (result.success &&
@@ -232,13 +233,11 @@ public:
             std::string publishError;
             if (!PublishCurrentFrameReferences(&publishError)) {
                 result.success = false;
-                result.messages.push_back(TelemetryMessageRecord{
-                    .severity = TelemetryMessageSeverity::Error,
-                    .origin = "DecodeSession",
-                    .text = publishError.empty()
+                result.failure = MakeCodecFailureRecord(
+                    CodecErrorCode::DecodeFailure, "operation-failed", "DecodeSession",
+                    publishError.empty()
                         ? "failed to publish supplemented decode reference"
-                        : std::move(publishError),
-                });
+                        : std::string_view(publishError));
             }
         }
         state.attributeReferenceOwner.reset();
@@ -318,9 +317,7 @@ public:
             (void)key;
             const auto& state = *stateOwner;
             const auto storeStats = state.workspace->ByteStoreSessionRef().SnapshotStats();
-            const auto scratchStats = state.workspace->ScratchBytePool().SnapshotStats();
             bytes = validation::SaturatingAddU64(bytes, storeStats.residentBytes);
-            bytes = validation::SaturatingAddU64(bytes, scratchStats.retainedBytes);
             bytes = validation::SaturatingAddU64(
                 bytes,
                 state.workspace->attributes.AdapterBackedResidentSizeHint());
@@ -475,8 +472,9 @@ private:
 
     [[nodiscard]] std::optional<DecodeReferenceKey> ReferenceKeyForFrame(
         const std::uint32_t frameIndex) const {
-        const auto identity = m_frameIdentities.find(frameIndex);
-        if (identity == m_frameIdentities.end() || !identity->second.IsStable()) {
+        if (!m_frameIdentities) { return std::nullopt; }
+        const auto identity = m_frameIdentities->find(frameIndex);
+        if (identity == m_frameIdentities->end() || !identity->second.IsStable()) {
             return std::nullopt;
         }
         return DecodeReferenceKey{
@@ -615,8 +613,7 @@ private:
         if (frame.leaves.empty()) {
             return validation::AssignError(error, "decode reference frame contains no reusable leaf data");
         }
-        m_referenceCache->Publish(*key, std::move(frame));
-        const auto published = m_referenceCache->Find(*key);
+        const auto published = m_referenceCache->Publish(*key, std::move(frame));
         if (published == nullptr) {
             return validation::AssignError(error, "failed to publish decode reference frame");
         }
@@ -672,8 +669,15 @@ private:
 
     DataCodecReferenceState m_state;
     std::shared_ptr<DecodeReferenceCache> m_referenceCache;
-    FrameIdentityMap m_frameIdentities;
-    std::optional<FramePackage> m_activeFramePackage;
+    struct ActiveFrameMetadata {
+        std::uint32_t frameIndex{0u};
+        TemporalFieldRole geometryTemporalRole{TemporalFieldRole::SingleFrame};
+        std::uint32_t geometryKeyFrameIndex{0u};
+        TemporalFieldRole attributeTemporalRole{TemporalFieldRole::SingleFrame};
+        std::uint32_t attributeKeyFrameIndex{0u};
+    };
+    std::shared_ptr<const FrameIdentityMap> m_frameIdentities;
+    std::optional<ActiveFrameMetadata> m_activeFramePackage;
     std::optional<std::uint32_t> m_outputFrameIndex;
     std::unordered_map<std::string, std::unique_ptr<LeafDecodeState>> m_leafStates;
     IFramePackageDecodeAssembly* m_frameAssembly{nullptr};

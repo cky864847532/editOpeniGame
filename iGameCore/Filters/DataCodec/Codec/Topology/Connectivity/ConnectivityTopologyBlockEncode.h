@@ -4,23 +4,18 @@
 #include "DataCodec/API/Adapter/IEncodeAdapter.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 #include "DataCodec/Codec/Remap/RemapOrderSource.h"
-#include "DataCodec/Codec/Topology/Common/TopologyWorkBudget.h"
 #include "DataCodec/Codec/Topology/Connectivity/ConnectivityTopologyCodec.h"
 #include "DataCodec/Codec/Topology/Connectivity/ConnectivityTopologyTypes.h"
 #include "DataCodec/Common/DataCodecCallback.h"
-#include "DataCodec/Runtime/Cache/TransferCache/Common/TopologyTransferCache.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
-#include "DataCodec/Storage/ByteStore/SegmentedBinaryObject.h"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -116,14 +111,10 @@ struct OrderedTopologyCellSource {
         throw std::runtime_error("DataCodec topology failed to read cell polynomial order");
     }
 
-    void ReadCell(
-        const std::size_t newCellIndex,
-        std::vector<IndexType>& output,
-        IndexType* cellType,
-        std::uint16_t* cellPolynomialOrder) const {
-        const auto oldCellIndex = OldCellIndex(newCellIndex);
-        std::size_t begin = 0u;
-        std::size_t end = 0u;
+    void CellRange(const std::size_t oldCellIndex, std::size_t& begin, std::size_t& end) const {
+        if (oldCellIndex >= cellCount) {
+            throw std::runtime_error("DataCodec topology cell index is out of range");
+        }
         if (fixedCellSize > 0) {
             const auto cellSize = static_cast<std::size_t>(fixedCellSize);
             if (!validation::CheckedMulSizeT(
@@ -153,7 +144,16 @@ struct OrderedTopologyCellSource {
         if (end > connectivityCount) {
             throw std::runtime_error("DataCodec topology cell range exceeds connectivity storage");
         }
+    }
 
+    void ReadCell(
+        const std::size_t newCellIndex,
+        std::vector<IndexType>& output,
+        IndexType* cellType,
+        std::uint16_t* cellPolynomialOrder) const {
+        const auto oldCellIndex = OldCellIndex(newCellIndex);
+        std::size_t begin = 0u, end = 0u;
+        CellRange(oldCellIndex, begin, end);
         output.resize(end - begin);
         for (std::size_t local = 0u; local < output.size(); ++local) {
             const auto sourcePoint = indices[begin + local];
@@ -206,10 +206,8 @@ struct TopologyEncodeData {
 };
 
 struct TopologyEncodeExecutionParams {
-    const EncodeResourceBudgetControlParams& resourceBudget;
-    std::uint32_t cellElementCount{262144u};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
-    std::size_t workerCount{1u};
+    DataCodecExecutionResources& resources;
+    std::uint32_t cellElementCount{numericarray::kSpatialBlockElementCount};
 };
 
 struct TopologyEncodeRuntime {
@@ -218,7 +216,7 @@ struct TopologyEncodeRuntime {
 
 struct TopologyEncodeContext {
     std::function<void(double)> progressCallback;
-    std::function<void(const char*, std::uint64_t, std::string)> memoryCheckpoint;
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 struct TopologyEncodeInput {
@@ -240,177 +238,126 @@ inline void InvokeConnectivityProgress(
     callback::InvokeProgress(input.context.progressCallback, normalized);
 }
 
-inline void RecordTopologyPathBudgetEstimate(
-    const TopologyEncodeInput& input,
-    const topology::TopologyEncodePath& path,
-    const char* scope) {
-    if (input.context.memoryCheckpoint) {
-        input.context.memoryCheckpoint(
-            "topology.work_budget.requested",
-            topology::TopologyWorkBudget::Estimate(path),
-            scope);
-    }
-}
 
-inline bool BuildOrderedTopologyCellRanges(
-    const OrderedTopologyCellSource& source,
-    const std::size_t cellElementCount,
-    std::vector<OrderedTopologyCellRangeSource>& ranges,
-    std::vector<TopologyConnectivityBlockLayoutParams>& layouts,
-    std::string* error = nullptr) {
-    if (cellElementCount == 0u) {
-        return validation::AssignError(error, "topology cell block size is zero");
+inline bool PrepareTopologyRemapValues(
+    const IRemapProvider* provider, const std::size_t count,
+    bytestore::ByteStoreSession& session,
+    std::shared_ptr<bytestore::MemoryStore>& owner,
+    std::span<const IndexType>& values, std::string* error) {
+    owner.reset();
+    values = {};
+    if (provider == nullptr || provider->IsIdentity()) { return true; }
+    if (provider->Size() != count) {
+        return validation::AssignError(error, "topology remap size does not match its domain");
     }
-    ranges.clear();
-    layouts.clear();
-    const auto blockCount = source.CellCount() == 0u
-        ? 0u
-        : 1u + (source.CellCount() - 1u) / cellElementCount;
-    ranges.reserve(blockCount);
-    layouts.reserve(blockCount);
-    for (std::size_t firstCell = 0u; firstCell < source.CellCount(); firstCell += cellElementCount) {
-        const auto currentCellCount = std::min(cellElementCount, source.CellCount() - firstCell);
-        ranges.push_back(OrderedTopologyCellRangeSource{
-            .source = &source,
-            .firstCell = firstCell,
-            .cellCount = currentCellCount,
-        });
-        layouts.push_back(TopologyConnectivityBlockLayoutParams{
-            .cellOffset = firstCell,
-            .cellCount = currentCellCount,
-        });
+    std::size_t byteSize = 0u;
+    if (!validation::CheckedMulSizeT(count, sizeof(IndexType), byteSize, "topology remap array", error)) {
+        return false;
     }
+    auto prepared = std::static_pointer_cast<bytestore::MemoryStore>(
+        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, byteSize, "topology_remap", error));
+    if (!prepared) { return false; }
+    auto bytes = prepared->WritableBytes();
+    if (bytes.size() != byteSize || reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(IndexType) != 0u) {
+        return validation::AssignError(error, "topology remap storage is not an aligned complete array");
+    }
+    const auto writable = std::span<IndexType>(reinterpret_cast<IndexType*>(bytes.data()), count);
+    if (!provider->ReadRange(0u, writable, error) || !prepared->Seal(error)) { return false; }
+    values = writable;
+    owner = std::move(prepared);
     return true;
 }
 
-struct TopologyBlockEncodeArtifact {
-    ConnectivityTopologyEncodedMetadata metadata;
-    std::size_t connectivityCount{0u};
-    std::shared_ptr<bytestore::IByteSource> payload;
-};
-
-inline bool WriteEncodedStream(
-    IConnectivityTopologyEncodedStreamSink& sink,
-    const ConnectivityTopologyStreamKind kind,
-    const std::span<const std::uint8_t> bytes,
-    std::string* error = nullptr) {
-    return sink.BeginStream(kind, error) &&
-        (bytes.empty() || sink.WriteStreamBytes(kind, bytes, error)) &&
-        sink.EndStream(kind, error);
-}
-
-inline bool EncodeTopologyBlock(
-    const OrderedTopologyCellRangeSource& range,
-    const std::size_t pointCount,
-    const int fixedCellSize,
-    const TopologyEncodeInput& input,
-    TopologyBlockEncodeArtifact& artifact,
-    std::string* error = nullptr) {
+struct TopologyBlockInput {
+    std::size_t firstCell{0u};
+    std::size_t cellCount{0u};
     std::vector<IndexType> connectivity;
-    if (fixedCellSize > 0) {
-        std::size_t reserveCount = 0u;
-        if (!validation::CheckedMulSizeT(
-                range.cellCount,
-                static_cast<std::size_t>(fixedCellSize),
-                reserveCount,
-                "topology block connectivity reservation",
-                error)) {
-            return false;
-        }
-        connectivity.reserve(reserveCount);
-    } else if (range.source->CellCount() != 0u) {
-        const auto averageCellSize = std::max<std::size_t>(
-            range.source->ConnectivityCount() / range.source->CellCount(),
-            1u);
-        connectivity.reserve(validation::SaturatingMulSizeT(range.cellCount, averageCellSize));
-    }
-
     std::vector<IndexType> cellSizes;
     std::vector<IndexType> cellTypes;
     std::vector<std::uint16_t> cellPolynomialOrders;
-    if (fixedCellSize <= 0) {
-        cellSizes.reserve(range.cellCount);
-    }
-    if (range.HasCellTypes()) {
-        cellTypes.reserve(range.cellCount);
-    }
-    if (range.HasCellPolynomialOrders()) {
-        cellPolynomialOrders.reserve(range.cellCount);
-    }
+    std::optional<TopologyBlockCapacitySamples> capacitySamples;
+};
 
-    std::vector<IndexType> cell;
-    for (std::size_t localCell = 0u; localCell < range.cellCount; ++localCell) {
-        IndexType cellType = 0u;
-        std::uint16_t cellPolynomialOrder = 0u;
-        range.source->ReadCell(
-            range.firstCell + localCell,
-            cell,
-            range.HasCellTypes() ? &cellType : nullptr,
-            range.HasCellPolynomialOrders() ? &cellPolynomialOrder : nullptr);
-        if (cell.size() > static_cast<std::size_t>(std::numeric_limits<IndexType>::max())) {
-            return validation::AssignError(error, "topology cell size exceeds index capacity");
-        }
-        connectivity.insert(connectivity.end(), cell.begin(), cell.end());
-        if (fixedCellSize <= 0) {
-            cellSizes.push_back(static_cast<IndexType>(cell.size()));
-        }
-        if (range.HasCellTypes()) {
-            cellTypes.push_back(cellType);
-        }
-        if (range.HasCellPolynomialOrders()) {
-            cellPolynomialOrders.push_back(cellPolynomialOrder);
-        }
-    }
-
+struct TopologyBlockEncodeArtifact {
+    std::size_t firstCell{0u};
+    std::size_t cellCount{0u};
+    std::size_t connectivityCount{0u};
     std::vector<std::uint8_t> connectivityBytes;
     std::vector<std::uint8_t> cellSizeBytes;
     std::vector<std::uint8_t> cellPolynomialOrderBytes;
     std::vector<std::uint8_t> cellTypeBytes;
-    if (!blockcodec::EncodeConnectivity(
-            connectivity,
-            cellSizes,
-            range.cellCount,
-            fixedCellSize,
-            pointCount,
-            connectivityBytes,
-            error,
-            true) ||
-        !blockcodec::EncodeUnsignedSequence<IndexType>(cellSizes, cellSizeBytes, error) ||
-        !blockcodec::EncodeUnsignedSequence<std::uint16_t>(
-            cellPolynomialOrders,
-            cellPolynomialOrderBytes,
-            error) ||
-        !blockcodec::EncodeUnsignedSequence<IndexType>(cellTypes, cellTypeBytes, error)) {
-        return false;
-    }
+    std::optional<TopologyBlockCapacitySamples> capacitySamples;
+};
 
-    auto spooler = topology::MakeConnectivityTopologyStreamSpooler(
-        input.runtime.byteStoreSession,
-        input.execution.resourceBudget.TopologyEncodeTransferCacheStorageMode() == EncodeStorageMode::Memory,
-        error);
-    if (!spooler.HasAllWriters() ||
-        !WriteEncodedStream(
-            spooler,
-            ConnectivityTopologyStreamKind::Connectivity,
-            connectivityBytes,
-            error) ||
-        !WriteEncodedStream(spooler, ConnectivityTopologyStreamKind::CellSize, cellSizeBytes, error) ||
-        !WriteEncodedStream(
-            spooler,
-            ConnectivityTopologyStreamKind::CellPolynomialOrder,
-            cellPolynomialOrderBytes,
-            error) ||
-        !WriteEncodedStream(spooler, ConnectivityTopologyStreamKind::CellType, cellTypeBytes, error)) {
-        return false;
+inline bool ReadTopologyBlock(
+    const OrderedTopologyCellRangeSource& range, const int fixedCellSize,
+    TopologyBlockInput& block, std::string* error = nullptr) {
+    block.firstCell = range.firstCell;
+    block.cellCount = range.cellCount;
+    std::size_t connectivityCount = 0u;
+    for (std::size_t local = 0u; local < range.cellCount; ++local) {
+        std::size_t begin = 0u, end = 0u;
+        range.source->CellRange(range.source->OldCellIndex(range.firstCell + local), begin, end);
+        if (!validation::CheckedAddSizeT(connectivityCount, end - begin, connectivityCount,
+                "topology block connectivity count", error)) { return false; }
     }
+    block.connectivity.reserve(connectivityCount);
+    if (fixedCellSize <= 0) { block.cellSizes.reserve(range.cellCount); }
+    if (range.HasCellTypes()) { block.cellTypes.reserve(range.cellCount); }
+    if (range.HasCellPolynomialOrders()) { block.cellPolynomialOrders.reserve(range.cellCount); }
 
-    artifact.metadata.connectivityByteCount = connectivityBytes.size();
-    artifact.metadata.cellSizeByteCount = cellSizeBytes.size();
-    artifact.metadata.cellPolynomialOrderByteCount = cellPolynomialOrderBytes.size();
-    artifact.metadata.cellTypeByteCount = cellTypeBytes.size();
-    artifact.connectivityCount = connectivity.size();
-    artifact.payload = topology::BuildTopologyTransferCache(spooler, error);
-    return artifact.payload != nullptr;
+    std::vector<IndexType> cell;
+    for (std::size_t local = 0u; local < range.cellCount; ++local) {
+        IndexType cellType = 0u;
+        std::uint16_t polynomialOrder = 0u;
+        range.source->ReadCell(range.firstCell + local, cell,
+            range.HasCellTypes() ? &cellType : nullptr,
+            range.HasCellPolynomialOrders() ? &polynomialOrder : nullptr);
+        if (block.capacitySamples) { block.capacitySamples->Observe(TopologyBufferSample::CellScratch, cell); }
+        if (cell.size() > std::numeric_limits<IndexType>::max() ||
+            block.connectivity.size() > connectivityCount ||
+            cell.size() > connectivityCount - block.connectivity.size()) {
+            return validation::AssignError(error, "topology cell size changed after counting");
+        }
+        block.connectivity.insert(block.connectivity.end(), cell.begin(), cell.end());
+        if (fixedCellSize <= 0) { block.cellSizes.push_back(static_cast<IndexType>(cell.size())); }
+        if (range.HasCellTypes()) { block.cellTypes.push_back(cellType); }
+        if (range.HasCellPolynomialOrders()) { block.cellPolynomialOrders.push_back(polynomialOrder); }
+    }
+    if (block.connectivity.size() != connectivityCount) {
+        return validation::AssignError(error, "topology block connectivity count changed");
+    }
+    if (block.capacitySamples) {
+        auto& samples = *block.capacitySamples;
+        samples.Observe(TopologyBufferSample::Connectivity, block.connectivity);
+        samples.Observe(TopologyBufferSample::CellSizes, block.cellSizes);
+        samples.Observe(TopologyBufferSample::CellTypes, block.cellTypes);
+        samples.Observe(TopologyBufferSample::PolynomialOrders, block.cellPolynomialOrders);
+    }
+    return true;
+}
+
+inline bool EncodeTopologyBlock(
+    const TopologyBlockInput& block, const std::size_t pointCount, const int fixedCellSize,
+    TopologyBlockEncodeArtifact& artifact, std::string* error = nullptr) {
+    artifact.firstCell = block.firstCell;
+    artifact.cellCount = block.cellCount;
+    artifact.connectivityCount = block.connectivity.size();
+    artifact.capacitySamples = block.capacitySamples;
+    auto* samples = artifact.capacitySamples ? &*artifact.capacitySamples : nullptr;
+    const bool encoded = blockcodec::EncodeConnectivity(block.connectivity, block.cellSizes, block.cellCount,
+            fixedCellSize, pointCount, artifact.connectivityBytes, error, true, samples) &&
+        blockcodec::EncodeUnsignedSequence<IndexType>(block.cellSizes, artifact.cellSizeBytes, error) &&
+        blockcodec::EncodeUnsignedSequence<std::uint16_t>(block.cellPolynomialOrders,
+            artifact.cellPolynomialOrderBytes, error) &&
+        blockcodec::EncodeUnsignedSequence<IndexType>(block.cellTypes, artifact.cellTypeBytes, error);
+    if (samples != nullptr) {
+        samples->Observe(TopologyBufferSample::ConnectivityBytes, artifact.connectivityBytes);
+        samples->Observe(TopologyBufferSample::CellSizeBytes, artifact.cellSizeBytes);
+        samples->Observe(TopologyBufferSample::PolynomialOrderBytes, artifact.cellPolynomialOrderBytes);
+        samples->Observe(TopologyBufferSample::CellTypeBytes, artifact.cellTypeBytes);
+    }
+    return encoded;
 }
 
 inline bool EncodeTopologyToTransferCache(
@@ -436,18 +383,10 @@ inline bool EncodeTopologyToTransferCache(
         }
         topo.isStructured = true;
         result.structuredAxisSize = {axisSize[0], axisSize[1], axisSize[2]};
-        RecordTopologyPathBudgetEstimate(
-            input,
-            topology::MakeStructuredTopologyEncodePath(descriptor),
-            "structured");
         result.transferCache = std::make_shared<bytestore::VectorByteSource>(std::vector<std::uint8_t>{});
         return true;
     }
     if (descriptor.cellCount == 0u) {
-        RecordTopologyPathBudgetEstimate(
-            input,
-            topology::MakeEmptyTopologyEncodePath(descriptor),
-            "empty");
         result.transferCache = std::make_shared<bytestore::VectorByteSource>(std::vector<std::uint8_t>{});
         return true;
     }
@@ -507,8 +446,6 @@ inline bool EncodeTopologyToTransferCache(
         return validation::AssignError(error, "topology point count exceeds index capacity");
     }
 
-    const auto topologyPath = topology::MakeConnectivityTopologyEncodePath(descriptor, connectivityCount);
-    RecordTopologyPathBudgetEstimate(input, topologyPath, "connectivity");
     topo.fixedCellSize = isFixedCellSize
         ? static_cast<int>(std::max(descriptor.fixedCellSize, 0))
         : 0;
@@ -549,126 +486,96 @@ inline bool EncodeTopologyToTransferCache(
     orderedCells.hasCellTypes = hasCellTypes;
     orderedCells.hasCellPolynomialOrders = hasCellPolynomialOrders;
 
-    std::vector<IndexType> inversePointRemapValues;
-    if (orderedCells.inversePointRemap != nullptr && !orderedCells.inversePointRemap->IsIdentity()) {
-        if (orderedCells.inversePointRemap->Size() != pointCount ||
-            !orderedCells.inversePointRemap->ReadRange(
-                0u,
-                pointCount,
-                inversePointRemapValues,
-                error)) {
-            return error != nullptr && !error->empty()
-                ? false
-                : validation::AssignError(error, "topology inverse point remap is invalid");
-        }
-        orderedCells.inversePointRemapValues = inversePointRemapValues;
-    }
-    std::vector<IndexType> cellOrderValues;
-    if (orderedCells.cellOrderProvider != nullptr && !orderedCells.cellOrderProvider->IsIdentity()) {
-        if (orderedCells.cellOrderProvider->Size() != cellCount ||
-            !orderedCells.cellOrderProvider->ReadRange(0u, cellCount, cellOrderValues, error)) {
-            return error != nullptr && !error->empty()
-                ? false
-                : validation::AssignError(error, "topology cell order is invalid");
-        }
-        orderedCells.cellOrderValues = cellOrderValues;
-    }
-    InvokeConnectivityProgress(input, 0.30);
-
-    std::vector<OrderedTopologyCellRangeSource> blockRanges;
-    std::vector<TopologyConnectivityBlockLayoutParams> blockLayouts;
-    if (!BuildOrderedTopologyCellRanges(
-            orderedCells,
-            std::max<std::size_t>(input.execution.cellElementCount, 1u),
-            blockRanges,
-            blockLayouts,
-            error)) {
+    auto& resources = input.execution.resources;
+    auto phase = WaitForHeavyPhase(resources);
+    if (!phase) { return false; }
+    std::shared_ptr<bytestore::MemoryStore> inversePointRemapOwner, cellOrderOwner;
+    if (!PrepareTopologyRemapValues(orderedCells.inversePointRemap, pointCount,
+            input.runtime.byteStoreSession, inversePointRemapOwner, orderedCells.inversePointRemapValues, error) ||
+        !PrepareTopologyRemapValues(orderedCells.cellOrderProvider, cellCount,
+            input.runtime.byteStoreSession, cellOrderOwner, orderedCells.cellOrderValues, error)) {
         return false;
     }
-    InvokeConnectivityProgress(input, 0.35);
-
-    std::vector<TopologyBlockEncodeArtifact> artifacts(blockRanges.size());
-    std::atomic<bool> failed{false};
-    std::mutex errorMutex;
-    std::string blockError;
-    const auto encodeBlocks = [&](const std::size_t beginBlock, const std::size_t endBlock) {
-        for (std::size_t blockIndex = beginBlock;
-             blockIndex < endBlock && !failed.load(std::memory_order_acquire);
-             ++blockIndex) {
-            std::string localError;
-            try {
-                if (!EncodeTopologyBlock(
-                        blockRanges[blockIndex],
-                        pointCount,
-                        topo.fixedCellSize,
-                        input,
-                        artifacts[blockIndex],
-                        &localError)) {
-                    if (localError.empty()) {
-                        localError = "topology block encoder returned failure";
-                    }
-                }
-            } catch (const std::exception& exception) {
-                localError = std::string("topology block encoder raised an exception: ") + exception.what();
-            } catch (...) {
-                localError = "topology block encoder raised an unknown exception";
-            }
-            if (!localError.empty()) {
-                failed.store(true, std::memory_order_release);
-                std::lock_guard<std::mutex> lock(errorMutex);
-                if (blockError.empty()) {
-                    blockError = "topology block " + std::to_string(blockIndex) +
-                        " encode failed: " + localError;
-                }
-            }
-        }
-    };
-    ParallelForChunksAllowNested(
-        0u,
-        blockRanges.size(),
-        encodeBlocks,
-        input.execution.parallelTaskRunner,
-        input.execution.workerCount);
-    if (failed.load(std::memory_order_acquire)) {
-        return validation::AssignError(error, blockError);
+    const auto cellsPerBlock = static_cast<std::size_t>(input.execution.cellElementCount);
+    if (cellsPerBlock == 0u) {
+        return validation::AssignError(error, "topology cell block size is zero");
     }
-    InvokeConnectivityProgress(input, 0.85);
+    auto transferCache = input.runtime.byteStoreSession.CreateAppendableByteStore("topology_connectivity", error);
+    bytestore::AppendableByteStoreWriter transferWriter(transferCache, resources);
+    if (!transferCache) { return false; }
+    auto& layouts = topo.connectivityLayout.blockLayouts;
+    layouts.reserve(1u + (cellCount - 1u) / cellsPerBlock);
+    InvokeConnectivityProgress(input, 0.30);
+    phase.reset();
 
-    auto transferCache = std::make_shared<bytestore::SegmentedBinaryObject>(
-        std::vector<bytestore::SegmentedBinaryObject::Segment>{},
-        bytestore::ByteSourceConsumptionMode::OneShot);
-    auto& aggregate = topo.connectivityLayout;
+    std::size_t nextCell = 0u;
+    std::size_t committedCells = 0u;
     std::size_t connectivityOffset = 0u;
-    for (std::size_t blockIndex = 0u; blockIndex < artifacts.size(); ++blockIndex) {
-        auto& layout = blockLayouts[blockIndex];
-        const auto& artifact = artifacts[blockIndex];
-        layout.connectivityOffset = connectivityOffset;
-        layout.connectivityCount = artifact.connectivityCount;
-        layout.connectivityByteCount = artifact.metadata.connectivityByteCount;
-        layout.cellSizeByteCount = artifact.metadata.cellSizeByteCount;
-        layout.cellPolynomialOrderByteCount = artifact.metadata.cellPolynomialOrderByteCount;
-        layout.cellTypeByteCount = artifact.metadata.cellTypeByteCount;
-        if (!validation::CheckedAddSizeT(
-                connectivityOffset,
-                artifact.connectivityCount,
-                connectivityOffset,
-                "topology block connectivity offset",
-                error)) {
-            return false;
-        }
-        if (!transferCache->AddSegment(std::move(artifacts[blockIndex].payload), error)) {
-            return false;
-        }
-    }
-    if (connectivityOffset != connectivityCount) {
-        return validation::AssignError(
-            error,
-            "topology block connectivity total does not match the source");
-    }
-    aggregate.blockLayouts = std::move(blockLayouts);
+    resources.SetWorkType({.path = ResourceWorkPath::ConnectivityEncode,
+        .blockElements = cellsPerBlock});
+    const bool success = RunOrderedBlocks<TopologyBlockInput, TopologyBlockEncodeArtifact>(
+        resources,
+        [&] { return nextCell < cellCount; },
+        [&](TopologyBlockInput& block) {
+            const auto n = std::min(cellsPerBlock, cellCount - nextCell);
+            const OrderedTopologyCellRangeSource range{&orderedCells, nextCell, n};
+            if (input.context.recordCapacitySamples) { block.capacitySamples.emplace(); }
+            if (!ReadTopologyBlock(range, topo.fixedCellSize, block, error)) { return false; }
+            nextCell += n;
+            return true;
+        },
+        [&](const TopologyBlockInput& block, TopologyBlockEncodeArtifact& artifact, WorkerContext&) {
+            std::string localError;
+            if (!EncodeTopologyBlock(block, pointCount, topo.fixedCellSize, artifact, &localError)) {
+                resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                    "topology-block-encode", "EncodeTopologyBlock", localError));
+                return false;
+            }
+            return true;
+        },
+        [&](const TopologyBlockEncodeArtifact& artifact) {
+            if (artifact.firstCell != committedCells || artifact.cellCount > cellCount - committedCells ||
+                artifact.connectivityCount > connectivityCount - connectivityOffset) {
+                return validation::AssignError(error, "topology block does not match the next commit range");
+            }
+            TopologyConnectivityBlockLayoutParams layout{
+                .cellOffset = artifact.firstCell, .cellCount = artifact.cellCount};
+            layout.connectivityOffset = connectivityOffset;
+            layout.connectivityCount = artifact.connectivityCount;
+            layout.connectivityByteCount = artifact.connectivityBytes.size();
+            layout.cellSizeByteCount = artifact.cellSizeBytes.size();
+            layout.cellPolynomialOrderByteCount = artifact.cellPolynomialOrderBytes.size();
+            layout.cellTypeByteCount = artifact.cellTypeBytes.size();
+            // 一个块的四条流依格式顺序消费，提交期间仍持有原槽位
+            for (const auto bytes : {std::span<const std::uint8_t>(artifact.connectivityBytes),
+                     std::span<const std::uint8_t>(artifact.cellSizeBytes),
+                     std::span<const std::uint8_t>(artifact.cellPolynomialOrderBytes),
+                     std::span<const std::uint8_t>(artifact.cellTypeBytes)}) {
+                for (std::size_t offset = 0u; offset < bytes.size();) {
+                    const auto n = std::min<std::size_t>(kIoWindowBytes, bytes.size() - offset);
+                    if (!transferWriter.Write(bytes.subspan(offset, n), error)) { return false; }
+                    offset += n;
+                }
+            }
+            layouts.push_back(layout);
+            connectivityOffset += artifact.connectivityCount;
+            committedCells += artifact.cellCount;
+            if (committedCells == cellCount) {
+                if (connectivityOffset != connectivityCount) {
+                    return validation::AssignError(error, "topology block connectivity total does not match the source");
+                }
+                if (!transferCache->Seal(error)) { return false; }
+            }
+            if (artifact.capacitySamples && input.context.recordCapacitySamples) {
+                try { input.context.recordCapacitySamples(artifact.capacitySamples->values); }
+                catch (...) { resources.RecordDiagnosticExportFailure(); }
+            }
+            InvokeConnectivityProgress(input, 0.30 + 0.68 * static_cast<double>(committedCells) / cellCount);
+            return true;
+        });
+    if (!success) { return false; }
     result.transferCache = std::move(transferCache);
     topo.binaryCount = result.transferCache->ByteSizeHint();
-    InvokeConnectivityProgress(input, 0.98);
     return true;
 }
 

@@ -49,18 +49,19 @@ public:
 
     void Submit(const RunRecord& record) override {
         const auto kind = GetRunRecordKind(record);
-        std::vector<SinkEntry> sinks;
+        std::size_t sinkCount = 0u;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            sinks.reserve(m_sinks.size());
-            for (const auto& entry : m_sinks) {
-                if (entry.sink->Wants(kind)) {
-                    sinks.push_back(entry);
-                }
-            }
+            sinkCount = m_sinks.size();
         }
-        for (const auto& entry : sinks) {
-            entry.sink->Submit(record);
+        // 逐个复制已有引用，锁外调用，单个消费者失败后继续交付其余消费者
+        for (std::size_t index = 0u; index < sinkCount; ++index) {
+            SinkEntry entry;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                entry = m_sinks[index];
+            }
+            if (entry.sink->Wants(kind) && !entry.sink->TrySubmit(record)) { RecordExportFailure(); }
         }
     }
 

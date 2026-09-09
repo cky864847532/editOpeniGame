@@ -3,7 +3,7 @@
 
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowBudget.h"
+#include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
@@ -14,36 +14,18 @@
 namespace datacodec {
 namespace window {
 
-inline std::size_t ResolveWindowedCopyBytes(
-    const std::size_t requestedWindowBytes,
-    const WindowBudget& windowBudget) noexcept {
-    const auto normalized = std::max<std::size_t>(requestedWindowBytes, 1u);
-    const auto maxActiveBytes = windowBudget.MaxActiveBytes();
-    if (maxActiveBytes == 0u) {
-        return normalized;
-    }
-    return static_cast<std::size_t>(std::min<std::uint64_t>(
-        static_cast<std::uint64_t>(normalized),
-        maxActiveBytes));
-}
-
 class WindowedByteSourceReader final {
 public:
     WindowedByteSourceReader(
         bytestore::IByteSource& source,
-        WindowBudget& windowBudget,
-        ScratchByteBufferPool& scratchBytePool,
-        const std::size_t windowBytes)
+        ScratchByteBufferPool& scratchBytePool)
         : m_source(source),
-          m_windowBudget(windowBudget),
-          m_scratchBytePool(scratchBytePool),
-          m_windowBytes(ResolveWindowedCopyBytes(windowBytes, windowBudget)) {}
+          m_scratchBytePool(scratchBytePool) {}
 
     bool Next(std::span<const std::uint8_t>& bytes, bool& hasBytes, std::string* error = nullptr) {
         bytes = {};
         hasBytes = false;
         m_scratchBuffer.Release();
-        m_windowLease.Release();
 
         const auto byteSize = m_source.ByteSizeHint();
         if (!m_source.CanRead() || bytestore::IsUnknownByteSize(byteSize)) {
@@ -57,8 +39,7 @@ public:
 
         const auto remaining = byteSize - m_offset;
         const auto currentBytes = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(m_windowBytes)));
-        m_windowLease = m_windowBudget.Acquire(currentBytes);
+            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(kIoWindowBytes)));
         m_scratchBuffer = m_scratchBytePool.Acquire(currentBytes);
         auto buffer = m_scratchBuffer.Span();
         if (!m_source.Read(m_offset, buffer, error)) {
@@ -72,27 +53,20 @@ public:
 
 private:
     bytestore::IByteSource& m_source;
-    WindowBudget& m_windowBudget;
     ScratchByteBufferPool& m_scratchBytePool;
-    std::size_t m_windowBytes{1u};
     std::uint64_t m_offset{0u};
-    WindowBudget::Lease m_windowLease;
     ScratchByteBuffer m_scratchBuffer;
 };
 
 template<typename TConsume>
 inline bool ForEachByteSourceWindow(
     bytestore::IByteSource& source,
-    WindowBudget& windowBudget,
     ScratchByteBufferPool& scratchBytePool,
-    const std::size_t windowBytes,
     TConsume&& consume,
     std::string* error = nullptr) {
     WindowedByteSourceReader reader(
         source,
-        windowBudget,
-        scratchBytePool,
-        windowBytes);
+        scratchBytePool);
     for (;;) {
         std::span<const std::uint8_t> bytes;
         bool hasBytes = false;
@@ -112,12 +86,9 @@ inline bool ForEachByteSourceWindow(
 inline bool CopyByteSourceByWindow(
     bytestore::IByteSource& source,
     bytestore::IByteWriter& writer,
-    WindowBudget& windowBudget,
     ScratchByteBufferPool& scratchBytePool,
-    const std::size_t windowBytes,
     std::string* error = nullptr) {
     const auto byteSize = source.ByteSizeHint();
-    const auto resolvedWindowBytes = ResolveWindowedCopyBytes(windowBytes, windowBudget);
     if (!source.CanRead() || bytestore::IsUnknownByteSize(byteSize)) {
         return validation::AssignError(
             error,
@@ -141,8 +112,7 @@ inline bool CopyByteSourceByWindow(
         while (copiedBytes < byteSize) {
             const auto currentBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
                 byteSize - copiedBytes,
-                static_cast<std::uint64_t>(resolvedWindowBytes)));
-            auto windowLease = windowBudget.Acquire(currentBytes);
+                static_cast<std::uint64_t>(kIoWindowBytes)));
             if (!writer.Write(
                     std::span<const std::uint8_t>(
                         contiguous.data() + static_cast<std::size_t>(copiedBytes),
@@ -164,9 +134,7 @@ inline bool CopyByteSourceByWindow(
 
     return ForEachByteSourceWindow(
         source,
-        windowBudget,
         scratchBytePool,
-        resolvedWindowBytes,
         [&](const std::span<const std::uint8_t> bytes) {
             return writer.Write(bytes, error);
         },
@@ -178,12 +146,9 @@ inline bool CopyByteSourceRangeByWindow(
     const std::uint64_t rangeOffset,
     const std::uint64_t rangeByteCount,
     bytestore::IByteWriter& writer,
-    WindowBudget& windowBudget,
     ScratchByteBufferPool& scratchBytePool,
-    const std::size_t windowBytes,
     std::string* error = nullptr) {
     const auto byteSize = source.ByteSizeHint();
-    const auto resolvedWindowBytes = ResolveWindowedCopyBytes(windowBytes, windowBudget);
     if (!source.CanRead() || bytestore::IsUnknownByteSize(byteSize)) {
         return validation::AssignError(
             error,
@@ -197,8 +162,7 @@ inline bool CopyByteSourceRangeByWindow(
     while (copiedBytes < rangeByteCount) {
         const auto remaining = rangeByteCount - copiedBytes;
         const auto currentBytes = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(resolvedWindowBytes)));
-        auto windowLease = windowBudget.Acquire(currentBytes);
+            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(kIoWindowBytes)));
         auto scratchBuffer = scratchBytePool.Acquire(currentBytes);
         auto buffer = scratchBuffer.Span();
         if (!source.Read(rangeOffset + copiedBytes, buffer, error) ||

@@ -1,7 +1,7 @@
 #ifndef DATACODEC_PLATFORM_WASM_WASMRUNTIME_H
 #define DATACODEC_PLATFORM_WASM_WASMRUNTIME_H
 
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -4,12 +4,15 @@
 #include "DataCodec/Codec/SubCodec/SegmentedBitpackCodec.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamFormat.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
+#include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <memory>
+#include <cstring>
 #include <string>
 #include <vector>
 namespace datacodec::polyhedron {
@@ -39,10 +42,9 @@ struct PolyhedronTopologyStreamStats {
 class PolyhedronTopologyStreamEncoder {
 public:
     explicit PolyhedronTopologyStreamEncoder(
-        IPolyhedronTopologyStreamWriter& sink,
-        const std::size_t flushThresholdBytes = 8u * 1024u * 1024u)
-        : m_sink(sink),
-          m_flushThresholdBytes(std::max<std::size_t>(flushThresholdBytes, 1024u)) {}
+        IPolyhedronTopologyStreamWriter& sink) : m_sink(sink) {
+        for (auto& buffer : m_buffers) { buffer = std::make_unique<std::uint8_t[]>(kIoWindowBytes); }
+    }
 
     bool AppendCell(const PolyhedronTopologyStreamCellView& cell, std::string* error = nullptr) {
         std::size_t localIndexCount = 0u;
@@ -132,7 +134,8 @@ public:
 
     bool Finish(std::string* error = nullptr) {
         if (m_localBitCursor != 0u) {
-            m_buffers[StreamIndex(PolyhedronTopologyStreamKind::LocalFaceVertexIds)].push_back(m_localByte);
+            if (!AppendBytes(PolyhedronTopologyStreamKind::LocalFaceVertexIds,
+                    std::span<const std::uint8_t>(&m_localByte, 1u), error)) { return false; }
             m_localByte = 0u;
             m_localBitCursor = 0u;
         }
@@ -148,12 +151,13 @@ public:
         return m_stats;
     }
 
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept {
-        std::uint64_t bytes = 0u;
-        for (const auto& buffer : m_buffers) {
-            bytes = validation::SaturatingAddU64(bytes, static_cast<std::uint64_t>(buffer.capacity()));
+    void ObserveCapacities(PolyhedronCapacitySamples& samples) const noexcept {
+        constexpr std::array kinds{PolyhedronBufferSample::StreamUniqueCounts,
+            PolyhedronBufferSample::StreamUniqueIds, PolyhedronBufferSample::StreamCellFaces,
+            PolyhedronBufferSample::StreamFaceVertices, PolyhedronBufferSample::StreamLocalIds};
+        for (std::size_t i = 0u; i < m_buffers.size(); ++i) {
+            samples.Observe(kinds[i], m_buffers[i] ? static_cast<std::uint64_t>(kIoWindowBytes) : 0u);
         }
-        return bytes;
     }
 
 private:
@@ -161,27 +165,29 @@ private:
         return static_cast<std::size_t>(kind);
     }
 
-    static void AppendVarUInt64(std::vector<std::uint8_t>& bytes, std::uint64_t value) {
+    bool AppendBytes(const PolyhedronTopologyStreamKind kind,
+        std::span<const std::uint8_t> bytes, std::string* error) {
+        const auto index = StreamIndex(kind);
+        while (!bytes.empty()) {
+            const auto count = std::min<std::size_t>(bytes.size(), kIoWindowBytes - m_sizes[index]);
+            std::memcpy(m_buffers[index].get() + m_sizes[index], bytes.data(), count);
+            m_sizes[index] += count;
+            bytes = bytes.subspan(count);
+            if (m_sizes[index] == kIoWindowBytes && !Flush(kind, error)) { return false; }
+        }
+        return true;
+    }
+
+    bool AppendVarint(const PolyhedronTopologyStreamKind kind, std::uint64_t value, std::string* error) {
+        std::array<std::uint8_t, 10> bytes;
+        std::size_t count = 0u;
         do {
             auto byte = static_cast<std::uint8_t>(value & 0x7fu);
             value >>= 7u;
-            if (value != 0u) {
-                byte |= 0x80u;
-            }
-            bytes.push_back(byte);
+            if (value != 0u) { byte |= 0x80u; }
+            bytes[count++] = byte;
         } while (value != 0u);
-    }
-
-    bool AppendVarint(
-        const PolyhedronTopologyStreamKind kind,
-        const std::uint64_t value,
-        std::string* error) {
-        auto& buffer = m_buffers[StreamIndex(kind)];
-        AppendVarUInt64(buffer, value);
-        if (buffer.size() >= m_flushThresholdBytes) {
-            return Flush(kind, error);
-        }
-        return true;
+        return AppendBytes(kind, std::span<const std::uint8_t>(bytes).first(count), error);
     }
 
     bool AppendLocalFaceVertexIds(
@@ -203,14 +209,10 @@ private:
                 }
                 ++m_localBitCursor;
                 if (m_localBitCursor == 8u) {
-                    auto& buffer = m_buffers[StreamIndex(PolyhedronTopologyStreamKind::LocalFaceVertexIds)];
-                    buffer.push_back(m_localByte);
+                    if (!AppendBytes(PolyhedronTopologyStreamKind::LocalFaceVertexIds,
+                            std::span<const std::uint8_t>(&m_localByte, 1u), error)) { return false; }
                     m_localByte = 0u;
                     m_localBitCursor = 0u;
-                    if (buffer.size() >= m_flushThresholdBytes &&
-                        !Flush(PolyhedronTopologyStreamKind::LocalFaceVertexIds, error)) {
-                        return false;
-                    }
                 }
             }
         }
@@ -218,23 +220,16 @@ private:
     }
 
     bool Flush(const PolyhedronTopologyStreamKind kind, std::string* error) {
-        auto& buffer = m_buffers[StreamIndex(kind)];
-        if (buffer.empty()) {
-            return true;
-        }
-        if (!m_sink.WriteStreamBytes(
-                kind,
-                std::span<const std::uint8_t>(buffer.data(), buffer.size()),
-                error)) {
-            return false;
-        }
-        buffer.clear();
+        const auto index = StreamIndex(kind);
+        if (m_sizes[index] == 0u) { return true; }
+        if (!m_sink.WriteStreamBytes(kind, {m_buffers[index].get(), m_sizes[index]}, error)) { return false; }
+        m_sizes[index] = 0u;
         return true;
     }
 
     IPolyhedronTopologyStreamWriter& m_sink;
-    std::size_t m_flushThresholdBytes{8u * 1024u * 1024u};
-    std::array<std::vector<std::uint8_t>, 5> m_buffers{};
+    std::array<std::unique_ptr<std::uint8_t[]>, 5> m_buffers;
+    std::array<std::size_t, 5> m_sizes{};
     PolyhedronTopologyStreamStats m_stats;
     std::uint8_t m_localByte{0};
     std::uint8_t m_localBitCursor{0};

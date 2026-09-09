@@ -2,6 +2,7 @@
 #define DATACODEC_API_ADAPTER_IENCODEADAPTER_H
 
 #include "DataCodec/Common/Views/ArrayViews.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
 #include "DataCodec/Common/Views/AttributeViews.h"
 #include "DataCodec/Common/Views/TopologyViews.h"
 #include "DataCodec/API/Adapter/ICellTypeMapping.h"
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -572,6 +574,9 @@ struct IEncodeAdapter
     // 供报告使用的可选源数据元数据
     virtual std::int64_t GetSourceByteSizeHint() const { return -1; }
     virtual std::string GetSourceLocationHint() const { return {}; }
+
+    // 仅返回显式接入数组的确定容量取样，未知宿主存储不纳入
+    [[nodiscard]] virtual std::span<const BufferCapacitySample> CapacitySamples() const noexcept { return {}; }
 
     // 释放 adapter 为转换视图准备的临时数据
     virtual std::uint64_t ReleaseConvertedInputs() { return 0; }

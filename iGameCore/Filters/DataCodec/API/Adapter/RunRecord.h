@@ -5,6 +5,7 @@
 #include "DataCodec/API/Adapter/RunRecordTypes.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -135,7 +136,7 @@ struct RunRemapOrderRecord {
     std::uint64_t runId{0u};
     BlockPath leafPath;
     RunRemapDomain domain{RunRemapDomain::Point};
-    const IRemapProvider* provider{nullptr};
+    std::shared_ptr<const IRemapProvider> provider;
 };
 
 using RunRecord = std::variant<

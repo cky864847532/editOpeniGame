@@ -19,6 +19,7 @@
 #include "iGameVolumeMesh.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -525,7 +526,9 @@ public:
 
     // 借用面顶点 offset 缓冲区
     const IndexType* GetFaceIdOffsetPtr() const override {
-        return ResolvePolyhedronCellArrayOffsets(GetPolyhedronFaceCells(), m_polyhedronFaceOffsets);
+        const auto* result = ResolvePolyhedronCellArrayOffsets(GetPolyhedronFaceCells(), m_polyhedronFaceOffsets);
+        m_capacitySamples[1].Observe(m_polyhedronFaceOffsets);
+        return result;
     }
 
     // 借用单元到面的扁平缓冲区
@@ -540,7 +543,9 @@ public:
 
     // 借用单元到面的 offset 缓冲区
     const IndexType* GetCellFaceOffsetPtr() const override {
-        return ResolvePolyhedronCellArrayOffsets(GetPolyhedronCellFaceCells(), m_polyhedronCellFaceOffsets);
+        const auto* result = ResolvePolyhedronCellArrayOffsets(GetPolyhedronCellFaceCells(), m_polyhedronCellFaceOffsets);
+        m_capacitySamples[0].Observe(m_polyhedronCellFaceOffsets);
+        return result;
     }
 
     // 点属性个数
@@ -588,12 +593,20 @@ public:
 
     // 释放 iGame adapter 为多面体输入构建的临时面表
     std::uint64_t ReleaseConvertedInputs() override {
+        m_capacitySamples[0].Observe(m_polyhedronCellFaceOffsets);
+        m_capacitySamples[1].Observe(m_polyhedronFaceOffsets);
         m_polyhedronCellFaces = nullptr;
         m_polyhedronFaces = nullptr;
-        m_polyhedronCellFaceOffsets.clear();
-        m_polyhedronFaceOffsets.clear();
+        std::vector<IndexType>{}.swap(m_polyhedronCellFaceOffsets);
+        std::vector<IndexType>{}.swap(m_polyhedronFaceOffsets);
+        m_capacitySamples[0].Observe(m_polyhedronCellFaceOffsets);
+        m_capacitySamples[1].Observe(m_polyhedronFaceOffsets);
         m_hasBuiltPolyhedronFaceTable = false;
         return 0;
+    }
+
+    [[nodiscard]] std::span<const ::datacodec::BufferCapacitySample> CapacitySamples() const noexcept override {
+        return m_capacitySamples;
     }
 
     // 释放本次编码输入对象和由输入派生的视图缓存
@@ -697,6 +710,22 @@ private:
         std::vector<igIndex> faceIds;
         std::vector<igIndex> pointIds;
         std::vector<igIndex> faceKey;
+        std::uint64_t storedKeyCapacity = 0u;
+        // 只记录 key 数组的真实容量，map 节点及原生面表容量保持未知
+        m_capacitySamples[2].Observe(faceKey);
+        m_capacitySamples[3].Observe(storedKeyCapacity);
+        struct KeyStorageRetirement {
+            std::map<std::vector<igIndex>, igIndex>& keys;
+            std::vector<igIndex>& scratch;
+            ::datacodec::BufferCapacitySample& scratchSample;
+            ::datacodec::BufferCapacitySample& storedSample;
+            ~KeyStorageRetirement() {
+                keys.clear();
+                std::vector<igIndex>{}.swap(scratch);
+                scratchSample.Observe(scratch);
+                storedSample.Observe(0u);
+            }
+        } keyRetirement{faceIdsByKey, faceKey, m_capacitySamples[2], m_capacitySamples[3]};
         for (std::size_t cellIndex = 0; cellIndex < unstructuredMesh->GetNumberOfCells(); ++cellIndex) {
             if (unstructuredMesh->GetCellType(cellIndex) != IG_POLYHEDRON) {
                 return false;
@@ -733,6 +762,7 @@ private:
                 }
 
                 faceKey = pointIds;
+                m_capacitySamples[2].Observe(faceKey);
                 std::sort(faceKey.begin(), faceKey.end());
                 const auto faceIterator = faceIdsByKey.find(faceKey);
                 igIndex faceId = 0;
@@ -741,7 +771,9 @@ private:
                         return false;
                     }
                     faceId = static_cast<igIndex>(faceIdsByKey.size());
-                    faceIdsByKey.emplace(faceKey, faceId);
+                    const auto inserted = faceIdsByKey.emplace(faceKey, faceId);
+                    storedKeyCapacity += static_cast<std::uint64_t>(inserted.first->first.capacity()) * sizeof(igIndex);
+                    m_capacitySamples[3].Observe(storedKeyCapacity);
                     faces->AddCellIds(pointIds.data(), pointCount);
                 } else {
                     faceId = faceIterator->second;
@@ -863,6 +895,12 @@ private:
     mutable std::vector<IndexType> m_polyhedronCellFaceOffsets;
     // DataCodec 多面体 face->point offset 缓存
     mutable std::vector<IndexType> m_polyhedronFaceOffsets;
+    mutable std::array<::datacodec::BufferCapacitySample, 4> m_capacitySamples{{
+        ::datacodec::BufferCapacitySample{"adapter.encode.cell_face_offsets"},
+        ::datacodec::BufferCapacitySample{"adapter.encode.face_vertex_offsets"},
+        ::datacodec::BufferCapacitySample{"adapter.encode.face_key_scratch"},
+        ::datacodec::BufferCapacitySample{"adapter.encode.stored_face_keys"},
+    }};
     // 标记临时多面体面表是否已经尝试构建
     mutable bool m_hasBuiltPolyhedronFaceTable{false};
     // iGame 原生 cell type 到 DataCodec cell type token 的映射

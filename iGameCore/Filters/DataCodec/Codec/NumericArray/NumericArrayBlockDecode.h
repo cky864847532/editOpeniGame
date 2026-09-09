@@ -83,7 +83,7 @@ inline bool DecodeNumericArrayComponentBytes(
     const NumericArrayBytesCodec bytesCodec,
     const std::span<const std::uint8_t> bytes,
     std::vector<std::uint8_t>& decodedComponent,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedComponent.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
         return false;
@@ -134,7 +134,7 @@ inline bool DecodeNumericArrayComponentBytes(
             componentLayout,
             compressor,
             MutableNumericArrayBufferView{decodedComponent.data(), componentLayout},
-            error)) {
+            error, compressorState)) {
         decodedComponent.clear();
         return false;
     }
@@ -148,7 +148,7 @@ inline bool DecodeNumericArrayComponentBundle(
     const std::span<const NumericArrayComponentLayoutParams> componentLayouts,
     const std::span<const std::uint8_t> bytes,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
         return false;
@@ -207,9 +207,12 @@ inline bool DecodeNumericArrayComponentBundle(
                 componentLayout.bytesCodec,
                 componentBytes,
                 decodedComponent,
-                error)) {
+                error, compressorState)) {
             decodedBytes.clear();
             return false;
+        }
+        if (params.capacitySamples != nullptr) {
+            params.capacitySamples->Observe(NumericBufferSample::DecodedComponent, decodedComponent);
         }
         for (std::size_t elementIndex = 0; elementIndex < static_cast<std::size_t>(elementCount); ++elementIndex) {
             std::memcpy(
@@ -234,7 +237,7 @@ inline bool ResolveDecodedNumericArrayBlockBytes(
     const std::span<const NumericArrayComponentLayoutParams> componentLayouts,
     const std::span<const std::uint8_t> bytes,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
         return false;
@@ -252,7 +255,7 @@ inline bool ResolveDecodedNumericArrayBlockBytes(
     if (bytesCodec != NumericArrayBytesCodec::NumericArrayCodec) {
         return validation::AssignError(error, "unsupported numeric array bytes codec");
     }
-    return DecodeNumericArrayComponentBundle(params, compressor, elementCount, componentLayouts, bytes, decodedBytes, error);
+    return DecodeNumericArrayComponentBundle(params, compressor, elementCount, componentLayouts, bytes, decodedBytes, error, compressorState);
 }
 
 template<typename TValue>
@@ -327,7 +330,7 @@ inline bool ResolveDecodedLayeredResidualNumericArrayBlockBytes(
     const std::span<const NumericArrayRegionLayerLayoutParams> regionLayers,
     const std::span<const std::uint8_t> bytes,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
         return false;
@@ -353,7 +356,7 @@ inline bool ResolveDecodedLayeredResidualNumericArrayBlockBytes(
             backgroundComponentLayouts,
             bytes.first(backgroundByteCount),
             decodedBytes,
-            error)) {
+            error, compressorState)) {
         return false;
     }
 
@@ -391,8 +394,11 @@ inline bool ResolveDecodedLayeredResidualNumericArrayBlockBytes(
                 layer.componentLayouts,
                 std::span<const std::uint8_t>(bytes.data() + cursor, residualByteLength),
                 residualBytes,
-                error)) {
+                error, compressorState)) {
             return false;
+        }
+        if (params.capacitySamples != nullptr) {
+            params.capacitySamples->Observe(NumericBufferSample::ResidualDecoded, residualBytes);
         }
         std::size_t refinedElementCount = 0u;
         std::size_t expectedResidualBytes = 0u;

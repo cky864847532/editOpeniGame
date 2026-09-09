@@ -62,7 +62,6 @@ public:
         std::uint64_t released = 0u;
         if (m_provider != nullptr) {
             released = m_provider->ResidentSizeHint();
-            m_provider->Release();
             m_provider.reset();
         }
         m_kind = RemapOrderSourceKind::Original;

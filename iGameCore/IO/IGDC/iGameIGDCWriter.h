@@ -25,7 +25,6 @@ public:
         m_hasCodecParams = true;
         m_CodecParams = definition.controlParams;
         m_pipelineControl = definition.pipelineControl;
-        m_execution = definition.execution;
         m_configurationSource = definition.source;
         m_language = definition.language;
     }
@@ -52,8 +51,10 @@ public:
         return m_writtenFilePaths;
     }
 
-    void SetEncodeTier(const ::datacodec::DataCodecEncodeTier tier) {
-        SetEncodeOptions(::datacodec::DataCodecEncodeOptions{.tier = tier});
+    [[nodiscard]] bool DiagnosticsIncomplete() const noexcept { return m_diagnosticsIncomplete; }
+
+    void SetResourceParams(const ::datacodec::CodecResourceParams& resources) {
+        m_resources = resources;
     }
 
     void SetEncodeOptions(const ::datacodec::DataCodecEncodeOptions& options) {
@@ -67,9 +68,10 @@ protected:
 private:
     bool m_hasCodecParams = false;
     bool m_hasAttributeTargets{false};
+    bool m_diagnosticsIncomplete{false};
     ::datacodec::CodecControlParams m_CodecParams;
     ::datacodec::EncodePipelineControlParams m_pipelineControl;
-    ::datacodec::EncodeExecutionOptions m_execution{::datacodec::MakeDefaultEncodeExecutionOptions()};
+    ::datacodec::CodecResourceParams m_resources;
     ::datacodec::DataCodecEncodeConfigurationSource m_configurationSource;
     ::datacodec::DataCodecLanguage m_language{
         ::datacodec::DataCodecLanguage::SimplifiedChinese};

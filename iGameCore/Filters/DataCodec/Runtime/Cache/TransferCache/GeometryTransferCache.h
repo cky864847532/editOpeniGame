@@ -40,7 +40,6 @@ public:
 
     void Release() noexcept {
         if (m_payload != nullptr) {
-            m_payload->Release();
             m_payload.reset();
         }
     }

@@ -202,14 +202,13 @@ private:
             if (m_reader == nullptr) {
                 return validation::AssignError(error, "byte range source reader is missing");
             }
-            constexpr std::size_t kWriteWindowBytes = 16u * 1024u * 1024u;
-            std::vector<std::uint8_t> buffer(kWriteWindowBytes, 0u);
+            std::vector<std::uint8_t> buffer(kIoWindowBytes, 0u);
             std::uint64_t offset = 0u;
             while (offset < m_byteSize) {
                 const auto currentBytes = static_cast<std::size_t>(
                     std::min<std::uint64_t>(
                         m_byteSize - offset,
-                        static_cast<std::uint64_t>(kWriteWindowBytes)));
+                        static_cast<std::uint64_t>(kIoWindowBytes)));
                 auto window = std::span<std::uint8_t>(buffer.data(), currentBytes);
                 if (!Read(offset, window, error) ||
                     !writer.Write(std::span<const std::uint8_t>(window.data(), window.size()), error)) {
@@ -218,12 +217,6 @@ private:
                 offset += static_cast<std::uint64_t>(currentBytes);
             }
             return true;
-        }
-
-        void Release() noexcept override {
-            m_reader.reset();
-            m_byteOffset = 0u;
-            m_byteSize = 0u;
         }
 
     private:
@@ -490,157 +483,14 @@ public:
         return object;
     }
 
-    static bool ReadFromMemory(
-        const std::span<const std::uint8_t> bytes,
-        LeafPackage& leafPackage,
-        std::string* error = nullptr) {
-        using namespace detail;
-
-        leafPackage = {};
-        if (bytes.size() < leafpackagewire::HeaderByteCount()) {
-            validation::AssignError(error, "buffer is too small for an leaf package header");
-            return false;
-        }
-
-        std::size_t cursor = 0;
-        std::uint32_t magic = 0;
-        std::uint16_t version = 0;
-        PackageIdentity identity;
-        std::uint32_t fieldCount = 0;
-        std::uint64_t rawFieldBytes = 0;
-        if (!ReadScalar(bytes, cursor, magic, error) ||
-            !ReadScalar(bytes, cursor, version, error) ||
-            !ReadScalar(bytes, cursor, identity.high, error) ||
-            !ReadScalar(bytes, cursor, identity.low, error) ||
-            !ReadScalar(bytes, cursor, fieldCount, error) ||
-            !ReadScalar(bytes, cursor, rawFieldBytes, error)) {
-            leafPackage = {};
-            return false;
-        }
-        if (magic != leafpackagewire::kLeafPackageMagic) {
-            validation::AssignError(error, "leaf package magic does not match");
-            leafPackage = {};
-            return false;
-        }
-        if (version != leafpackagewire::kLeafPackageVersion) {
-            validation::AssignError(error, "版本不符合");
-            leafPackage = {};
-            return false;
-        }
-        if (!identity.IsValid()) {
-            validation::AssignError(error, "leaf package identity is invalid");
-            leafPackage = {};
-            return false;
-        }
-
-        const auto descBytes =
-            static_cast<std::uint64_t>(leafpackagewire::FieldDescriptorByteCount()) * static_cast<std::uint64_t>(fieldCount);
-        std::size_t localDescBytes = 0u;
-        std::size_t fieldTableEnd = 0u;
-        if (!validation::CheckedCastSizeT(descBytes, localDescBytes, "leaf package field table", error) ||
-            !validation::CheckedAddSizeT(cursor, localDescBytes, fieldTableEnd, "leaf package field table", error) ||
-            fieldTableEnd > bytes.size()) {
-            validation::AssignError(error, "leaf package field table exceeds the input buffer");
-            leafPackage = {};
-            return false;
-        }
-
-        if (!leafpackagewire::CheckAddressableRawFieldBytes(rawFieldBytes, error)) {
-            leafPackage = {};
-            return false;
-        }
-
-        leafPackage.identity = identity;
-        leafPackage.rawFieldBytes = static_cast<std::size_t>(rawFieldBytes);
-        leafPackage.fields.reserve(fieldCount);
-        std::uint64_t expectedFieldByteOffset =
-            static_cast<std::uint64_t>(leafpackagewire::HeaderByteCount()) + descBytes;
-        for (std::uint32_t fieldIndex = 0; fieldIndex < fieldCount; ++fieldIndex) {
-            std::uint16_t typeValue = 0;
-            std::uint32_t compressionType = 0;
-            std::uint64_t fieldRawSize = 0;
-            std::uint64_t fieldByteOffset = 0;
-            std::uint64_t fieldByteSize = 0;
-            if (!ReadScalar(bytes, cursor, typeValue, error) ||
-                !ReadScalar(bytes, cursor, compressionType, error) ||
-                !ReadScalar(bytes, cursor, fieldRawSize, error) ||
-                !ReadScalar(bytes, cursor, fieldByteOffset, error) ||
-                !ReadScalar(bytes, cursor, fieldByteSize, error)) {
-                leafPackage = {};
-                return false;
-            }
-
-            if (compressionType != static_cast<std::uint32_t>(EncodedFieldCompressionType::None) &&
-                compressionType != static_cast<std::uint32_t>(EncodedFieldCompressionType::ZSTD)) {
-                validation::AssignError(error, "unsupported encoded field compression type");
-                leafPackage = {};
-                return false;
-            }
-            std::size_t localFieldByteOffset = 0u;
-            if (!leafpackagewire::CheckAddressableFieldSizes(fieldRawSize, fieldByteSize, error) ||
-                !validation::CheckedCastSizeT(
-                    fieldByteOffset,
-                    localFieldByteOffset,
-                    "leaf package field byte offset",
-                    error)) {
-                leafPackage = {};
-                return false;
-            }
-            const auto resolvedCompressionType = static_cast<EncodedFieldCompressionType>(compressionType);
-            if (!leafpackagewire::CheckRawAndEncodedSizeConsistency(
-                    resolvedCompressionType,
-                    fieldRawSize,
-                    fieldByteSize,
-                    error)) {
-                leafPackage = {};
-                return false;
-            }
-            if (fieldByteOffset > static_cast<std::uint64_t>(bytes.size()) ||
-                fieldByteSize > static_cast<std::uint64_t>(bytes.size()) - fieldByteOffset) {
-                validation::AssignError(error, "leaf package field bytes range is out of bounds");
-                leafPackage = {};
-                return false;
-            }
-            if (!leafpackagewire::CheckSequentialFieldOffset(
-                    fieldByteOffset,
-                    expectedFieldByteOffset,
-                    error) ||
-                !leafpackagewire::AdvanceSequentialFieldOffset(
-                    fieldByteSize,
-                    expectedFieldByteOffset,
-                    error)) {
-                leafPackage = {};
-                return false;
-            }
-
-            LeafPackage::Field field;
-            field.type = static_cast<FieldType>(typeValue);
-            field.compressionType = resolvedCompressionType;
-            field.rawSize = static_cast<std::size_t>(fieldRawSize);
-            std::vector<std::uint8_t> fieldBytes(
-                bytes.begin() + static_cast<std::ptrdiff_t>(localFieldByteOffset),
-                bytes.begin() + static_cast<std::ptrdiff_t>(fieldByteOffset + fieldByteSize));
-            field.source = std::make_shared<bytestore::VectorByteSource>(std::move(fieldBytes));
-            leafPackage.fields.push_back(std::move(field));
-        }
-        if (expectedFieldByteOffset != static_cast<std::uint64_t>(bytes.size())) {
-            validation::AssignError(error, "leaf package field descriptors do not cover the input buffer");
-            leafPackage = {};
-            return false;
-        }
-        if (!leafpackagewire::CheckLeafPackageRawFieldBytes(leafPackage, error)) {
-            leafPackage = {};
-            return false;
-        }
-        return true;
-    }
 
     static bool ReadFromByteRange(
         std::shared_ptr<IByteRangeReader> reader,
         const std::uint64_t leafPackageOffset,
         const std::uint64_t leafPackageSize,
         LeafPackage& leafPackage,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        const std::stop_token stop = {}) {
         using namespace detail;
 
         leafPackage = {};
@@ -670,7 +520,7 @@ public:
                 validation::AssignError(error, "leaf package descriptor range is outside the leaf package");
                 return false;
             }
-            return reader->ReadAt(leafPackageOffset + offset, output, error);
+            return reader->ReadAtCancellable(leafPackageOffset + offset, output, stop, error);
         };
 
         std::vector<std::uint8_t> headerBytes(leafpackagewire::HeaderByteCount(), 0u);

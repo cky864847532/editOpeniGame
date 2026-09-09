@@ -6,6 +6,7 @@
 #include "DataCodec/Runtime/Failure/EncodeFailureManagement.h"
 #include "DataCodec/Runtime/Workspace/EncodeLeafWorkspace.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 #include <cstddef>
 #include <memory>
@@ -43,11 +44,8 @@ inline bool EncodeGeometryTransferCache(
             .cacheResources = workspace.CacheResourcesRef(),
             .byteStoreSession = workspace.ByteStoreSessionRef(),
             .currentReferenceCache = context.currentGeometryReferenceCache,
-            .useMemoryTransferCache =
-                workspace.ResourceBudget().GeometryEncodeTransferCacheStorageMode() == EncodeStorageMode::Memory,
-            .useMemoryStaging =
-                workspace.ResourceBudget().GeometryEncodeStagingStorageMode() == EncodeStorageMode::Memory,
         },
+        .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
     };
     const GeometryReferenceControlParams defaultDependency{};
     auto geometrySource = workspace.GeometryNumericArraySource();

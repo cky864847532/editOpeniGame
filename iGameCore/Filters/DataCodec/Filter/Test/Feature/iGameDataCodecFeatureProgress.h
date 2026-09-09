@@ -3,6 +3,9 @@
 
 #include <DataCodec/API/Adapter/IRunRecordSink.h>
 #include <DataCodec/Filter/Output/iGameDataCodecOutputSinks.h>
+#include <DataCodec/Filter/Output/iGameDataCodecOutputBinding.h>
+#include <DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h>
+#include <DataCodec/Test/Common/DataCodecAllocationFailure.h>
 #include <DataCodec/Runtime/Record/ProgressRangeRunRecordSink.h>
 #include <DataCodec/Test/Common/DataCodecTestResult.h>
 
@@ -39,6 +42,26 @@ inline void PrintResult(const TestResult& result) {
     for (const auto& failure : result.failures) {
         std::cerr << failure.check << ": " << failure.message << '\n';
     }
+}
+
+inline bool TestOptionalOutputAllocationFailure() {
+    auto downstream = std::make_shared<CapturingProgressSink>();
+    bool optionalSurvived = false;
+    bool requiredAnalysisRejected = false;
+    {
+        RejectAllocationsScope reject;
+        iGameDataCodecOutputBinding binding({}, downstream, true, true);
+        iGameDataCodecTelemetryCapture capture(downstream);
+        capture.CaptureSessions(kRunLifecycleRecordMask);
+        optionalSurvived = binding.RecordSink() == downstream && binding.DiagnosticsIncomplete() &&
+            capture.Sink() == downstream && capture.DiagnosticsIncomplete() &&
+            binding.TryExport([] {}) && !binding.TryExport([] { throw std::bad_alloc{}; });
+        try { capture.CaptureRemapOrders(); }
+        catch (const std::bad_alloc&) { requiredAnalysisRejected = true; }
+    }
+    const RunRecord record{RunProgressRecord{.normalized = 0.5}};
+    return optionalSurvived && requiredAnalysisRejected && downstream->TrySubmit(record) &&
+        downstream->updates.size() == 1u;
 }
 
 inline bool TestProgressRangeMapping() {
@@ -193,7 +216,8 @@ using namespace ::datacodec;
 using namespace ::datacodec::test;
 
 inline int RunDataCodecFeatureProgress() {
-    if (!feature_progress::TestProgressRangeMapping() ||
+    if (!feature_progress::TestOptionalOutputAllocationFailure() ||
+        !feature_progress::TestProgressRangeMapping() ||
         !feature_progress::TestProgressRangeWithoutFrameTag() ||
         !feature_progress::TestiGameProgressFrameText() ||
         !feature_progress::TestiGameProgressCallback()) {

@@ -6,6 +6,7 @@
 #include <DataCodec/Runtime/Record/RunRecordEmitter.h>
 #include <DataCodec/Test/Assertions/ProcessReportAssertions.h>
 #include <DataCodec/Test/Common/DataCodecTestResult.h>
+#include <DataCodec/Test/Feature/DataCodecFeatureDiagnosticExport.h>
 
 #include <cereal/external/rapidjson/document.h>
 
@@ -142,6 +143,61 @@ inline TestResult TestSessionCaptureAndProcessReport() {
     return result;
 }
 
+inline TestResult TestTelemetryRetention() {
+    TestResult result;
+    TelemetrySessionSink sessions(kTelemetrySessionRecordMask);
+    for (std::uint64_t id = 1u; id <= TelemetrySessionSink::kSessionLimit + 1u; ++id) {
+        sessions.Submit(RunBeginRecord{RunRecordInfo{.runId = id}});
+    }
+    Require(result, sessions.RetainedSessionCount() == 256u && sessions.RetentionStats().omittedSessions == 1u,
+        "telemetry.active-session-cap", "full active sessions must omit the next capture without growing the table");
+    sessions.Submit(RunEndRecord{.run = {.runId = 257u}, .success = true});
+    Require(result, !sessions.TakeSession(257u).has_value(), "telemetry.omitted-session-end",
+        "completion of an omitted session must not recreate its retained state");
+    sessions.Submit(RunEndRecord{.run = {.runId = 1u}, .success = true});
+    sessions.Submit(RunBeginRecord{RunRecordInfo{.runId = 258u}});
+    Require(result, !sessions.TakeSession(1u).has_value() && sessions.RetainedSessionCount() == 256u &&
+        sessions.RetentionStats().omittedSessions == 2u,
+        "telemetry.completed-session-eviction", "new capture must evict the oldest completed session");
+
+    TelemetrySessionSink sink(kTelemetrySessionRecordMask);
+    RunRecordEmitter records;
+    records.Reset(RunRecordInfo{.runKind = TelemetryRunKind::Encode, .objectName = "bounded"}, &sink);
+    records.BeginRun();
+    for (std::size_t i = 0u; i < TelemetrySessionSink::kRecordLimit; ++i) {
+        records.AddMessage({.text = i == 0u ? std::string(2047u, 'x') + "中文" : "ok"});
+    }
+    records.RecordStageTiming("overflow", 1.0);
+    records.AddMessage({.text = "omitted"});
+    records.EndRun({.success = true});
+    const auto before = sink.RetentionStats();
+    const auto firstSnapshot = sink.SnapshotCompletedSessions();
+    const auto secondSnapshot = sink.SnapshotCompletedSessions();
+    const auto retained = sink.TakeSession(records.RunId());
+    Require(result, retained && retained->success && retained->messages.size() == 4096u &&
+        retained->messages.front().text.size() == 2047u && retained->messages.front().textTruncated &&
+        before.omittedRecords == 2u && before.truncatedText == 1u,
+        "telemetry.record-and-utf8-cap", "detail cap and UTF-8 text truncation must preserve run completion");
+    Require(result, sink.RetainedRecordCount() == 0u && sink.RetainedSessionCount() == 0u &&
+        firstSnapshot.size() == 1u && secondSnapshot.size() == 1u,
+        "telemetry.take-reclaims-capacity", "snapshots must not accumulate inside the sink and take must free its retained slots");
+    Require(result, records.MessageRetention().omittedRecords == 1u &&
+        records.MessageRetention().truncatedText == 1u && records.TakeMessages().size() == 4096u,
+        "telemetry.emitter-cap", "entry message collection must use the same fixed bounds");
+    const auto nodes = BuildTelemetryProcessNodes(firstSnapshot, TelemetryRunKind::Encode);
+    const auto json = SerializeDataCodecProcessReportJson(DataCodecProcessReport{
+        .operation = TelemetryRunKind::Encode, .processes = nodes});
+    Require(result, json.find("capture.omittedRecords") != std::string::npos &&
+        json.find("capture.incomplete") != std::string::npos,
+        "telemetry.retention-report", "report must expose omitted and truncated capture coverage");
+
+    TelemetrySessionSink unscoped;
+    unscoped.Submit(RunMessageRecord{.message = {.text = "outside a run"}});
+    Require(result, unscoped.TakeUnscopedMessages().size() == 1u && unscoped.RetainedRecordCount() == 0u,
+        "telemetry.unscoped-take", "unscoped messages must share and release the detail capacity");
+    return result;
+}
+
 inline TestResult TestStageCategoryResolution() {
     TestResult result;
     Require(result, ResolveTelemetryStageCategory("ParamsEncodeStage") == TelemetryStageCategory::Params,
@@ -178,6 +234,8 @@ inline TestResult RunDataCodecFeatureTelemetry() {
     };
     appendResult(feature_telemetry::TestSessionCaptureAndProcessReport());
     appendResult(feature_telemetry::TestStageCategoryResolution());
+    appendResult(feature_telemetry::TestTelemetryRetention());
+    appendResult(RunDataCodecFeatureDiagnosticExport());
     return result;
 }
 

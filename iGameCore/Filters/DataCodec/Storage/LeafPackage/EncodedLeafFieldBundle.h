@@ -7,6 +7,7 @@
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackage.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackageWireLayout.h"
+#include "DataCodec/API/Params/ParamsDecodeLimits.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -59,7 +60,7 @@ struct EncodedLeafFieldBundle {
     }
 
     BlockPath path;
-    std::vector<std::uint8_t> paramsBytes;
+    std::shared_ptr<bytestore::IByteSource> paramsSource;
     std::vector<EncodedLeafSegment> segments;
     std::vector<std::shared_ptr<bytestore::IByteSource>> backingOwners;
     std::shared_ptr<bytestore::ByteStoreSession> byteStoreSession;
@@ -67,19 +68,17 @@ struct EncodedLeafFieldBundle {
     void Release() noexcept {
         for (auto& segment : segments) {
             if (segment.data != nullptr) {
-                segment.data->Release();
                 segment.data.reset();
             }
         }
         segments.clear();
         for (auto& backingOwner : backingOwners) {
             if (backingOwner != nullptr) {
-                backingOwner->Release();
                 backingOwner.reset();
             }
         }
         backingOwners.clear();
-        paramsBytes.clear();
+        paramsSource.reset();
         path.clear();
         if (byteStoreSession != nullptr) {
             byteStoreSession.reset();
@@ -89,7 +88,7 @@ struct EncodedLeafFieldBundle {
 private:
     void MoveFrom(EncodedLeafFieldBundle&& other) noexcept {
         path = std::move(other.path);
-        paramsBytes = std::move(other.paramsBytes);
+        paramsSource = std::move(other.paramsSource);
         segments = std::move(other.segments);
         backingOwners = std::move(other.backingOwners);
         byteStoreSession = std::move(other.byteStoreSession);
@@ -168,7 +167,7 @@ inline bool AppendEncodedLeafSegment(
 
 inline bool BuildLeafPackageFromEncodedFieldBundle(
     const BlockPath& path,
-    const std::span<const std::uint8_t> paramsBytes,
+    std::shared_ptr<bytestore::IByteSource> paramsSource,
     const std::vector<EncodedLeafSegment>& segments,
     LeafPackage& output,
     std::string* error = nullptr) {
@@ -176,13 +175,16 @@ inline bool BuildLeafPackageFromEncodedFieldBundle(
     output.path = path;
 
     // 参数字段
-    auto paramsCache = std::make_shared<bytestore::VectorByteSource>(
-        std::vector<std::uint8_t>(paramsBytes.begin(), paramsBytes.end()));
+    if (!paramsSource || !paramsSource->CanRead() || paramsSource->ByteSizeHint() == 0u ||
+        paramsSource->ByteSizeHint() > kMaxDecodedParamsBytes) {
+        return validation::AssignError(error, "encoded params source is unreadable or exceeds the format limit");
+    }
+    const auto paramsSize = static_cast<std::size_t>(paramsSource->ByteSizeHint());
     output.fields.push_back(LeafPackage::Field{
         .type = FieldType::Params,
         .compressionType = EncodedFieldCompressionType::None,
-        .rawSize = paramsBytes.size(),
-        .source = std::move(paramsCache),
+        .rawSize = paramsSize,
+        .source = std::move(paramsSource),
     });
 
     // 几何字段

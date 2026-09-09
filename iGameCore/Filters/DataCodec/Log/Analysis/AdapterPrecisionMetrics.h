@@ -93,7 +93,7 @@ inline NumericFieldPrecisionMetric ComputeNumericFieldPrecision(
     const NumericArrayView& actual,
     LogAnalysisResult& status,
     const std::string& checkPath,
-    const std::vector<IndexType>* expectedTupleOrder = nullptr) {
+    const IRemapProvider* expectedTupleOrder = nullptr) {
     NumericFieldPrecisionMetric metric;
     metric.leafPath = leafPath;
     metric.kind = kind;
@@ -122,23 +122,15 @@ inline NumericFieldPrecisionMetric ComputeNumericFieldPrecision(
     const auto actualScalarSize = ScalarTypeSize(actual.scalarType);
     std::vector<std::uint8_t> expectedTuple(componentCount * expectedScalarSize, 0u);
     std::vector<std::uint8_t> actualTuple(componentCount * actualScalarSize, 0u);
+    detail::SignatureOrderWindow orderWindow(expectedTupleOrder, metric.tupleCount);
 
     for (std::uint64_t tupleIndex = 0u; tupleIndex < metric.tupleCount; ++tupleIndex) {
         std::uint64_t expectedTupleIndex = tupleIndex;
-        if (expectedTupleOrder != nullptr && !expectedTupleOrder->empty()) {
-            if (tupleIndex >= expectedTupleOrder->size()) {
-                detail::FailPrecisionMetric(
-                    metric,
-                    status,
-                    checkPath + ".tupleOrder",
-                    "tuple order is shorter than tuple count");
-                return metric;
-            }
-            expectedTupleIndex = static_cast<std::uint64_t>(
-                (*expectedTupleOrder)[static_cast<std::size_t>(tupleIndex)]);
-        }
-
         std::string error;
+        if (!orderWindow.ReadAt(tupleIndex, expectedTupleIndex, &error)) {
+            detail::FailPrecisionMetric(metric, status, checkPath + ".tupleOrder", error);
+            return metric;
+        }
         if (!ReadNumericArrayTupleBytes(
                 expected,
                 static_cast<std::size_t>(expectedTupleIndex),

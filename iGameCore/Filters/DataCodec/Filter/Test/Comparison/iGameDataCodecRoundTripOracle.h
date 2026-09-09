@@ -28,19 +28,19 @@ public:
     explicit CodecRoundTripOracle(DataObjectSignatureOptions options = {})
         : m_options(std::move(options)) {}
 
-    void SetPointOrder(std::vector<IndexType> order) {
+    void SetPointOrder(std::shared_ptr<const IRemapProvider> order) {
         m_orders.pointOrders[BlockPath{}] = std::move(order);
     }
 
-    void SetCellOrder(std::vector<IndexType> order) {
+    void SetCellOrder(std::shared_ptr<const IRemapProvider> order) {
         m_orders.cellOrders[BlockPath{}] = std::move(order);
     }
 
-    void SetPointOrders(std::unordered_map<BlockPath, std::vector<IndexType>> orders) {
+    void SetPointOrders(std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>> orders) {
         m_orders.pointOrders = std::move(orders);
     }
 
-    void SetCellOrders(std::unordered_map<BlockPath, std::vector<IndexType>> orders) {
+    void SetCellOrders(std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>> orders) {
         m_orders.cellOrders = std::move(orders);
     }
 

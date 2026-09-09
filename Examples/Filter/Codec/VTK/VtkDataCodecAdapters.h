@@ -169,7 +169,6 @@ public:
         const void* data,
         std::size_t byteSize,
         std::string* error = nullptr) override;
-    bool SupportsConcurrentAttributeRangeWrites() const noexcept override;
     bool SupportsAttributeDecodeStore() const noexcept override;
     bool EndAttribute(std::size_t attrIndex, std::string* error = nullptr) override;
 

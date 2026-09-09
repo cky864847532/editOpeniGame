@@ -4,6 +4,13 @@
 #include "DataCodec/Test/Feature/DataCodecFeatureAdapterRoundTrip.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureByteRange.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureCellGraphTopology.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureFailure.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureStorageOwnership.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureMortonResources.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureTopologyExecution.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureNumericExecution.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureNumericDecodeExecution.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureExecutionMechanism.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureLocalization.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureOutputSinks.h"
 #include "DataCodec/Test/Feature/DataCodecFeaturePackageIdentity.h"
@@ -33,6 +40,13 @@ namespace datacodec::test {
     auto pipelineResult = RunDataCodecFeaturePipelineContracts();
     appendResult(pipelineResult);
     appendResult(RunDataCodecFeatureByteRange());
+    appendResult(RunDataCodecFeatureFailure());
+    appendResult(RunDataCodecFeatureStorageOwnership());
+    appendResult(RunDataCodecFeatureMortonResources());
+    appendResult(RunDataCodecFeatureTopologyExecution());
+    appendResult(RunDataCodecFeatureNumericExecution());
+    appendResult(RunDataCodecFeatureNumericDecodeExecution());
+    appendResult(RunDataCodecFeatureExecutionMechanism());
     appendResult(RunDataCodecFeatureCellGraphTopology());
     appendResult(RunDataCodecFeatureLocalization());
     appendResult(RunDataCodecFeatureOutputSinks());

@@ -150,6 +150,7 @@ add_subdirectory(iGameCore)
 if (EMSCRIPTEN)
     target_compile_definitions(iGameCore PUBLIC
             DATACODEC_MAX_PARALLEL_WORKERS=${IGAME_WASM_DATACODEC_MAX_WORKERS}
+            DATACODEC_RUNTIME_THREAD_LIMIT=${IGAME_WASM_PTHREAD_POOL_SIZE}
     )
 endif ()
 

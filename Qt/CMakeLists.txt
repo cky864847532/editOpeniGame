@@ -82,6 +82,12 @@ if (EMSCRIPTEN)
 endif ()
 
 target_link_libraries(${MODULE_NAME} PUBLIC ${LINK_LIBS})
+if (IGAME_DATACODEC_BUILD_TESTS)
+    add_executable(iGameDataCodecQtResourceTests Test/DataCodecResourceControlsTest.cpp)
+    target_link_libraries(iGameDataCodecQtResourceTests PRIVATE ${MODULE_NAME})
+    add_test(NAME DataCodec.QtResourceControls COMMAND iGameDataCodecQtResourceTests -platform offscreen)
+    set_tests_properties(DataCodec.QtResourceControls PROPERTIES TIMEOUT 30)
+endif ()
 if (WIN32)
     #  内部库在cmake构建时定义IG_QT_COMPILE_EXPORT，使得模式切换为dllexport, 否则外部库在使用编译这个动态库代码时将其模式切换为dllimport
     target_compile_definitions(${MODULE_NAME} PRIVATE IG_QT_COMPILE_EXPORT)

@@ -34,10 +34,6 @@ namespace datacodec {
 using DecodeStageNode = PipelineStageNode<std::unique_ptr<DecodeStage>>;
 
 struct DecodePipelineOptions {
-    // 为 false 时强制串行执行
-    bool enableParallelStages{true};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
-    DecodeResourceBudgetControlParams resourceBudget;
     CodecValidationPolicy validationPolicy;
 };
 
@@ -107,6 +103,7 @@ public:
     // 预览固定 decode stage schedule
     std::vector<DecodeStageId> DescribeStageIds(const DecodeContext& context) const {
         DecodeLeafWorkspace workspace;
+        RunBinding binding(workspace, context.resources);
         workspace.Reset(context.leafPackage);
         std::vector<DecodeStageId> ids;
         ParamsDecodeStage paramsStage(BindFieldInput(workspace, FieldType::Params));
@@ -124,16 +121,9 @@ public:
     }
 
     void Execute(DecodeContext& context, DecodeLeafWorkspace& workspace) const {
+        RunBinding binding(workspace, context.resources);
         DecodeFailureGuard guard(context, workspace);
         guard.Run("DecodePipeline", CodecErrorCode::PipelineFailure, [&]() {
-            if (m_options.enableParallelStages && m_options.parallelTaskRunner == nullptr) {
-                FailDecodePipeline(
-                    context,
-                    workspace,
-                    CodecErrorCode::PipelineFailure,
-                    "parallel DataCodec decode requires a task runner");
-                return false;
-            }
             SubmitProgress(
                 context,
                 RunProgressPhase::Begin,
@@ -181,16 +171,9 @@ public:
     }
 
     void ExecuteAttributes(DecodeContext& context, DecodeLeafWorkspace& workspace) const {
+        RunBinding binding(workspace, context.resources);
         DecodeFailureGuard guard(context, workspace);
         guard.Run("DecodePipeline", CodecErrorCode::PipelineFailure, [&]() {
-            if (m_options.enableParallelStages && m_options.parallelTaskRunner == nullptr) {
-                FailDecodePipeline(
-                    context,
-                    workspace,
-                    CodecErrorCode::PipelineFailure,
-                    "parallel DataCodec decode requires a task runner");
-                return false;
-            }
             if (!workspace.MatchesLeafPackage(context.leafPackage)) {
                 FailDecodePipeline(
                     context,
@@ -238,8 +221,7 @@ public:
             }
 
             workspace.PrepareSupplementRun(
-                m_options.validationPolicy,
-                m_options.resourceBudget);
+                m_options.validationPolicy);
             SubmitProgress(
                 context,
                 RunProgressPhase::Begin,
@@ -286,41 +268,12 @@ public:
 private:
     static void RecordRuntimeResourceUsage(
         DecodeContext& context,
-        const DecodeLeafWorkspace& workspace) {
-        if (!context.runRecords.Wants(RunRecordKind::ResourceUsage)) {
-            return;
-        }
-        const auto storeStats = workspace.ByteStoreSessionRef().SnapshotStats();
-        const auto scratchStats = workspace.ScratchBytePool().SnapshotStats();
-        const auto windowStats = workspace.CacheResourcesRef().windowBudget.SnapshotStats();
-        context.runRecords.RecordResourceUsage("bytestore.logical_bytes", storeStats.logicalBytes);
-        context.runRecords.RecordResourceUsage("bytestore.resident_bytes", storeStats.residentBytes);
-        context.runRecords.RecordResourceUsage("bytestore.peak_resident_bytes", storeStats.peakResidentBytes);
-        context.runRecords.RecordResourceUsage("bytestore.resident_limit_bytes", storeStats.residentLimitBytes);
-        context.runRecords.RecordResourceUsage("bytestore.mapped_bytes", storeStats.mappedBytes);
-        context.runRecords.RecordResourceUsage("bytestore.managed_file_bytes", storeStats.managedFileBytes);
-        context.runRecords.RecordResourceUsage("bytestore.store_count", storeStats.storeCount);
-        context.runRecords.RecordResourceUsage("scratch_pool.acquired_bytes", scratchStats.acquiredBytes);
-        context.runRecords.RecordResourceUsage(
-            "scratch_pool.max_retained_block_count",
-            scratchStats.maxRetainedBlockCount);
-        context.runRecords.RecordResourceUsage(
-            "scratch_pool.max_retained_block_bytes",
-            scratchStats.maxRetainedBlockBytes);
-        context.runRecords.RecordResourceUsage(
-            "scratch_pool.max_retained_total_bytes",
-            scratchStats.maxRetainedTotalBytes);
-        context.runRecords.RecordResourceUsage("scratch_pool.peak_active_bytes", scratchStats.peakActiveBytes);
-        context.runRecords.RecordResourceUsage("scratch_pool.retained_bytes", scratchStats.retainedBytes);
-        context.runRecords.RecordResourceUsage("scratch_pool.reused_block_count", scratchStats.reusedBlockCount);
-        context.runRecords.RecordResourceUsage("scratch_pool.allocation_count", scratchStats.allocationCount);
-        context.runRecords.RecordResourceUsage("window.max_active_bytes", windowStats.maxActiveBytes);
-        context.runRecords.RecordResourceUsage("window.peak_active_bytes", windowStats.peakActiveBytes);
-        context.runRecords.RecordResourceUsage("window.wait_count", windowStats.waitCount);
+        const DecodeLeafWorkspace&) noexcept {
+        RecordRootCapacityAudit(context.runRecords, context.resources);
         if (context.adapter != nullptr) {
-            context.runRecords.RecordResourceUsage(
-                "adapter.native_resident_bytes",
-                context.adapter->NativeResidentBytesHint());
+            context.runRecords.TryExport([&] {
+                RecordBufferCapacitySamples(context.runRecords, context.adapter->CapacitySamples());
+            });
         }
     }
 
@@ -337,13 +290,6 @@ private:
         const DecodePipelineOptions& options) {
         workspace.Reset(context.leafPackage);
         workspace.SetValidationPolicy(options.validationPolicy);
-        workspace.SetResourceBudget(options.resourceBudget);
-        workspace.ConfigureCacheResources(
-            options.resourceBudget.AccessWindowBytes(),
-            options.resourceBudget.ActiveWindowBytes(),
-            options.resourceBudget.ScratchRetainedBlockCount(),
-            options.resourceBudget.ScratchRetainedBlockBytes(),
-            options.resourceBudget.ScratchRetainedTotalBytes());
     }
 
     static std::vector<DecodeStageNode> BuildStageSchedule(
@@ -480,160 +426,63 @@ private:
         DecodeLeafWorkspace& workspace,
         const std::vector<DecodeStageNode>& stageNodes,
         std::string* error = nullptr) const {
-        if (stageNodes.empty()) {
-            return true;
-        }
-
-        if (m_options.enableParallelStages && m_options.parallelTaskRunner == nullptr) {
-            const std::string message = "parallel DataCodec decode requires a task runner";
-            FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-            validation::AssignError(error, message);
-            return false;
-        }
-
-        const auto allowParallelStages = m_options.enableParallelStages &&
-            ResolveParallelTaskCount(stageNodes.size(), m_options.parallelTaskRunner) > 1u;
-        InlineParallelTaskRunner inlineRunner;
-        IParallelTaskRunner* runner = allowParallelStages
-            ? m_options.parallelTaskRunner
-            : &inlineRunner;
-
         std::vector<std::vector<std::size_t>> dependents(stageNodes.size());
         std::vector<std::size_t> remainingDependencies(stageNodes.size(), 0u);
-        for (std::size_t stageIndex = 0; stageIndex < stageNodes.size(); ++stageIndex) {
-            remainingDependencies[stageIndex] = stageNodes[stageIndex].dependencies.size();
-            for (const auto& dependencyId : stageNodes[stageIndex].dependencies) {
-                const auto dependencyIndex = detail::FindStageIndex(stageNodes, dependencyId);
-                if (dependencyIndex == static_cast<std::size_t>(-1)) {
-                    const auto message = stageNodes[stageIndex].stage->Describe() +
-                        " depends on a missing stage " + dependencyId.ToString();
-                    FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                    validation::AssignError(error, message);
+        for (std::size_t index = 0u; index < stageNodes.size(); ++index) {
+            remainingDependencies[index] = stageNodes[index].dependencies.size();
+            for (const auto& dependency : stageNodes[index].dependencies) {
+                const auto predecessor = detail::FindStageIndex(stageNodes, dependency);
+                if (predecessor == static_cast<std::size_t>(-1)) {
+                    FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure,
+                        "decode stage depends on a missing stage");
                     return false;
                 }
-                dependents[dependencyIndex].push_back(stageIndex);
+                dependents[predecessor].push_back(index);
             }
         }
-
-        std::vector<std::uint8_t> completed(stageNodes.size(), 0u);
-        std::size_t completedCount = 0u;
-        while (completedCount < stageNodes.size()) {
+        std::vector<bool> completed(stageNodes.size(), false);
+        for (std::size_t count = 0u; count < stageNodes.size(); ++count) {
             if (context.HasFailure() || workspace.StopRequested()) {
-                AssignFailureOrError(context, error, "decode pipeline stopped before scheduling the next stage batch");
+                AssignFailureOrError(context, error, "decode pipeline stopped");
                 return false;
             }
-            std::vector<std::size_t> readyStageIndices;
-            for (std::size_t stageIndex = 0; stageIndex < stageNodes.size(); ++stageIndex) {
-                if (completed[stageIndex] == 0u && remainingDependencies[stageIndex] == 0u) {
-                    readyStageIndices.push_back(stageIndex);
-                    if (!allowParallelStages) {
-                        break;
-                    }
-                }
-            }
-
-            if (readyStageIndices.empty()) {
-                const std::string message = "decode pipeline scheduler detected a dependency cycle";
-                FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                validation::AssignError(error, message);
+            std::size_t next = 0u;
+            while (next < stageNodes.size() && (completed[next] || remainingDependencies[next] != 0u)) { ++next; }
+            if (next == stageNodes.size()) {
+                FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure,
+                    "decode stage dependency cycle");
                 return false;
             }
-
-            for (const auto readyStageIndex : readyStageIndices) {
-                completed[readyStageIndex] = 1u;
-            }
-
+            const auto stageName = stageNodes[next].stage->Id().name;
+            const auto timing = context.runRecords.Wants(RunRecordKind::StageTiming);
+            const auto start = callback::StartTiming(timing);
             try {
-                auto taskGroup = runner->CreateGroup(workspace.StopToken());
-                if (taskGroup == nullptr) {
-                    throw std::runtime_error("decode stage task group is unavailable");
-                }
-                const auto executeStage = [&context, &workspace, &stageNodes](const std::size_t stageIndex) {
-                    if (context.HasFailure() || workspace.StopRequested()) {
-                        return;
-                    }
-                    const auto stageName = stageNodes[stageIndex].stage->Id().name;
-                    const auto collectTiming = context.runRecords.Wants(RunRecordKind::StageTiming);
-                    SubmitStageStartProgress(context, stageName);
-                    RecordMemoryTraceStageEvent(context, stageName, true);
-                    const auto startTime = callback::StartTiming(collectTiming);
-                    try {
-                        stageNodes[stageIndex].stage->Execute(context, workspace);
-                        if (collectTiming) {
-                            RecordStageTiming(
-                                stageName,
-                                context,
-                                callback::ElapsedMilliseconds(startTime));
-                        }
-                        RecordMemoryTraceStageEvent(context, stageName, false);
-                        SubmitStageProgress(context, stageName);
-                    } catch (...) {
-                        RecordMemoryTraceStageEvent(context, stageName, false);
-                        throw;
-                    }
-                };
-                const auto inlineStageIt = std::find_if(
-                    readyStageIndices.begin(),
-                    readyStageIndices.end(),
-                    [&stageNodes](const std::size_t stageIndex) {
-                        return stageNodes[stageIndex].stage->UsesInternalParallelism();
-                    });
-                const auto inlineStageIndex = inlineStageIt != readyStageIndices.end()
-                    ? *inlineStageIt
-                    : static_cast<std::size_t>(-1);
-                for (const auto readyStageIndex : readyStageIndices) {
-                    if (readyStageIndex == inlineStageIndex) {
-                        continue;
-                    }
-                    taskGroup->Submit([&executeStage, readyStageIndex]() {
-                        executeStage(readyStageIndex);
-                    });
-                }
-                std::exception_ptr inlineException;
-                if (inlineStageIndex != static_cast<std::size_t>(-1)) {
-                    // 内部并行阶段留在调用线程，避免同一线程池的嵌套任务被降为单线程
-                    try {
-                        executeStage(inlineStageIndex);
-                    } catch (...) {
-                        inlineException = std::current_exception();
-                    }
-                }
-                std::exception_ptr workerException;
-                try {
-                    taskGroup->Wait();
-                } catch (...) {
-                    workerException = std::current_exception();
-                }
-                if (inlineException != nullptr) {
-                    std::rethrow_exception(inlineException);
-                }
-                if (workerException != nullptr) {
-                    std::rethrow_exception(workerException);
-                }
+                SubmitStageStartProgress(context, stageName);
+                RecordMemoryTraceStageEvent(context, stageName, true);
+                stageNodes[next].stage->Execute(context, workspace);
+                if (timing) { RecordStageTiming(stageName, context, callback::ElapsedMilliseconds(start)); }
+                RecordMemoryTraceStageEvent(context, stageName, false);
+                SubmitStageProgress(context, stageName);
+            } catch (const std::bad_alloc&) {
+                context.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+                    "allocation-failed", "DecodePipeline", "memory allocation failed"));
+                workspace.RequestStop();
+                return false;
             } catch (const std::exception& exception) {
-                const auto message = std::string("decode stage failed: ") + exception.what();
-                FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                validation::AssignError(error, message);
+                FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, exception.what());
+                AssignFailureOrError(context, error, "decode stage failed");
                 return false;
             } catch (...) {
-                const std::string message = "decode stage failed";
-                FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, message);
-                validation::AssignError(error, message);
+                FailDecodePipeline(context, workspace, CodecErrorCode::PipelineFailure, "decode stage failed");
+                AssignFailureOrError(context, error, "decode stage failed");
                 return false;
             }
-
             if (context.HasFailure() || workspace.StopRequested()) {
-                AssignFailureOrError(context, error, "decode pipeline stopped after a stage batch failed");
+                AssignFailureOrError(context, error, "decode stage failed");
                 return false;
             }
-            for (const auto readyStageIndex : readyStageIndices) {
-                ++completedCount;
-                for (const auto dependentIndex : dependents[readyStageIndex]) {
-                    if (remainingDependencies[dependentIndex] > 0u) {
-                        --remainingDependencies[dependentIndex];
-                    }
-                }
-            }
+            completed[next] = true;
+            for (const auto dependent : dependents[next]) { --remainingDependencies[dependent]; }
         }
         return true;
     }

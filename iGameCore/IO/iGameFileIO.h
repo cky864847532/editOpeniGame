@@ -4,6 +4,7 @@
 #include "iGameObject.h"
 #include "iGameDataObject.h"
 #include <cstddef>
+#include <memory>
 
 IGAME_NAMESPACE_BEGIN
 class FileIO : public Object {
@@ -39,7 +40,7 @@ public:
     static DataObject::Pointer ReadVTKFromMemory(const void* data, size_t size);
     static DataObject::Pointer ReadVTUFromMemory(const void* data, size_t size);
     static DataObject::Pointer ReadVTPFromMemory(const void* data, size_t size);
-    static DataObject::Pointer ReadIGCFromMemory(const void* data, size_t size);
+    static DataObject::Pointer ReadIGCFromMemory(std::shared_ptr<const void> owner, const void* data, size_t size);
     static bool WriteFile(const std::string& file_name, DataObject::Pointer);
     static IGenum GetFileType(const std::string& file_name);
     static std::string GetFileTypeAsString(IGenum type);

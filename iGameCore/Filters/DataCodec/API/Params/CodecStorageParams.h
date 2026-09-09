@@ -3,8 +3,10 @@
 
 #include "DataCodec/API/Params/NumericArrayParams.h"
 #include "DataCodec/API/Params/ParamSerialization.h"
+#include "DataCodec/API/Params/ParamsDecodeLimits.h"
 #include "DataCodec/Common/DataCodecError.h"
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <cereal/archives/portable_binary.hpp>
@@ -41,9 +43,9 @@ struct StructuredMeshStorageParams {
 };
 
 struct SpatialBlockStorageParams {
-    // Point 与 Cell 使用独立的固定块大小
-    std::uint32_t pointElementCount{262144u};
-    std::uint32_t cellElementCount{262144u};
+    // 新编码使用固定规格，反序列化保留文件实际值以读取旧块
+    std::uint32_t pointElementCount{numericarray::kSpatialBlockElementCount};
+    std::uint32_t cellElementCount{numericarray::kSpatialBlockElementCount};
 
     [[nodiscard]] std::uint32_t ElementCount(
         const AttrAttachment attachment) const noexcept {
@@ -1364,6 +1366,9 @@ inline bool SerializeCodecStorageParams(
         archive(header, params);
 
         const auto serialized = stream.str();
+        if (serialized.size() > kMaxDecodedParamsBytes) {
+            return validation::AssignError(error, "serialized params exceed the 16 MiB format limit");
+        }
         bytes.assign(serialized.begin(), serialized.end());
         return true;
     } catch (const std::exception& exception) {

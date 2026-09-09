@@ -3,6 +3,7 @@
 
 #include "DataCodec/Codec/SubCodec/CanonicalHuffmanCodec.h"
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Codec/Topology/Connectivity/ConnectivityTopologyTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
@@ -875,7 +876,8 @@ inline bool EncodeConnectivityGrammar(
     const std::size_t pointCount,
     std::vector<std::uint8_t>& output,
     std::string* error = nullptr,
-    const bool inputAlreadyValidated = false) {
+    const bool inputAlreadyValidated = false,
+    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
     output.clear();
     if (!connectivity.empty() && pointCount == 0u) {
         return validation::AssignError(error, "topology connectivity references an empty point set");
@@ -1099,6 +1101,20 @@ inline bool EncodeConnectivityGrammar(
     output.insert(output.end(), residualBytes.begin(), residualBytes.end());
     output.insert(output.end(), seedAuxStream.begin(), seedAuxStream.end());
 
+    if (capacitySamples != nullptr) {
+        using Sample = TopologyBufferSample;
+        capacitySamples->Observe(Sample::GrammarOffsets, cellOffsets);
+        capacitySamples->Observe(Sample::MainEvents, mainEvents);
+        capacitySamples->Observe(Sample::SeedLeadSymbols, seedLeadSymbols);
+        capacitySamples->Observe(Sample::SeedOrderBytes, seedOrderBytes);
+        capacitySamples->Observe(Sample::ResidualBytes, residualBytes);
+        capacitySamples->Observe(Sample::MainSymbols, mainSymbols);
+        capacitySamples->Observe(Sample::RawSeedAux, rawSeedAuxBytes);
+        capacitySamples->Observe(Sample::MainStream, mainStream);
+        capacitySamples->Observe(Sample::SeedLeadStream, seedLeadStream);
+        capacitySamples->Observe(Sample::SeedAuxStream, seedAuxStream);
+        capacitySamples->Observe(Sample::ConnectivityBytes, output);
+    }
     g_topologyEncodeStats.blockCount.fetch_add(1u, std::memory_order_relaxed);
     g_topologyEncodeStats.cellCount.fetch_add(cellCount, std::memory_order_relaxed);
     g_topologyEncodeStats.connectivityCount.fetch_add(connectivity.size(), std::memory_order_relaxed);
@@ -1152,7 +1168,8 @@ inline bool DecodeConnectivityGrammar(
     const std::size_t connectivityCount,
     const int fixedCellSize,
     std::vector<IndexType>& output,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
     output.clear();
     if (input.size() < 6u) {
         return validation::AssignError(error, "topology grammar header is incomplete");
@@ -1249,6 +1266,10 @@ inline bool DecodeConnectivityGrammar(
     }
 
     output.resize(connectivityCount);
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(TopologyBufferSample::GrammarOffsets, cellOffsets);
+        capacitySamples->Observe(TopologyBufferSample::Connectivity, output);
+    }
     TopologyState state;
     state.nextVertex = initialNextVertex;
     state.deltaReference = static_cast<IndexType>(initialNextVertex);
@@ -1479,7 +1500,8 @@ inline bool EncodeConnectivity(
     const std::size_t pointCount,
     std::vector<std::uint8_t>& output,
     std::string* error = nullptr,
-    const bool inputAlreadyValidated = false) {
+    const bool inputAlreadyValidated = false,
+    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
     return EncodeConnectivityGrammar(
         connectivity,
         cellSizes,
@@ -1488,7 +1510,7 @@ inline bool EncodeConnectivity(
         pointCount,
         output,
         error,
-        inputAlreadyValidated);
+        inputAlreadyValidated, capacitySamples);
 }
 
 inline bool DecodeConnectivity(
@@ -1499,7 +1521,8 @@ inline bool DecodeConnectivity(
     const std::size_t connectivityCount,
     const int fixedCellSize,
     std::vector<IndexType>& output,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
     return DecodeConnectivityGrammar(
         input,
         cellSizes,
@@ -1508,7 +1531,7 @@ inline bool DecodeConnectivity(
         connectivityCount,
         fixedCellSize,
         output,
-        error);
+        error, capacitySamples);
 }
 
 } // namespace datacodec::topocodec::blockcodec

@@ -38,11 +38,18 @@ public:
         std::uint64_t* exportedByteCount = nullptr,
         std::string* error = nullptr) {
         output.Release();
+        auto phase = WaitForHeavyPhase(context.resources);
+        if (!phase) { return false; }
         EncodedLeafFieldBundle staging;
         staging.path = context.path;
-        RefreshAttributeDecodeScheduleHints(workspace.StorageParams());
-        if (!SerializeCodecStorageParams(workspace.StorageParams(), staging.paramsBytes, error)) {
-            return false;
+        const auto paramsIndex = workspace.TransferCacheLayout().params;
+        if (paramsIndex == kInvalidTransferCacheIndex || !workspace.IsTransferCacheReady(paramsIndex)) {
+            return validation::AssignError(error, "encoded params staging source is not ready");
+        }
+        staging.paramsSource = std::move(workspace.TransferCache(paramsIndex).transferCache);
+        if (!staging.paramsSource || !staging.paramsSource->CanRead() ||
+            staging.paramsSource->ByteSizeHint() > kMaxDecodedParamsBytes) {
+            return validation::AssignError(error, "encoded params staging source is invalid");
         }
 
         const auto geometryIndex = workspace.TransferCacheLayout().geometry;
@@ -63,7 +70,7 @@ public:
 
         staging.byteStoreSession = std::make_shared<bytestore::ByteStoreSession>(
             workspace.TakeByteStoreSession());
-        std::uint64_t outputBytes = staging.paramsBytes.size();
+        std::uint64_t outputBytes = staging.paramsSource->ByteSizeHint();
         for (const auto& segment : staging.segments) {
             outputBytes = validation::SaturatingAddU64(
                 outputBytes,
@@ -90,6 +97,8 @@ public:
                 "leaf package byte writer requires a byte range output");
         }
 
+        auto phase = WaitForHeavyPhase(context.resources);
+        if (!phase) { return false; }
         std::uint64_t totalRawBytes = 0u;
         for (std::size_t index = 0u; index < workspace.TransferCaches().Count(); ++index) {
             const auto& record = workspace.TransferCache(index);
@@ -149,6 +158,7 @@ public:
             if (!WriteTransferCache(
                     packageWriter,
                     workspace,
+                    *phase,
                     index,
                     encodingParams,
                     reportFieldProgress,
@@ -235,12 +245,12 @@ private:
             return true;
         }
         auto transferCache = std::move(record.transferCache);
-        auto segmented = std::dynamic_pointer_cast<bytestore::SegmentedBinaryObject>(transferCache);
-        if (segmented == nullptr) {
-            return validation::AssignError(error, "encoded topology staging source is not segmented");
-        }
-        const auto slotCount = segmented->SegmentCount();
         if (workspace.StorageParams().topoParams.isPolyhedron) {
+            auto segmented = std::dynamic_pointer_cast<bytestore::SegmentedBinaryObject>(transferCache);
+            if (segmented == nullptr) {
+                return validation::AssignError(error, "encoded polyhedron topology staging source is not segmented");
+            }
+            const auto slotCount = segmented->SegmentCount();
             constexpr EncodedLeafSegmentKind kKinds[]{
                 EncodedLeafSegmentKind::PolyhedronUniqueVertexCounts,
                 EncodedLeafSegmentKind::PolyhedronCellFaceCounts,
@@ -262,20 +272,35 @@ private:
                 }
             }
         } else {
-            const auto expectedBlockCount =
-                workspace.StorageParams().topoParams.connectivityLayout.blockLayouts.size();
-            if (slotCount != expectedBlockCount) {
-                return validation::AssignError(error, "encoded ordinary topology segment count mismatch");
+            const auto& layouts = workspace.StorageParams().topoParams.connectivityLayout.blockLayouts;
+            if (layouts.size() > std::numeric_limits<std::uint32_t>::max()) {
+                return validation::AssignError(error, "encoded topology block count exceeds ordinal range");
             }
-            for (std::size_t index = 0u; index < slotCount; ++index) {
+            const auto total = transferCache->ByteSizeHint();
+            std::uint64_t offset = 0u;
+            for (std::size_t index = 0u; index < layouts.size(); ++index) {
+                const auto& layout = layouts[index];
+                std::uint64_t byteCount = 0u;
+                for (const auto count : {layout.connectivityByteCount, layout.cellSizeByteCount,
+                         layout.cellPolynomialOrderByteCount, layout.cellTypeByteCount}) {
+                    if (!validation::CheckedAddU64(byteCount, count, byteCount,
+                            "encoded topology block byte count", error)) { return false; }
+                }
+                if (offset > total || byteCount > total - offset) {
+                    return validation::AssignError(error, "encoded topology block exceeds staging source");
+                }
                 if (!AppendEncodedLeafSegment(
                         segments,
                         EncodedLeafSegmentKind::OrdinaryTopologyBlockPayload,
                         static_cast<std::uint32_t>(index),
-                        segmented->SegmentSource(index),
+                        std::make_shared<bytestore::SubrangeByteSource>(transferCache, offset, byteCount),
                         error)) {
                     return false;
                 }
+                offset += byteCount;
+            }
+            if (offset != total) {
+                return validation::AssignError(error, "encoded topology block ranges do not cover staging source");
             }
         }
         backingOwners.push_back(std::move(transferCache));
@@ -322,6 +347,7 @@ private:
     static bool WriteTransferCache(
         LeafPackageByteWriter& packageWriter,
         EncodeLeafWorkspace& workspace,
+        const HeavyPhaseLease& phase,
         const std::size_t transferCacheIndex,
         const PackageFieldEncodingParams& encodingParams,
         const std::function<void(std::uint64_t, std::uint64_t)>& progressCallback,
@@ -339,7 +365,6 @@ private:
                 !packageWriter.EndStream(schedule, error)) {
                 return false;
             }
-            record.transferCache->Release();
             record.transferCache.reset();
             return true;
         }
@@ -354,9 +379,8 @@ private:
                 schedule.fieldType,
                 encodingParams,
                 LeafPackageFieldEncodeRuntime{
-                    .windowBudget = workspace.CacheResourcesRef().windowBudget,
-                    .scratchBytePool = workspace.CacheResourcesRef().scratchBytePool,
-                    .accessWindowBytes = workspace.CacheResourcesRef().accessWindowBytes,
+                    .run = workspace.CacheResourcesRef().Run(),
+                    .phase = phase,
                     .progressCallback = progressCallback,
                 },
                 streamWriter,
@@ -369,7 +393,6 @@ private:
         if (!packageWriter.EndStream(schedule, error)) {
             return false;
         }
-        record.transferCache->Release();
         record.transferCache.reset();
         return true;
     }

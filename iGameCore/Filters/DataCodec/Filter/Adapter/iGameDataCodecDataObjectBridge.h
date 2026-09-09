@@ -2,14 +2,14 @@
 #define iGameDataCodecDataObjectBridge_h
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
 #include "DataCodec/Workflow/Session/DecodeSession.h"
 #include "DataCodec/API/Params/DataCodecControlParams.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Params/EncodedInputCacheParams.h"
 #include "DataCodec/Runtime/Cache/DecodeCacheRuntime.h"
-#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
+#include "DataCodec/API/Params/CodecResourceParams.h"
 #include "iGameDataObject.h"
 
 #include <cstdint>
@@ -33,11 +33,8 @@ struct DataCodecDataObjectDecodeRequest {
     ::datacodec::DataCodecLanguage language{
         ::datacodec::DataCodecLanguage::SimplifiedChinese};
     ::datacodec::DecodedFrameCachePolicy decodedFrameCachePolicy;
-    std::shared_ptr<::datacodec::IDecodedFrameCache> decodedFrameCache;
     ::datacodec::EncodedInputCachePolicy encodedInputCachePolicy;
-    std::shared_ptr<::datacodec::IEncodedInputCache> encodedInputCache;
-    std::shared_ptr<::datacodec::DecodeCacheRuntime> cacheRuntime;
-    ::datacodec::DataCodecExecutionResources executionResources;
+    ::datacodec::CodecResourceParams resources;
     std::optional<std::uint32_t> requestedFrameIndex;
     std::vector<::datacodec::AttributeTarget> attributeTargets;
     // true 表示一次完成几何、拓扑和全部属性解压
@@ -83,6 +80,8 @@ public:
         const ::datacodec::AttributeTarget& target) const;
     [[nodiscard]] DataObject::Pointer GetOutput() const;
     [[nodiscard]] bool IsOpen() const;
+    [[nodiscard]] ::datacodec::DecodedFrameCacheStats DecodedCacheStatistics() const;
+    [[nodiscard]] ::datacodec::EncodedInputCacheStats InputCacheStatistics() const;
     void Reset();
 
 private:

@@ -1,6 +1,5 @@
 #include "iGameIGDCReader.h"
 
-#include "DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h"
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
 #include "DataCodec/Log/Report/DataCodecProcessReportJson.h"
@@ -126,12 +125,12 @@ std::string WriteDecodeRunningReport(
         },
         .configuration = configuration,
     };
-    const auto result = reportSink->WriteReportFile({
+    const auto result = reportSink->TryWriteReportFile([&] { return ::datacodec::DataCodecReportFile{
         .name = "decode_process_" + reportFileTimestamp,
         .mediaType = "application/json",
         .preferredExtension = ".json",
         .content = ::datacodec::SerializeDataCodecProcessReportJson(report),
-    });
+    }; });
     return result.success
         ? std::string{}
         : result.error.empty()
@@ -186,12 +185,12 @@ std::string WriteDecodeReports(
         .configuration = configuration,
     };
     ::datacodec::CompleteDataCodecProcessReportMemory(processReport);
-    const auto processResult = reportSink->WriteReportFile({
+    const auto processResult = reportSink->TryWriteReportFile([&] { return ::datacodec::DataCodecReportFile{
         .name = "decode_process_" + reportFileTimestamp,
         .mediaType = "application/json",
         .preferredExtension = ".json",
         .content = ::datacodec::SerializeDataCodecProcessReportJson(processReport),
-    });
+    }; });
     if (!processResult.success) {
         return processResult.error.empty()
             ? std::string{"failed to write decode process report"}
@@ -213,12 +212,12 @@ std::string WriteDecodeReports(
         sessions,
         messages,
         "decode failed without a detailed error record");
-    const auto errorResult = reportSink->WriteReportFile({
+    const auto errorResult = reportSink->TryWriteReportFile([&] { return ::datacodec::DataCodecReportFile{
         .name = "decode_errors_" + reportFileTimestamp,
         .mediaType = "application/json",
         .preferredExtension = ".json",
         .content = ::datacodec::SerializeDataCodecErrorReportJson(errorReport),
-    });
+    }; });
     if (!errorResult.success) {
         return errorResult.error.empty()
             ? std::string{"failed to write decode error report"}
@@ -239,13 +238,11 @@ struct IGDCReader::State {
     ::datacodec::DecodeControlParams codecParams;
     ::datacodec::DecodeExecutionOptions executionOptions;
     ::datacodec::DataCodecDecodeConfigurationSource configurationSource;
-    std::optional<::datacodec::DataCodecDecodeTier> decodeTier;
+    ::datacodec::CodecResourceParams resources;
     std::vector<::datacodec::TelemetryMessageRecord> messages;
     std::vector<std::string> selectedFramePaths;
     ::datacodec::DecodedFrameCachePolicy decodedFrameCachePolicy;
-    std::shared_ptr<::datacodec::IDecodedFrameCache> decodedFrameCache;
     ::datacodec::EncodedInputCachePolicy encodedInputCachePolicy;
-    std::shared_ptr<::datacodec::IEncodedInputCache> encodedInputCache;
     ::datacodec::DataCodecOutputSinks outputSinks;
     std::shared_ptr<::datacodec::IRunRecordSink> telemetrySink;
     ::datacodec::DataCodecDecodeLogParams logging;
@@ -253,6 +250,7 @@ struct IGDCReader::State {
         ::datacodec::DataCodecLanguage::SimplifiedChinese};
     AttributeDataSourcePointer attributeDataSource;
     bool loadAllAvailableAttributes{true};
+    bool diagnosticsIncomplete{false};
 };
 
 IGDCReader::Pointer IGDCReader::New() {
@@ -261,6 +259,7 @@ IGDCReader::Pointer IGDCReader::New() {
 
 IGDCReader::IGDCReader() : m_state(std::make_unique<State>()) {
     SetDecodeOptions(DataCodecIOSettings::GetDefaultDecodeOptions());
+    SetResourceParams(DataCodecIOSettings::GetDefaultDecodeResources());
     SetLoadAllAvailableAttributes(
         DataCodecIOSettings::GetDefaultLoadAllAvailableAttributes());
 }
@@ -271,7 +270,6 @@ void IGDCReader::SetCodecControlParams(const ::datacodec::DecodeControlParams& p
     auto& state = *m_state;
     state.hasCodecParams = true;
     state.codecParams = params;
-    state.decodeTier.reset();
 }
 
 void IGDCReader::SetDecodeControls(
@@ -285,17 +283,15 @@ void IGDCReader::SetDecodeControls(
     state.configurationSource = definition.source;
     state.logging = definition.logging;
     state.language = definition.language;
-    state.decodeTier.reset();
 }
 
-void IGDCReader::SetDecodeTier(const ::datacodec::DataCodecDecodeTier tier) {
-    SetDecodeOptions(::datacodec::DataCodecDecodeOptions{.tier = tier});
+void IGDCReader::SetResourceParams(const ::datacodec::CodecResourceParams& resources) {
+    m_state->resources = resources;
 }
 
 void IGDCReader::SetDecodeOptions(const ::datacodec::DataCodecDecodeOptions& options) {
     auto definition = ::datacodec::MakeDecodeConfigurationParams(options);
     SetDecodeControls(definition);
-    m_state->decodeTier = options.tier;
 }
 
 void IGDCReader::SetSelectedFramePaths(std::vector<std::string> framePaths) {
@@ -304,24 +300,12 @@ void IGDCReader::SetSelectedFramePaths(std::vector<std::string> framePaths) {
 
 void IGDCReader::SetDecodedFrameCachePolicy(
         const ::datacodec::DecodedFrameCachePolicy& policy) {
-    ::datacodec::AssertValidDecodedFrameCachePolicy(policy);
     m_state->decodedFrameCachePolicy = policy;
-}
-
-void IGDCReader::SetDecodedFrameCache(
-        std::shared_ptr<::datacodec::IDecodedFrameCache> frameCache) {
-    m_state->decodedFrameCache = std::move(frameCache);
 }
 
 void IGDCReader::SetEncodedInputCachePolicy(
         const ::datacodec::EncodedInputCachePolicy& policy) {
-    ::datacodec::AssertValidEncodedInputCachePolicy(policy);
     m_state->encodedInputCachePolicy = policy;
-}
-
-void IGDCReader::SetEncodedInputCache(
-        std::shared_ptr<::datacodec::IEncodedInputCache> inputCache) {
-    m_state->encodedInputCache = std::move(inputCache);
 }
 
 void IGDCReader::SetLoadAllAvailableAttributes(const bool loadAllAvailableAttributes) {
@@ -348,6 +332,18 @@ AttributeDataSourcePointer IGDCReader::GetAttributeDataSource() const {
 const std::vector<::datacodec::TelemetryMessageRecord>& IGDCReader::GetMessages() const {
     static const std::vector<::datacodec::TelemetryMessageRecord> empty;
     return m_state != nullptr ? m_state->messages : empty;
+}
+
+bool IGDCReader::DiagnosticsIncomplete() const noexcept {
+    return m_state->diagnosticsIncomplete;
+}
+
+void IGDCReader::SetMemoryInput(
+    std::shared_ptr<const void> owner, const std::span<const std::uint8_t> bytes) {
+    auto input = std::make_shared<::datacodec::MemoryByteRangeReader>(std::move(owner), bytes);
+    FileReader::SetMemoryBuffer(bytes.data(), bytes.size());
+    m_UseMemoryBuffer = true;
+    m_memoryInput = std::move(input);
 }
 
 bool IGDCReader::Execute() {
@@ -393,8 +389,12 @@ bool IGDCReader::DecodeInput() {
     m_FileSize = 0u;
     state.messages.clear();
     state.attributeDataSource.reset();
+    state.diagnosticsIncomplete = false;
 
+    iGameDataCodecTelemetryCapture telemetryCapture(state.telemetrySink);
     std::shared_ptr<::datacodec::IDataCodecReportFileSink> decodeReportSink;
+    std::string decodeReportFileTimestamp;
+    telemetryCapture.TryExport([&] {
     if (state.logging.enableFileLog) {
         decodeReportSink = state.outputSinks.reportFile;
         if (decodeReportSink == nullptr && !m_UseMemoryBuffer && !m_FilePath.empty()) {
@@ -404,12 +404,12 @@ bool IGDCReader::DecodeInput() {
             decodeReportSink = std::move(fileSink);
         }
     }
-    const auto decodeReportFileTimestamp = decodeReportSink != nullptr
+    decodeReportFileTimestamp = decodeReportSink != nullptr
         ? ::datacodec::MakeDataCodecReportFileTimestampUtc()
         : std::string{};
+    });
     const bool captureDecodeTelemetry =
         state.logging.enableConsoleLog || decodeReportSink != nullptr;
-    iGameDataCodecTelemetryCapture telemetryCapture(state.telemetrySink);
     if (captureDecodeTelemetry) {
         auto interests = ::datacodec::kRunLifecycleRecordMask |
             ::datacodec::RunRecordKind::Message |
@@ -445,20 +445,24 @@ bool IGDCReader::DecodeInput() {
         .logging = state.logging,
         .language = state.language,
     };
-    const auto reportConfiguration =
-        ::datacodec::MakeDataCodecDecodeReportConfiguration(
-            state.decodeTier,
+    ::datacodec::DataCodecReportConfiguration reportConfiguration;
+    outputBinding.TryExport([&] {
+        reportConfiguration = ::datacodec::MakeDataCodecDecodeReportConfiguration(
+            state.resources,
             effectiveConfiguration,
             state.loadAllAvailableAttributes);
-    (void)WriteDecodeRunningReport(
-        decodeReportSink,
-        decodeReportFileTimestamp,
-        m_FilePath,
-        reportConfiguration);
-    const auto addStatus = [&state, &runRecordSink](
+        (void)WriteDecodeRunningReport(
+            decodeReportSink,
+            decodeReportFileTimestamp,
+            m_FilePath,
+            reportConfiguration);
+    });
+    const auto addStatus = [&state, &runRecordSink, &outputBinding](
         ::datacodec::TelemetryMessageRecord message) {
+        outputBinding.TryExport([&] {
         ::datacodec::SubmitRunMessage(runRecordSink.get(), message);
-        state.messages.push_back(std::move(message));
+        ::datacodec::AppendRetainedTelemetryMessage(state.messages, std::move(message));
+        });
     };
     const auto addHostError = [&addStatus, &state](
         const iGameDataCodecHostMessageId messageId,
@@ -543,10 +547,8 @@ bool IGDCReader::DecodeInput() {
                     .configurationSource = &state.configurationSource,
                     .language = state.language,
                     .decodedFrameCachePolicy = state.decodedFrameCachePolicy,
-                    .decodedFrameCache = state.decodedFrameCache,
                     .encodedInputCachePolicy = state.encodedInputCachePolicy,
-                    .encodedInputCache = state.encodedInputCache,
-                    .parallelTaskRunner = DataCodecTaskRunner(),
+                    .resources = state.resources,
                     .loadAllAvailableAttributes = state.loadAllAvailableAttributes,
                     .enableConsoleLog = state.logging.enableConsoleLog,
                     .runRecordSink = runRecordSink,
@@ -580,10 +582,13 @@ bool IGDCReader::DecodeInput() {
                 addHostError(iGameDataCodecHostMessageId::MemoryInputEmpty, {});
                 return false;
             }
-            inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(
-                std::span<const std::uint8_t>(
-                    reinterpret_cast<const std::uint8_t*>(m_MemoryBuffer),
-                    m_MemoryBufferSize));
+            if (m_memoryInput == nullptr ||
+                m_memoryInput->Bytes().data() != reinterpret_cast<const std::uint8_t*>(m_MemoryBuffer) ||
+                m_memoryInput->ByteSize() != m_MemoryBufferSize) {
+                addCodecError("IGC memory input must retain its original shared owner");
+                return false;
+            }
+            inputReader = m_memoryInput;
             std::string headerError;
             if (!::datacodec::InspectPackage(
                     *inputReader,
@@ -604,10 +609,8 @@ bool IGDCReader::DecodeInput() {
             .configurationSource = &state.configurationSource,
             .language = state.language,
             .decodedFrameCachePolicy = state.decodedFrameCachePolicy,
-            .decodedFrameCache = state.decodedFrameCache,
             .encodedInputCachePolicy = state.encodedInputCachePolicy,
-            .encodedInputCache = state.encodedInputCache,
-            .executionResources = MakeDataCodecExecutionResources(),
+            .resources = state.resources,
             .requestedFrameIndex = m_requestedFrameIndex,
             .loadAllAvailableAttributes = state.loadAllAvailableAttributes,
             .runRecordSink = runRecordSink,
@@ -628,6 +631,7 @@ bool IGDCReader::DecodeInput() {
         loggingEnd - loggingStart).count();
 
     if (captureDecodeTelemetry) {
+        outputBinding.TryExport([&] {
         auto sessions = telemetryCapture.SnapshotCompletedTelemetrySessions();
         if (state.logging.enableConsoleLog) {
             SubmitDecodeProcessTimingToConsole(
@@ -656,7 +660,7 @@ bool IGDCReader::DecodeInput() {
                     state.language,
                     iGameDataCodecHostMessageId::WriteDecodeTelemetryFailed,
                     {{"detail", writeError}});
-                state.messages.push_back({
+                ::datacodec::AppendRetainedTelemetryMessage(state.messages, {
                     .severity = ::datacodec::TelemetryMessageSeverity::Error,
                     .origin = "IGDCReader",
                     .language = state.language,
@@ -670,7 +674,9 @@ bool IGDCReader::DecodeInput() {
                     ::datacodec::DataCodecStatusSeverity::Error);
             }
         }
+        });
     }
+    state.diagnosticsIncomplete |= outputBinding.DiagnosticsIncomplete() || telemetryCapture.DiagnosticsIncomplete();
     return success;
 }
 
@@ -685,17 +691,18 @@ bool IGDCReader::CreateDataObject() {
 void IGDCReader::RecordMessage(
     const iGameDataCodecHostMessageId messageId,
     std::string technicalDetail) {
+    auto outputBinding = iGameDataCodecOutputBinding(
+        m_state->outputSinks,
+        m_state->telemetrySink,
+        false,
+        m_state->logging.enableConsoleLog);
+    outputBinding.TryExport([&] {
     const auto text = std::string(iGameDataCodecHostMessage(
         m_state->language,
         messageId));
     if (text.empty()) {
         return;
     }
-    auto outputBinding = iGameDataCodecOutputBinding(
-        m_state->outputSinks,
-        m_state->telemetrySink,
-        false,
-        m_state->logging.enableConsoleLog);
     ::datacodec::TelemetryMessageRecord message{
         .severity = ::datacodec::TelemetryMessageSeverity::Error,
         .origin = "IGDCReader",
@@ -704,7 +711,9 @@ void IGDCReader::RecordMessage(
         .technicalDetail = std::move(technicalDetail),
     };
     ::datacodec::SubmitRunMessage(outputBinding.RecordSink().get(), message);
-    m_state->messages.push_back(std::move(message));
+    ::datacodec::AppendRetainedTelemetryMessage(m_state->messages, std::move(message));
+    });
+    m_state->diagnosticsIncomplete |= outputBinding.DiagnosticsIncomplete();
 }
 
 IGAME_NAMESPACE_END

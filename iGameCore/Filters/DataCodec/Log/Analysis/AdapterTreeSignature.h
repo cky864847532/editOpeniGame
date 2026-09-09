@@ -5,6 +5,7 @@
 #include "DataCodec/Common/Views/AttributeViews.h"
 #include "DataCodec/Common/Views/ArrayViews.h"
 #include "DataCodec/Log/Analysis/LogAnalysisResult.h"
+#include "DataCodec/Log/Capture/RemapOrderCapture.h"
 
 #include <algorithm>
 #include <cmath>
@@ -53,12 +54,54 @@ struct AdapterTreeSignature {
     std::vector<LeafAdapterSignature> leaves;
 };
 
-struct AdapterSignatureOrderSet {
-    std::unordered_map<BlockPath, std::vector<IndexType>> pointOrders;
-    std::unordered_map<BlockPath, std::vector<IndexType>> cellOrders;
-};
+using AdapterSignatureOrderSet = RemapOrderSnapshot;
 
 namespace detail {
+
+class SignatureOrderWindow final {
+public:
+    SignatureOrderWindow(const IRemapProvider* provider, std::uint64_t tupleCount) noexcept
+        : m_provider(provider), m_tupleCount(tupleCount) {}
+
+    bool ReadAt(std::uint64_t ordinal, std::uint64_t& source, std::string* error) {
+        if (ordinal >= m_tupleCount || (m_provider && m_provider->Size() != m_tupleCount)) {
+            return validation::AssignError(error, "analysis remap shape does not match the numeric field");
+        }
+        if (!m_provider || m_provider->IsIdentity()) {
+            source = ordinal;
+            return true;
+        }
+        if (!m_values) {
+            m_capacity = static_cast<std::size_t>(std::min<std::uint64_t>(
+                m_tupleCount, kIoWindowBytes / sizeof(IndexType)));
+            m_values = std::make_unique<IndexType[]>(m_capacity);
+        }
+        if (ordinal < m_begin || ordinal - m_begin >= m_count) {
+            m_begin = ordinal;
+            m_count = 0u;
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+                m_capacity, m_tupleCount - ordinal));
+            if (!m_provider->ReadRange(ordinal, std::span<IndexType>(m_values.get(), count), error)) {
+                return false;
+            }
+            m_count = count;
+        }
+        const auto index = m_values[static_cast<std::size_t>(ordinal - m_begin)];
+        if (index < 0 || static_cast<std::uint64_t>(index) >= m_tupleCount) {
+            return validation::AssignError(error, "analysis remap index exceeds the numeric field");
+        }
+        source = static_cast<std::uint64_t>(index);
+        return true;
+    }
+
+private:
+    const IRemapProvider* m_provider;
+    std::uint64_t m_tupleCount;
+    std::unique_ptr<IndexType[]> m_values;
+    std::size_t m_capacity{0u};
+    std::uint64_t m_begin{0u};
+    std::size_t m_count{0u};
+};
 
 template<typename TValue>
 [[nodiscard]] inline double ReadScalarAsDouble(const std::uint8_t* bytes) {
@@ -206,7 +249,7 @@ inline bool BuildNumericFieldSignature(
     NumericFieldSignature& output,
     LogAnalysisResult& result,
     const std::string& checkPath,
-    const std::vector<IndexType>* tupleOrder = nullptr) {
+    const IRemapProvider* tupleOrder = nullptr) {
     output = {};
     output.name = name;
     output.scalarType = view.scalarType;
@@ -235,16 +278,14 @@ inline bool BuildNumericFieldSignature(
     }
 
     std::vector<std::uint8_t> tupleBytes(componentCount * scalarSize, 0u);
+    detail::SignatureOrderWindow orderWindow(tupleOrder, output.tupleCount);
     for (std::uint64_t tupleIndex = 0u; tupleIndex < output.sampledTupleCount; ++tupleIndex) {
         std::uint64_t sourceTupleIndex = tupleIndex;
-        if (tupleOrder != nullptr && !tupleOrder->empty()) {
-            if (tupleIndex >= tupleOrder->size()) {
-                result.AddFailure(checkPath, "tuple order is shorter than sampled tuple count");
-                return false;
-            }
-            sourceTupleIndex = static_cast<std::uint64_t>((*tupleOrder)[static_cast<std::size_t>(tupleIndex)]);
-        }
         std::string error;
+        if (!orderWindow.ReadAt(tupleIndex, sourceTupleIndex, &error)) {
+            result.AddFailure(checkPath + ".tupleOrder", error);
+            return false;
+        }
         if (!ReadNumericArrayTupleBytes(
                 view,
                 static_cast<std::size_t>(sourceTupleIndex),
@@ -272,7 +313,7 @@ inline bool BuildAttributeSignature(
     NumericFieldSignature& output,
     LogAnalysisResult& result,
     const std::string& checkPath,
-    const std::vector<IndexType>* tupleOrder = nullptr) {
+    const IRemapProvider* tupleOrder = nullptr) {
     EncodeAttributeView attrView;
     if (!attr.BuildAttributeView(attrView)) {
         result.AddFailure(checkPath, "failed to build attribute view");
@@ -281,14 +322,14 @@ inline bool BuildAttributeSignature(
     return BuildNumericFieldSignature(attr.GetName(), attrView.values, options, output, result, checkPath, tupleOrder);
 }
 
-[[nodiscard]] inline const std::vector<IndexType>* FindSignatureOrder(
-    const std::unordered_map<BlockPath, std::vector<IndexType>>& orders,
+[[nodiscard]] inline const IRemapProvider* FindSignatureOrder(
+    const std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>>& orders,
     const BlockPath& path) {
     if (const auto it = orders.find(path); it != orders.end()) {
-        return &it->second;
+        return it->second.get();
     }
     if (const auto it = orders.find(BlockPath{}); it != orders.end()) {
-        return &it->second;
+        return it->second.get();
     }
     return nullptr;
 }

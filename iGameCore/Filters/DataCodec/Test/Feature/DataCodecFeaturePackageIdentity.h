@@ -3,6 +3,7 @@
 
 #include "DataCodec/Storage/Common/BinaryValueIO.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
+#include "DataCodec/Storage/ByteIO/ByteBudget.h"
 #include "DataCodec/Storage/FramePackage/FramePackageIO.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackageByteWriter.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackageIO.h"
@@ -33,7 +34,8 @@ inline bool CheckPackageIdentityTestHeader(
     const std::uint16_t version,
     const PackageIdentity identity,
     const PackageBinaryFormat expectedFormat) {
-    MemoryByteRangeReader reader(MakePackageIdentityTestHeader(magic, version, identity));
+    MemoryByteRangeReader reader(std::make_shared<const std::vector<std::uint8_t>>(
+        MakePackageIdentityTestHeader(magic, version, identity)));
     PackageInspection inspection;
     std::string error;
     return InspectPackage(reader, inspection, &error) &&
@@ -152,7 +154,8 @@ inline bool CheckPackageIdentityTestHeader(
         leafpackagewire::kLeafPackageMagic,
         2u,
         first);
-    MemoryByteRangeReader versionMismatchReader(std::move(versionMismatchBytes));
+    MemoryByteRangeReader versionMismatchReader(
+        std::make_shared<const std::vector<std::uint8_t>>(std::move(versionMismatchBytes)));
     PackageInspection versionMismatchInspection;
     std::string versionMismatchError;
     const auto versionMismatchRead = InspectPackage(
@@ -186,7 +189,9 @@ inline bool CheckPackageIdentityTestHeader(
         "packageIdentity.cacheRevision",
         "package source identity revision mismatch");
 
-    MemoryByteRangeOutput leafOutput;
+    DataCodecExecutionResources outputRoot(ResolvedResourceConfiguration{
+        {1024u * 1024u, 1u, 1u}, 1024u * 1024u, 1u, false, true});
+    MemoryByteRangeOutput leafOutput(outputRoot);
     LeafPackageByteWriter leafWriter;
     std::string leafError;
     const auto leafWritten =
@@ -198,8 +203,9 @@ inline bool CheckPackageIdentityTestHeader(
             "identity-test") &&
         leafWriter.EndPackage(&leafError);
     Require(result, leafWritten, "packageIdentity.leafWrite", leafError.empty() ? "leaf package write failed" : leafError);
+    auto leafOwner = std::make_shared<const EncodedBuffer>(leafOutput.TakeBytes());
     if (leafWritten) {
-        auto leafReader = std::make_shared<MemoryByteRangeReader>(leafOutput.Bytes());
+        auto leafReader = std::make_shared<MemoryByteRangeReader>(leafOwner);
         LeafPackage decodedLeaf;
         const auto leafRead = LeafPackageIO::ReadFromByteRange(
             leafReader,
@@ -211,7 +217,7 @@ inline bool CheckPackageIdentityTestHeader(
         Require(result, decodedLeaf.identity.IsValid(), "packageIdentity.leafRoundTrip", "decoded leaf identity is invalid");
     }
 
-    MemoryByteRangeOutput repeatedLeafOutput;
+    MemoryByteRangeOutput repeatedLeafOutput(outputRoot);
     LeafPackageByteWriter repeatedLeafWriter;
     const auto repeatedLeafWritten =
         repeatedLeafWriter.BeginPackageToSink(
@@ -225,7 +231,7 @@ inline bool CheckPackageIdentityTestHeader(
     PackageIdentity repeatedLeafIdentity;
     const auto deterministicLeafIdentity =
         leafWritten && repeatedLeafWritten &&
-        TryReadPackageIdentityPrefix(leafOutput.Bytes(), firstLeafIdentity) &&
+        TryReadPackageIdentityPrefix(leafOwner->span(), firstLeafIdentity) &&
         TryReadPackageIdentityPrefix(repeatedLeafOutput.Bytes(), repeatedLeafIdentity) &&
         firstLeafIdentity == repeatedLeafIdentity;
     Require(
@@ -238,12 +244,13 @@ inline bool CheckPackageIdentityTestHeader(
     frame.frameIndex = 7u;
     frame.timeValue = 1.5f;
     frame.rootName = "identity-test";
-    MemoryByteRangeOutput frameOutput;
+    MemoryByteRangeOutput frameOutput(outputRoot);
     std::string frameError;
     const auto frameWritten = FramePackageIO::WriteToSink(frame, {}, frameOutput, nullptr, &frameError);
     Require(result, frameWritten, "packageIdentity.frameWrite", frameError.empty() ? "frame package write failed" : frameError);
+    auto frameOwner = std::make_shared<const EncodedBuffer>(frameOutput.TakeBytes());
     if (frameWritten) {
-        MemoryByteRangeReader frameReader(frameOutput.Bytes());
+        MemoryByteRangeReader frameReader(frameOwner);
         FramePackage decodedFrame;
         const auto frameRead = FramePackageIO::ReadMetadata(frameReader, decodedFrame, &frameError);
         Require(result, frameRead, "packageIdentity.frameRead", frameError.empty() ? "frame package read failed" : frameError);
@@ -252,7 +259,7 @@ inline bool CheckPackageIdentityTestHeader(
         Require(result, decodedFrame.rootName == frame.rootName, "packageIdentity.frameName", "decoded frame name mismatch");
     }
 
-    MemoryByteRangeOutput repeatedFrameOutput;
+    MemoryByteRangeOutput repeatedFrameOutput(outputRoot);
     const auto repeatedFrameWritten = FramePackageIO::WriteToSink(
         frame,
         {},
@@ -261,7 +268,7 @@ inline bool CheckPackageIdentityTestHeader(
         &frameError);
     auto renamedFrame = frame;
     renamedFrame.rootName = "identity-best";
-    MemoryByteRangeOutput renamedFrameOutput;
+    MemoryByteRangeOutput renamedFrameOutput(outputRoot);
     const auto renamedFrameWritten = FramePackageIO::WriteToSink(
         renamedFrame,
         {},
@@ -273,7 +280,7 @@ inline bool CheckPackageIdentityTestHeader(
     PackageIdentity renamedFrameIdentity;
     const auto frameIdentityContract =
         frameWritten && repeatedFrameWritten && renamedFrameWritten &&
-        TryReadPackageIdentityPrefix(frameOutput.Bytes(), firstFrameIdentity) &&
+        TryReadPackageIdentityPrefix(frameOwner->span(), firstFrameIdentity) &&
         TryReadPackageIdentityPrefix(repeatedFrameOutput.Bytes(), repeatedFrameIdentity) &&
         TryReadPackageIdentityPrefix(renamedFrameOutput.Bytes(), renamedFrameIdentity) &&
         firstFrameIdentity == repeatedFrameIdentity &&

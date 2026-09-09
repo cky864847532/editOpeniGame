@@ -2,239 +2,154 @@
 #define DATACODEC_TEST_FEATURE_DATACODECFEATUREDECODETASKCOORDINATOR_H
 
 #include "DataCodec/Workflow/Task/DecodeTaskCoordinator.h"
+#include "DataCodec/Test/Common/DataCodecAllocationFailure.h"
 
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
-#include <cstdint>
 #include <iostream>
-#include <memory>
+#include <latch>
 #include <mutex>
-#include <stdexcept>
-#include <stop_token>
-#include <thread>
-#include <utility>
 #include <vector>
 
-namespace datacodec::test::feature_decode_task_coordinator
-{
+namespace datacodec::test::feature_decode_task_coordinator {
 
-class TestParallelTaskGroup final : public IParallelTaskGroup {
-public:
-    explicit TestParallelTaskGroup(std::stop_token) {}
-
-    void Submit(std::function<void()> task) override {
-        if (!task) {
-            return;
-        }
-        m_workers.emplace_back([task = std::move(task)]() mutable {
-            task();
-        });
-    }
-
-    void Wait() override {
-        for (auto& worker : m_workers) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-        m_workers.clear();
-    }
-
-    ~TestParallelTaskGroup() override { Wait(); }
-
-private:
-    std::vector<std::jthread> m_workers;
+struct Result {
+    bool success{false};
+    bool cancelled{false};
+    std::optional<CodecFailureRecord> failure;
+    unsigned value{0u};
 };
-
-class TestParallelTaskRunner final : public IParallelTaskRunner {
-public:
-    [[nodiscard]] std::unique_ptr<IParallelTaskGroup> CreateGroup(
-        const std::stop_token stopToken = {}) override {
-        m_groupCount.fetch_add(1u, std::memory_order_relaxed);
-        return std::make_unique<TestParallelTaskGroup>(stopToken);
-    }
-
-    [[nodiscard]] std::size_t Concurrency() const noexcept override { return 2u; }
-
-    [[nodiscard]] std::uint32_t GroupCount() const noexcept {
-        return m_groupCount.load(std::memory_order_relaxed);
-    }
-
-private:
-    std::atomic_uint32_t m_groupCount{0u};
-};
-
-class UnavailableTaskGroupRunner final : public IParallelTaskRunner {
-public:
-    [[nodiscard]] std::unique_ptr<IParallelTaskGroup> CreateGroup(
-        std::stop_token = {}) override {
-        return nullptr;
-    }
-
-    [[nodiscard]] std::size_t Concurrency() const noexcept override { return 2u; }
-};
+using Coordinator = DecodeTaskCoordinator<Result>;
 
 inline bool TestDuplicateTargetUsesSingleTask() {
-    auto runner = std::make_shared<TestParallelTaskRunner>();
-    DecodeTaskCoordinator<int> coordinator(runner);
-    std::atomic_uint32_t executionCount{0u};
-    std::mutex mutex;
-    std::condition_variable condition;
-    bool started = false;
-    bool released = false;
-    const auto task = [&](const std::stop_token stopToken) {
-        executionCount.fetch_add(1u, std::memory_order_relaxed);
-        std::unique_lock<std::mutex> lock(mutex);
-        started = true;
-        condition.notify_all();
-        condition.wait(lock, [&]() { return released || stopToken.stop_requested(); });
-        return stopToken.stop_requested() ? -1 : 42;
-    };
-    const DecodeTaskKey key{
-        .scope = 1u,
-        .frameIndex = 7u,
-        .variant = "all-attributes",
-    };
-    const auto first = coordinator.Submit(key, task);
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        if (!condition.wait_for(lock, std::chrono::seconds(2), [&]() { return started; })) {
-            released = true;
-            condition.notify_all();
-            return false;
-        }
-    }
-    const auto second = coordinator.Submit(key, task);
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        released = true;
-    }
-    condition.notify_all();
-
-    int firstResult = 0;
-    int secondResult = 0;
-    return first.Wait(firstResult) && second.Wait(secondResult) && firstResult == 42 &&
-           secondResult == 42 && executionCount.load(std::memory_order_relaxed) == 1u &&
-           runner->GroupCount() == 1u;
-}
-
-inline bool TestIndependentTargetsUseExternalRunner() {
-    auto runner = std::make_shared<TestParallelTaskRunner>();
-    DecodeTaskCoordinator<std::uint32_t> coordinator(runner);
-    std::mutex mutex;
-    std::condition_variable condition;
-    std::size_t startedCount = 0u;
-    bool release = false;
-
-    const auto makeTask = [&](const std::uint32_t value) {
-        return [&, value](const std::stop_token stopToken) {
-            std::unique_lock<std::mutex> lock(mutex);
-            ++startedCount;
-            condition.notify_all();
-            condition.wait(lock, [&]() { return release || stopToken.stop_requested(); });
-            return value;
-        };
-    };
-
-    const auto first = coordinator.Submit({.frameIndex = 10u}, makeTask(10u));
-    const auto second = coordinator.Submit({.frameIndex = 20u}, makeTask(20u));
-    bool bothStarted = false;
-    {
-        std::unique_lock<std::mutex> lock(mutex);
-        bothStarted = condition.wait_for(lock, std::chrono::seconds(2), [&]() { return startedCount == 2u; });
-        release = true;
-    }
-    condition.notify_all();
-
-    std::uint32_t firstResult = 0u;
-    std::uint32_t secondResult = 0u;
-    return bothStarted && first.Wait(firstResult) && second.Wait(secondResult) &&
-           firstResult == 10u && secondResult == 20u && runner->GroupCount() == 2u;
-}
-
-inline bool TestMissingRunnerIsRejected() {
-    try {
-        DecodeTaskCoordinator<std::uint32_t> coordinator;
-        (void)coordinator;
-    } catch (const std::invalid_argument&) {
-        return true;
-    }
-    return false;
-}
-
-inline bool TestUnavailableTaskGroupIsRejected() {
-    auto runner = std::make_shared<UnavailableTaskGroupRunner>();
-    DecodeTaskCoordinator<std::uint32_t> coordinator(runner);
-    const auto task = coordinator.Submit(
-        {.frameIndex = 8u},
-        [](std::stop_token) { return 8u; });
-    std::uint32_t result = 0u;
-    try {
-        (void)task.Wait(result);
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
-}
-
-inline bool TestTaskGroupDoesNotDropAcceptedTaskAfterStop() {
-    TestParallelTaskRunner runner;
-    std::stop_source stopSource;
-    stopSource.request_stop();
-    auto group = runner.CreateGroup(stopSource.get_token());
-    std::atomic_uint32_t executionCount{0u};
-    group->Submit([&executionCount]() {
-        executionCount.fetch_add(1u, std::memory_order_relaxed);
+    DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 2u, 3u}, 64u, 2u, true, true});
+    Coordinator coordinator(run);
+    std::latch started(1), release(1);
+    std::atomic_uint count{0u};
+    auto first = coordinator.Submit({.frameIndex = 7u}, [&](std::stop_token) {
+        ++count;
+        started.count_down();
+        release.wait();
+        return Result{.success = true, .value = 42u};
     });
-    group->Wait();
-    return executionCount.load(std::memory_order_relaxed) == 1u;
+    started.wait();
+    auto second = coordinator.Submit({.frameIndex = 7u}, [](std::stop_token) {
+        return Result{.success = true, .value = 0u};
+    });
+    first = {};
+    release.count_down();
+    Result result;
+    const bool completed = second.Wait(result);
+    coordinator.WaitIdle();
+    return completed && result.success && result.value == 42u && count == 1u;
 }
 
-inline bool TestTaskGroupDestructorWaitsForAcceptedTask() {
-    TestParallelTaskRunner runner;
-    std::atomic_uint32_t executionCount{0u};
+inline bool TestReleasedHandleStillJoinsTaskOnDriver() {
+    DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 1u, 2u}, 64u, 2u, true, true});
+    Coordinator coordinator(run);
+    std::mutex mutex;
+    std::condition_variable_any condition;
+    std::latch started(1);
+    auto handle = coordinator.Submit({.frameIndex = 12u}, [&](std::stop_token stop) {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        condition.wait(lock, stop, [] { return false; });
+        return Result{.cancelled = true};
+    });
+    started.wait();
+    handle = {};
+    bool cleanupAllocated = false;
     {
-        auto group = runner.CreateGroup();
-        group->Submit([&executionCount]() {
-            executionCount.fetch_add(1u, std::memory_order_relaxed);
-        });
+        RejectAllocationsScope reject;
+        coordinator.WaitIdle();
+        cleanupAllocated = rejectedAllocationCount != 0u;
     }
-    return executionCount.load(std::memory_order_relaxed) == 1u;
+    auto next = coordinator.Submit({.frameIndex = 13u}, [](std::stop_token) {
+        return Result{.success = true, .value = 13u};
+    });
+    Result result;
+    const bool completed = next.Wait(result);
+    coordinator.WaitIdle();
+    return !cleanupAllocated && completed && result.success && result.value == 13u &&
+        coordinator.InFlightTaskCount() == 0u;
 }
 
-inline bool TestInlineSubmissionUsesCallerThread() {
-    auto runner = std::make_shared<TestParallelTaskRunner>();
-    DecodeTaskCoordinator<std::thread::id> coordinator(runner);
-    const auto callerThread = std::this_thread::get_id();
-    const auto task = coordinator.SubmitInline(
-        {.frameIndex = 4u},
-        [](const std::stop_token) {
-            return std::this_thread::get_id();
-        });
-    std::thread::id taskThread;
-    return task.Wait(taskThread) && taskThread == callerThread && runner->GroupCount() == 0u;
+inline bool TestCommandWindowAndOrder() {
+    DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 2u, 3u}, 64u, 2u, true, true});
+    Coordinator coordinator(run);
+    std::latch started(1), release(1);
+    std::vector<unsigned> order;
+    auto first = coordinator.Submit({.frameIndex = 1u}, [&](std::stop_token) {
+        started.count_down();
+        release.wait();
+        order.push_back(1u);
+        return Result{.success = true, .value = 1u};
+    });
+    started.wait();
+    auto second = coordinator.Submit({.frameIndex = 2u}, [&](std::stop_token) {
+        order.push_back(2u);
+        return Result{.success = true, .value = 2u};
+    });
+    auto third = coordinator.Submit({.frameIndex = 3u}, [](std::stop_token) {
+        return Result{.success = true, .value = 3u};
+    });
+    auto prefetch = coordinator.Submit({.frameIndex = 4u}, [&](std::stop_token) {
+        order.push_back(4u);
+        return Result{.success = true, .value = 4u};
+    }, DecodeCommandKind::Prefetch);
+    Result rejected;
+    const bool rejectedCorrectly = third.Wait(rejected) && rejected.failure &&
+        std::string_view(rejected.failure->reason.data()) == "command-window-full";
+    const auto inFlight = coordinator.InFlightTaskCount();
+    release.count_down();
+    Result result;
+    const bool complete = first.Wait(result) && second.Wait(result) && prefetch.Wait(result);
+    coordinator.WaitIdle();
+    return rejectedCorrectly && inFlight == 3u && complete &&
+        order == std::vector<unsigned>({1u, 2u, 4u});
 }
 
-} // namespace datacodec::test::feature_decode_task_coordinator
+inline bool TestCancelAllDoesNotAllocate() {
+    DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 1u, 2u}, 64u, 2u, true, true});
+    Coordinator coordinator(run);
+    std::mutex mutex;
+    std::condition_variable_any condition;
+    std::latch started(1);
+    auto current = coordinator.Submit({.frameIndex = 1u}, [&](std::stop_token stop) {
+        started.count_down();
+        std::unique_lock lock(mutex);
+        condition.wait(lock, stop, [] { return false; });
+        return Result{.cancelled = true};
+    });
+    started.wait();
+    auto queued = coordinator.Submit({.frameIndex = 2u}, [](std::stop_token) {
+        return Result{.success = true};
+    });
+    bool noAllocations = false;
+    {
+        RejectAllocationsScope reject;
+        coordinator.CancelAll();
+        coordinator.WaitIdle();
+        noAllocations = rejectedAllocationCount == 0u;
+    }
+    Result first, second;
+    return noAllocations && current.Wait(first) && queued.Wait(second) &&
+        first.cancelled && second.cancelled;
+}
 
-namespace datacodec::test
-{
+}
 
+namespace datacodec::test {
 inline int RunDataCodecFeatureDecodeTaskCoordinator() {
     using namespace feature_decode_task_coordinator;
-    if (!TestDuplicateTargetUsesSingleTask() || !TestIndependentTargetsUseExternalRunner() ||
-        !TestMissingRunnerIsRejected() || !TestUnavailableTaskGroupIsRejected() ||
-        !TestTaskGroupDoesNotDropAcceptedTaskAfterStop() ||
-        !TestTaskGroupDestructorWaitsForAcceptedTask() ||
-        !TestInlineSubmissionUsesCallerThread()) {
+    if (!TestDuplicateTargetUsesSingleTask() || !TestReleasedHandleStillJoinsTaskOnDriver() ||
+        !TestCommandWindowAndOrder() || !TestCancelAllDoesNotAllocate()) {
         std::cerr << "DataCodec decode task coordinator feature test failed\n";
         return 1;
     }
     std::cout << "DataCodec decode task coordinator feature test passed\n";
     return 0;
 }
-
-} // namespace datacodec::test
+}
 
 #endif

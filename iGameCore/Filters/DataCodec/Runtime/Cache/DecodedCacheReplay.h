@@ -55,6 +55,7 @@ inline bool ReplayTypedDecodedCache(
         }
         std::size_t cursor = 0u;
         while (cursor < elementCount) {
+            if (runtime.Run().Stopped()) { return false; }
             const auto currentCount = std::min(valuesPerWindow, elementCount - cursor);
             const auto byteOffset = cursor * valuesPerElement * sizeof(TValue);
             const auto* values = reinterpret_cast<const TValue*>(contiguous.data() + byteOffset);
@@ -67,10 +68,10 @@ inline bool ReplayTypedDecodedCache(
     }
     std::size_t cursor = 0u;
     while (cursor < elementCount) {
+        if (runtime.Run().Stopped()) { return false; }
         const auto currentCount = std::min(valuesPerWindow, elementCount - cursor);
         const auto byteCount = currentCount * valuesPerElement * sizeof(TValue);
-        auto windowLease = runtime.windowBudget.Acquire(byteCount);
-        auto scratchBuffer = runtime.scratchBytePool.Acquire(byteCount);
+        auto scratchBuffer = runtime.ScratchBytePool().Acquire(byteCount);
         auto bytes = scratchBuffer.Span();
         if (!cache.Read(
                 static_cast<std::uint64_t>(cursor) * valuesPerElement * sizeof(TValue),

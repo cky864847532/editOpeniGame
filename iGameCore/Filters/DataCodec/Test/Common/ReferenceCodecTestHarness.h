@@ -78,7 +78,9 @@ inline bool EncodeDecodeReferenceTestBlock(
     const NumericArrayReferenceKind referenceKind,
     NumericArrayReferenceEncodedBlock& encoded,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    numericarray::NumericArrayBlockCapacitySamples* encodeSamples = nullptr,
+    numericarray::NumericArrayBlockCapacitySamples* decodeSamples = nullptr) {
     encoded = {};
     decodedBytes.clear();
     if (componentCount == 0u ||
@@ -109,6 +111,7 @@ inline bool EncodeDecodeReferenceTestBlock(
                 .referenceKind = referenceKind,
                 .localParentFieldIndex = 0u,
                 .predictorOffset = 0,
+                .capacitySamples = encodeSamples,
             },
             encoded,
             error);
@@ -129,6 +132,7 @@ inline bool EncodeDecodeReferenceTestBlock(
             .block = parsed,
             .referenceBytes = NumericValueBytes(reference),
             .referenceElementOffset = 0u,
+            .capacitySamples = decodeSamples,
         },
         decodedBytes,
         error);

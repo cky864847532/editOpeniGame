@@ -5,6 +5,7 @@
 
 #include <exception>
 #include <functional>
+#include <new>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -39,8 +40,12 @@ public:
         const std::string_view origin,
         const CodecErrorCode code,
         const std::string_view message) noexcept {
+        return Fail(MakeCodecFailureRecord(code, "operation-failed", origin, message));
+    }
+
+    bool Fail(const CodecFailureRecord& record) noexcept {
         try {
-            m_context.RecordFailure(origin, code, message);
+            m_context.RecordFailure(record);
             m_workspace.RequestStop();
         } catch (...) {
             m_forceCleanup = true;
@@ -79,15 +84,17 @@ public:
                 result = static_cast<bool>(std::invoke(std::forward<TFn>(fn)));
             }
             if (!result) {
-                // 阶段已经明确失败时，即使没有留下 failure 记录也必须执行资源清理
+                // 调用方按既有 error/status 补充详情，作用域仍须执行清理
                 m_forceCleanup = true;
                 return false;
             }
             return !FailedOrStopped();
+        } catch (const std::bad_alloc&) {
+            return Fail(MakeCodecFailureRecord(code, "allocation-failed", origin, "memory allocation failed"));
         } catch (const std::exception& exception) {
-            return Fail(origin, code, exception.what());
+            return Fail(MakeCodecFailureRecord(code, "exception", origin, exception.what()));
         } catch (...) {
-            return Fail(origin, code, "unknown exception");
+            return Fail(MakeCodecFailureRecord(code, "unknown-exception", origin, "unknown exception"));
         }
     }
 

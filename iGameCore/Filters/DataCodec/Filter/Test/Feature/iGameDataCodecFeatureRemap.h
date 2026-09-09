@@ -597,12 +597,12 @@ inline bool NearlySameCoordinate(const std::array<double, 3u>& left, const std::
     return true;
 }
 
-inline bool HasCapturedOrder(const std::unordered_map<BlockPath, std::vector<IndexType>>& orders) {
+inline bool HasCapturedOrder(const std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>>& orders) {
     return std::any_of(
         orders.begin(),
         orders.end(),
         [](const auto& entry) {
-            return !entry.second.empty();
+            return entry.second && !entry.second->IsIdentity() && entry.second->Size() != 0u;
         });
 }
 
@@ -678,7 +678,6 @@ inline void RemoveRemapOutput(const std::filesystem::path& directory) {
 inline DataCodecEncodeConfigurationParams MakeRemapSemanticConfiguration() {
     auto configuration = MakeEncodeConfigurationParams(
         DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::Balanced,
             .enableCompressionEnhancement = true,
         });
     auto& params = configuration.controlParams;

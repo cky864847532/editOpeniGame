@@ -22,6 +22,11 @@
 
 namespace datacodec {
 
+struct FrameReferenceNeeds {
+    TemporalFieldState attributes;
+    TemporalFieldState geometry;
+};
+
 struct DataCodecEncodeFrameInput {
     IBlockTreeAdapter* blockTreeAdapter{nullptr};
     std::string rootName;
@@ -30,6 +35,7 @@ struct DataCodecEncodeFrameInput {
     float timeValue{0.0f};
     const CodecControlParams* controlParams{nullptr};
     std::span<const AttributeTarget> attributeTargets;
+    std::optional<FrameReferenceNeeds> nextFrameReferences;
 };
 
 struct LeafEncodeRun {
@@ -40,7 +46,9 @@ struct LeafEncodeRun {
 };
 
 struct FrameEncodeState {
-    CodecControlParams controlParams;
+    std::unique_ptr<const CodecControlParams> defaultControlParams;
+    const CodecControlParams* controlParams{nullptr};
+    std::optional<FrameReferenceNeeds> nextFrameReferences;
     TemporalFrame temporalFrame;
     std::unordered_map<BlockPath, TemporalTopologyEntry> topologyByPath;
     FramePackage framePackage;
@@ -63,6 +71,7 @@ public:
     bool PrepareFrame(
         const DataCodecEncodeFrameInput& input,
         FrameEncodeState& output,
+        DataCodecExecutionResources& resources,
         std::string* error = nullptr) {
         ResetActiveFrame();
         if (input.blockTreeAdapter == nullptr) {
@@ -78,12 +87,17 @@ public:
         }
 
         output = {};
-        output.controlParams = input.controlParams != nullptr
-            ? *input.controlParams
-            : CodecControlParamsFactory::MakeEncodeConfiguration(
-                DataCodecEncodeOptions{}).controlParams;
-        m_referenceByteStoreSession.ConfigureResidentLimit(
-            output.controlParams.resourceBudget.EncodeReferenceResidentLimitBytes());
+        output.controlParams = input.controlParams;
+        if (!output.controlParams) {
+            output.defaultControlParams = std::make_unique<const CodecControlParams>(
+                CodecControlParamsFactory::MakeEncodeConfiguration(DataCodecEncodeOptions{}).controlParams);
+            output.controlParams = output.defaultControlParams.get();
+        }
+        output.nextFrameReferences = input.nextFrameReferences;
+        if (input.frameCount <= 1u || input.frameIndex == input.frameCount - 1u) {
+            output.nextFrameReferences = FrameReferenceNeeds{};
+        }
+        m_referenceByteStoreSession.BindRun(resources);
 
         output.leaves = input.blockTreeAdapter->GetLeafRecords();
         if (output.leaves.empty()) {
@@ -96,9 +110,9 @@ public:
                 *input.blockTreeAdapter,
                 input.frameCount,
                 input.frameIndex,
-                output.controlParams.attrReference,
-                output.controlParams.geometryReference,
-                output.controlParams.topologyReference,
+                output.controlParams->attrReference,
+                output.controlParams->geometryReference,
+                output.controlParams->topologyReference,
                 m_state.temporalHistory,
                 output.temporalFrame,
                 error)) {
@@ -135,6 +149,7 @@ public:
         const FrameEncodeState& framePlan,
         const std::size_t leafIndex,
         LeafEncodeRun& output,
+        DataCodecExecutionResources& resources,
         std::string* error = nullptr) {
         output.leaf = {};
         output.frameLeaf = {};
@@ -149,6 +164,7 @@ public:
             AssignError(error, "DataCodec encode workspace leaf index is out of range");
             return false;
         }
+        m_referenceByteStoreSession.BindRun(resources);
 
         const auto& leaf = framePlan.leaves[leafIndex];
         auto adapter = m_blockTreeAdapter->GetLeaf(leaf.path);
@@ -157,10 +173,10 @@ public:
             return false;
         }
 
-        auto context = std::make_unique<EncodeContext>();
+        auto context = std::make_unique<EncodeContext>(resources);
         context->adapter = adapter.get();
         context->objectName = leaf.name;
-        context->controlParams = &framePlan.controlParams;
+        context->controlParams = framePlan.controlParams;
         context->path = leaf.path;
         context->frameIndex = framePlan.framePackage.frameIndex;
         context->attributeTargets = m_attributeTargets;
@@ -195,6 +211,38 @@ public:
         record.leafPackageByteSize = leafPackageByteSize;
         framePlan.framePackage.leaves.push_back(std::move(record));
         return true;
+    }
+
+    void CompleteLeafReferences(const FrameEncodeState& framePlan, LeafEncodeRun& leafRun) {
+        // 编码已完成，封装只消费字段 owner，解除当前叶持有的 reference
+        if (leafRun.context) {
+            leafRun.context->attributeKeyFrameReference.attrReferenceCache.reset();
+            leafRun.context->geometryKeyFrameReference.geometryReferenceCache.reset();
+            leafRun.context->currentAttributeReferenceCache = nullptr;
+            leafRun.context->currentGeometryReferenceCache = nullptr;
+        }
+        if (framePlan.nextFrameReferences) {
+            const auto& next = *framePlan.nextFrameReferences;
+            for (auto frame = m_referenceCaches.begin(); frame != m_referenceCaches.end();) {
+                const auto leaf = frame->second.find(leafRun.leaf.path);
+                if (leaf != frame->second.end()) {
+                    if (next.attributes.temporalRole != TemporalFieldRole::PredFrame ||
+                        frame->first != next.attributes.keyFrameIndex) {
+                        leaf->second.attributes.reset();
+                    }
+                    if (next.geometry.temporalRole != TemporalFieldRole::PredFrame ||
+                        frame->first != next.geometry.keyFrameIndex) {
+                        leaf->second.geometry.reset();
+                    }
+                    if (!leaf->second.attributes && !leaf->second.geometry) { frame->second.erase(leaf); }
+                }
+                if (frame->second.empty()) { frame = m_referenceCaches.erase(frame); }
+                else { ++frame; }
+            }
+        }
+        // Session 登记为弱引用，阶段完成后清理登记不会改变仍存活的底层 owner
+        m_referenceByteStoreSession.Reset();
+        m_referenceByteStoreSession.UnbindRun();
     }
 
     DataCodecReferenceState& ReferenceState() noexcept { return m_state; }

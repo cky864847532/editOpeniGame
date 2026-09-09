@@ -5,12 +5,14 @@
 #include "DataCodec/Filter/Output/iGameDataCodecOutputSinks.h"
 #include "DataCodec/Log/Report/DataCodecProcessReportJson.h"
 #include "DataCodec/Test/Suite/DataCodecTestSuite.h"
+#include "DataCodec/Test/Experiment/DataCodecResourcePerformance.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
 #include "IGDC/iGameIGDCReader.h"
 #include "IGDC/iGameIGDCWriter.h"
 #include "iGameFilterIncludes.h"
 
 #include <chrono>
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -319,6 +321,77 @@ int WriteBrowserFixture(const std::filesystem::path& outputPath) {
 }
 
 int main(const int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--remap-contract") {
+        return iGame::datacodec_test::RunDataCodecFeatureRemap();
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "--resource-performance") {
+        if (argc != 7) {
+            std::cerr << "usage: --resource-performance tuples repetitions storage_MiB max_threads audit_0_or_1\n";
+            return 2;
+        }
+        std::array<std::uint64_t, 5u> values{};
+        for (std::size_t i = 0u; i < values.size(); ++i) {
+            const std::string_view text(argv[i + 2u]);
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), values[i]);
+            if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) { return 2; }
+        }
+        constexpr std::uint64_t MiB = 1024u * 1024u;
+        if (values[0] > std::numeric_limits<std::size_t>::max() || values[1] > 100u ||
+            values[2] > std::numeric_limits<std::uint64_t>::max() / MiB ||
+            values[3] > std::numeric_limits<std::size_t>::max() || values[4] > 1u) { return 2; }
+        try {
+            const auto result = datacodec::test::RunDataCodecResourcePerformance(
+                values[0], values[1], values[2] * MiB, values[3], values[4] != 0u);
+            PrintResult(result);
+            return result.passed ? 0 : 1;
+        } catch (const std::exception& failure) {
+            std::cerr << "resource experiment failed: " << failure.what() << '\n';
+            return 1;
+        }
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--resource-mode-contract") {
+        const auto result = datacodec::test::RunDataCodecResourcePerformance(17u, 1u, 16u * 1024u * 1024u, 2u);
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--numeric-decode-execution") {
+        const auto result = datacodec::test::RunDataCodecFeatureNumericDecodeExecution();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--numeric-execution") {
+        const auto result = datacodec::test::RunDataCodecFeatureNumericExecution();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--topology-execution") {
+        const auto result = datacodec::test::RunDataCodecFeatureTopologyExecution();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--morton-resources") {
+        const auto result = datacodec::test::RunDataCodecFeatureMortonResources();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--execution-mechanism") {
+        const auto result = datacodec::test::RunDataCodecFeatureExecutionMechanism();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--task-coordinator") {
+        return datacodec::test::RunDataCodecFeatureDecodeTaskCoordinator();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--storage-ownership") {
+        const auto result = datacodec::test::RunDataCodecFeatureStorageOwnership();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--failure-contract") {
+        const auto result = datacodec::test::RunDataCodecFeatureFailure();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
     if (argc == 2 && std::string(argv[1]) == "--report-contract") {
         const auto result = datacodec::test::RunDataCodecSelfTest();
         PrintResult(result);

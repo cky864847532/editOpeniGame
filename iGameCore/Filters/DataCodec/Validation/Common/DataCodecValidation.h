@@ -10,9 +10,9 @@
 namespace datacodec::validation {
 
 // [DC防护:通用] 统一承载无业务语义的整数和字节范围防护
-inline bool AssignError(std::string* error, std::string message) {
+inline bool AssignError(std::string* error, const std::string_view message) {
     if (error != nullptr) {
-        *error = std::move(message);
+        error->assign(message);
     }
     return false;
 }

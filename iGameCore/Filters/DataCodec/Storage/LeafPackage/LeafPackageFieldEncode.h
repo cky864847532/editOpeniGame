@@ -2,13 +2,13 @@
 #define DATACODEC_STORAGE_LEAFPACKAGE_LEAFPACKAGEFIELDENCODE_H
 
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
-#include "DataCodec/Storage/ByteIO/Window/WindowBudget.h"
 #include "DataCodec/Storage/ByteIO/Window/WindowedCopy.h"
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Codec/SubCodec/ZstdCodec.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/EncodePipelineParams.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -21,9 +21,8 @@
 namespace datacodec {
 
 struct LeafPackageFieldEncodeRuntime {
-    window::WindowBudget& windowBudget;
-    ScratchByteBufferPool& scratchBytePool;
-    std::size_t accessWindowBytes{kDefaultEncodeAccessWindowBytes};
+    DataCodecExecutionResources& run;
+    const HeavyPhaseLease& phase;
     std::function<void(std::uint64_t, std::uint64_t)> progressCallback;
 };
 
@@ -78,14 +77,18 @@ public:
     LeafPackageFieldProgressWriter(
         bytestore::IByteWriter& downstream,
         const std::uint64_t totalBytes,
-        std::function<void(std::uint64_t, std::uint64_t)> callback)
+        std::function<void(std::uint64_t, std::uint64_t)> callback,
+        std::stop_token stop)
         : m_downstream(downstream),
           m_totalBytes(totalBytes),
-          m_callback(std::move(callback)) {}
+          m_callback(std::move(callback)), m_stop(stop) {}
 
     bool Write(
         const std::span<const std::uint8_t> bytes,
         std::string* error = nullptr) override {
+        if (m_stop.stop_requested()) {
+            return validation::AssignError(error, "package field encoding was stopped");
+        }
         if (!m_downstream.Write(bytes, error)) {
             return false;
         }
@@ -113,6 +116,7 @@ private:
     std::uint64_t m_totalBytes{0u};
     std::uint64_t m_writtenBytes{0u};
     std::function<void(std::uint64_t, std::uint64_t)> m_callback;
+    std::stop_token m_stop;
 };
 
 inline bool ShouldCompressLeafPackageField(
@@ -135,8 +139,7 @@ inline bool ShouldCompressLeafPackageField(
     const auto probeBytes = static_cast<std::size_t>(std::min<std::uint64_t>(
         rawByteSize,
         static_cast<std::uint64_t>(kPackageFieldZstdProbeBytes)));
-    auto windowLease = runtime.windowBudget.Acquire(probeBytes);
-    auto probeBuffer = runtime.scratchBytePool.Acquire(probeBytes);
+    auto probeBuffer = runtime.run.Scratch().Acquire(probeBytes);
     if (!source.Read(0u, probeBuffer.Span(), error)) {
         return false;
     }
@@ -159,7 +162,7 @@ inline bool ShouldCompressLeafPackageField(
 
 } // namespace detail
 
-inline bool EncodeLeafPackageFieldToWriter(
+inline bool EncodeLeafPackageFieldTerminal(
     bytestore::IByteSource& source,
     const FieldType fieldType,
     const PackageFieldEncodingParams& params,
@@ -167,7 +170,11 @@ inline bool EncodeLeafPackageFieldToWriter(
     bytestore::IByteWriter& output,
     EncodedFieldCompressionType& compressionType,
     std::uint64_t& rawByteSize,
+    const std::size_t computeUnits,
     std::string* error = nullptr) {
+    if (runtime.run.Stopped()) {
+        return validation::AssignError(error, "package field encoding was stopped");
+    }
     rawByteSize = source.ByteSizeHint();
     if (bytestore::IsUnknownByteSize(rawByteSize)) {
         return validation::AssignError(error, "leaf package field source has unknown byte size");
@@ -198,20 +205,19 @@ inline bool EncodeLeafPackageFieldToWriter(
         detail::LeafPackageFieldProgressWriter progressWriter(
             output,
             rawByteSize,
-            runtime.progressCallback);
+            runtime.progressCallback,
+            runtime.run.StopToken());
         return window::CopyByteSourceByWindow(
             source,
             progressWriter,
-            runtime.windowBudget,
-            runtime.scratchBytePool,
-            runtime.accessWindowBytes,
+            runtime.run.Scratch(),
             error);
     }
 
     codec::ZstdStreamingEncoder encoder;
     if (!encoder.Initialize(
             params.zstdLevel,
-            params.workerCount,
+            computeUnits,
             rawByteSize,
             error)) {
         return false;
@@ -220,13 +226,12 @@ inline bool EncodeLeafPackageFieldToWriter(
     detail::LeafPackageFieldProgressWriter progressWriter(
         zstdWriter,
         rawByteSize,
-        runtime.progressCallback);
+        runtime.progressCallback,
+        runtime.run.StopToken());
     if (!window::CopyByteSourceByWindow(
             source,
             progressWriter,
-            runtime.windowBudget,
-            runtime.scratchBytePool,
-            runtime.accessWindowBytes,
+            runtime.run.Scratch(),
             error) ||
         !encoder.Finish(output, error)) {
         return false;
@@ -235,6 +240,34 @@ inline bool EncodeLeafPackageFieldToWriter(
         return validation::AssignError(error, "leaf package field raw byte size changed during Zstd encoding");
     }
     return true;
+}
+
+inline bool EncodeLeafPackageFieldToWriter(
+    bytestore::IByteSource& source,
+    const FieldType fieldType,
+    const PackageFieldEncodingParams& params,
+    const LeafPackageFieldEncodeRuntime& runtime,
+    bytestore::IByteWriter& output,
+    EncodedFieldCompressionType& compressionType,
+    std::uint64_t& rawByteSize,
+    std::string* error = nullptr) {
+    if (!runtime.phase) {
+        return validation::AssignError(error, "package field encoding requires an admitted output phase");
+    }
+    if (params.mode == PackageFieldEncodingMode::Raw) {
+        return EncodeLeafPackageFieldTerminal(source, fieldType, params, runtime, output,
+            compressionType, rawByteSize, 1u, error);
+    }
+    return RunTerminalWork(runtime.run, runtime.phase, [&](WorkerContext& worker) {
+        const bool ok = EncodeLeafPackageFieldTerminal(source, fieldType, params, runtime, output,
+            compressionType, rawByteSize, worker.ComputeUnits(), error);
+        if (!ok && !runtime.run.Stopped()) {
+            runtime.run.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                "package-field-encode", "EncodeLeafPackageFieldToWriter",
+                error != nullptr ? std::string_view(*error) : std::string_view("package field encoding failed")));
+        }
+        return ok;
+    }, TerminalWorkKind::ExclusivePackage);
 }
 
 } // namespace datacodec

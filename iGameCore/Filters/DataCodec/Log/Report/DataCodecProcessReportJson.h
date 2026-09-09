@@ -1,7 +1,7 @@
 #ifndef DATACODEC_LOG_REPORT_DATACODECPROCESSREPORTJSON_H
 #define DATACODEC_LOG_REPORT_DATACODECPROCESSREPORTJSON_H
 
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Log/Telemetry/TelemetrySession.h"
 
 #include <algorithm>
@@ -22,7 +22,7 @@ struct DataCodecProcessMemory {
     bool valid{false};
     std::uint64_t beforeWorkingSetBytes{0u};
     std::uint64_t afterWorkingSetBytes{0u};
-    std::uint64_t peakWorkingSetBytes{0u};
+    std::uint64_t sampledPeakWorkingSetBytes{0u};
 };
 
 struct DataCodecProcessDetail {
@@ -59,7 +59,7 @@ struct DataCodecReportConfigurationSection {
 };
 
 struct DataCodecReportConfiguration {
-    std::string preset;
+    std::string resourceMode;
     std::string runtimeProfile;
     std::vector<DataCodecReportConfigurationSection> sections;
 };
@@ -125,7 +125,7 @@ inline void AppendProcessMemorySpan(
         destination.beforeWorkingSetBytes = source.beforeWorkingSetBytes;
     }
     if (source.afterWorkingSetBytes > 0u) { destination.afterWorkingSetBytes = source.afterWorkingSetBytes; }
-    destination.peakWorkingSetBytes = std::max(destination.peakWorkingSetBytes, source.peakWorkingSetBytes);
+    destination.sampledPeakWorkingSetBytes = std::max(destination.sampledPeakWorkingSetBytes, source.sampledPeakWorkingSetBytes);
 }
 
 inline void MergeProcessMemoryPeak(
@@ -133,21 +133,21 @@ inline void MergeProcessMemoryPeak(
         const DataCodecProcessMemory& source) {
     if (!source.valid) { return; }
     destination.valid = true;
-    destination.peakWorkingSetBytes = std::max(
-        destination.peakWorkingSetBytes,
-        source.peakWorkingSetBytes);
+    destination.sampledPeakWorkingSetBytes = std::max(
+        destination.sampledPeakWorkingSetBytes,
+        source.sampledPeakWorkingSetBytes);
 }
 
 [[nodiscard]] inline DataCodecProcessMemory ProcessMemoryFromResource(const TelemetryResourceUsage& resource) {
     DataCodecProcessMemory memory;
     if (!resource.valid || (resource.workingSetBytes == 0u && resource.workingSetBeforeBytes == 0u &&
-                            resource.workingSetAfterBytes == 0u && resource.peakWorkingSetBytes == 0u)) {
+                            resource.workingSetAfterBytes == 0u && resource.sampledPeakWorkingSetBytes == 0u)) {
         return memory;
     }
     memory.valid = true;
     memory.beforeWorkingSetBytes = resource.workingSetBeforeBytes;
     memory.afterWorkingSetBytes = resource.workingSetAfterBytes;
-    memory.peakWorkingSetBytes = std::max(resource.peakWorkingSetBytes, resource.workingSetBytes);
+    memory.sampledPeakWorkingSetBytes = std::max(resource.sampledPeakWorkingSetBytes, resource.workingSetBytes);
     return memory;
 }
 
@@ -157,11 +157,11 @@ inline void MergeProcessMemoryPeak(
     if (!memory.valid) { return memory; }
     memory.beforeWorkingSetBytes = 0u;
     memory.afterWorkingSetBytes = 0u;
-    memory.peakWorkingSetBytes = std::max({
+    memory.sampledPeakWorkingSetBytes = std::max({
         resource.workingSetBytes,
         resource.workingSetBeforeBytes,
         resource.workingSetAfterBytes,
-        resource.peakWorkingSetBytes,
+        resource.sampledPeakWorkingSetBytes,
     });
     return memory;
 }
@@ -239,11 +239,6 @@ enum class ProcessStageGroup : std::uint8_t {
     return ProcessStageGroup::Count;
 }
 
-[[nodiscard]] inline bool ShouldExposeLogicalMetric(const std::string& name) noexcept {
-    return name.find("peak_") != std::string::npos || name.find("resident_limit_bytes") != std::string::npos ||
-           name == "adapter.native_resident_bytes";
-}
-
 [[nodiscard]] inline std::string SessionProcessName(const TelemetrySession& session) {
     if (session.objectName == "Package" || session.meshType == "Package") { return "Package"; }
     if (!session.leafPath.empty()) { return "Leaf: " + session.leafPath; }
@@ -297,9 +292,9 @@ inline void CompleteNodeMemoryFromChildren(DataCodecProcessNode& node) {
     if (node.memory.afterWorkingSetBytes == 0u) {
         node.memory.afterWorkingSetBytes = childrenMemory.afterWorkingSetBytes;
     }
-    node.memory.peakWorkingSetBytes = std::max(
-        node.memory.peakWorkingSetBytes,
-        childrenMemory.peakWorkingSetBytes);
+    node.memory.sampledPeakWorkingSetBytes = std::max(
+        node.memory.sampledPeakWorkingSetBytes,
+        childrenMemory.sampledPeakWorkingSetBytes);
 }
 
 } // namespace processreportdetail
@@ -336,6 +331,14 @@ BuildTelemetryProcessNodes(const std::vector<TelemetrySession>& sessions, const 
                 .outputBytes = session.outputBytes,
         };
         if (!active.insert(session.runId).second) { return node; }
+        const auto& retention = session.captureRetention;
+        node.details.emplace_back("capture.omittedSessions", retention.omittedSessions);
+        node.details.emplace_back("capture.omittedRecords", retention.omittedRecords);
+        node.details.emplace_back("capture.truncatedText", retention.truncatedText);
+        node.details.emplace_back("capture.exportFailures", retention.exportFailures);
+        node.details.emplace_back("capture.incomplete", retention.exportFailures != 0u || retention.omittedSessions != 0u ||
+            retention.omittedRecords != 0u || retention.truncatedText != 0u);
+        node.details.emplace_back("capture.counterScope", "sink-cumulative-snapshot");
 
         std::array<DataCodecProcessNode, static_cast<std::size_t>(processreportdetail::ProcessStageGroup::Count)>
                 groups;
@@ -348,6 +351,26 @@ BuildTelemetryProcessNodes(const std::vector<TelemetrySession>& sessions, const 
         }
 
         for (const auto& stage: session.stages) {
+            if (stage.resource.capacityCoverage != TelemetryCapacityCoverage::None) {
+                const auto& capacity = stage.resource;
+                const auto set = [&](const char* suffix, DataCodecProcessDetail::Value value) {
+                    processreportdetail::SetProcessDetail(node.details, stage.name + suffix, std::move(value));
+                };
+                const char* coverage = capacity.capacityCoverage == TelemetryCapacityCoverage::OwnedStorageArrays
+                    ? "owned-storage-arrays" : capacity.capacityCoverage == TelemetryCapacityCoverage::RetainedScratch
+                    ? "retained-scratch-only" : "sampled-buffer-only";
+                set(".coverage", std::string(coverage));
+                set(".scope_id", capacity.capacityScopeId);
+                set(".sample_ns", capacity.capacitySampleNanoseconds);
+                set(".aggregation", std::string("independent-snapshot-no-sum"));
+                if (capacity.trackedCapacityBytes) { set(".capacity_bytes", *capacity.trackedCapacityBytes); }
+                if (capacity.eventPeakCapacityBytes) {
+                    set(".event_peak_bytes", *capacity.eventPeakCapacityBytes);
+                    set(".peak_scope", std::string("root-lifetime"));
+                }
+                if (capacity.sampledPeakCapacityBytes) { set(".sampled_peak_bytes", *capacity.sampledPeakCapacityBytes); }
+                continue;
+            }
             if (stage.name == "memory.run") {
                 processreportdetail::AppendProcessMemorySpan(
                     node.memory,
@@ -370,11 +393,10 @@ BuildTelemetryProcessNodes(const std::vector<TelemetrySession>& sessions, const 
             processreportdetail::MergeProcessMemoryPeak(
                 groupNode.memory,
                 processreportdetail::ProcessPeakMemoryFromResource(stage.resource));
-            if (stage.resource.valid && stage.resource.logicalBytes > 0u &&
-                processreportdetail::ShouldExposeLogicalMetric(stage.name)) {
+            if (stage.resource.valid && stage.resource.logicalBytes > 0u) {
                 processreportdetail::SetProcessDetail(
                     groupNode.details,
-                    stage.name,
+                    stage.name + ".logical_bytes",
                     stage.resource.logicalBytes);
             }
         }
@@ -476,12 +498,12 @@ BuildDataCodecErrorReport(const TelemetryRunKind operation, std::string generate
     const DataCodecProcessReport& report);
 
 [[nodiscard]] DataCodecReportConfiguration MakeDataCodecEncodeReportConfiguration(
-    DataCodecEncodeTier preset,
+    const CodecResourceParams& resources,
     bool compressionEnhancementEnabled,
     const DataCodecEncodeConfigurationParams& configuration);
 
 [[nodiscard]] DataCodecReportConfiguration MakeDataCodecDecodeReportConfiguration(
-    std::optional<DataCodecDecodeTier> preset,
+    const CodecResourceParams& resources,
     const DataCodecDecodeConfigurationParams& configuration,
     bool loadAllAvailableAttributes);
 

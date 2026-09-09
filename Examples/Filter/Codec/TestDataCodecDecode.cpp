@@ -2,7 +2,6 @@
 #include <DataCodec/Filter/Adapter/iGameDecodeAdapter.h>
 #include <DataCodec/Filter/Adapter/iGameFileByteRangeIO.h>
 #include <DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h>
-#include <DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h>
 #include <iGameInteractor.h>
 #include <iGameRenderWindow.h>
 #include <iGameScene.h>
@@ -42,7 +41,6 @@ int main(const int argc, char** argv) {
 
     // 完整配置包含session缓存策略 package入口只提取实际消费的配置
     const auto configuration = ::datacodec::MakeDecodeConfigurationParams({
-        .tier = ::datacodec::DataCodecDecodeTier::Balanced,
         .validationProfile = ::datacodec::DataCodecDecodeValidationProfile::Required,
     });
 
@@ -53,7 +51,6 @@ int main(const int argc, char** argv) {
         .frameAssembly = &frameAssembly,
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = configuration.PackageConfiguration(),
-        .executionResources = iGame::MakeDataCodecExecutionResources(),
     });
     if (!result.success) {
         std::cerr << "DataCodec decode failed\n";

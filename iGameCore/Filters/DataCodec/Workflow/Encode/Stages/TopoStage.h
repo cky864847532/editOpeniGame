@@ -8,6 +8,7 @@
 #include "DataCodec/Runtime/Failure/EncodeFailureManagement.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyEncode.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 #include <chrono>
 #include <cstddef>
@@ -42,11 +43,13 @@ inline callback::ProgressCallback MakeTopologyProgressTimingCallback(
         const auto elapsedMs = callback::ElapsedMilliseconds(lastTick, now);
         const auto beginPercent = static_cast<int>(lastProgress * 100.0 + 0.5);
         const auto endPercent = static_cast<int>(normalized * 100.0 + 0.5);
+        context.runRecords.TryExport([&] {
         context.runRecords.RecordStageTiming(
             prefix + "." + std::to_string(endPercent),
             elapsedMs,
             TelemetryStageCategory::Topology,
             std::to_string(beginPercent) + "-" + std::to_string(endPercent) + "%");
+        });
         lastTick = now;
         lastProgress = normalized;
     };
@@ -72,10 +75,8 @@ inline void RunTopologyEncode(
             .cellOrderSource = workspace.CellOrderSource(),
         },
         .execution = topocodec::TopologyEncodeExecutionParams{
-            .resourceBudget = workspace.ResourceBudget(),
+            .resources = context.resources,
             .cellElementCount = workspace.StorageParams().spatialBlockParams.cellElementCount,
-            .parallelTaskRunner = context.parallelTaskRunner,
-            .workerCount = workspace.ResourceBudget().TopologyBlockLaneCount(),
         },
         .runtime = topocodec::TopologyEncodeRuntime{
             .byteStoreSession = workspace.ByteStoreSessionRef(),
@@ -85,16 +86,7 @@ inline void RunTopologyEncode(
         input.context.progressCallback =
             MakeTopologyProgressTimingCallback(context, "TopoStage.connectivity.progress");
     }
-    if (context.runRecords.Wants(RunRecordKind::ResourceUsage)) {
-        input.context.memoryCheckpoint =
-            [&context](const char* name, const std::uint64_t logicalBytes, std::string scope) {
-                context.runRecords.RecordResourceUsage(
-                    std::string(name),
-                    logicalBytes,
-                    TelemetryStageCategory::Topology,
-                    std::move(scope));
-            };
-    }
+    input.context.recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords);
 
     topocodec::TopologyEncodeResult result;
     std::string error;
@@ -142,8 +134,8 @@ inline void RunPolyhedronTopologyEncode(
             .pointInverseOrderSource = workspace.PointInverseOrderSource(),
             .cellOrderSource = workspace.CellOrderSource(),
         },
-        .schedule = polyhedron::PolyhedronTopologySchedule{
-            .resourceBudget = workspace.ResourceBudget(),
+        .execution = polyhedron::PolyhedronTopologyExecution{
+            .resources = context.resources,
         },
         .cache = polyhedron::PolyhedronTopologyCache{
             .byteStoreSession = workspace.ByteStoreSessionRef(),
@@ -160,16 +152,7 @@ inline void RunPolyhedronTopologyEncode(
         input.context.progressCallback =
             MakeTopologyProgressTimingCallback(context, "TopoStage.polyhedron.progress");
     }
-    if (context.runRecords.Wants(RunRecordKind::ResourceUsage)) {
-        input.context.memoryCheckpoint =
-            [&context](const char* name, const std::uint64_t logicalBytes, std::string scope) {
-                context.runRecords.RecordResourceUsage(
-                    std::string(name),
-                    logicalBytes,
-                    TelemetryStageCategory::Topology,
-                    std::move(scope));
-            };
-    }
+    input.context.recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords);
 
     polyhedron::PolyhedronTopologyEncodeResult result;
     std::string error;

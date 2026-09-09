@@ -2,12 +2,14 @@
 #define DATACODEC_API_ADAPTER_IDECODEADAPTER_H
 
 #include "DataCodec/Common/Views/TopologyViews.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
 #include "DataCodec/API/Adapter/ICellTypeMapping.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 namespace datacodec {
 
@@ -119,10 +121,6 @@ struct IDecodeAdapter : public ICellTypeMapping {
         const void* data,
         std::size_t byteSize,
         std::string* error = nullptr) = 0;
-    // BeginAttribute 全部完成后，不同属性的 range 是否允许并发写入
-    [[nodiscard]] virtual bool SupportsConcurrentAttributeRangeWrites() const noexcept {
-        return false;
-    }
     // 是否允许 DataCodec 直接把解码缓存放入 Adapter 的原生属性存储
     [[nodiscard]] virtual bool SupportsAttributeDecodeStore() const noexcept {
         return false;
@@ -140,6 +138,8 @@ struct IDecodeAdapter : public ICellTypeMapping {
     }
     // 结束属性写入并挂接到目标对象
     virtual bool EndAttribute(std::size_t attrIndex, std::string* error = nullptr) = 0;
+    // 仅返回显式接入数组的确定容量取样，未知宿主存储不纳入
+    [[nodiscard]] virtual std::span<const BufferCapacitySample> CapacitySamples() const noexcept { return {}; }
     // 当前后端已经常驻原生对象的逻辑字节估计
     virtual std::uint64_t NativeResidentBytesHint() const { return 0u; }
     // 解码失败时由 Failure 模块调用，保证在失败路径恰好调用一次

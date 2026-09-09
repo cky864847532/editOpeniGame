@@ -39,20 +39,19 @@ struct GeometryEncodeData {
     EncodeGeometryReferenceFrame& keyFrameReference;
     TemporalFieldRole temporalRole{TemporalFieldRole::SingleFrame};
     std::uint32_t keyFrameIndex{0u};
-    std::uint32_t spatialBlockElementCount{262144u};
+    std::uint32_t spatialBlockElementCount{numericarray::kSpatialBlockElementCount};
 };
 
 struct GeometryEncodeCache {
     CacheResources& cacheResources;
     bytestore::ByteStoreSession& byteStoreSession;
     DecodedGeometryReferenceCache* currentReferenceCache{nullptr};
-    bool useMemoryTransferCache{false};
-    bool useMemoryStaging{false};
 };
 
 struct GeometryEncodeRuntime {
     GeometryEncodeData data;
     GeometryEncodeCache cache;
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 struct GeometryReferenceDecision {
@@ -172,9 +171,13 @@ inline bool WriteCurrentGeometryReferenceCache(
     if (store == nullptr) {
         return true;
     }
-    if (!store->BeginGeometry(meta, error)) {
-        return false;
-    }
+    auto& root = runtime.cache.cacheResources.Run();
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase || !store->BeginGeometry(meta, runtime.cache.byteStoreSession, error)) { return false; }
+    struct Guard {
+        DecodedGeometryReferenceCache& store;
+        ~Guard() { if (!store.IsComplete()) { store.Reset(); } }
+    } guard{*store};
     numericarray::NumericArrayReader reader;
     if (!numericarray::BuildNumericArrayReader(source, reader, error)) {
         return false;
@@ -197,7 +200,7 @@ inline bool WriteCurrentGeometryReferenceCache(
     if (tupleBytes == 0u) {
         return store->EndGeometry(error);
     }
-    const auto resolvedWindowBytes = std::max<std::size_t>(runtime.cache.cacheResources.accessWindowBytes, tupleBytes);
+    const auto resolvedWindowBytes = std::max<std::size_t>(kIoWindowBytes, tupleBytes);
     const auto elementsPerWindow = std::max<std::size_t>(1u, resolvedWindowBytes / tupleBytes);
     std::size_t elementOffset = 0u;
     while (elementOffset < localElementCount) {
@@ -211,12 +214,10 @@ inline bool WriteCurrentGeometryReferenceCache(
                 error)) {
             return false;
         }
-        auto windowLease = runtime.cache.cacheResources.windowBudget.Acquire(currentWindowBytes);
-        (void)windowLease;
         ScratchByteBuffer rangeBytes;
-        if (!reader.ReadElements(elementOffset, elementCount, runtime.cache.cacheResources.scratchBytePool, rangeBytes, error)) {
-            return false;
-        }
+        if (!RunTerminalWork(root, *phase, [&](WorkerContext& worker) {
+                return reader.ReadElements(elementOffset, elementCount, worker.Scratch(), rangeBytes, error);
+            })) { return false; }
         if (!store->WriteRange(elementOffset, elementCount, rangeBytes.Bytes().data(), rangeBytes.Bytes().size(), error)) {
             return false;
         }
@@ -272,18 +273,6 @@ inline bool BuildGeometryTransferCache(
     bool encodeOrdinary = !referenceDecision.hasReference;
     if (referenceDecision.hasReference) {
         const auto& defaultCompressor = regionControl.defaultPrecision.compressor;
-        const auto createStagingStore =
-            numericarrayreference::NumericArrayReferenceStagingStoreFactory{
-                [&runtime](
-                    const std::string& label,
-                    std::uint64_t,
-                    std::string* storeError) {
-                    return bytestore::CreateByteStore(
-                        runtime.cache.byteStoreSession,
-                        label,
-                        runtime.cache.useMemoryStaging,
-                        storeError);
-                }};
         std::string referenceError;
         if (!numericarrayreference::BuildNumericArrayReferenceTransferCache(
                 geometryMeta,
@@ -293,19 +282,13 @@ inline bool BuildGeometryTransferCache(
                 referenceDecision.codecId,
                 numericarrayreference::NumericArrayReferenceTransferControl{
                     .predictor = dependency.temporalField.predictor,
-                    .selectionMode = dependency.temporalField.selectionMode,
-                    .spatialBlockElementCount = runtime.data.spatialBlockElementCount,
-                    .createStagingStore = createStagingStore,
-                    .useMemoryStaging = runtime.cache.useMemoryStaging,
-                    .useMemoryTransferCache = runtime.cache.useMemoryTransferCache},
-                runtime.cache.cacheResources.scratchBytePool,
-                runtime.cache.cacheResources.windowBudget,
-                runtime.cache.cacheResources.accessWindowBytes,
+                    .selectionMode = dependency.temporalField.selectionMode},
+                runtime.cache.cacheResources.Run(),
                 payload,
                 runtime.cache.byteStoreSession,
                 &geometryMeta.blockLayouts,
                 &referenceError,
-                "geometry_reference")) {
+                "geometry_reference", runtime.recordCapacitySamples)) {
             if (dependency.temporalField.selectionMode == ReferenceSelectionMode::Forced) {
                 return validation::AssignError(
                     error,
@@ -330,7 +313,7 @@ inline bool BuildGeometryTransferCache(
     if (encodeOrdinary) {
         encodeimpl::NumericArrayTransferCacheResult numericArrayResult;
         encodeimpl::NumericArrayTransferCacheRuntime transferRuntime;
-        transferRuntime.useMemoryTransferCache = runtime.cache.useMemoryTransferCache;
+        transferRuntime.recordCapacitySamples = runtime.recordCapacitySamples;
         numericarray::NumericArrayBlockParams blockParams;
         if (!numericarray::MakeNumericArrayBlockParamsFromMeta(geometryMeta, blockParams, error)) {
             return false;
@@ -341,13 +324,11 @@ inline bool BuildGeometryTransferCache(
         if (!encodeimpl::BuildNumericArrayTransferCache(
                 blockParams,
                 reader,
-                runtime.cache.cacheResources.scratchBytePool,
+                runtime.cache.cacheResources.Run(),
                 numericArrayResult,
                 runtime.cache.byteStoreSession,
                 error,
                 "geometry",
-                runtime.cache.cacheResources.accessWindowBytes,
-                runtime.data.spatialBlockElementCount,
                 &transferRuntime)) {
             return false;
         }

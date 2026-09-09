@@ -2,7 +2,6 @@
 #include <DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h>
 #include <DataCodec/Filter/Adapter/iGameEncodeAdapter.h>
 #include <DataCodec/Filter/Adapter/iGameFileByteRangeIO.h>
-#include <DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h>
 #include <iGameFileIO.h>
 
 #include <filesystem>
@@ -73,7 +72,6 @@ int main(const int argc, char** argv) {
 
     // Options经过工厂展开为codec、pipeline、execution和来源参数组
     auto configuration = ::datacodec::MakeEncodeConfigurationParams({
-        .tier = ::datacodec::DataCodecEncodeTier::Balanced,
         .enableCompressionEnhancement = false,
     });
 
@@ -84,7 +82,6 @@ int main(const int argc, char** argv) {
         .output = ::datacodec::EncodeOutput::ByteRange(output, packageKind),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = std::move(configuration),
-        .executionResources = iGame::MakeDataCodecExecutionResources(),
     });
     if (!result.success || !result.hasEncodedOutput) {
         std::cerr << "DataCodec encode failed\n";

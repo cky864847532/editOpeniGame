@@ -1,6 +1,5 @@
 #include "iGameDataCodecIOSettings.h"
 
-#include <DataCodec/Runtime/Cache/DecodeCacheRuntime.h>
 
 #include <mutex>
 
@@ -14,15 +13,18 @@ std::mutex& DefaultDecodeOptionsMutex() {
 }
 
 ::datacodec::DataCodecDecodeOptions& DefaultDecodeOptions() {
-    static ::datacodec::DataCodecDecodeOptions options{
-        .tier = ::datacodec::DataCodecDecodeTier::Fast,
-    };
+    static ::datacodec::DataCodecDecodeOptions options;
     return options;
 }
 
 bool& DefaultLoadAllAvailableAttributes() {
     static bool loadAllAvailableAttributes = true;
     return loadAllAvailableAttributes;
+}
+
+::datacodec::CodecResourceParams& DefaultDecodeResources() {
+    static ::datacodec::CodecResourceParams resources;
+    return resources;
 }
 
 } // namespace
@@ -33,22 +35,23 @@ bool& DefaultLoadAllAvailableAttributes() {
 }
 
 void DataCodecIOSettings::SetDefaultDecodeOptions(const ::datacodec::DataCodecDecodeOptions& options) {
-    const auto definition = ::datacodec::MakeDecodeConfigurationParams(options);
-    {
-        std::scoped_lock lock(DefaultDecodeOptionsMutex());
-        DefaultDecodeOptions() = options;
-    }
-    const auto runtime = ::datacodec::DefaultDecodeCacheRuntime();
-    runtime->DefaultFrameCache()->Configure(
-        definition.decodedFrameCachePolicy.residentFrameLimit,
-        definition.decodedFrameCachePolicy.residentLimitBytes);
-    runtime->SetDefaultDecodedFrameCacheEnabled(
-        definition.decodedFrameCachePolicy.enabled);
+    std::scoped_lock lock(DefaultDecodeOptionsMutex());
+    DefaultDecodeOptions() = options;
 }
 
 bool DataCodecIOSettings::GetDefaultLoadAllAvailableAttributes() {
     std::scoped_lock lock(DefaultDecodeOptionsMutex());
     return DefaultLoadAllAvailableAttributes();
+}
+
+::datacodec::CodecResourceParams DataCodecIOSettings::GetDefaultDecodeResources() {
+    std::scoped_lock lock(DefaultDecodeOptionsMutex());
+    return DefaultDecodeResources();
+}
+
+void DataCodecIOSettings::SetDefaultDecodeResources(const ::datacodec::CodecResourceParams& resources) {
+    std::scoped_lock lock(DefaultDecodeOptionsMutex());
+    DefaultDecodeResources() = resources;
 }
 
 void DataCodecIOSettings::SetDefaultLoadAllAvailableAttributes(

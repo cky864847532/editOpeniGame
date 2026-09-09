@@ -10,11 +10,13 @@
 #include "DataCodec/Codec/Reference/NumericArrayReferenceBytes.h"
 #include "DataCodec/Codec/Reference/ReferenceCodec.h"
 #include "DataCodec/Common/DataCodecError.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -34,15 +36,12 @@ struct GeometryDecodeCache {
     bytestore::ByteStoreSession& byteStoreSession;
     DecodedGeometryCache& geometry;
     DecodedGeometryReferenceCache* referenceCache{nullptr};
-    DecodeStorageMode geometryCacheStorageMode{DecodeStorageMode::Managed};
-    std::uint64_t geometryMemoryCacheLimitBytes{0u};
-    DecodeStorageMode geometryReferenceCacheStorageMode{DecodeStorageMode::Managed};
-    std::uint64_t geometryMemoryReferenceLimitBytes{0u};
 };
 
 struct GeometryDecodeRuntime {
     GeometryDecodeData data;
     GeometryDecodeCache cache;
+    callback::CapacityCallback recordCapacitySamples;
 };
 
 namespace detail {
@@ -58,217 +57,38 @@ inline GeometryDecodeResult MakeGeometryDecodeFailure(
 }
 
 template<typename TValue>
-inline bool WriteConvertedPointRange(
-    const CacheResources& cacheResources,
-    DecodedGeometryCache& geometry,
-    const NumericArrayBlockHeader& header,
-    const std::span<const std::uint8_t> decodedBytes,
-    const std::size_t dimension,
-    const std::uint64_t byteOffset,
-    std::uint64_t& scratchPeakBytes,
-    std::string* error = nullptr) {
-    const auto* source = reinterpret_cast<const TValue*>(decodedBytes.data());
-    const auto decodedValueCount = decodedBytes.size() / sizeof(TValue);
-    std::size_t convertedByteCount = 0u;
-    if (!validation::CheckedMulSizeT(
-            decodedValueCount,
-            sizeof(float),
-            convertedByteCount,
-            "converted geometry scratch bytes",
-            error)) {
-        return false;
+inline bool ConvertGeometryPointValues(
+    const std::span<const std::uint8_t> raw, ScratchByteBufferPool& scratch,
+    ScratchByteBuffer& converted, std::string* error) {
+    if (raw.size() % sizeof(TValue) != 0u) {
+        return validation::AssignError(error, "geometry source has an incomplete numeric value");
     }
-    auto converted = cacheResources.scratchBytePool.Acquire(convertedByteCount);
-    auto* output = reinterpret_cast<float*>(converted.Bytes().data());
-    for (std::size_t index = 0; index < decodedValueCount; ++index) {
-        output[index] = static_cast<float>(source[index]);
-    }
-    scratchPeakBytes = std::max<std::uint64_t>(
-        scratchPeakBytes,
-        validation::SaturatingAddU64(
-            static_cast<std::uint64_t>(decodedBytes.size()),
-            static_cast<std::uint64_t>(converted.Bytes().capacity())));
-    std::size_t localElementCount = 0u;
-    std::size_t expectedValues = 0u;
-    if (!validation::CheckedCastSizeT(header.elementCount, localElementCount, "geometry block element count", error) ||
-        !validation::CheckedMulSizeT(
-            localElementCount,
-            dimension,
-            expectedValues,
-            "converted geometry block value count",
-            error)) {
-        return false;
-    }
-    if (decodedValueCount != expectedValues) {
-        return validation::AssignError(error, "converted geometry block value count does not match range");
-    }
-    return geometry.bytes != nullptr &&
-        geometry.bytes->WriteBytesAt(byteOffset, converted.Span(), error);
+    const auto count = raw.size() / sizeof(TValue);
+    std::size_t bytes = 0u;
+    if (!validation::CheckedMulSizeT(count, sizeof(float), bytes, "converted geometry values", error)) { return false; }
+    converted = scratch.Acquire(bytes);
+    const auto* source = reinterpret_cast<const TValue*>(raw.data());
+    auto* target = reinterpret_cast<float*>(converted.Bytes().data());
+    for (std::size_t i = 0u; i < count; ++i) { target[i] = static_cast<float>(source[i]); }
+    return true;
 }
 
-inline bool WriteRawGeometryReferenceBlock(
-    DecodedGeometryReferenceCache* referenceCache,
-    const GeometryStorageParams& meta,
-    const NumericArrayBlockHeader& header,
-    const std::span<const std::uint8_t> decodedBytes,
-    std::string* error = nullptr) {
-    if (referenceCache == nullptr) {
-        return true;
+inline bool ConvertGeometryPointBlock(
+    const DataType type, const std::span<const std::uint8_t> raw,
+    ScratchByteBufferPool& scratch, ScratchByteBuffer& converted, std::string* error) {
+    switch (type) {
+        case DataType::Float32: return true;
+        case DataType::Float64: return ConvertGeometryPointValues<double>(raw, scratch, converted, error);
+        case DataType::Int8: return ConvertGeometryPointValues<std::int8_t>(raw, scratch, converted, error);
+        case DataType::UInt8: return ConvertGeometryPointValues<std::uint8_t>(raw, scratch, converted, error);
+        case DataType::Int16: return ConvertGeometryPointValues<std::int16_t>(raw, scratch, converted, error);
+        case DataType::UInt16: return ConvertGeometryPointValues<std::uint16_t>(raw, scratch, converted, error);
+        case DataType::Int32: return ConvertGeometryPointValues<std::int32_t>(raw, scratch, converted, error);
+        case DataType::UInt32: return ConvertGeometryPointValues<std::uint32_t>(raw, scratch, converted, error);
+        case DataType::Int64: return ConvertGeometryPointValues<std::int64_t>(raw, scratch, converted, error);
+        case DataType::UInt64: return ConvertGeometryPointValues<std::uint64_t>(raw, scratch, converted, error);
+        default: return validation::AssignError(error, "geometry value type is unsupported");
     }
-    std::size_t localValueSize = 0u;
-    if (!TryParamSizeToSizeT(NumericArrayValueSize(meta), localValueSize)) {
-        return validation::AssignError(error, "geometry metadata exceeds this platform size limit");
-    }
-    std::size_t tupleBytes = 0u;
-    std::size_t expectedBytes = 0u;
-    if (!validation::CheckedMulSizeT(
-            static_cast<std::size_t>(std::max(meta.dimension, 0)),
-            localValueSize,
-            tupleBytes,
-            "decoded geometry reference tuple bytes",
-            error) ||
-        !validation::CheckedMulSizeT(
-            static_cast<std::size_t>(header.elementCount),
-            tupleBytes,
-            expectedBytes,
-            "decoded geometry reference block bytes",
-            error)) {
-        return false;
-    }
-    if (decodedBytes.size() != expectedBytes) {
-        return validation::AssignError(error, "decoded geometry reference block size does not match range");
-    }
-    return referenceCache->WriteRange(
-        header.elementOffset,
-        header.elementCount,
-        decodedBytes.data(),
-        decodedBytes.size(),
-        error);
-}
-
-inline bool WriteConvertedGeometryBlock(
-    const CacheResources& cacheResources,
-    DecodedGeometryCache& geometry,
-    DecodedGeometryReferenceCache* referenceCache,
-    const GeometryStorageParams& meta,
-    const NumericArrayBlockHeader& header,
-    const std::span<const std::uint8_t> decodedBytes,
-    const std::size_t dimension,
-    const std::size_t expectedSourceBytes,
-    const std::size_t outputTupleBytes,
-    std::size_t& writtenBytes,
-    std::uint64_t& scratchPeakBytes,
-    std::string* error = nullptr) {
-    std::size_t localValueSize = 0u;
-    if (!TryParamSizeToSizeT(NumericArrayValueSize(meta), localValueSize)) {
-        return validation::AssignError(error, "geometry metadata exceeds this platform size limit");
-    }
-    std::size_t sourceTupleBytes = 0u;
-    std::size_t localElementOffset = 0u;
-    std::size_t localElementCount = 0u;
-    std::size_t sourceByteOffset = 0u;
-    if (!validation::CheckedMulSizeT(
-            dimension,
-            localValueSize,
-            sourceTupleBytes,
-            "decoded geometry source tuple bytes",
-            error) ||
-        !validation::CheckedCastSizeT(header.elementOffset, localElementOffset, "geometry block element offset", error) ||
-        !validation::CheckedCastSizeT(header.elementCount, localElementCount, "geometry block element count", error) ||
-        !validation::CheckedMulSizeT(
-            localElementOffset,
-            sourceTupleBytes,
-            sourceByteOffset,
-            "decoded geometry source byte offset",
-            error)) {
-        return false;
-    }
-    if (sourceByteOffset > expectedSourceBytes || decodedBytes.size() > expectedSourceBytes - sourceByteOffset) {
-        return validation::AssignError(error, "geometry block is outside output range");
-    }
-    if (!WriteRawGeometryReferenceBlock(referenceCache, meta, header, decodedBytes, error)) {
-        return false;
-    }
-
-    std::uint64_t outputByteOffset = 0u;
-    std::size_t expectedOutputBytes = 0u;
-    if (!validation::CheckedMulU64(
-            header.elementOffset,
-            static_cast<std::uint64_t>(outputTupleBytes),
-            outputByteOffset,
-            "decoded geometry output byte offset",
-            error) ||
-        !validation::CheckedMulSizeT(
-            localElementCount,
-            outputTupleBytes,
-            expectedOutputBytes,
-            "decoded geometry output block bytes",
-            error)) {
-        return false;
-    }
-    switch (meta.dataType) {
-        case DataType::Float32:
-            scratchPeakBytes = std::max<std::uint64_t>(
-                scratchPeakBytes,
-                static_cast<std::uint64_t>(decodedBytes.size()));
-            if (decodedBytes.size() != expectedOutputBytes ||
-                geometry.bytes == nullptr ||
-                !geometry.bytes->WriteBytesAt(outputByteOffset, decodedBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::Float64:
-            if (!WriteConvertedPointRange<double>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::Int8:
-            if (!WriteConvertedPointRange<std::int8_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::UInt8:
-            if (!WriteConvertedPointRange<std::uint8_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::Int16:
-            if (!WriteConvertedPointRange<std::int16_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::UInt16:
-            if (!WriteConvertedPointRange<std::uint16_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::Int32:
-            if (!WriteConvertedPointRange<std::int32_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::UInt32:
-            if (!WriteConvertedPointRange<std::uint32_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::Int64:
-            if (!WriteConvertedPointRange<std::int64_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-        case DataType::UInt64:
-            if (!WriteConvertedPointRange<std::uint64_t>(cacheResources, geometry, header, decodedBytes, dimension, outputByteOffset, scratchPeakBytes, error)) {
-                return false;
-            }
-            break;
-    }
-    return validation::CheckedAddSizeT(
-        writtenBytes,
-        expectedOutputBytes,
-        writtenBytes,
-        "decoded geometry written bytes",
-        error);
 }
 
 inline bool ResolveGeometryReferenceBytesForBlock(
@@ -338,337 +158,194 @@ inline bool ResolveGeometryReferenceBytesForBlock(
         error);
 }
 
-inline GeometryDecodeResult PrepareGeometryCache(
-    bytestore::ByteStoreSession& byteStoreSession,
-    const GeometryStorageParams& meta,
-    DecodedGeometryCache& geometry,
-    DecodedGeometryReferenceCache* referenceCache,
-    const DecodeStorageMode geometryCacheStorageMode,
-    const std::uint64_t geometryMemoryCacheLimitBytes,
-    const DecodeStorageMode geometryReferenceCacheStorageMode,
-    const std::uint64_t geometryMemoryReferenceLimitBytes,
-    const std::size_t count,
-    const std::size_t dimension) {
-    std::string error;
-    if (!geometry.Initialize(
-            count,
-            dimension,
-            byteStoreSession,
-            geometryCacheStorageMode,
-            geometryMemoryCacheLimitBytes,
-            &error)) {
-        return MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "failed to allocate geometry cache: " + error);
+struct GeometryDecodedBlock {
+    NumericArrayBlockHeader header;
+    ScratchByteBuffer raw;
+    ScratchByteBuffer converted;
+    std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
+};
+
+inline bool ComputeGeometryDecodedBlock(
+    const GeometryDecodeRuntime& runtime, const numericarray::NumericArrayBlockParams& sourceParams,
+    const numericarray::NumericArrayBlockPayload& input, GeometryDecodedBlock& output,
+    WorkerContext& worker, std::string* error) {
+    auto params = sourceParams;
+    params.capacitySamples = output.capacitySamples ? &*output.capacitySamples : nullptr;
+    if (params.capacitySamples != nullptr) {
+        params.capacitySamples->Observe(numericarray::NumericBufferSample::EncodedInput, input.bytes.Bytes());
     }
-    if (referenceCache != nullptr &&
-        !referenceCache->IsInitialized() &&
-        !referenceCache->Initialize(
-            meta,
-            byteStoreSession,
-            geometryReferenceCacheStorageMode,
-            geometryMemoryReferenceLimitBytes,
-            &error)) {
-        return MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "failed to prepare current geometry reference cache: " + error);
+    output.header = input.header;
+    output.raw = worker.Scratch().Acquire(0u);
+    auto& decoded = output.raw.Bytes();
+    if (input.header.codecId == NumericArrayReferenceCodecId::NonReference) {
+        if (input.header.referenceKind != NumericArrayReferenceKind::None ||
+            !numericarray::ResolveDecodedNumericArrayBlockBytes(
+                params, input, decoded, error, &worker.NumericCompressor())) { return false; }
+    } else {
+        if (runtime.data.meta.codecType != EncodedFieldCodecType::Delta) {
+            return validation::AssignError(error, "ordinary geometry field contains a reference block");
+        }
+        const auto block = numericarray::MakeParsedBlockView(input);
+        ScratchByteBuffer reference;
+        if (!ResolveGeometryReferenceBytesForBlock(runtime.data.meta, runtime.data.keyFrameReference,
+                block, worker.Scratch(), reference, error)) { return false; }
+        if (params.capacitySamples != nullptr) {
+            params.capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, reference.Bytes());
+        }
+        const auto* codec = ResolveNumericArrayReferenceCodec(input.header.codecId);
+        if (codec == nullptr) { return validation::AssignError(error, "unsupported geometry reference codec"); }
+        if (!codec->DecodeBlock(NumericArrayReferenceCodecDecodeInput{
+                .meta = runtime.data.meta, .block = block, .referenceBytes = reference.Span(),
+                .referenceElementOffset = 0u,
+                .compressorState = &worker.NumericCompressor(),
+                .capacitySamples = params.capacitySamples}, decoded, error)) { return false; }
     }
-    if (referenceCache != nullptr &&
-        !referenceCache->BeginGeometry(meta, &error)) {
-        return MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "failed to prepare current geometry reference cache: " + error);
+    std::size_t expected = 0u;
+    if (!numericarray::ResolveNumericArrayBlockRawByteCount(params, input.header.elementCount, expected, error) ||
+        decoded.size() != expected) {
+        return validation::AssignError(error, "geometry decoded block does not match its logical shape");
     }
-    return MakeGeometryDecodeSuccess();
+    if (!ConvertGeometryPointBlock(params.dataType, output.raw.Span(), worker.Scratch(), output.converted, error)) {
+        return false;
+    }
+    if (params.capacitySamples != nullptr) {
+        params.capacitySamples->Observe(numericarray::NumericBufferSample::Output, output.raw.Bytes());
+        if (params.dataType != DataType::Float32) {
+            params.capacitySamples->Observe(numericarray::NumericBufferSample::Converted, output.converted.Bytes());
+        }
+    }
+    if (params.dataType != DataType::Float32 && runtime.cache.referenceCache == nullptr) { output.raw.Release(); }
+    return true;
 }
 
-inline GeometryDecodeResult FinishGeometryCache(
-    DecodedGeometryCache& geometry,
-    DecodedGeometryReferenceCache* referenceCache,
-    const std::size_t writtenBytes,
-    const std::size_t expectedOutputBytes,
-    std::string incompleteMessage) {
-    std::string error;
-    if (referenceCache != nullptr &&
-        !referenceCache->EndGeometry(&error)) {
-        return MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "failed to finish current geometry reference cache: " + error);
-    }
-    geometry.complete = true;
-    if (writtenBytes != expectedOutputBytes) {
-        return MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            std::move(incompleteMessage));
-    }
-    return MakeGeometryDecodeSuccess();
-}
-
-} // namespace detail
+} // 几何解码内部实现
 
 template<typename TStream>
-inline GeometryDecodeResult DecodeNumericArrayGeometryField(
-    GeometryDecodeRuntime& decodeRuntime,
-    TStream& stream) {
-    const auto& meta = decodeRuntime.data.meta;
-    const auto payloadBytes = decodeRuntime.data.payloadBytes;
-    const auto& cacheResources = decodeRuntime.cache.cacheResources;
-    auto& byteStoreSession = decodeRuntime.cache.byteStoreSession;
-    auto& geometry = decodeRuntime.cache.geometry;
-    auto* referenceCache = decodeRuntime.cache.referenceCache;
-    std::size_t count = 0u;
-    std::size_t localValueSize = 0u;
-    if (!TryParamSizeToSizeT(meta.elementCount, count) ||
-        !TryParamSizeToSizeT(NumericArrayValueSize(meta), localValueSize)) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::UnsupportedPlatform,
-            "geometry metadata exceeds this platform size limit");
-    }
-    const auto dimension = static_cast<std::size_t>(std::max(0, meta.dimension));
-    const auto sourceTupleBytes = dimension * localValueSize;
-    const auto outputTupleBytes = dimension * sizeof(float);
-    const auto expectedSourceBytes = count * sourceTupleBytes;
-    const auto expectedOutputBytes = count * outputTupleBytes;
-    std::size_t writtenBytes = 0u;
-    std::uint64_t scratchPeakBytes = 0u;
-    const auto begin = stream.Position();
-    if (!validation::CanAddU64(begin, payloadBytes)) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::InvalidInput,
-            "geometry payload range exceeds stream address space");
-    }
-    const auto end = begin + payloadBytes;
-
-    if (auto prepared = detail::PrepareGeometryCache(
-            byteStoreSession,
-            meta,
-            geometry,
-            referenceCache,
-            decodeRuntime.cache.geometryCacheStorageMode,
-            decodeRuntime.cache.geometryMemoryCacheLimitBytes,
-            decodeRuntime.cache.geometryReferenceCacheStorageMode,
-            decodeRuntime.cache.geometryMemoryReferenceLimitBytes,
-            count,
-            dimension); !prepared) {
-        return prepared;
-    }
-
-    const auto writeDecodedBlock = [&](const NumericArrayBlockHeader& header,
-                                       const std::span<const std::uint8_t> decodedBytes,
-                                       std::string* blockError) -> bool {
-        return detail::WriteConvertedGeometryBlock(
-            cacheResources,
-            geometry,
-            referenceCache,
-            meta,
-            header,
-            decodedBytes,
-            dimension,
-            expectedSourceBytes,
-            outputTupleBytes,
-            writtenBytes,
-            scratchPeakBytes,
-            blockError);
-    };
-
+inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime, TStream& stream) {
+    const auto& meta = runtime.data.meta;
+    auto& root = runtime.cache.cacheResources.Run();
+    auto& geometry = runtime.cache.geometry;
+    auto* referenceCache = runtime.cache.referenceCache;
+    numericarray::NumericArrayBlockParams params;
     std::string error;
-    auto blockParams = numericarray::MakeNumericArrayBlockParams(
-        numericarray::MakeNumericArrayLayout(meta.dataType, localValueSize, count, dimension));
-    if (!numericarray::DecodeNumericArrayBlocks(
-            stream,
-            blockParams,
-            meta.blockLayouts,
-            cacheResources,
-            writeDecodedBlock,
-            &error)) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "failed to decode numeric-array geometry blocks: " + error);
+    if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, &error) ||
+        !numericarray::ValidateNumericArrayBlockParams(params, &error)) {
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, std::move(error));
     }
-    if (stream.Position() != end) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "geometry decode consumed an unexpected payload size");
+    if (meta.codecType != EncodedFieldCodecType::NumericArrayBlocks && meta.codecType != EncodedFieldCodecType::Delta) {
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, "unsupported geometry field codec");
     }
-
-    return detail::FinishGeometryCache(
-        geometry,
-        referenceCache,
-        writtenBytes,
-        expectedOutputBytes,
-        "geometry blocks did not cover the full output range");
-}
-
-template<typename TStream>
-inline GeometryDecodeResult DecodeReferenceGeometryField(
-    GeometryDecodeRuntime& decodeRuntime,
-    TStream& stream) {
-    const auto& meta = decodeRuntime.data.meta;
-    const auto* keyFrameReference = decodeRuntime.data.keyFrameReference;
-    const auto payloadBytes = decodeRuntime.data.payloadBytes;
-    const auto& cacheResources = decodeRuntime.cache.cacheResources;
-    auto& byteStoreSession = decodeRuntime.cache.byteStoreSession;
-    auto& geometry = decodeRuntime.cache.geometry;
-    auto* referenceCache = decodeRuntime.cache.referenceCache;
-    std::size_t count = 0u;
-    std::size_t localValueSize = 0u;
-    if (!TryParamSizeToSizeT(meta.elementCount, count) ||
-        !TryParamSizeToSizeT(NumericArrayValueSize(meta), localValueSize)) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::UnsupportedPlatform,
-            "geometry metadata exceeds this platform size limit");
-    }
-    const auto dimension = static_cast<std::size_t>(std::max(0, meta.dimension));
-    const auto sourceTupleBytes = dimension * localValueSize;
-    const auto outputTupleBytes = dimension * sizeof(float);
-    const auto expectedSourceBytes = count * sourceTupleBytes;
-    const auto expectedOutputBytes = count * outputTupleBytes;
-    std::size_t writtenBytes = 0u;
-    std::uint64_t scratchPeakBytes = 0u;
     const auto begin = stream.Position();
-    if (!validation::CanAddU64(begin, payloadBytes)) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::InvalidInput,
-            "geometry payload range exceeds stream address space");
+    std::uint64_t end = 0u, expectedPayload = 0u;
+    if (!validation::CheckedAddU64(begin, runtime.data.payloadBytes, end, "geometry payload range", &error)) {
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, std::move(error));
     }
-    const auto end = begin + payloadBytes;
-
-    if (auto prepared = detail::PrepareGeometryCache(
-            byteStoreSession,
-            meta,
-            geometry,
-            referenceCache,
-            decodeRuntime.cache.geometryCacheStorageMode,
-            decodeRuntime.cache.geometryMemoryCacheLimitBytes,
-            decodeRuntime.cache.geometryReferenceCacheStorageMode,
-            decodeRuntime.cache.geometryMemoryReferenceLimitBytes,
-            count,
-            dimension); !prepared) {
-        return prepared;
-    }
-
-    if (count != 0u && meta.blockLayouts.empty()) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::InvalidInput,
-            "geometry reference params are missing spatial block layouts");
-    }
-    std::string error;
-    auto blockParams = numericarray::MakeNumericArrayBlockParams(
-        numericarray::MakeNumericArrayLayout(meta.dataType, localValueSize, count, dimension));
-    std::uint64_t consumedElements = 0u;
     for (const auto& layout : meta.blockLayouts) {
-        numericarray::NumericArrayBlockPayload ownedBlock;
-        if (!numericarray::ReadNumericArrayBlockPayload(
-                stream,
-                dimension,
-                layout,
-                cacheResources,
-                ownedBlock,
-                &error)) {
-            return detail::MakeGeometryDecodeFailure(
-                CodecErrorCode::PipelineFailure,
-                "failed to read geometry spatial block: " + error);
+        if (!validation::CheckedAddU64(expectedPayload, layout.encodedByteLength, expectedPayload,
+                "geometry layout payload bytes", &error)) {
+            return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, std::move(error));
         }
-        if (ownedBlock.header.elementCount == 0u ||
-            ownedBlock.header.elementOffset != consumedElements ||
-            ownedBlock.header.elementCount > count - consumedElements) {
-            return detail::MakeGeometryDecodeFailure(
-                CodecErrorCode::InvalidInput,
-                "geometry spatial block ranges are not contiguous");
-        }
-
-        std::vector<std::uint8_t> decodedBlockBytes;
-        if (ownedBlock.header.codecId == NumericArrayReferenceCodecId::NonReference) {
-            if (!numericarray::ResolveDecodedNumericArrayBlockBytes(
-                    blockParams,
-                    ownedBlock,
-                    decodedBlockBytes,
-                    &error)) {
-                return detail::MakeGeometryDecodeFailure(
-                    CodecErrorCode::DecodeFailure,
-                    "failed to decode ordinary geometry spatial block: " + error);
-            }
-        } else {
-            ParsedNumericArrayBlock block;
-            block.header = ownedBlock.header;
-            block.backgroundCompressor = ownedBlock.backgroundCompressor;
-            block.backgroundEncodedByteLength = ownedBlock.backgroundEncodedByteLength;
-            block.componentLayouts = ownedBlock.componentLayouts;
-            block.regionLayers = ownedBlock.regionLayers;
-            block.alpha = ownedBlock.alpha;
-            block.beta = ownedBlock.beta;
-            block.bytes = ownedBlock.bytes.Span();
-
-            ScratchByteBuffer referenceBytes;
-            if (!detail::ResolveGeometryReferenceBytesForBlock(
-                    meta,
-                    keyFrameReference,
-                    block,
-                    cacheResources.scratchBytePool,
-                    referenceBytes,
-                    &error)) {
-                return detail::MakeGeometryDecodeFailure(
-                    CodecErrorCode::DecodeFailure,
-                    "failed to resolve geometry spatial block reference: " + error);
-            }
-            const auto* codec = ResolveNumericArrayReferenceCodec(block.header.codecId);
-            if (codec == nullptr) {
-                return detail::MakeGeometryDecodeFailure(
-                    CodecErrorCode::InvalidInput,
-                    "unsupported geometry spatial block reference codec");
-            }
-            if (!codec->DecodeBlock(
-                    NumericArrayReferenceCodecDecodeInput{
-                        .meta = meta,
-                        .block = block,
-                        .referenceBytes = referenceBytes.Span(),
-                        .referenceElementOffset = 0u,
-                    },
-                    decodedBlockBytes,
-                    &error)) {
-                return detail::MakeGeometryDecodeFailure(
-                    CodecErrorCode::DecodeFailure,
-                    "failed to decode geometry reference spatial block: " + error);
-            }
-        }
-        if (!detail::WriteConvertedGeometryBlock(
-                cacheResources,
-                geometry,
-                referenceCache,
-                meta,
-                ownedBlock.header,
-                std::span<const std::uint8_t>(decodedBlockBytes.data(), decodedBlockBytes.size()),
-                dimension,
-                expectedSourceBytes,
-                outputTupleBytes,
-                writtenBytes,
-                scratchPeakBytes,
-                &error)) {
-            return detail::MakeGeometryDecodeFailure(
-                CodecErrorCode::DecodeFailure,
-                "failed to write decoded geometry spatial block: " + error);
-        }
-        consumedElements += ownedBlock.header.elementCount;
     }
-    if (consumedElements != count) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::InvalidInput,
-            "geometry spatial block layouts do not cover the full field");
+    if (expectedPayload != runtime.data.payloadBytes) {
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, "geometry payload does not match block layouts");
     }
-    if (stream.Position() != end) {
-        return detail::MakeGeometryDecodeFailure(
-            CodecErrorCode::PipelineFailure,
-            "geometry decode consumed an unexpected payload size");
+    numericarray::NumericDecodeCursor<TStream> cursor{
+        stream, params, meta.blockLayouts, runtime.cache.cacheResources};
+    if (!cursor.Prepare(&error)) {
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, std::move(error));
     }
-
-    return detail::FinishGeometryCache(
-        geometry,
-        referenceCache,
-        writtenBytes,
-        expectedOutputBytes,
-        "reference geometry did not cover the full output range");
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return detail::MakeGeometryDecodeFailure(CodecErrorCode::PipelineFailure, "geometry preparation was stopped"); }
+    // 完整目标在块流前取得容量，两个真实数组分别持有 owner
+    if (!geometry.Initialize(params.elementCount, params.componentCount, runtime.cache.byteStoreSession, &error) ||
+        (referenceCache != nullptr &&
+            !referenceCache->BeginGeometry(meta, runtime.cache.byteStoreSession, &error))) {
+        geometry.Release();
+        if (referenceCache != nullptr) { referenceCache->Reset(); }
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::DecodeFailure, std::move(error));
+    }
+    const auto finish = [&] {
+        if (stream.Position() != end) {
+            return validation::AssignError(&error, "geometry decode consumed an unexpected payload size");
+        }
+        if (referenceCache != nullptr && !referenceCache->EndGeometry(&error)) { return false; }
+        if (!geometry.bytes || !geometry.bytes->Seal(&error)) { return false; }
+        geometry.complete = true;
+        return true;
+    };
+    if (params.elementCount == 0u) {
+        if (finish()) { return detail::MakeGeometryDecodeSuccess(); }
+        geometry.Release();
+        if (referenceCache != nullptr) { referenceCache->Reset(); }
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::PipelineFailure, std::move(error));
+    }
+    std::size_t sourceTupleBytes = 0u, targetTupleBytes = 0u;
+    if (!validation::CheckedMulSizeT(params.componentCount, params.valueSize, sourceTupleBytes,
+            "geometry source tuple", &error) ||
+        !validation::CheckedMulSizeT(params.componentCount, sizeof(float), targetTupleBytes,
+            "geometry output tuple", &error)) {
+        geometry.Release();
+        if (referenceCache != nullptr) { referenceCache->Reset(); }
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, std::move(error));
+    }
+    ParamSize committedElements = 0u;
+    phase.reset();
+    const bool success = RunOrderedBlocks<numericarray::NumericArrayBlockPayload, detail::GeometryDecodedBlock>(
+        root, [&] { return cursor.HasMore(); },
+        [&](numericarray::NumericArrayBlockPayload& input, const SlotLease& slot) {
+            // driver 串行推进唯一字段流，外层解压使用同一槽位的计算额度
+            return RunTerminalWork(root, slot, [&](WorkerContext&) { return cursor.ReadNext(input, &error); });
+        },
+        [&](const numericarray::NumericArrayBlockPayload& input, detail::GeometryDecodedBlock& output, WorkerContext& worker) {
+            std::string localError;
+            if (runtime.recordCapacitySamples) { output.capacitySamples.emplace(); }
+            if (!detail::ComputeGeometryDecodedBlock(runtime, params, input, output, worker, &localError)) {
+                root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+                    "geometry-block-decode", "ComputeGeometryDecodedBlock", localError));
+                return false;
+            }
+            return true;
+        },
+        [&](detail::GeometryDecodedBlock& output) {
+            if (output.header.elementOffset != committedElements) {
+                return validation::AssignError(&error, "geometry commit order is not contiguous");
+            }
+            if (referenceCache != nullptr) {
+                const auto windowElements = std::max<std::size_t>(1u, kIoWindowBytes / sourceTupleBytes);
+                for (std::size_t offset = 0u; offset < output.header.elementCount;) {
+                    const auto count = std::min<std::size_t>(windowElements, output.header.elementCount - offset);
+                    if (!referenceCache->WriteRange(output.header.elementOffset + offset, count,
+                            output.raw.Span().data() + offset * sourceTupleBytes, count * sourceTupleBytes, &error)) {
+                        return false;
+                    }
+                    offset += count;
+                }
+            }
+            const auto points = params.dataType == DataType::Float32 ? output.raw.Span() : output.converted.Span();
+            std::uint64_t byteOffset = 0u;
+            if (!validation::CheckedMulU64(committedElements, targetTupleBytes, byteOffset,
+                    "geometry output offset", &error)) { return false; }
+            for (std::size_t offset = 0u; offset < points.size();) {
+                const auto bytes = std::min(kIoWindowBytes, points.size() - offset);
+                if (!geometry.bytes->WriteBytesAt(byteOffset + offset, points.subspan(offset, bytes), &error)) { return false; }
+                offset += bytes;
+            }
+            committedElements += output.header.elementCount;
+            if (output.capacitySamples && runtime.recordCapacitySamples) {
+                try { runtime.recordCapacitySamples(output.capacitySamples->values); }
+                catch (...) { root.RecordDiagnosticExportFailure(); }
+            }
+            return committedElements != params.elementCount || finish();
+        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::GeometryDecode); });
+    if (!success) {
+        geometry.Release();
+        if (referenceCache != nullptr) { referenceCache->Reset(); }
+        if (error.empty()) { error = "geometry block flow failed"; }
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::DecodeFailure, std::move(error));
+    }
+    return detail::MakeGeometryDecodeSuccess();
 }
 
-} // namespace datacodec
+} // DataCodec 命名空间
 
 #endif

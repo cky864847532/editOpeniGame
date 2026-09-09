@@ -1,4 +1,6 @@
 #include <IQWidgets/igQtDataCodecCompressionWidget.h>
+#include <IQWidgets/igQtDataCodecResourceControls.h>
+#include <IQCore/igQtDataCodecDecodeSettings.h>
 
 #include <QAbstractSpinBox>
 #include <QAbstractItemView>
@@ -98,14 +100,12 @@ constexpr int kPrecisionModeRel = 1;
 constexpr auto kSettingsOrganization = "iGame";
 constexpr auto kSettingsApplication = "iGameVis";
 constexpr auto kEncodeSettingsGroup = "DataCodec/Encode";
-constexpr auto kEncodePerformanceTierKey = "PerformanceTier";
 constexpr auto kEncodeCompressionEnhancementKey = "CompressionEnhancement";
 constexpr auto kEncodeZstdLevelKey = "ZstdLevel";
 constexpr auto kEncodeGopFrameCountKey = "GopFrameCount";
-constexpr auto kDefaultEncodeTier = ::datacodec::DataCodecEncodeTier::TimePriority;
 
 struct DataCodecCompressionPerformanceSettings {
-    ::datacodec::DataCodecEncodeTier tier{kDefaultEncodeTier};
+    ::datacodec::CodecResourceParams resources;
     bool compressionEnhancement{false};
     int zstdLevel{3};
     int gopFrameCount{8};
@@ -119,26 +119,11 @@ QSettings CreateDataCodecCompressionSettings() {
         QString::fromLatin1(kSettingsApplication));
 }
 
-::datacodec::DataCodecEncodeTier DecodeEncodeTierFromValue(const int value) {
-    const auto tier = static_cast<::datacodec::DataCodecEncodeTier>(value);
-    switch (tier) {
-        case ::datacodec::DataCodecEncodeTier::TimePriority:
-        case ::datacodec::DataCodecEncodeTier::Balanced:
-        case ::datacodec::DataCodecEncodeTier::MemoryPriority:
-            return tier;
-    }
-    return kDefaultEncodeTier;
-}
-
 DataCodecCompressionPerformanceSettings LoadDataCodecCompressionPerformanceSettings() {
     auto storage = CreateDataCodecCompressionSettings();
     storage.beginGroup(QString::fromLatin1(kEncodeSettingsGroup));
-    const int storedTierValue = storage.value(
-        QString::fromLatin1(kEncodePerformanceTierKey),
-        static_cast<int>(kDefaultEncodeTier)).toInt();
-    const auto tier = DecodeEncodeTierFromValue(storedTierValue);
-    const auto definition = ::datacodec::MakeEncodeConfigurationParams(
-        ::datacodec::DataCodecEncodeOptions{.tier = tier});
+    const auto resources = igQtDataCodecDecodeSettingsStore::LoadResources(storage);
+    const auto definition = ::datacodec::MakeDefaultEncodeConfigurationParams();
     const bool compressionEnhancement = storage.value(
         QString::fromLatin1(kEncodeCompressionEnhancementKey),
         false).toBool();
@@ -153,7 +138,7 @@ DataCodecCompressionPerformanceSettings LoadDataCodecCompressionPerformanceSetti
         storage.value(QString::fromLatin1(kEncodeGopFrameCountKey), 8).toInt());
     storage.endGroup();
     return DataCodecCompressionPerformanceSettings{
-        .tier = tier,
+        .resources = resources,
         .compressionEnhancement = compressionEnhancement,
         .zstdLevel = zstdLevel,
         .gopFrameCount = gopFrameCount,
@@ -164,9 +149,7 @@ void SaveDataCodecCompressionPerformanceSettings(
         const DataCodecCompressionPerformanceSettings& settings) {
     auto storage = CreateDataCodecCompressionSettings();
     storage.beginGroup(QString::fromLatin1(kEncodeSettingsGroup));
-    storage.setValue(
-        QString::fromLatin1(kEncodePerformanceTierKey),
-        static_cast<int>(settings.tier));
+    igQtDataCodecDecodeSettingsStore::SaveResources(storage, settings.resources);
     storage.setValue(
         QString::fromLatin1(kEncodeCompressionEnhancementKey),
         settings.compressionEnhancement);
@@ -847,25 +830,8 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     pathRow->addWidget(m_outputPathButton, 0);
     layout->addLayout(pathRow);
 
-    auto* tierRow = new QHBoxLayout;
-    auto* tierLabel = new QLabel(QStringLiteral("资源模式"), panel);
-    tierLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
-    m_performanceCombo = new QComboBox(panel);
-    m_performanceCombo->addItem(
-        QStringLiteral("快速"),
-        static_cast<int>(::datacodec::DataCodecEncodeTier::TimePriority));
-    m_performanceCombo->addItem(
-        QStringLiteral("标准"),
-        static_cast<int>(::datacodec::DataCodecEncodeTier::Balanced));
-    m_performanceCombo->addItem(
-        QStringLiteral("低内存"),
-        static_cast<int>(::datacodec::DataCodecEncodeTier::MemoryPriority));
-    m_performanceCombo->setToolTip(
-        QStringLiteral("设置编码速度、内存占用及默认 ZSTD压缩等级"));
-    configureComboPopup(m_performanceCombo);
-    tierRow->addWidget(tierLabel, 1);
-    tierRow->addWidget(m_performanceCombo, 0);
-    layout->addLayout(tierRow);
+    m_resourceControls = new igQtDataCodecResourceControls(panel);
+    layout->addWidget(m_resourceControls);
 
     m_compressionEnhancementCheck = new QCheckBox(QStringLiteral("压缩率增强"), panel);
     m_compressionEnhancementCheck->setToolTip(
@@ -947,16 +913,11 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
             });
 
     const auto performanceSettings = LoadDataCodecCompressionPerformanceSettings();
-    const auto tierIndex = m_performanceCombo->findData(
-        static_cast<int>(performanceSettings.tier));
-    const auto defaultTierIndex = m_performanceCombo->findData(
-        static_cast<int>(kDefaultEncodeTier));
-    m_performanceCombo->setCurrentIndex(tierIndex >= 0 ? tierIndex : defaultTierIndex);
+    m_resourceControls->SetParams(performanceSettings.resources);
     m_compressionEnhancementCheck->setChecked(performanceSettings.compressionEnhancement);
     m_zstdLevelSpin->setValue(performanceSettings.zstdLevel);
     m_gopFrameCountSpin->setValue(performanceSettings.gopFrameCount);
-    connect(m_performanceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
-        [this](const int) { applyPerformanceTierDefaults(); });
+    m_resourceControls->OnChanged([this] { persistPerformanceSettings(); });
     connect(m_compressionEnhancementCheck, &QCheckBox::toggled, this,
         [this](const bool checked) {
             persistPerformanceSettings();
@@ -1948,7 +1909,7 @@ void igQtDataCodecCompressionWidget::refreshFeatureState() {
                 : (basisComputed ? currentBasisName() + QStringLiteral(" 已计算")
                                  : QStringLiteral("待计算")));
     }
-    if (m_performanceCombo) m_performanceCombo->setEnabled(hasData);
+    if (m_resourceControls) m_resourceControls->setEnabled(hasData);
     if (m_zstdLevelSpin) m_zstdLevelSpin->setEnabled(hasData);
     if (m_fieldList) m_fieldList->setEnabled(hasData && !m_featureComputationActive);
     if (m_selectAllFieldsCheck) m_selectAllFieldsCheck->setEnabled(hasData && !m_featureComputationActive);
@@ -2151,22 +2112,8 @@ void igQtDataCodecCompressionWidget::refreshPerformanceControls() {
     m_gopFrameCountSpin->setRange(1, frameCount);
 }
 
-::datacodec::DataCodecEncodeTier
-igQtDataCodecCompressionWidget::selectedPerformanceTier() const {
-    if (m_performanceCombo == nullptr) {
-        return kDefaultEncodeTier;
-    }
-    return DecodeEncodeTierFromValue(m_performanceCombo->currentData().toInt());
-}
-
-void igQtDataCodecCompressionWidget::applyPerformanceTierDefaults() {
-    const auto definition = ::datacodec::MakeEncodeConfigurationParams(
-        ::datacodec::DataCodecEncodeOptions{.tier = selectedPerformanceTier()});
-    if (m_zstdLevelSpin != nullptr) {
-        QSignalBlocker blocker(m_zstdLevelSpin);
-        m_zstdLevelSpin->setValue(definition.pipelineControl.packageFields.zstdLevel);
-    }
-    persistPerformanceSettings();
+::datacodec::CodecResourceParams igQtDataCodecCompressionWidget::selectedResources() const {
+    return m_resourceControls ? m_resourceControls->Params() : ::datacodec::CodecResourceParams{};
 }
 
 void igQtDataCodecCompressionWidget::persistPerformanceSettings() const {
@@ -2175,7 +2122,7 @@ void igQtDataCodecCompressionWidget::persistPerformanceSettings() const {
         ? m_gopFrameCountSpin->value()
         : 8;
     SaveDataCodecCompressionPerformanceSettings({
-        .tier = selectedPerformanceTier(),
+        .resources = selectedResources(),
         .compressionEnhancement = m_compressionEnhancementCheck != nullptr &&
             m_compressionEnhancementCheck->isChecked(),
         .zstdLevel = zstdLevel,
@@ -2307,16 +2254,17 @@ void igQtDataCodecCompressionWidget::startEncode() {
     }
     const bool outputPerformance = !multiFrame && m_emitPerformanceCheck != nullptr &&
         m_emitPerformanceCheck->isChecked();
-    const qint64 initialBeforeBytes = outputPerformance
-        ? sourceFileSizeFromDataObject(dataObject)
-        : -1;
-    const std::string compressionRatioNote = outputPerformance
-        ? iGame::iGameDataCodecHostMessage(
+    iGame::iGameDataCodecTelemetryCapture telemetryCapture;
+    qint64 initialBeforeBytes = -1;
+    std::string compressionRatioNote;
+    if (outputPerformance) { telemetryCapture.TryExport([&] {
+        initialBeforeBytes = sourceFileSizeFromDataObject(dataObject);
+        compressionRatioNote = iGame::iGameDataCodecHostMessage(
             m_dataCodecLanguage,
-            iGame::iGameDataCodecHostMessageId::CompressionRatioCalculationNote)
-        : std::string{};
+            iGame::iGameDataCodecHostMessageId::CompressionRatioCalculationNote);
+    }); }
     ::datacodec::DataCodecEncodeOptions options;
-    options.tier = selectedPerformanceTier();
+    const auto resources = selectedResources();
     options.enableCompressionEnhancement =
         m_compressionEnhancementCheck != nullptr &&
         m_compressionEnhancementCheck->isChecked();
@@ -2333,16 +2281,23 @@ void igQtDataCodecCompressionWidget::startEncode() {
     auto definition = ::datacodec::MakeEncodeConfigurationParams(options);
     definition.language = m_dataCodecLanguage;
     applyCompressionControlToDataCodec(definition.controlParams);
-    const auto reportConfiguration =
-        ::datacodec::MakeDataCodecEncodeReportConfiguration(
-            options.tier,
+    ::datacodec::DataCodecReportConfiguration reportConfiguration;
+    if (outputPerformance) { telemetryCapture.TryExport([&] {
+        reportConfiguration = ::datacodec::MakeDataCodecEncodeReportConfiguration(
+            resources,
             options.enableCompressionEnhancement,
             definition);
+    }); }
     writer->SetEncodeControls(definition);
+    writer->SetResourceParams(resources);
     QString reportDirectory;
+    std::shared_ptr<iGame::iGameDataCodecReportFileSink> reportSink;
+    std::string reportFileTimestamp;
+    telemetryCapture.TryExport([&] {
     if (outputPerformance) {
         reportDirectory = makeCompressionReportDirectory(outputPath);
         if (!QDir().mkpath(reportDirectory)) {
+            telemetryCapture.MarkDiagnosticsIncomplete();
             publishStatus(
                 dataCodecHostLogText(
                     m_dataCodecLanguage,
@@ -2352,8 +2307,6 @@ void igQtDataCodecCompressionWidget::startEncode() {
             return;
         }
     }
-    std::shared_ptr<iGame::iGameDataCodecReportFileSink> reportSink;
-    std::string reportFileTimestamp;
     if (outputPerformance) {
         reportSink = std::make_shared<iGame::iGameDataCodecReportFileSink>(
             std::filesystem::u8path(toUtf8StdString(reportDirectory)),
@@ -2386,6 +2339,7 @@ void igQtDataCodecCompressionWidget::startEncode() {
             runningReport,
             std::nullopt);
         if (!runningReportResult.success) {
+            telemetryCapture.MarkDiagnosticsIncomplete();
             publishStatus(
                 dataCodecHostLogText(
                     m_dataCodecLanguage,
@@ -2394,9 +2348,11 @@ void igQtDataCodecCompressionWidget::startEncode() {
             return;
         }
     }
+    });
 
     QPointer<igQtDataCodecCompressionWidget> self(this);
     ::datacodec::DataCodecOutputSinks outputSinks;
+    telemetryCapture.TryExport([&] {
     outputSinks.ui = std::make_shared<igQtDataCodecUiSink>(
         this,
         [self](
@@ -2408,8 +2364,8 @@ void igQtDataCodecCompressionWidget::startEncode() {
         });
     outputSinks.console = std::make_shared<iGame::iGameSpdlogDataCodecConsoleSink>();
     outputSinks.progress = std::make_shared<iGame::iGameDataCodecProgressBarSink>();
+    });
     writer->SetOutputSinks(std::move(outputSinks));
-    iGame::iGameDataCodecTelemetryCapture telemetryCapture;
     auto sessionInterests = ::datacodec::kRunLifecycleRecordMask |
         ::datacodec::RunRecordKind::Message;
     auto collectionRequests = ::datacodec::RunCollectionMask{0u};
@@ -2420,7 +2376,12 @@ void igQtDataCodecCompressionWidget::startEncode() {
             ::datacodec::RunRecordKind::Artifact;
         collectionRequests = ::datacodec::RunCollectionBit(
             ::datacodec::RunCollectionKind::MemoryTrace);
-        telemetryCapture.CaptureRemapOrders();
+        try { telemetryCapture.CaptureRemapOrders(); }
+        catch (...) {
+            publishStatus(QStringLiteral("无法准备精度分析所需的重排记录，编码未启动"),
+                ::datacodec::DataCodecStatusSeverity::Error);
+            return;
+        }
     }
     telemetryCapture.CaptureSessions(
         sessionInterests,
@@ -2472,7 +2433,7 @@ void igQtDataCodecCompressionWidget::startEncode() {
         precisionFields,
         compressorName,
         logLanguage = m_dataCodecLanguage,
-        telemetryCapture,
+        telemetryCapture = std::move(telemetryCapture),
         complete = std::move(complete)]() mutable {
         qint64 beforeBytes = initialBeforeBytes;
         QStringList writtenPaths;
@@ -2496,7 +2457,10 @@ void igQtDataCodecCompressionWidget::startEncode() {
                 const bool reportSuccess,
                 std::vector<::datacodec::DataCodecProcessNode> additionalProcesses,
                 std::vector<::datacodec::TelemetryMessageRecord> additionalMessages,
-                std::string fallbackError) {
+                std::string fallbackError) noexcept {
+            DataCodecRunReportWriteResult outcome;
+            telemetryCapture.TryExport([&] {
+            outcome = [&]() -> DataCodecRunReportWriteResult {
             DataCodecRunReportWriteResult skipped{.success = true};
             if (!outputPerformance) {
                 return skipped;
@@ -2587,6 +2551,10 @@ void igQtDataCodecCompressionWidget::startEncode() {
                 reportFileTimestamp,
                 processReport,
                 errorReport);
+            }();
+            });
+            if (!outcome.success) { telemetryCapture.MarkDiagnosticsIncomplete(); }
+            return outcome;
         };
 
         try {
@@ -2794,12 +2762,8 @@ void igQtDataCodecCompressionWidget::startEncode() {
                     std::move(verificationErrors),
                     "encoding verification failed without a detailed error record");
                 if (!reportOutcome.success) {
-                    complete(
-                        {dataCodecHostLogText(
-                            logLanguage,
-                            iGame::iGameDataCodecHostMessageId::WriteReportFailed)},
-                        ::datacodec::DataCodecStatusSeverity::Error);
-                    return;
+                    messages.push_back(dataCodecHostLogText(logLanguage,
+                        iGame::iGameDataCodecHostMessageId::WriteReportFailed));
                 }
 
                 messages.push_back(dataCodecHostLogText(
@@ -2845,6 +2809,9 @@ void igQtDataCodecCompressionWidget::startEncode() {
                     logLanguage,
                     iGame::iGameDataCodecHostMessageId::LastFrameFile,
                     {{"path", toUtf8StdString(writtenPaths.back())}}));
+            }
+            if (writer->DiagnosticsIncomplete() || telemetryCapture.DiagnosticsIncomplete()) {
+                messages.push_back(QStringLiteral("编码输出已生成，部分诊断或报告未能完整导出"));
             }
             complete(std::move(messages));
         } catch (const std::exception& exception) {

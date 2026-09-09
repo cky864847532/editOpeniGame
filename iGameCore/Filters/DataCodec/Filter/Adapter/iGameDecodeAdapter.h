@@ -180,7 +180,7 @@ public:
         }
         m_cellArray = nullptr;
         m_cellTypes = nullptr;
-        m_cellPolynomialOrders.clear();
+        ReleasePolynomialOrders();
         return true;
     }
 
@@ -283,11 +283,7 @@ public:
         }
         if (m_cellPolynomialOrders.empty()) {
             m_cellPolynomialOrders.resize(m_pendingCellCount, 0);
-            m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-                m_nativeResidentBytes,
-                ::datacodec::validation::SaturatingMulU64(
-                    static_cast<std::uint64_t>(m_cellPolynomialOrders.size()),
-                    sizeof(std::uint16_t)));
+            m_polynomialOrdersCapacity.Observe(m_cellPolynomialOrders);
         }
         std::copy(data, data + count, m_cellPolynomialOrders.begin() + static_cast<std::ptrdiff_t>(offset));
         return true;
@@ -316,6 +312,7 @@ public:
             }
         }
         CommitCellArray();
+        ReleasePolynomialOrders();
         m_pendingConnectivityIds = nullptr;
         m_pendingOffsets = nullptr;
         m_pendingConnectivityCount = 0u;
@@ -457,14 +454,14 @@ public:
                 volumeMesh->InitVolumesWithPolyhedron(m_polyFaceTable->GetOutput(), m_polyCellFaces);
                 m_cellArray = volumeMesh->GetCellArray();
                 m_cellTypes = nullptr;
-                m_cellPolynomialOrders.clear();
+                ReleasePolynomialOrders();
             } else {
                 return Fail(error, "failed to commit volume polyhedron topology");
             }
         } else if (m_polyCells != nullptr && m_polyCellTypes != nullptr) {
             m_cellArray = m_polyCells;
             m_cellTypes = m_polyCellTypes;
-            m_cellPolynomialOrders.clear();
+            ReleasePolynomialOrders();
             CommitCellArray();
         } else {
             return Fail(error, "failed to commit unstructured polyhedron topology");
@@ -541,10 +538,6 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool SupportsConcurrentAttributeRangeWrites() const noexcept override {
-        return true;
-    }
-
     [[nodiscard]] bool SupportsAttributeDecodeStore() const noexcept override {
         return true;
     }
@@ -613,6 +606,10 @@ public:
     }
 
     std::uint64_t NativeResidentBytesHint() const override { return m_nativeResidentBytes; }
+
+    [[nodiscard]] std::span<const ::datacodec::BufferCapacitySample> CapacitySamples() const noexcept override {
+        return {&m_polynomialOrdersCapacity, 1u};
+    }
 
     void ResetOutput() override {
         ReleaseOutputState();
@@ -718,13 +715,6 @@ private:
                 error);
         }
 
-        void Release() noexcept override {
-            m_owner = nullptr;
-            m_bytes = {};
-            m_appendOffset = 0u;
-            m_released = true;
-        }
-
     private:
         ArrayObject::Pointer m_owner;
         std::span<std::uint8_t> m_bytes;
@@ -743,12 +733,18 @@ private:
         return ::datacodec::validation::AssignError(error, m_failureMessage);
     }
 
+    void ReleasePolynomialOrders() noexcept {
+        m_polynomialOrdersCapacity.Observe(m_cellPolynomialOrders);
+        ::datacodec::ReleaseVectorStorage(m_cellPolynomialOrders);
+        m_polynomialOrdersCapacity.Observe(m_cellPolynomialOrders);
+    }
+
     void ResetPartialState() {
         m_failed = false;
         m_failureMessage.clear();
         m_cellArray = nullptr;
         m_cellTypes = nullptr;
-        ::datacodec::ReleaseVectorStorage(m_cellPolynomialOrders);
+        ReleasePolynomialOrders();
         m_pendingPoints = nullptr;
         m_pendingPointCount = 0u;
         m_pointDimension = 3u;
@@ -1142,6 +1138,7 @@ private:
     UnsignedIntArray::Pointer m_cellTypes;
     // 暂存的逐 cell 阶数流
     std::vector<std::uint16_t> m_cellPolynomialOrders;
+    ::datacodec::BufferCapacitySample m_polynomialOrdersCapacity{"adapter.decode.polynomial_orders"};
     // 正在写入的 cell 数
     std::size_t m_pendingCellCount{0u};
     // 正在写入的原生 connectivity

@@ -2,7 +2,7 @@
 #define iGameDataCodecFeatureStreamingFrameCache_h
 
 #include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
-#include "DataCodec/Filter/Adapter/iGameStreamingFrameCacheAdapter.h"
+#include "DataCodec/Runtime/Cache/DecodedFrameLruCache.h"
 #include "iGameDrawObject.h"
 #include "iGameStreamingData.h"
 #include "iGameStringArray.h"
@@ -47,10 +47,8 @@ private:
 
     const DecodeSourceIdentity source0{.stableId = "streaming-source-0", .revision = "r1"};
     const DecodeSourceIdentity source1{.stableId = "streaming-source-1", .revision = "r1"};
-    iGame::iGameStreamingFrameCacheAdapter cache(
-        streamingData.GetPointer(),
-        {{10u, 0u}, {20u, 1u}},
-        {{10u, source0}, {20u, source1}});
+    DecodedFrameLruCache cache;
+    cache.Configure(1u);
     const DecodedFrameKey key0{.source = source0, .frameIndex = 10u};
     const DecodedFrameKey key1{.source = source1, .frameIndex = 20u};
     auto frame0 = std::make_shared<iGameStreamingCacheTestFrame>(
@@ -91,7 +89,7 @@ private:
         },
         .frameIndex = 10u,
     };
-    return cache.Find(wrongRevision, DecodedFrameAccessKind::UserRequest).IsError();
+    return cache.Find(wrongRevision, DecodedFrameAccessKind::UserRequest).IsMiss();
 }
 
 } // namespace datacodec::test

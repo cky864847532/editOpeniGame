@@ -133,7 +133,6 @@ struct StagedIgcDecodeTask {
     int reusedModelId{0};
     bool enableReuseCache{true};
     std::optional<bool> enableEncodedInputCache;
-    std::optional<bool> enableFullInputPrefetch;
 };
 
 std::shared_ptr<StagedIgcDecodeTask> g_stagedIgcDecodeTask;
@@ -153,8 +152,7 @@ int StartStagedIgcDecode(
     const std::string& sourceName,
     bool replaceExisting,
     bool enableReuseCache,
-    std::optional<bool> enableEncodedInputCache = {},
-    std::optional<bool> enableFullInputPrefetch = {});
+    std::optional<bool> enableEncodedInputCache = {});
 std::string GetStagedIgcDecodeStatusJson();
 int FinishStagedIgcDecode();
 void ForEachDrawObjectInTree(const iGame::DataObject::Pointer& root,
@@ -1652,8 +1650,7 @@ int StartStagedIgcDecode(
     const std::string& sourceName,
     const bool replaceExisting,
     const bool enableReuseCache,
-    const std::optional<bool> enableEncodedInputCache,
-    const std::optional<bool> enableFullInputPrefetch) {
+    const std::optional<bool> enableEncodedInputCache) {
     if (filePath.empty() || filePath != g_stagedFilePath || g_stagedFile != nullptr) {
         return FailWithError(0, "StartStagedIgcDecode", "completed WasmFS staging input is required");
     }
@@ -1691,7 +1688,6 @@ int StartStagedIgcDecode(
     task->sourceIdentity = sourceIdentity;
     task->enableReuseCache = enableReuseCache;
     task->enableEncodedInputCache = enableEncodedInputCache;
-    task->enableFullInputPrefetch = enableFullInputPrefetch;
     g_stagedFilePath.clear();
     g_stagedExpectedBytes = 0u;
     g_stagedWrittenBytes = 0u;
@@ -1732,7 +1728,6 @@ int StartStagedIgcDecode(
                         ? iGame::iGameWasmTopologyOutputMode::CommitToAdapter
                         : iGame::iGameWasmTopologyOutputMode::PreparedSurface,
                     task->enableEncodedInputCache,
-                    task->enableFullInputPrefetch,
                     progressSink,
                     task->sourceIdentity);
                 auto success = bridgeResult.success;
@@ -1776,9 +1771,7 @@ int StartStagedIgcDecode(
                                  << ",surfaces:" << preparationStats.surfaceRenderableCount;
                     timingDetail = timingOutput.str();
                     if (!success) {
-                        ::datacodec::DefaultDecodeCacheRuntime()
-                            ->DefaultFrameCache()
-                            ->InvalidateSource(task->sourceIdentity);
+                        bridgeResult.session->Reset();
                     }
                 }
                 std::lock_guard<std::mutex> lock(task->mutex);
@@ -1951,8 +1944,7 @@ struct API {
         const std::string& sourceName,
         bool replaceExisting,
         bool enableDecodedFrameCache,
-        bool enableEncodedInputCache,
-        bool enableFullInputPrefetch);
+        bool enableEncodedInputCache);
     static std::string getStagedIgcDecodeStatusJson();
     static int finishStagedIgcDecode();
     static int findLoadedIgcModel(const std::string& sourceIdentity);
@@ -2201,7 +2193,7 @@ int LoadVtpFromMemEx(const std::string& bytes, const std::string& sourceName, bo
     return AddModelFromDataObject(dataObj, sourceName.c_str(), replaceExisting, "memory-vtp");
 }
 
-int LoadIgcFromMemory(const std::string& bytes, const std::string& sourceName, bool replaceExisting) {
+int LoadIgcFromMemory(std::string bytes, const std::string& sourceName, bool replaceExisting) {
     DebugLog("INFO", "LoadIgcFromMemory called bytes=" + std::to_string(bytes.size()) + " sourceName=" + sourceName +
                              " replaceExisting=" + (replaceExisting ? "true" : "false"));
     if (bytes.empty()) return FailWithError(0, "LoadIgcFromMemory", "empty input bytes");
@@ -2209,10 +2201,13 @@ int LoadIgcFromMemory(const std::string& bytes, const std::string& sourceName, b
     EnsureScene();
 
     auto t0 = std::chrono::steady_clock::now();
+    // 宿主接收的字节直接交给共享 owner，按需属性会话保留同一输入
+    auto inputOwner = std::make_shared<const std::string>(std::move(bytes));
     auto bridgeResult = iGame::DecodeiGameWasmDataCodecMemory(
+        inputOwner,
         std::span<const std::uint8_t>(
-            reinterpret_cast<const std::uint8_t*>(bytes.data()),
-            bytes.size()));
+            reinterpret_cast<const std::uint8_t*>(inputOwner->data()),
+            inputOwner->size()));
     auto t1 = std::chrono::steady_clock::now();
 
     if (!bridgeResult.success || bridgeResult.output == nullptr) {
@@ -2249,8 +2244,7 @@ int LoadIgcFromBrowserFileEx(
     const std::string& sourceName,
     const bool replaceExisting,
     const bool enableReuseCache,
-    const std::optional<bool> enableEncodedInputCache = {},
-    const std::optional<bool> enableFullInputPrefetch = {}) {
+    const std::optional<bool> enableEncodedInputCache = {}) {
     DebugLog(
         "INFO",
         "LoadIgcFromBrowserFileEx called fileId=" + std::to_string(browserFileId) +
@@ -2273,8 +2267,7 @@ int LoadIgcFromBrowserFileEx(
         enableReuseCache
             ? iGame::iGameWasmTopologyOutputMode::CommitToAdapter
             : iGame::iGameWasmTopologyOutputMode::PreparedSurface,
-        enableEncodedInputCache,
-        enableFullInputPrefetch);
+        enableEncodedInputCache);
     if (!bridgeResult.timingDetail.empty()) {
         DebugLog("INFO", "Direct browser DataCodec timing " + bridgeResult.timingDetail);
     }
@@ -2383,7 +2376,7 @@ int LoadZipFromMemEx(const std::string& bytes, const std::string& sourceName, bo
         } else if (EndsWithCaseInsensitive(entryFileName, ".vtu")) {
             ret = LoadVtuFromMemEx(extracted, entrySourceName, shouldReplace);
         } else if (EndsWithCaseInsensitive(entryFileName, ".igc")) {
-            ret = LoadIgcFromMemory(extracted, entrySourceName, shouldReplace);
+            ret = LoadIgcFromMemory(std::move(extracted), entrySourceName, shouldReplace);
         } else {
             ret = LoadVtkFromMemEx(extracted, entrySourceName, shouldReplace);
         }
@@ -4059,8 +4052,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE int igameLoadIgcBrowserFile(
     const char* sourceName,
     const int replaceExisting,
     const int enableDecodedFrameCache,
-    const int enableEncodedInputCache,
-    const int enableFullInputPrefetch) {
+    const int enableEncodedInputCache) {
     if (!std::isfinite(browserFileSize) ||
         browserFileSize <= 0.0 ||
         std::floor(browserFileSize) != browserFileSize ||
@@ -4076,8 +4068,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE int igameLoadIgcBrowserFile(
         sourceName != nullptr ? sourceName : "Imported IGC",
         replaceExisting != 0,
         enableDecodedFrameCache != 0,
-        enableEncodedInputCache != 0,
-        enableFullInputPrefetch != 0);
+        enableEncodedInputCache != 0);
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE int igameEnsureIgcAttribute(
@@ -4426,21 +4417,18 @@ int iGameWeb::API::startStagedIgcDecode(
     const std::string& sourceName,
     const bool replaceExisting,
     const bool enableDecodedFrameCache,
-    const bool enableEncodedInputCache,
-    const bool enableFullInputPrefetch) {
+    const bool enableEncodedInputCache) {
     DebugLog(
         "INFO",
         "API.startStagedIgcDecode called filePath=" + filePath +
             " decoded-frame-cache=" + (enableDecodedFrameCache ? "1" : "0") +
-            " encoded-input-cache=" + (enableEncodedInputCache ? "1" : "0") +
-            " full-input-prefetch=" + (enableFullInputPrefetch ? "1" : "0"));
+            " encoded-input-cache=" + (enableEncodedInputCache ? "1" : "0"));
     const auto result = StartStagedIgcDecode(
         filePath,
         sourceName,
         replaceExisting,
         enableDecodedFrameCache,
-        enableEncodedInputCache,
-        enableFullInputPrefetch);
+        enableEncodedInputCache);
     if (result <= 0) {
         DebugLog(
             "ERROR",
@@ -4522,7 +4510,7 @@ int iGameWeb::API::loadIgcFromMemory(const val& bytes, const std::string& source
     std::string byteBuffer;
     if (!ReadBytesFromJsValue(bytes, byteBuffer, "API.loadIgcFromMemory")) { return 0; }
     auto t1 = std::chrono::steady_clock::now();
-    int ret = iGameWeb::LoadIgcFromMemory(byteBuffer, sourceName, replaceExisting);
+    int ret = iGameWeb::LoadIgcFromMemory(std::move(byteBuffer), sourceName, replaceExisting);
     auto t2 = std::chrono::steady_clock::now();
 
     DebugLog("INFO", "[IGC timing cpp] js-to-wasm-copy=" + Ms(t1 - t0) + " load-core=" + Ms(t2 - t1));

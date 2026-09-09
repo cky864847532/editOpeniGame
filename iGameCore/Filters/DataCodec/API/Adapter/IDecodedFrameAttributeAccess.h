@@ -1,7 +1,7 @@
 #ifndef DATACODEC_API_ADAPTER_IDECODEDFRAMEATTRIBUTEACCESS_H
 #define DATACODEC_API_ADAPTER_IDECODEDFRAMEATTRIBUTEACCESS_H
 
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Workflow/Session/DecodeSession.h"
 
@@ -21,6 +21,7 @@ struct DecodedFrameAttributeRequest {
 struct DecodedFrameAttributeResult {
     bool success{false};
     bool cancelled{false};
+    std::optional<CodecFailureRecord> failure;
     std::vector<TelemetryMessageRecord> messages;
 };
 

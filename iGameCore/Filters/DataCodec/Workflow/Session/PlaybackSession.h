@@ -3,11 +3,11 @@
 
 #include "DataCodec/API/Adapter/IDecodedFrameAssembly.h"
 #include "DataCodec/API/Adapter/IDecodedFrameAttributeAccess.h"
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
-#include "DataCodec/API/Adapter/IEncodedInputCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
+#include "DataCodec/Runtime/Cache/EncodedInputTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
 #include "DataCodec/Workflow/Session/DecodeSession.h"
 #include "DataCodec/Workflow/FrameSequence/FrameDecodeSource.h"
@@ -34,16 +34,10 @@ struct PlaybackOpenRequest {
     const DecodeExecutionOptions* executionOptions{nullptr};
     const DataCodecDecodeConfigurationSource* configurationSource{nullptr};
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
-    // 长生命周期播放任务使用调用方提供的执行资源
-    std::shared_ptr<IParallelTaskRunner> parallelTaskRunner;
+    // 会话内部创建并持有唯一运行状态
+    CodecResourceParams resources;
     DecodedFrameCachePolicy decodedFrameCachePolicy;
-    // 外部完整帧缓存存在时DataCodec不创建默认完整帧缓存
-    std::shared_ptr<IDecodedFrameCache> decodedFrameCache;
     EncodedInputCachePolicy encodedInputCachePolicy;
-    // 外部编码输入缓存存在时DataCodec不创建默认编码输入缓存
-    std::shared_ptr<IEncodedInputCache> encodedInputCache;
-    // 未提供时使用DataCodec进程内默认缓存运行时
-    std::shared_ptr<DecodeCacheRuntime> cacheRuntime;
     // true 表示每帧在同一次 pipeline 中完成全部属性解压
     bool loadAllAvailableAttributes{true};
 };
@@ -58,13 +52,10 @@ struct PlaybackSequenceOpenRequest {
     const DecodeExecutionOptions* executionOptions{nullptr};
     const DataCodecDecodeConfigurationSource* configurationSource{nullptr};
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
-    // 长生命周期播放任务使用调用方提供的执行资源
-    std::shared_ptr<IParallelTaskRunner> parallelTaskRunner;
+    // 会话内部创建并持有唯一运行状态
+    CodecResourceParams resources;
     DecodedFrameCachePolicy decodedFrameCachePolicy;
-    std::shared_ptr<IDecodedFrameCache> decodedFrameCache;
     EncodedInputCachePolicy encodedInputCachePolicy;
-    std::shared_ptr<IEncodedInputCache> encodedInputCache;
-    std::shared_ptr<DecodeCacheRuntime> cacheRuntime;
     // true 表示每帧在同一次 pipeline 中完成全部属性解压
     bool loadAllAvailableAttributes{true};
 };
@@ -78,6 +69,7 @@ struct PlaybackFrameRequest {
 
 struct PlaybackFrameResult {
     bool success{false};
+    std::optional<CodecFailureRecord> failure;
     bool decodedFrameCacheHit{false};
     bool cancelled{false};
     DecodedFrameLease::Pointer frame;
@@ -118,6 +110,8 @@ public:
     void Reset();
 
 private:
+    [[nodiscard]] DecodedFrameAttributeResult RequestDecodedFrameAttributesInRun(
+        const DecodedFrameLease::Pointer&, const DecodedFrameAttributeRequest&);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

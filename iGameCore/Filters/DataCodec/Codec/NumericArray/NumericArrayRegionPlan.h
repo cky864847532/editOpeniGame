@@ -47,6 +47,12 @@ struct RegionPrecisionLevel {
     std::uint32_t firstLabel{0u};
 };
 
+struct PreparedRegionPrecision {
+    std::vector<RegionPrecisionLevel> levels;
+    std::vector<std::size_t> labelToLevel;
+    NumericArrayRegionRunNormalizePolicy runPolicy;
+};
+
 struct PrecisionGapCandidate {
     std::size_t gapIndex{0u};
     ParamSize promotedElementCount{0u};
@@ -243,13 +249,12 @@ inline bool BuildPrecisionLevels(
     return true;
 }
 
-inline bool ValidateRegionRunsForEncode(
-    const std::span<const RegionRun> runs,
+inline bool SortAndValidateRegionRunsForEncode(
+    const std::span<RegionRun> runs,
     const ParamSize totalElementCount,
     const std::size_t regionCount,
     std::string* error = nullptr) {
-    std::vector<RegionRun> sortedRuns(runs.begin(), runs.end());
-    for (const auto& run : sortedRuns) {
+    for (const auto& run : runs) {
         if (run.count == 0u) {
             return validation::AssignError(error, "region run count must be non-zero");
         }
@@ -261,8 +266,8 @@ inline bool ValidateRegionRunsForEncode(
         }
     }
     std::sort(
-        sortedRuns.begin(),
-        sortedRuns.end(),
+        runs.begin(),
+        runs.end(),
         [](const RegionRun& left, const RegionRun& right) {
             if (left.begin != right.begin) {
                 return left.begin < right.begin;
@@ -271,7 +276,7 @@ inline bool ValidateRegionRunsForEncode(
         });
     ParamSize previousEnd = 0u;
     bool havePrevious = false;
-    for (const auto& run : sortedRuns) {
+    for (const auto& run : runs) {
         if (havePrevious && run.begin < previousEnd) {
             return validation::AssignError(error, "region runs must not overlap");
         }
@@ -279,6 +284,18 @@ inline bool ValidateRegionRunsForEncode(
         havePrevious = true;
     }
     return true;
+}
+
+// 输入为字段准备阶段校验过的有序数组，返回值借用字段 owner
+inline std::span<const RegionRun> FindIntersectingRegionRuns(
+    const std::span<const RegionRun> sortedRuns,
+    const ParamSize blockBegin, const ParamSize blockCount) noexcept {
+    if (blockCount == 0u) { return {}; }
+    const auto first = std::lower_bound(sortedRuns.begin(), sortedRuns.end(), blockBegin,
+        [](const RegionRun& run, const ParamSize begin) { return run.begin + run.count <= begin; });
+    const auto last = std::lower_bound(first, sortedRuns.end(), blockBegin + blockCount,
+        [](const RegionRun& run, const ParamSize end) { return run.begin < end; });
+    return {first, last};
 }
 
 inline bool BuildPrecisionTargetRunsFromRegionRuns(
@@ -328,16 +345,6 @@ inline bool BuildPrecisionTargetRunsFromRegionRuns(
             .regionId = run.regionId,
         });
     }
-    std::sort(
-        clippedRegionRuns.begin(),
-        clippedRegionRuns.end(),
-        [](const ClippedRegionRun& left, const ClippedRegionRun& right) {
-            if (left.begin != right.begin) {
-                return left.begin < right.begin;
-            }
-            return left.end < right.end;
-        });
-
     const bool includeDefaultRegion = !labelToLevel.empty() && labelToLevel[0u] >= precisionLevel;
     ParamSize cursor = blockElementOffset;
     for (const auto& run : clippedRegionRuns) {
@@ -663,32 +670,37 @@ inline bool BuildPrecisionLayerPlanFromRegionRuns(
     return true;
 }
 
-inline bool BuildNormalizedRegionPlansFromRegionRuns(
-    const std::span<const RegionRun> regionRuns,
-    const ParamSize totalElementCount,
-    const ParamSize blockElementOffset,
-    const ParamSize blockElementCount,
+inline bool PrepareRegionPrecision(
     const NumericArrayRegionControlParams& control,
-    LayeredResidualRegionPlan& plan,
+    PreparedRegionPrecision& prepared,
     std::string* error = nullptr) {
-    plan = {};
+    prepared = {};
     if (!ValidateRegionControlForEncode(control, error)) {
         return false;
     }
-    if (!control.regions.empty() && regionRuns.empty()) {
-        return validation::AssignError(error, "region precision control requires region runs");
-    }
-    if (!ValidateRegionRunsForEncode(regionRuns, totalElementCount, control.regions.size(), error)) {
+    if (!BuildPrecisionLevels(control, prepared.levels, prepared.labelToLevel, error)) {
         return false;
     }
-
-    std::vector<RegionPrecisionLevel> levels;
-    std::vector<std::size_t> labelToLevel;
-    if (!BuildPrecisionLevels(control, levels, labelToLevel, error)) {
-        return false;
-    }
-    if (levels.empty()) {
+    if (prepared.levels.empty()) {
         return validation::AssignError(error, "region precision control did not produce any precision level");
+    }
+    prepared.runPolicy = control.runPolicy;
+    return true;
+}
+
+// regionRuns 只包含当前块相交的有序区域，空交集使用默认精度区域
+inline bool BuildNormalizedRegionPlansFromRegionRuns(
+    const std::span<const RegionRun> regionRuns,
+    const ParamSize blockElementOffset,
+    const ParamSize blockElementCount,
+    const PreparedRegionPrecision& prepared,
+    LayeredResidualRegionPlan& plan,
+    std::string* error = nullptr) {
+    plan = {};
+    const auto& levels = prepared.levels;
+    const auto& labelToLevel = prepared.labelToLevel;
+    if (levels.empty()) {
+        return validation::AssignError(error, "region precision was not prepared before block planning");
     }
     plan.backgroundCompressor = levels.front().compressor;
 
@@ -701,7 +713,7 @@ inline bool BuildNormalizedRegionPlansFromRegionRuns(
                 precisionLevel,
                 blockElementOffset,
                 blockElementCount,
-                control.runPolicy,
+                prepared.runPolicy,
                 layer,
                 error)) {
             return false;
@@ -718,7 +730,7 @@ inline bool BuildNormalizedRegionPlansFromRegionRuns(
         const double refinedRatio = blockElementCount == 0u
             ? 0.0
             : static_cast<double>(totalRefinedElementCount) / static_cast<double>(blockElementCount);
-        if (refinedRatio > control.runPolicy.maxRefinedElementRatio) {
+        if (refinedRatio > prepared.runPolicy.maxRefinedElementRatio) {
             return validation::AssignError(error, "precision layer refined element ratio exceeds the configured limit");
         }
         plan.layers.push_back(std::move(layer));
@@ -726,11 +738,11 @@ inline bool BuildNormalizedRegionPlansFromRegionRuns(
     return true;
 }
 
-inline NumericArrayRegionLayerLayoutParams MakeRegionLayerLayoutFromPlan(const RegionPlan& plan) {
+inline NumericArrayRegionLayerLayoutParams MakeRegionLayerLayoutFromPlan(RegionPlan&& plan) {
     NumericArrayRegionLayerLayoutParams layout;
     layout.refinedElementCount = plan.refinedElementCount;
-    layout.refineCompressor = plan.refineCompressor;
-    layout.runs = plan.runs;
+    layout.refineCompressor = std::move(plan.refineCompressor);
+    layout.runs = std::move(plan.runs);
     return layout;
 }
 

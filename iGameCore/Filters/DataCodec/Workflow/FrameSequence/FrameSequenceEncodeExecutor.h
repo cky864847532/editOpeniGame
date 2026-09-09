@@ -10,7 +10,8 @@
 #include "DataCodec/Runtime/Record/RunRecordTimestamp.h"
 #include "DataCodec/Workflow/Frame/FrameEncodeExecutor.h"
 #include "DataCodec/Workflow/Session/EncodeSessionWorkspace.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -65,12 +66,12 @@ struct FrameSequenceEncodeRequest {
     DataCodecEncodeConfigurationSource configurationSource;
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
     IRunRecordSink* runRecordSink{nullptr};
-    bool enableParallelStages{true};
-    IParallelTaskRunner* parallelTaskRunner{nullptr};
+    CodecResourceParams resources;
 };
 
 struct FrameSequenceEncodeResult {
     bool success{false};
+    std::optional<CodecFailureRecord> failure;
     std::size_t encodedFrameCount{0u};
     std::uint64_t encodedByteCount{0u};
     std::vector<TelemetryMessageRecord> messages;
@@ -79,7 +80,42 @@ struct FrameSequenceEncodeResult {
 class FrameSequenceEncodeExecutor final {
 public:
     [[nodiscard]] static FrameSequenceEncodeResult Execute(
-        const FrameSequenceEncodeRequest& request) {
+        const FrameSequenceEncodeRequest& request) noexcept {
+        FrameSequenceEncodeResult result;
+        if (!request.source || !request.outputSink || request.source->FrameCount() == 0u) {
+            result.failure = MakeCodecFailureRecord(CodecErrorCode::InvalidInput,
+                "invalid-sequence-input", "FrameSequenceEncodeExecutor", "frame sequence requires a source, output sink and frames");
+            return result;
+        }
+        try {
+            DataCodecExecutionResources resources(request.resources);
+            CodecRunScope run(resources);
+            if (!run) { result.failure = resources.FirstFailure(); return result; }
+            try {
+                result = ExecuteInRun(request, resources);
+                if (result.failure) { resources.RecordFailure(*result.failure); }
+            } catch (...) {
+                RecordExecutionException(resources, "FrameSequenceEncodeExecutor");
+            }
+            result.success = run.Finish(result.success);
+            if (auto failure = resources.FirstFailure()) { result.failure = failure; }
+        } catch (const std::bad_alloc&) {
+            result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                "allocation-failed", "FrameSequenceEncodeExecutor", "memory allocation failed");
+        } catch (const std::exception& error) {
+            result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                "entry-exception", "FrameSequenceEncodeExecutor", error.what());
+        } catch (...) {
+            result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                "entry-exception", "FrameSequenceEncodeExecutor", "unknown exception");
+        }
+        if (!result.success && request.outputSink) { request.outputSink->AbortSequence(); }
+        return result;
+    }
+
+private:
+    static FrameSequenceEncodeResult ExecuteInRun(
+        const FrameSequenceEncodeRequest& request, DataCodecExecutionResources& resources) {
         FrameSequenceEncodeResult result;
         RunRecordDispatcher recordDispatcher;
         recordDispatcher.AddSink(request.runRecordSink);
@@ -100,12 +136,14 @@ public:
             RunRecordEmitter& records;
             callback::PhaseTimePoint start;
 
-            ~RunFinalizer() {
-                records.EndRun(RunEndRecord{
+            ~RunFinalizer() noexcept {
+                const RunEndRecord end{
                     .success = result.success,
                     .elapsedMs = callback::ElapsedMilliseconds(start),
                     .outputBytes = result.encodedByteCount,
-                });
+                };
+                if (result.failure) { records.TryEndFailedRun(*result.failure, end); }
+                else { try { records.EndRun(end); } catch (...) {} }
             }
         } runFinalizer{result, runRecords, runStart};
         if (request.source == nullptr) {
@@ -122,9 +160,12 @@ public:
             return result;
         }
 
-        const auto fallbackControlParams = request.controlParams != nullptr
-            ? *request.controlParams
-            : MakeDefaultEncodeControlParams();
+        std::optional<CodecControlParams> defaultControlParams;
+        const auto* controlParams = request.controlParams;
+        if (!controlParams) {
+            defaultControlParams.emplace(MakeDefaultEncodeControlParams());
+            controlParams = &*defaultControlParams;
+        }
         SubmitProgress(runRecords, RunProgressPhase::Begin, 0.0, false);
         EncodeSessionWorkspace workspace;
 
@@ -144,7 +185,6 @@ public:
                         result,
                         runRecords,
                         error.empty() ? "failed to load frame sequence input" : std::move(error));
-                    request.outputSink->AbortSequence();
                     SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
                     return result;
                 }
@@ -159,7 +199,6 @@ public:
                         result,
                         runRecords,
                         error.empty() ? "failed to open frame sequence output" : std::move(error));
-                    request.outputSink->AbortSequence();
                     SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
                     return result;
                 }
@@ -178,7 +217,7 @@ public:
                     .frameIndex = frame.frameIndex,
                     .frameCount = static_cast<std::uint32_t>(frameCount),
                     .timeValue = frame.timeValue,
-                    .controlParams = &fallbackControlParams,
+                    .controlParams = controlParams,
                     .pipelineControl = request.pipelineControl,
                     .configurationSource = request.configurationSource,
                     .language = request.language,
@@ -186,18 +225,23 @@ public:
                     .outputSink = output.get(),
                     .attributeTargets = std::span<const AttributeTarget>(frame.attributeTargets),
                     .workspace = &workspace,
-                    .enableParallelStages = request.enableParallelStages,
-                    .parallelTaskRunner = request.parallelTaskRunner,
-                });
-                result.messages.insert(
-                    result.messages.end(),
-                    frameResult.messages.begin(),
-                    frameResult.messages.end());
+                    .nextFrameReferences = FrameReferenceNeeds{
+                        .attributes = TemporalBuilder::ResolveTemporalFieldState(
+                            static_cast<std::uint32_t>(frameCount), frame.frameIndex + 1u, controlParams->attrReference),
+                        .geometry = TemporalBuilder::ResolveTemporalFieldState(
+                            static_cast<std::uint32_t>(frameCount), frame.frameIndex + 1u, controlParams->geometryReference),
+                    },
+                }, resources);
+                if (frameResult.failure && !result.failure) {
+                    result.failure = frameResult.failure;
+                }
+                if (frameResult.success) {
+                    AppendRetainedTelemetryMessages(result.messages, frameResult.messages);
+                }
                 if (!frameResult.success || !frameResult.hasEncodedOutput) {
                     if (result.messages.empty()) {
                         AddError(result, runRecords, "failed to encode frame sequence frame");
                     }
-                    request.outputSink->AbortSequence();
                     SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
                     return result;
                 }
@@ -210,7 +254,6 @@ public:
                         result,
                         runRecords,
                         error.empty() ? "failed to commit frame sequence output" : std::move(error));
-                    request.outputSink->AbortSequence();
                     SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
                     return result;
                 }
@@ -219,12 +262,10 @@ public:
             }
         } catch (const std::bad_alloc&) {
             AddError(result, runRecords, "frame sequence encode ran out of memory");
-            request.outputSink->AbortSequence();
             SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
             return result;
         } catch (const std::exception& exception) {
-            AddError(result, runRecords, std::string("frame sequence encode failed: ") + exception.what());
-            request.outputSink->AbortSequence();
+            AddError(result, runRecords, exception.what());
             SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
             return result;
         }
@@ -238,15 +279,12 @@ private:
     static void AddError(
         FrameSequenceEncodeResult& result,
         RunRecordEmitter& runRecords,
-        std::string text) {
-        TelemetryMessageRecord message{
-            .order = static_cast<std::uint64_t>(result.messages.size()),
-            .severity = TelemetryMessageSeverity::Error,
-            .origin = "FrameSequenceEncodeExecutor",
-            .text = std::move(text),
-        };
-        runRecords.AddMessage(message);
-        result.messages.push_back(std::move(message));
+        std::string_view text) noexcept {
+        if (!result.failure) {
+            result.failure = MakeCodecFailureRecord(
+                CodecErrorCode::EncodeFailure, "operation-failed", "FrameSequenceEncodeExecutor", text);
+        }
+        (void)runRecords;
     }
 
     static void SubmitProgress(

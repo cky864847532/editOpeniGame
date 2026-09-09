@@ -144,7 +144,12 @@ inline bool WriteNumericArrayBlock(
     (void)header;
     (void)alpha;
     (void)beta;
-    return writer.Write(bytes, error);
+    for (std::size_t offset = 0u; offset < bytes.size();) {
+        const auto n = std::min<std::size_t>(kIoWindowBytes, bytes.size() - offset);
+        if (!writer.Write(bytes.subspan(offset, n), error)) { return false; }
+        offset += n;
+    }
+    return true;
 }
 
 } // namespace datacodec

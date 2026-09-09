@@ -2,9 +2,12 @@
 #define DATACODEC_CODEC_NUMERICARRAY_NUMERICARRAYBUFFER_H
 
 #include "DataCodec/Codec/NumericArray/NumericArrayLayout.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <cstddef>
+#include <array>
+#include <optional>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -24,6 +27,79 @@ struct PressioDataDeleter {
 };
 
 using PressioDataHandle = std::unique_ptr<pressio_data, PressioDataDeleter>;
+
+enum class NumericBufferSample : std::size_t {
+    Raw,
+    ComponentRaw,
+    ComponentOwnedPayloads,
+    BaseDecoded,
+    ResidualRaw,
+    ResidualDecoded,
+    BundleScratch,
+    Output,
+    EncodedInput,
+    Converted,
+    ReferencePrimary,
+    ReferenceResampled,
+    ReferenceShifted,
+    DecodedComponent,
+    WaveletReferenceComponent,
+    WaveletReferenceLow,
+    WaveletReferenceHigh,
+    WaveletLowDelta,
+    WaveletHighDelta,
+    WaveletLow,
+    WaveletHigh,
+    WaveletReconstructed,
+    WaveletLowBlob,
+    WaveletHighBlob,
+    ReferencePreparedDelta,
+    OrdinaryCandidate,
+    ReferenceCandidate,
+    ReaderOrder,
+    ReferenceReaderOrder,
+    Count,
+};
+
+// 每块只携带固定取样记录，worker 不导出报告，不保存数组引用
+struct NumericArrayBlockCapacitySamples {
+    std::array<BufferCapacitySample, static_cast<std::size_t>(NumericBufferSample::Count)> values{{
+        BufferCapacitySample{"numeric.raw"},
+        BufferCapacitySample{"numeric.component_raw"},
+        BufferCapacitySample{"numeric.component_owned_payload_arrays"},
+        BufferCapacitySample{"numeric.base_decoded"},
+        BufferCapacitySample{"numeric.residual_raw"},
+        BufferCapacitySample{"numeric.residual_decoded"},
+        BufferCapacitySample{"numeric.bundle_scratch"},
+        BufferCapacitySample{"numeric.output"},
+        BufferCapacitySample{"numeric.encoded_input"},
+        BufferCapacitySample{"numeric.converted"},
+        BufferCapacitySample{"numeric.reference_primary"},
+        BufferCapacitySample{"numeric.reference_resampled"},
+        BufferCapacitySample{"numeric.reference_shifted"},
+        BufferCapacitySample{"numeric.decoded_component"},
+        BufferCapacitySample{"wavelet.reference_component"},
+        BufferCapacitySample{"wavelet.reference_low"},
+        BufferCapacitySample{"wavelet.reference_high"},
+        BufferCapacitySample{"wavelet.low_delta"},
+        BufferCapacitySample{"wavelet.high_delta"},
+        BufferCapacitySample{"wavelet.low"},
+        BufferCapacitySample{"wavelet.high"},
+        BufferCapacitySample{"wavelet.reconstructed"},
+        BufferCapacitySample{"wavelet.low_blob"},
+        BufferCapacitySample{"wavelet.high_blob"},
+        BufferCapacitySample{"reference.prepared_delta"},
+        BufferCapacitySample{"reference.ordinary_candidate"},
+        BufferCapacitySample{"reference.encoded_candidate"},
+        BufferCapacitySample{"numeric.reader_order"},
+        BufferCapacitySample{"numeric.reference_reader_order"},
+    }};
+
+    template<class T>
+    void Observe(const NumericBufferSample kind, const T& storage) noexcept {
+        values[static_cast<std::size_t>(kind)].Observe(storage);
+    }
+};
 
 struct NumericArrayBufferLayout : public NumericArrayLayout {
     std::vector<std::size_t> shape;
@@ -85,6 +161,12 @@ public:
 
     [[nodiscard]] bool Empty() const noexcept {
         return this->Bytes().empty();
+    }
+
+    // 库内部结果容量未知，自有 vector 按真实 capacity 单独报告
+    [[nodiscard]] std::optional<std::uint64_t> OwnedCapacityBytes() const noexcept {
+        if (pressioData != nullptr) { return std::nullopt; }
+        return static_cast<std::uint64_t>(ownedBytes.capacity());
     }
 
     void Reset() {

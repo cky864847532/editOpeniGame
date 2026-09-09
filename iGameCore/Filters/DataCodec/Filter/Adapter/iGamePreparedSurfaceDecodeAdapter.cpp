@@ -1,12 +1,13 @@
 #include "DataCodec/Filter/Adapter/iGamePreparedSurfaceDecodeAdapter.h"
 
-#include "DataCodec/Runtime/Execution/ParallelDecodeTopologyBlockObserver.h"
+#include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "ModelSurface/iGameModelGeometryFilter.h"
 #include "iGameDrawObject.h"
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
 
 #include <chrono>
+#include <atomic>
 #include <functional>
 #include <iomanip>
 #include <mutex>
@@ -42,44 +43,19 @@ void CollectUnstructuredMeshes(
 } // 匿名命名空间
 
 struct iGamePreparedSurfaceDecodeAdapter::Impl {
-    Impl(
-        std::shared_ptr<::datacodec::IParallelTaskRunner> taskRunner,
-        const std::size_t workerCountValue,
-        const std::size_t maxPendingBlockCount) {
-        if (taskRunner == nullptr) {
-            throw std::invalid_argument(
-                "prepared surface decode adapter requires a task runner");
-        }
-        observer = std::make_unique<::datacodec::ParallelDecodeTopologyBlockObserver>(
-            ::datacodec::ParallelDecodeTopologyBlockObserver::Options{
-                .taskRunner = std::move(taskRunner),
-                .workerCount = workerCountValue,
-                .maxPendingBlockCount = maxPendingBlockCount,
-            },
-            [this](
-                const ::datacodec::ConnectivityTopologyDecodeInfo& info,
-                const std::size_t resolvedWorkerCount,
-                std::string* error) {
-                return BeginSurface(info, resolvedWorkerCount, error);
-            },
-            [this](
-                const std::size_t workerIndex,
-                ::datacodec::DecodedConnectivityTopologyBlock block,
-                std::string* error) {
-                return AccumulateSurfaceBlock(workerIndex, std::move(block), error);
-            });
-    }
-
-    ~Impl() {
-        observer.reset();
-    }
-
     bool BeginSurface(
         const ::datacodec::ConnectivityTopologyDecodeInfo& info,
-        const std::size_t resolvedWorkerCount,
         std::string* error) {
+        std::unique_ptr<ModelGeometryDecodedSurfaceBuilder> retired;
         std::lock_guard<std::mutex> lock(mutex);
-        builder.reset();
+        retired = std::move(builder);
+        completed = false;
+        failed = false;
+        expectedBlockCount = info.blockCount;
+        completedBlockCount = 0u;
+        expectedCellCount = info.cellCount;
+        completedCellCount = 0u;
+        diagnosticsIncomplete.store(false, std::memory_order_relaxed);
         summary.clear();
         accumulateCpuMs = 0.0;
         startedAt = std::chrono::steady_clock::now();
@@ -92,64 +68,85 @@ struct iGamePreparedSurfaceDecodeAdapter::Impl {
             }
             return false;
         }
-        builder = std::make_shared<ModelGeometryDecodedSurfaceBuilder>(
+        builder = std::make_unique<ModelGeometryDecodedSurfaceBuilder>(
             static_cast<IGsize>(info.pointCount),
-            resolvedWorkerCount);
+            1u);
         return true;
     }
 
     bool AccumulateSurfaceBlock(
-        const std::size_t workerIndex,
         ::datacodec::DecodedConnectivityTopologyBlock block,
         std::string* error) {
-        std::shared_ptr<ModelGeometryDecodedSurfaceBuilder> localBuilder;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            localBuilder = builder;
-        }
-        if (localBuilder == nullptr) {
-            if (error != nullptr) {
-                *error = "prepared surface builder is unavailable";
-            }
-            return false;
+        // 同步消费当前块，返回时不保留块数组，也不创建第二条执行队列
+        std::unique_ptr<ModelGeometryDecodedSurfaceBuilder> retired;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (builder == nullptr || completed || failed || completedBlockCount >= expectedBlockCount ||
+            block.blockIndex != completedBlockCount || block.cellOffset != completedCellCount ||
+            block.fixedCellSize != fixedCellSize || completedCellCount > expectedCellCount ||
+            block.cellTypes.size() > expectedCellCount - completedCellCount) {
+            failed = true;
+            retired = std::move(builder);
+            return ::datacodec::validation::AssignError(error, "prepared surface is not accepting topology blocks");
         }
         const auto blockStartedAt = std::chrono::steady_clock::now();
-        const auto success = localBuilder->AccumulateBlock(
-            workerIndex,
+        bool success = false;
+        try {
+        success = builder->AccumulateBlock(
+            0u,
             block.cellOffset,
             block.fixedCellSize,
             block.connectivity,
             block.offsets,
             block.cellTypes,
             error);
+        } catch (...) {
+            failed = true;
+            retired = std::move(builder);
+            throw;
+        }
         const auto elapsedMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - blockStartedAt).count();
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            accumulateCpuMs += elapsedMs;
+        accumulateCpuMs += elapsedMs;
+        failed = !success;
+        if (success) {
+            ++completedBlockCount;
+            completedCellCount += block.cellTypes.size();
+        } else {
+            retired = std::move(builder);
         }
         return success;
+    }
+
+    bool EndSurface(std::string* error) {
+        std::unique_ptr<ModelGeometryDecodedSurfaceBuilder> retired;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!builder || failed || completed || completedBlockCount != expectedBlockCount ||
+            completedCellCount != expectedCellCount) {
+            failed = true;
+            retired = std::move(builder);
+            return ::datacodec::validation::AssignError(error, "prepared surface topology is incomplete");
+        }
+        completed = true;
+        finishedAt = std::chrono::steady_clock::now();
+        return true;
     }
 
     bool AttachPreparedSurface(
         const DataObject::Pointer& root,
         std::string* error) {
-        std::shared_ptr<ModelGeometryDecodedSurfaceBuilder> localBuilder;
+        std::unique_ptr<ModelGeometryDecodedSurfaceBuilder> localBuilder;
         double localAccumulateCpuMs = 0.0;
         std::chrono::steady_clock::time_point localStartedAt;
         std::chrono::steady_clock::time_point localFinishedAt;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (!observer->Succeeded() || builder == nullptr) {
+            if (!completed || failed || builder == nullptr) {
                 if (error != nullptr) {
-                    const auto observerError = observer->Error();
-                    *error = observerError.empty()
-                        ? "prepared surface construction did not complete"
-                        : observerError;
+                    *error = "prepared surface construction did not complete";
                 }
                 return false;
             }
-            localBuilder = builder;
+            localBuilder = std::move(builder);
             localAccumulateCpuMs = accumulateCpuMs;
             localStartedAt = startedAt;
             localFinishedAt = finishedAt;
@@ -184,13 +181,13 @@ struct iGamePreparedSurfaceDecodeAdapter::Impl {
             std::chrono::steady_clock::now() - finalizeStart).count();
         const auto overlapMs = std::chrono::duration<double, std::milli>(
             localFinishedAt - localStartedAt).count();
-        const auto stats = observer->Stats();
 
+        try {
         std::ostringstream output;
         output << std::fixed << std::setprecision(2)
-               << "surface-execution=injected-runner"
-               << "; surface-blocks=" << stats.completedBlockCount
-               << "/" << stats.observedBlockCount
+               << "surface-execution=synchronous-observer"
+               << "; surface-blocks=" << completedBlockCount
+               << "/" << expectedBlockCount
                << "; surface-overlap=" << overlapMs << " ms"
                << "; surface-accumulate-cpu=" << localAccumulateCpuMs << " ms"
                << "; surface-finalize=" << finalizeMs << " ms"
@@ -203,12 +200,21 @@ struct iGamePreparedSurfaceDecodeAdapter::Impl {
             std::lock_guard<std::mutex> lock(mutex);
             summary = output.str();
         }
+        } catch (...) {
+            diagnosticsIncomplete.store(true, std::memory_order_relaxed);
+        }
         return true;
     }
 
     mutable std::mutex mutex;
-    std::unique_ptr<::datacodec::ParallelDecodeTopologyBlockObserver> observer;
-    std::shared_ptr<ModelGeometryDecodedSurfaceBuilder> builder;
+    bool completed{false};
+    bool failed{false};
+    std::size_t expectedBlockCount{0u};
+    std::size_t completedBlockCount{0u};
+    std::size_t expectedCellCount{0u};
+    std::size_t completedCellCount{0u};
+    std::unique_ptr<ModelGeometryDecodedSurfaceBuilder> builder;
+    std::atomic_bool diagnosticsIncomplete{false};
     double accumulateCpuMs{0.0};
     int fixedCellSize{0};
     bool hasOffsets{false};
@@ -218,34 +224,25 @@ struct iGamePreparedSurfaceDecodeAdapter::Impl {
     std::string summary;
 };
 
-iGamePreparedSurfaceDecodeAdapter::iGamePreparedSurfaceDecodeAdapter(
-    std::shared_ptr<::datacodec::IParallelTaskRunner> taskRunner,
-    const std::size_t workerCount,
-    const std::size_t maxPendingBlockCount)
-    : m_impl(std::make_unique<Impl>(
-        std::move(taskRunner),
-        workerCount,
-        maxPendingBlockCount)) {}
+iGamePreparedSurfaceDecodeAdapter::iGamePreparedSurfaceDecodeAdapter()
+    : m_impl(std::make_unique<Impl>()) {}
 
 iGamePreparedSurfaceDecodeAdapter::~iGamePreparedSurfaceDecodeAdapter() = default;
 
 bool iGamePreparedSurfaceDecodeAdapter::BeginConnectivityTopology(
     const ::datacodec::ConnectivityTopologyDecodeInfo& info,
     std::string* error) {
-    return m_impl->observer->BeginConnectivityTopology(info, error);
+    return m_impl->BeginSurface(info, error);
 }
 
 bool iGamePreparedSurfaceDecodeAdapter::ObserveConnectivityBlock(
     ::datacodec::DecodedConnectivityTopologyBlock block,
     std::string* error) {
-    return m_impl->observer->ObserveConnectivityBlock(std::move(block), error);
+    return m_impl->AccumulateSurfaceBlock(std::move(block), error);
 }
 
 bool iGamePreparedSurfaceDecodeAdapter::EndConnectivityTopology(std::string* error) {
-    const auto ended = m_impl->observer->EndConnectivityTopology(error);
-    std::lock_guard<std::mutex> lock(m_impl->mutex);
-    m_impl->finishedAt = std::chrono::steady_clock::now();
-    return ended;
+    return m_impl->EndSurface(error);
 }
 
 bool iGamePreparedSurfaceDecodeAdapter::AttachPreparedSurface(
@@ -257,6 +254,10 @@ bool iGamePreparedSurfaceDecodeAdapter::AttachPreparedSurface(
 std::string iGamePreparedSurfaceDecodeAdapter::Summary() const {
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     return m_impl->summary;
+}
+
+bool iGamePreparedSurfaceDecodeAdapter::DiagnosticsIncomplete() const noexcept {
+    return m_impl->diagnosticsIncomplete.load(std::memory_order_relaxed);
 }
 
 IGAME_NAMESPACE_END

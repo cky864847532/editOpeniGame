@@ -2,7 +2,7 @@
 #define iGameFramePackageDecodeAssembly_h
 
 #include "DataCodec/API/Adapter/IDecodedFrameAssembly.h"
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "iGameDataObject.h"
 
 #include <memory>

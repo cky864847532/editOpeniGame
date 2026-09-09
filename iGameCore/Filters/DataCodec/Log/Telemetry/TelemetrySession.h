@@ -28,6 +28,7 @@ struct TelemetrySession {
     std::vector<TelemetryStageRecord> stages;
     std::vector<TelemetryMessageRecord> messages;
     std::vector<TelemetryArtifactRecord> artifacts;
+    TelemetryRetentionStats captureRetention;
 
     void AddStageRecord(TelemetryStageRecord record) {
         stages.push_back(std::move(record));

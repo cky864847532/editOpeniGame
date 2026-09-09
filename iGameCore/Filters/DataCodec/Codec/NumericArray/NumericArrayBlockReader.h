@@ -4,6 +4,8 @@
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockDecode.h"
+#include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
@@ -26,6 +28,19 @@ struct NumericArrayBlockPayload {
     std::vector<double> beta;
     ScratchByteBuffer bytes;
 };
+
+inline ParsedNumericArrayBlock MakeParsedBlockView(const NumericArrayBlockPayload& input) {
+    ParsedNumericArrayBlock block;
+    block.header = input.header;
+    block.backgroundCompressor = input.backgroundCompressor;
+    block.backgroundEncodedByteLength = input.backgroundEncodedByteLength;
+    block.componentLayouts = input.componentLayouts;
+    block.regionLayers = input.regionLayers;
+    block.alpha = input.alpha;
+    block.beta = input.beta;
+    block.bytes = input.bytes.Span();
+    return block;
+}
 
 template<typename TStream>
 inline bool ReadNumericArrayBlockPayload(
@@ -52,15 +67,86 @@ inline bool ReadNumericArrayBlockPayload(
         block.beta = layout.beta;
     }
 
-    block.bytes = runtime.scratchBytePool.Acquire(block.header.encodedByteLength);
-    return stream.ReadBytes(block.bytes.Bytes().data(), block.bytes.Bytes().size(), error);
+    block.bytes = runtime.ScratchBytePool().Acquire(block.header.encodedByteLength);
+    auto& bytes = block.bytes.Bytes();
+    for (std::size_t offset = 0u; offset < bytes.size();) {
+        if (runtime.Run().Stopped()) { return validation::AssignError(error, "numeric block read cancelled"); }
+        const auto count = std::min(kIoWindowBytes, bytes.size() - offset);
+        if (!stream.ReadBytes(bytes.data() + offset, count, error)) { return false; }
+        if (runtime.Run().Stopped()) { return validation::AssignError(error, "numeric block read cancelled"); }
+        offset += count;
+    }
+    return true;
 }
+
+template<class TStream>
+struct NumericDecodeCursor {
+    TStream& stream;
+    const NumericArrayBlockParams& params;
+    const std::vector<NumericArrayBlockLayoutParams>& layouts;
+    const CacheResources& resources;
+    std::size_t nextBlock{0u};
+    bool singleRecord{false};
+
+    bool Prepare(std::string* error) {
+        ParamSize elements = 0u;
+        for (const auto& layout : layouts) {
+            NumericArrayBlockHeader header;
+            std::size_t rawBytes = 0u;
+            if (!MakeNumericArrayBlockHeader(layout, header, error) ||
+                !ResolveNumericArrayBlockRawByteCount(params, header.elementCount, rawBytes, error)) { return false; }
+            if (header.elementCount == 0u || header.elementOffset != elements || elements > params.elementCount ||
+                header.elementCount > params.elementCount - elements) {
+                return validation::AssignError(error, "numeric array block layouts are not a contiguous complete field");
+            }
+            elements += header.elementCount;
+            singleRecord |= header.elementCount > kSpatialBlockElementCount;
+        }
+        return elements == params.elementCount ||
+            validation::AssignError(error, "numeric array block layouts do not cover the full field");
+    }
+    bool HasMore() const noexcept { return nextBlock < layouts.size(); }
+    ResourceWorkType NextWorkType(const ResourceWorkPath path) const noexcept {
+        const auto& layout = layouts[nextBlock];
+        ResourceWorkType key{
+            .path = path,
+            .codec = static_cast<std::uint32_t>(layout.bytesCodec),
+            .scalar = static_cast<std::uint32_t>(params.dataType),
+            .components = static_cast<std::uint32_t>(params.componentCount),
+            .blockElements = std::max<std::uint64_t>(kSpatialBlockElementCount, layout.elementCount),
+            .referencePath = (static_cast<std::uint32_t>(layout.mode) << 8u) |
+                static_cast<std::uint32_t>(layout.referenceKind),
+        };
+        const auto includeCodec = [&](const NumericArrayBytesCodec codec) {
+            switch (codec) {
+            case NumericArrayBytesCodec::RawBytes: key.componentCodecMask |= 1u; break;
+            case NumericArrayBytesCodec::NumericArrayCodec: key.componentCodecMask |= 2u; break;
+            case NumericArrayBytesCodec::IntegerDeltaRunVarint: key.componentCodecMask |= 4u; break;
+            case NumericArrayBytesCodec::IntegerDeltaLiteralRunVarint: key.componentCodecMask |= 8u; break;
+            }
+        };
+        includeCodec(layout.bytesCodec);
+        for (const auto& component : layout.componentLayouts) { includeCodec(component.bytesCodec); }
+        for (const auto& layer : layout.regionLayers) {
+            for (const auto& component : layer.componentLayouts) { includeCodec(component.bytesCodec); }
+        }
+        return key;
+    }
+    bool ReadNext(NumericArrayBlockPayload& block, std::string* error) {
+        if (!HasMore()) { return validation::AssignError(error, "numeric decode cursor is exhausted"); }
+        if (!ReadNumericArrayBlockPayload(stream, params.componentCount, layouts[nextBlock], resources, block, error)) {
+            return false;
+        }
+        ++nextBlock;
+        return true;
+    }
+};
 
 inline bool ResolveDecodedNumericArrayBlockBytes(
     const numericarray::NumericArrayBlockParams& params,
     const NumericArrayBlockPayload& block,
     std::vector<std::uint8_t>& decodedBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!numericarray::ValidateNumericArrayBlockParams(params, error)) {
         return false;
@@ -76,7 +162,7 @@ inline bool ResolveDecodedNumericArrayBlockBytes(
             block.regionLayers,
             block.bytes.Span(),
             decodedBytes,
-            error);
+            error, compressorState);
     }
     return numericarray::ResolveDecodedNumericArrayBlockBytes(
         params,
@@ -86,71 +172,10 @@ inline bool ResolveDecodedNumericArrayBlockBytes(
         block.componentLayouts,
         block.bytes.Span(),
         decodedBytes,
-        error);
+        error, compressorState);
 }
 
-using DecodedNumericArrayBlockConsumer = std::function<bool(
-    const NumericArrayBlockHeader& header,
-    std::span<const std::uint8_t> decodedBytes,
-    std::string* error)>;
-
-template<typename TStream>
-inline bool DecodeNumericArrayBlocks(
-    TStream& stream,
-    const numericarray::NumericArrayBlockParams& params,
-    const std::vector<NumericArrayBlockLayoutParams>& blockLayouts,
-    const CacheResources& runtime,
-    const DecodedNumericArrayBlockConsumer& consumer,
-    std::string* error = nullptr) {
-    const auto componentCount = params.componentCount;
-    std::uint64_t consumedElements = 0u;
-    const auto expectedElements = static_cast<std::uint64_t>(params.elementCount);
-    if (expectedElements != 0u && blockLayouts.empty()) {
-        return validation::AssignError(error, "numeric array params are missing block layout metadata");
-    }
-    for (const auto& layout : blockLayouts) {
-        NumericArrayBlockPayload block;
-        if (!ReadNumericArrayBlockPayload(stream, componentCount, layout, runtime, block, error)) {
-            return false;
-        }
-        if ((block.header.mode != NumericArrayBlockMode::NonReference &&
-             block.header.mode != NumericArrayBlockMode::LayeredResidual) ||
-            block.header.referenceKind != NumericArrayReferenceKind::None ||
-            block.header.codecId != NumericArrayReferenceCodecId::NonReference) {
-            return validation::AssignError(error, "numeric array decoder only accepts non-reference blocks");
-        }
-        if (block.header.elementCount == 0u ||
-            block.header.elementOffset != consumedElements ||
-            block.header.elementCount > expectedElements - consumedElements) {
-            return validation::AssignError(error, "numeric array block range is not contiguous");
-        }
-
-        std::vector<std::uint8_t> decodedBytes;
-        if (!ResolveDecodedNumericArrayBlockBytes(params, block, decodedBytes, error)) {
-            return false;
-        }
-        if (!consumer(
-                block.header,
-                std::span<const std::uint8_t>(decodedBytes.data(), decodedBytes.size()),
-                error)) {
-            return false;
-        }
-        if (!validation::CheckedAddU64(
-                consumedElements,
-                block.header.elementCount,
-                consumedElements,
-                "numeric array consumed block elements",
-                error)) {
-            return false;
-        }
-    }
-    if (consumedElements != expectedElements) {
-        return validation::AssignError(error, "numeric array block layouts do not cover the full field");
-    }
-    return true;
-}
-
-} // namespace numericarray
-} // namespace datacodec
+} // 数值数组命名空间
+} // DataCodec 命名空间
 
 #endif

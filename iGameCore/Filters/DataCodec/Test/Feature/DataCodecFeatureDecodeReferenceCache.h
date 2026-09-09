@@ -4,6 +4,7 @@
 #include "DataCodec/Workflow/FrameSequence/FrameSequenceDependencyPlanner.h"
 #include "DataCodec/Workflow/Temporal/TemporalBuilder.h"
 #include "DataCodec/Runtime/Cache/DecodeReferenceCache.h"
+#include "DataCodec/Storage/ByteIO/ByteBudget.h"
 
 #include <cstdint>
 #include <iostream>
@@ -40,7 +41,7 @@ inline DecodeReferenceFrame MakeReferenceFrame(
 
 inline bool TestReferenceCacheUsesActualKeyFrameLRU() {
     DecodeReferenceCache cache;
-    cache.Configure(2u, 0u);
+    cache.Configure(2u);
     cache.Publish(Key(0u), MakeReferenceFrame(0u, "topology-0"));
     cache.Publish(Key(1u), MakeReferenceFrame(1u, "topology-1"));
     {
@@ -53,9 +54,53 @@ inline bool TestReferenceCacheUsesActualKeyFrameLRU() {
         cache.Find(Key(2u)) != nullptr;
 }
 
+inline bool TestTrimPreservesReferenceConsumer() {
+    DecodeReferenceCache cache;
+    cache.Configure(1u);
+    cache.Publish(Key(0u), MakeReferenceFrame(0u, "topology"));
+    auto consumer = cache.Find(Key(0u));
+    std::weak_ptr<DecodeReferenceFrame> lifetime = consumer;
+    if (consumer == nullptr || !cache.TrimOne() || cache.TrimOne() ||
+        cache.Find(Key(0u)) != nullptr || lifetime.expired() ||
+        !consumer->leaves.at("/leaf").topology.at("topology").store->complete) {
+        return false;
+    }
+    consumer.reset();
+    cache.Configure(0u);
+    cache.Publish(Key(1u), MakeReferenceFrame(1u, "topology"));
+    return lifetime.expired() && cache.Find(Key(1u)) == nullptr;
+}
+
+inline bool TestRequiredReferencesSurviveRetentionDisabled() {
+    DataCodecExecutionResources run(ResolvedResourceConfiguration{
+        .initialLimits = {0u, 1u, 1u},
+        .storageCeilingBytes = 64u,
+        .computeCeiling = 1u,
+        .threaded = false,
+    });
+    CodecRunScope scope(run);
+    DecodeReferenceCache cache(&run);
+    cache.Configure(1u);
+    auto firstDependency = cache.RequireFrame(Key(0u));
+    auto secondDependency = cache.RequireFrame(Key(1u));
+    auto sharedDependency = cache.RequireFrame(Key(0u));
+    auto published = cache.Publish(Key(0u), MakeReferenceFrame(0u, "topology-a"));
+    std::weak_ptr<DecodeReferenceFrame> lifetime = published;
+    published.reset();
+    cache.Publish(Key(1u), MakeReferenceFrame(1u, "topology-b"));
+    if (cache.TrimOne() || cache.Statistics().residentFrames != 0u ||
+        cache.Find(Key(0u)) == nullptr || cache.Find(Key(1u)) == nullptr) { return false; }
+    firstDependency.Reset();
+    if (lifetime.expired() || cache.Find(Key(0u)) == nullptr) { return false; }
+    sharedDependency.Reset();
+    secondDependency.Reset();
+    return lifetime.expired() && cache.Find(Key(0u)) == nullptr &&
+        cache.Find(Key(1u)) == nullptr && scope.Finish(true);
+}
+
 inline bool TestReferenceKindsMergeForOneKeyFrame() {
     DecodeReferenceCache cache;
-    cache.Configure(2u, 0u);
+    cache.Configure(2u);
     cache.Publish(Key(0u), MakeReferenceFrame(0u, "topology-a"));
     cache.Publish(Key(0u), MakeReferenceFrame(0u, "topology-b"));
     const auto frame = cache.Find(Key(0u));
@@ -68,12 +113,12 @@ inline bool TestReferenceKindsMergeForOneKeyFrame() {
 
 inline bool TestReferenceRevisionSeparatesEntries() {
     DecodeReferenceCache cache;
-    cache.Configure(4u, 0u);
+    cache.Configure(4u);
     cache.Publish(Key(0u, "r1"), MakeReferenceFrame(0u, "topology"));
     return cache.Find(Key(0u, "r1")) != nullptr && cache.Find(Key(0u, "r2")) == nullptr;
 }
 
-inline std::vector<std::uint8_t> MakeFramePackageBytes(
+inline EncodedBuffer MakeFramePackageBytes(
     const std::uint32_t frameIndex,
     const TemporalFieldRole role,
     const std::uint32_t keyFrameIndex,
@@ -93,24 +138,26 @@ inline std::vector<std::uint8_t> MakeFramePackageBytes(
         .topologyMode = topologyMode,
     });
     const std::vector<FramePackageIO::LeafPackageWriter> leafWriters(1u);
-    MemoryByteRangeOutput output;
+    DataCodecExecutionResources root(ResolvedResourceConfiguration{
+        {1024u * 1024u, 1u, 1u}, 1024u * 1024u, 1u, false, true});
+    MemoryByteRangeOutput output(root);
     std::string error;
     if (!FramePackageIO::WriteToSink(package, leafWriters, output, nullptr, &error)) { return {}; }
     return output.TakeBytes();
 }
 
 inline FrameSequenceDependencyPlanner::FrameReaderMap MakeDependencyTestReaders() {
-    const auto frame0 = MakeFramePackageBytes(
+    auto frame0 = MakeFramePackageBytes(
         0u, TemporalFieldRole::KeyFrame, 0u, TopologyOwnershipMode::Owned, 0u);
-    const auto frame1 = MakeFramePackageBytes(
+    auto frame1 = MakeFramePackageBytes(
         1u, TemporalFieldRole::PredFrame, 0u, TopologyOwnershipMode::Reused, 0u);
-    const auto frame2 = MakeFramePackageBytes(
+    auto frame2 = MakeFramePackageBytes(
         2u, TemporalFieldRole::PredFrame, 0u, TopologyOwnershipMode::Reused, 0u);
     if (frame0.empty() || frame1.empty() || frame2.empty()) { return {}; }
     FrameSequenceDependencyPlanner::FrameReaderMap readers;
-    readers.emplace(0u, std::make_shared<MemoryByteRangeReader>(frame0));
-    readers.emplace(1u, std::make_shared<MemoryByteRangeReader>(frame1));
-    readers.emplace(2u, std::make_shared<MemoryByteRangeReader>(frame2));
+    readers.emplace(0u, std::make_shared<MemoryByteRangeReader>(std::move(frame0)));
+    readers.emplace(1u, std::make_shared<MemoryByteRangeReader>(std::move(frame1)));
+    readers.emplace(2u, std::make_shared<MemoryByteRangeReader>(std::move(frame2)));
     return readers;
 }
 
@@ -153,6 +200,8 @@ namespace datacodec::test
 inline int RunDataCodecFeatureDecodeReferenceCache() {
     using namespace feature_decode_reference_cache;
     if (!TestReferenceCacheUsesActualKeyFrameLRU() ||
+        !TestTrimPreservesReferenceConsumer() ||
+        !TestRequiredReferencesSurviveRetentionDisabled() ||
         !TestReferenceKindsMergeForOneKeyFrame() ||
         !TestReferenceRevisionSeparatesEntries() ||
         !TestDirectReferenceDependencyPlanning() ||

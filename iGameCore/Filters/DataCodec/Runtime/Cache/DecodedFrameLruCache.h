@@ -1,8 +1,9 @@
 #ifndef DATACODEC_RUNTIME_CACHE_DECODEDFRAMELRUCACHE_H
 #define DATACODEC_RUNTIME_CACHE_DECODEDFRAMELRUCACHE_H
 
-#include "DataCodec/API/Adapter/IDecodedFrameCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/Runtime/Cache/LruCacheIndex.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 #include <algorithm>
 #include <mutex>
@@ -12,8 +13,9 @@
 
 namespace datacodec {
 
-class DecodedFrameLruCache final : public IDecodedFrameCache {
+class DecodedFrameLruCache final {
 public:
+    explicit DecodedFrameLruCache(DataCodecExecutionResources* run = nullptr) noexcept : m_run(run) {}
     void SetEnabled(const bool enabled) {
         std::vector<DecodedFrameLease::Pointer> released;
         {
@@ -38,11 +40,11 @@ public:
         }
     }
 
-    void Configure(const std::size_t frameLimit, const std::uint64_t residentLimitBytes) {
+    void Configure(const std::size_t frameLimit) {
         std::vector<DecodedFrameLease::Pointer> evicted;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_index.Configure(frameLimit, residentLimitBytes);
+            m_index.Configure(frameLimit);
             PruneLocked({}, evicted);
             RefreshStatsLocked();
         }
@@ -50,7 +52,7 @@ public:
 
     [[nodiscard]] DecodedFrameCacheLookupResult Find(
         const DecodedFrameKey& key,
-        const DecodedFrameAccessKind accessKind) override {
+        const DecodedFrameAccessKind accessKind) {
         std::vector<DecodedFrameLease::Pointer> evicted;
         DecodedFrameLease::Pointer frame;
         {
@@ -92,7 +94,7 @@ public:
     [[nodiscard]] CacheStoreResult Store(
         const DecodedFrameKey& key,
         DecodedFrameLease::Pointer frame,
-        const DecodedFrameAccessKind accessKind) override {
+        const DecodedFrameAccessKind accessKind) {
         if (frame == nullptr || !key.source.IsStable() ||
             frame->FrameIndex() != key.frameIndex || frame->Payload() == nullptr) {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -103,7 +105,7 @@ public:
         bool stored = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_enabled || !m_index.CanAdmitSingle(frame->ResidentSizeHint())) {
+            if (!m_enabled || !m_index.CanAdmitSingle() || (m_run && !m_run->OptionalRetentionAllowed())) {
                 ++m_stats.storeRejections;
                 return CacheStoreResult::RejectedByPolicy();
             }
@@ -116,7 +118,6 @@ public:
             }
             m_index.InsertOrAssign(
                 key,
-                m_frames.at(key)->ResidentSizeHint(),
                 accessKind == DecodedFrameAccessKind::UserRequest);
             ++m_stats.stores;
             PruneLocked(key, evicted);
@@ -143,7 +144,7 @@ public:
         return CacheStoreResult::Stored();
     }
 
-    void InvalidateSource(const DecodeSourceIdentity& source) override {
+    void InvalidateSource(const DecodeSourceIdentity& source) {
         std::vector<DecodedFrameLease::Pointer> released;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -161,7 +162,7 @@ public:
     }
 
     [[nodiscard]] std::vector<std::uint32_t> ResidentFrameIndices(
-        const DecodeSourceIdentity& source) const override {
+        const DecodeSourceIdentity& source) const {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::vector<std::uint32_t> frames;
         for (const auto& [key, frame] : m_frames) {
@@ -174,12 +175,32 @@ public:
         return frames;
     }
 
-    [[nodiscard]] DecodedFrameCacheStats Statistics() const override {
+    [[nodiscard]] DecodedFrameCacheStats Statistics() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_stats;
     }
 
+    // 仅解除一个可选缓存引用，数据仍可由活跃消费者持有
+    bool TrimOne() {
+        DecodedFrameLease::Pointer released;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const auto* key = m_index.LeastRecentlyUsedKey();
+            if (key == nullptr) { return false; }
+            const auto found = m_frames.find(*key);
+            if (found != m_frames.end()) {
+                released = std::move(found->second);
+                m_frames.erase(found);
+            }
+            m_index.Erase(*key);
+            ++m_stats.evictions;
+            RefreshStatsLocked();
+        }
+        return true;
+    }
+
 private:
+    DataCodecExecutionResources* m_run{nullptr};
     void ClearLocked(std::vector<DecodedFrameLease::Pointer>& released) {
         released.reserve(released.size() + m_frames.size());
         for (auto& [key, frame] : m_frames) {
@@ -202,7 +223,6 @@ private:
                 m_index.Erase(candidate);
                 continue;
             }
-            if (iterator->second.use_count() > 1u) { continue; }
             evicted.push_back(std::move(iterator->second));
             m_frames.erase(iterator);
             m_index.Erase(candidate);
@@ -212,8 +232,6 @@ private:
 
     void RefreshStatsLocked() noexcept {
         m_stats.residentFrames = m_index.Size();
-        m_stats.residentBytes = m_index.ResidentBytes();
-        m_stats.peakResidentBytes = m_index.PeakResidentBytes();
     }
 
     mutable std::mutex m_mutex;

@@ -4,8 +4,10 @@
 #include "DataCodec/Localization/DataCodecMessageCatalog.h"
 
 #include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace datacodec {
@@ -104,10 +106,17 @@ struct DataCodecReportFile {
     std::string content;
 };
 
+enum class DataCodecReportExportFailure : std::uint8_t {
+    None,
+    Preparation,
+    Write,
+};
+
 struct DataCodecReportWriteResult {
     bool success{false};
     std::string path;
     std::string error;
+    DataCodecReportExportFailure failure{DataCodecReportExportFailure::None};
 };
 
 class IDataCodecUiSink {
@@ -133,6 +142,33 @@ public:
     virtual ~IDataCodecReportFileSink() = default;
     [[nodiscard]] virtual DataCodecReportWriteResult WriteReportFile(
         const DataCodecReportFile& report) = 0;
+
+    // 报告构造、序列化与文件交付共用可选导出边界，失败时只保留固定状态
+    template<class Prepare>
+    [[nodiscard]] DataCodecReportWriteResult TryWriteReportFile(Prepare&& prepare) noexcept {
+        auto failure = DataCodecReportExportFailure::Preparation;
+        try {
+            auto report = std::forward<Prepare>(prepare)();
+            failure = DataCodecReportExportFailure::Write;
+            auto result = WriteReportFile(report);
+            if (!result.success) {
+                result.failure = failure;
+                m_exportFailures.fetch_add(1u, std::memory_order_relaxed);
+            }
+            return result;
+        } catch (...) {
+            m_exportFailures.fetch_add(1u, std::memory_order_relaxed);
+            return {.failure = failure};
+        }
+    }
+
+    [[nodiscard]] std::uint64_t ExportFailureCount() const noexcept {
+        return m_exportFailures.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool DiagnosticsIncomplete() const noexcept { return ExportFailureCount() != 0u; }
+
+private:
+    std::atomic_uint64_t m_exportFailures{0u};
 };
 
 struct DataCodecOutputSinks {

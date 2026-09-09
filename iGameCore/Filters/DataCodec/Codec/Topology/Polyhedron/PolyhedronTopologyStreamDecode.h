@@ -5,9 +5,11 @@
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedIndexCache.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Codec/SubCodec/SegmentedBitpackCodec.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamFormat.h"
 #include "DataCodec/Common/DataCodecTypes.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 
@@ -37,43 +39,15 @@ inline bool ValidatePolyhedronTopologyStreamOrder(
     return true;
 }
 
-inline bool ValidatePolyhedronDecodedTopologyCacheBudget(
-    const std::span<const PolyhedronTopologyStreamSchedule> schedules,
-    const DecodeStorageMode storageMode,
-    const std::uint64_t memoryCacheLimitBytes,
-    std::string* error = nullptr) {
-    if (storageMode != DecodeStorageMode::Memory) {
-        return true;
-    }
-    std::uint64_t totalBytes = 0u;
-    for (const auto& schedule : schedules) {
-        std::uint64_t streamBytes = 0u;
-        if (!CalculateIndexCacheBytes(schedule.elementCount, streamBytes, error) ||
-            !validation::CheckedAddU64(
-                totalBytes,
-                streamBytes,
-                totalBytes,
-                "stateful polyhedron decoded topology cache bytes",
-                error)) {
-            return false;
-        }
-    }
-    if (memoryCacheLimitBytes == 0u || totalBytes > memoryCacheLimitBytes) {
-        return validation::AssignError(
-            error,
-            "stateful polyhedron decoded topology cache exceeds configured memory limit");
-    }
-    return true;
-}
-
 template<typename TStream>
 class PolyhedronTopologyStreamByteReader final {
 public:
     PolyhedronTopologyStreamByteReader(
         TStream& stream,
-        const PolyhedronTopologyStreamSchedule& schedule)
-        : m_stream(stream),
-          m_schedule(schedule) {}
+        const PolyhedronTopologyStreamSchedule& schedule, const CacheResources& runtime)
+        : m_stream(stream), m_schedule(schedule), m_runtime(runtime) {
+        m_buffer.resize(static_cast<std::size_t>(std::min<std::uint64_t>(schedule.streamByteSize, kIoWindowBytes)));
+    }
 
     bool ValidateCurrentFormat(std::string* error = nullptr) const {
         if (m_schedule.auxiliaryStreamByteSize != 0u ||
@@ -89,9 +63,14 @@ public:
         if (m_streamByteCursor >= m_schedule.streamByteSize) {
             return validation::AssignError(error, "stateful polyhedron stream bytes are exhausted");
         }
-        if (!m_stream.ReadBytes(&value, 1u, error)) {
-            return false;
+        if (m_bufferCursor == m_bufferSize) {
+            if (m_runtime.Run().Stopped()) { return false; }
+            m_bufferSize = static_cast<std::size_t>(std::min<std::uint64_t>(
+                m_buffer.size(), m_schedule.streamByteSize - m_streamByteCursor));
+            if (!m_stream.ReadBytes(m_buffer.data(), m_bufferSize, error)) { return false; }
+            m_bufferCursor = 0u;
         }
+        value = m_buffer[m_bufferCursor++];
         if (!validation::CheckedAddU64(
                 m_streamByteCursor,
                 1u,
@@ -100,7 +79,6 @@ public:
                 error)) {
             return false;
         }
-        m_peakStreamReadBytes = std::max<std::uint64_t>(m_peakStreamReadBytes, 1u);
         return true;
     }
 
@@ -111,13 +89,17 @@ public:
         return true;
     }
 
-    [[nodiscard]] std::uint64_t PeakStreamReadBytes() const noexcept { return m_peakStreamReadBytes; }
+    void ObserveCapacity(PolyhedronCapacitySamples& samples) const noexcept {
+        samples.Observe(PolyhedronBufferSample::StreamReadWindow, m_buffer);
+    }
 
 private:
     TStream& m_stream;
     const PolyhedronTopologyStreamSchedule& m_schedule;
+    const CacheResources& m_runtime;
+    std::vector<std::uint8_t> m_buffer;
+    std::size_t m_bufferCursor{0u}, m_bufferSize{0u};
     std::uint64_t m_streamByteCursor{0u};
-    std::uint64_t m_peakStreamReadBytes{0u};
 };
 
 template<typename TStreamReader>
@@ -147,11 +129,8 @@ inline bool DecodeVarintScheduleToIndexCache(
     const PolyhedronTopologyStreamSchedule& schedule,
     DecodedIndexCache& output,
     const CacheResources& runtime,
-    bytestore::ByteStoreSession& byteStoreSession,
-    const DecodeStorageMode cacheStorageMode,
-    const std::uint64_t cacheMemoryLimitBytes,
-    std::uint64_t& peakStreamReadBytes,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    PolyhedronCapacitySamples* capacitySamples = nullptr) {
     if (schedule.codec != PolyhedronTopologyStreamCodec::Varint) {
         return validation::AssignError(error, "stateful polyhedron id stream requires varint codec");
     }
@@ -160,21 +139,20 @@ inline bool DecodeVarintScheduleToIndexCache(
             error,
             "stateful polyhedron id stream element count is too large for this platform");
     }
-    PolyhedronTopologyStreamByteReader<TStream> streamReader(stream, schedule);
+    PolyhedronTopologyStreamByteReader<TStream> streamReader(stream, schedule, runtime);
     if (!streamReader.ValidateCurrentFormat(error)) {
         return false;
     }
-    if (!output.Initialize(
-            schedule.elementCount,
-            byteStoreSession,
-            cacheStorageMode,
-            cacheMemoryLimitBytes,
-            error)) {
-        return false;
+    if (output.Count() != schedule.elementCount || output.WrittenCount() != 0u) {
+        return validation::AssignError(error, "polyhedron varint target must be prepared before terminal work");
     }
     const auto kIndexWriteBatch = runtime.ValuesPerWindow<IndexType>();
     std::vector<IndexType> buffer;
     buffer.reserve(kIndexWriteBatch);
+    if (capacitySamples != nullptr) {
+        streamReader.ObserveCapacity(*capacitySamples);
+        capacitySamples->Observe(PolyhedronBufferSample::IndexWriteWindow, buffer);
+    }
     for (std::uint64_t index = 0u; index < schedule.elementCount; ++index) {
         std::uint64_t value = 0u;
         if (!DecodeVarUInt64FromStream(streamReader, value, error) ||
@@ -188,6 +166,7 @@ inline bool DecodeVarintScheduleToIndexCache(
         }
         buffer.push_back(static_cast<IndexType>(value));
         if (buffer.size() == kIndexWriteBatch) {
+            if (runtime.Run().Stopped()) { return false; }
             if (!output.Append(std::span<const IndexType>(buffer.data(), buffer.size()), error)) {
                 return false;
             }
@@ -204,9 +183,6 @@ inline bool DecodeVarintScheduleToIndexCache(
     if (!streamReader.Finish(error)) {
         return false;
     }
-    peakStreamReadBytes = std::max<std::uint64_t>(
-        peakStreamReadBytes,
-        streamReader.PeakStreamReadBytes());
     return true;
 }
 
@@ -275,9 +251,8 @@ inline bool ValidateGlobalPolyhedronCountStores(
     const DecodedIndexCache& cellFaceCountStore,
     const DecodedIndexCache& faceVertexCountStore,
     const CacheResources& runtime,
-    std::uint64_t& peakCountBytes,
-    std::string* error = nullptr) {
-    peakCountBytes = 0u;
+    std::string* error = nullptr,
+    PolyhedronCapacitySamples* capacitySamples = nullptr) {
     if (header.cellCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
         header.faceCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         return validation::AssignError(
@@ -299,6 +274,7 @@ inline bool ValidateGlobalPolyhedronCountStores(
     std::uint64_t derivedUniqueIdCount = 0u;
     const auto cellCount = static_cast<std::size_t>(header.cellCount);
     for (std::size_t cursor = 0u; cursor < cellCount;) {
+        if (runtime.Run().Stopped()) { return false; }
         const auto count = std::min<std::size_t>(kCountReadBatch, cellCount - cursor);
         uniqueVertexCounts.assign(count, 0);
         cellFaceCounts.assign(count, 0);
@@ -312,11 +288,10 @@ inline bool ValidateGlobalPolyhedronCountStores(
                 error)) {
             return false;
         }
-        peakCountBytes = std::max<std::uint64_t>(
-            peakCountBytes,
-            validation::SaturatingAddU64(
-                VectorCapacityBytes(uniqueVertexCounts),
-                VectorCapacityBytes(cellFaceCounts)));
+        if (capacitySamples != nullptr) {
+            capacitySamples->Observe(PolyhedronBufferSample::UniqueCounts, uniqueVertexCounts);
+            capacitySamples->Observe(PolyhedronBufferSample::CellFaceCounts, cellFaceCounts);
+        }
         for (std::size_t index = 0u; index < count; ++index) {
             if (uniqueVertexCounts[index] < 0 || cellFaceCounts[index] < 0) {
                 return validation::AssignError(
@@ -350,6 +325,7 @@ inline bool ValidateGlobalPolyhedronCountStores(
     std::uint64_t derivedLocalFaceIdCount = 0u;
     const auto faceCount = static_cast<std::size_t>(header.faceCount);
     for (std::size_t cursor = 0u; cursor < faceCount;) {
+        if (runtime.Run().Stopped()) { return false; }
         const auto count = std::min<std::size_t>(kCountReadBatch, faceCount - cursor);
         faceVertexCounts.assign(count, 0);
         if (!faceVertexCountStore.ReadRangeInto(
@@ -358,9 +334,9 @@ inline bool ValidateGlobalPolyhedronCountStores(
                 error)) {
             return false;
         }
-        peakCountBytes = std::max<std::uint64_t>(
-            peakCountBytes,
-            VectorCapacityBytes(faceVertexCounts));
+        if (capacitySamples != nullptr) {
+            capacitySamples->Observe(PolyhedronBufferSample::FaceCountWindow, faceVertexCounts);
+        }
         for (const auto faceVertexCount : faceVertexCounts) {
             if (faceVertexCount < 0) {
                 return validation::AssignError(
@@ -393,26 +369,22 @@ inline bool DecodeLocalFaceIdsToCache(
     TLocalFaceIdReader& localIdReader,
     DecodedIndexCache& localIdStore,
     const CacheResources& runtime,
-    bytestore::ByteStoreSession& byteStoreSession,
-    const DecodeStorageMode cacheStorageMode,
-    const std::uint64_t cacheMemoryLimitBytes,
-    std::uint64_t& peakBatchBytes,
-    std::string* error = nullptr) {
-    if (!localIdStore.Initialize(
-            header.localFaceVertexIdCount,
-            byteStoreSession,
-            cacheStorageMode,
-            cacheMemoryLimitBytes,
-            error)) {
-        return false;
+    std::string* error = nullptr,
+    PolyhedronCapacitySamples* capacitySamples = nullptr) {
+    if (localIdStore.Count() != header.localFaceVertexIdCount || localIdStore.WrittenCount() != 0u) {
+        return validation::AssignError(error, "polyhedron local-id target must be prepared before terminal work");
     }
 
     const auto kLocalIdWriteBatch = runtime.ValuesPerWindow<IndexType>();
     std::vector<IndexType> output;
     output.reserve(kLocalIdWriteBatch);
+    if (capacitySamples != nullptr) {
+        capacitySamples->Observe(PolyhedronBufferSample::IndexWriteWindow, output);
+    }
     std::uint64_t written = 0u;
     std::uint64_t faceCursor = 0u;
     for (std::uint64_t cell = 0u; cell < header.cellCount; ++cell) {
+        if (runtime.Run().Stopped()) { return false; }
         IndexType uniqueCountValue = 0;
         IndexType cellFaceCountValue = 0;
         if (!uniqueVertexCountStore.ReadScalar(cell, uniqueCountValue, error) ||
@@ -455,6 +427,7 @@ inline bool DecodeLocalFaceIdsToCache(
                 }
                 output.push_back(localId);
                 if (output.size() == kLocalIdWriteBatch) {
+                    if (runtime.Run().Stopped()) { return false; }
                     if (!localIdStore.Append(std::span<const IndexType>(output.data(), output.size()), error)) {
                         return false;
                     }
@@ -466,11 +439,6 @@ inline bool DecodeLocalFaceIdsToCache(
                             error)) {
                         return false;
                     }
-                    peakBatchBytes = std::max<std::uint64_t>(
-                        peakBatchBytes,
-                        validation::SaturatingMulU64(
-                            static_cast<std::uint64_t>(output.capacity()),
-                            static_cast<std::uint64_t>(sizeof(IndexType))));
                     output.clear();
                 }
             }
@@ -488,11 +456,6 @@ inline bool DecodeLocalFaceIdsToCache(
                 error)) {
             return false;
         }
-        peakBatchBytes = std::max<std::uint64_t>(
-            peakBatchBytes,
-            validation::SaturatingMulU64(
-                static_cast<std::uint64_t>(output.capacity()),
-                static_cast<std::uint64_t>(sizeof(IndexType))));
     }
     if (written != header.localFaceVertexIdCount || !localIdReader.Finish(error)) {
         if (error != nullptr && error->empty()) {
@@ -507,12 +470,11 @@ template<typename TStream>
 inline bool DecodePolyhedronTopologyStreamsToCache(
     const CacheResources& runtime,
     bytestore::ByteStoreSession& byteStoreSession,
-    const DecodeStorageMode topologyCacheStorageMode,
-    const std::uint64_t topologyMemoryCacheLimitBytes,
     DecodedTopologyCache& topology,
     const TopoStorageParams& topo,
     TStream& stream,
-    std::string* error = nullptr) {
+    std::string* error = nullptr,
+    const callback::CapacityCallback& recordCapacitySamples = {}) {
     PolyhedronTopologyStreamHeader streamHeader;
     streamHeader.streamCount = static_cast<std::uint32_t>(topo.polyhedronStreamLayouts.size());
     streamHeader.cellCount = topo.cellCount;
@@ -560,14 +522,6 @@ inline bool DecodePolyhedronTopologyStreamsToCache(
     if (!ValidatePolyhedronTopologyStreamOrder(schedules, error)) {
         return false;
     }
-    if (!ValidatePolyhedronDecodedTopologyCacheBudget(
-            schedules,
-            topologyCacheStorageMode,
-            topologyMemoryCacheLimitBytes,
-            error)) {
-        return false;
-    }
-
     const auto& uniqueCountsSchedule = schedules[0];
     const auto& cellFaceCountsSchedule = schedules[1];
     const auto& faceVertexCountsSchedule = schedules[2];
@@ -590,96 +544,57 @@ inline bool DecodePolyhedronTopologyStreamsToCache(
         return validation::AssignError(error, "stateful polyhedron stream schedules do not match topology totals");
     }
 
-    std::uint64_t peakStreamReadBytes = 0u;
-    std::uint64_t peakBatchBytes = 0u;
-    std::uint64_t peakCountBytes = 0u;
-
+    auto& root = runtime.Run();
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return false; }
     topology.Release();
-    topology.kind = DecodedTopologyCache::Kind::Polyhedron;
-    auto& polyhedron = topology.polyhedron;
+    DecodedTopologyCache prepared;
+    prepared.kind = DecodedTopologyCache::Kind::Polyhedron;
+    auto& polyhedron = prepared.polyhedron;
     polyhedron.cellCount = streamHeader.cellCount;
     polyhedron.faceCount = streamHeader.faceCount;
     polyhedron.uniqueVertexIdCount = streamHeader.uniqueVertexIdCount;
     polyhedron.localFaceVertexIdCount = streamHeader.localFaceVertexIdCount;
-
-    if (!DecodeVarintScheduleToIndexCache(
-            stream,
-            uniqueCountsSchedule,
-            polyhedron.uniqueVertexCounts,
-            runtime,
-            byteStoreSession,
-            topologyCacheStorageMode,
-            topologyMemoryCacheLimitBytes,
-            peakStreamReadBytes,
-            error) ||
-        !DecodeVarintScheduleToIndexCache(
-            stream,
-            cellFaceCountsSchedule,
-            polyhedron.cellFaceCounts,
-            runtime,
-            byteStoreSession,
-            topologyCacheStorageMode,
-            topologyMemoryCacheLimitBytes,
-            peakStreamReadBytes,
-            error) ||
-        !DecodeVarintScheduleToIndexCache(
-            stream,
-            faceVertexCountsSchedule,
-            polyhedron.faceVertexCounts,
-            runtime,
-            byteStoreSession,
-            topologyCacheStorageMode,
-            topologyMemoryCacheLimitBytes,
-            peakStreamReadBytes,
-            error) ||
-        !DecodeVarintScheduleToIndexCache(
-            stream,
-            uniqueIdsSchedule,
-            polyhedron.cellUniqueVertexIds,
-            runtime,
-            byteStoreSession,
-            topologyCacheStorageMode,
-            topologyMemoryCacheLimitBytes,
-            peakStreamReadBytes,
-            error)) {
-        return false;
+    // 五个完整目标先由 driver 准入，终端解码仅填充既有范围
+    bytestore::KnownStorageOwners coexist;
+    const auto prepare = [&](DecodedIndexCache& target, const std::uint64_t count, const char* label) {
+        if (!target.Initialize(count, byteStoreSession, error, coexist.Entries(), label)) { return false; }
+        coexist.Add(target.ByteSource());
+        return true;
+    };
+    if (!prepare(polyhedron.uniqueVertexCounts, streamHeader.cellCount, "poly_unique_n") ||
+        !prepare(polyhedron.cellFaceCounts, streamHeader.cellCount, "poly_cell_n") ||
+        !prepare(polyhedron.faceVertexCounts, streamHeader.faceCount, "poly_face_n") ||
+        !prepare(polyhedron.cellUniqueVertexIds, streamHeader.uniqueVertexIdCount, "poly_unique_id") ||
+        !prepare(polyhedron.localFaceVertexIds, streamHeader.localFaceVertexIdCount, "poly_local_id")) { return false; }
+    std::optional<std::array<PolyhedronCapacitySamples, 6>> samples;
+    if (recordCapacitySamples) { samples.emplace(); }
+    const auto sample = [&](const std::size_t index) -> PolyhedronCapacitySamples* {
+        return samples ? &(*samples)[index] : nullptr;
+    };
+    if (!RunTerminalWork(root, *phase, [&](WorkerContext&) {
+        if (!DecodeVarintScheduleToIndexCache(stream, uniqueCountsSchedule, polyhedron.uniqueVertexCounts, runtime, error, sample(0)) ||
+            !DecodeVarintScheduleToIndexCache(stream, cellFaceCountsSchedule, polyhedron.cellFaceCounts, runtime, error, sample(1)) ||
+            !DecodeVarintScheduleToIndexCache(stream, faceVertexCountsSchedule, polyhedron.faceVertexCounts, runtime, error, sample(2)) ||
+            !DecodeVarintScheduleToIndexCache(stream, uniqueIdsSchedule, polyhedron.cellUniqueVertexIds, runtime, error, sample(3)) ||
+            !ValidateGlobalPolyhedronCountStores(streamHeader, polyhedron.uniqueVertexCounts,
+                polyhedron.cellFaceCounts, polyhedron.faceVertexCounts, runtime, error, sample(4))) { return false; }
+        PolyhedronTopologyStreamByteReader<TStream> localStreamReader(stream, localIdsSchedule, runtime);
+        if (!localStreamReader.ValidateCurrentFormat(error)) { return false; }
+        if (samples) { localStreamReader.ObserveCapacity(*sample(5)); }
+        LocalFaceIdBitReader<decltype(localStreamReader)> localIdReader(localStreamReader);
+        return DecodeLocalFaceIdsToCache(streamHeader, polyhedron.uniqueVertexCounts, polyhedron.cellFaceCounts,
+            polyhedron.faceVertexCounts, localIdReader, polyhedron.localFaceVertexIds, runtime, error, sample(5));
+    })) { return false; }
+    if (samples && recordCapacitySamples) {
+        for (const auto& entry : *samples) {
+            try { recordCapacitySamples(entry.values); }
+            catch (...) { root.RecordDiagnosticExportFailure(); }
+        }
     }
-    if (!ValidateGlobalPolyhedronCountStores(
-            streamHeader,
-            polyhedron.uniqueVertexCounts,
-            polyhedron.cellFaceCounts,
-            polyhedron.faceVertexCounts,
-            runtime,
-            peakCountBytes,
-            error)) {
-        return false;
-    }
-
-    PolyhedronTopologyStreamByteReader<TStream> localStreamReader(stream, localIdsSchedule);
-    if (!localStreamReader.ValidateCurrentFormat(error)) {
-        return false;
-    }
-    LocalFaceIdBitReader<decltype(localStreamReader)> localIdReader(localStreamReader);
-    if (!DecodeLocalFaceIdsToCache(
-            streamHeader,
-            polyhedron.uniqueVertexCounts,
-            polyhedron.cellFaceCounts,
-            polyhedron.faceVertexCounts,
-            localIdReader,
-            polyhedron.localFaceVertexIds,
-            runtime,
-            byteStoreSession,
-            topologyCacheStorageMode,
-            topologyMemoryCacheLimitBytes,
-            peakBatchBytes,
-            error)) {
-        return false;
-    }
-    peakStreamReadBytes = std::max<std::uint64_t>(
-        peakStreamReadBytes,
-        localStreamReader.PeakStreamReadBytes());
-
-    return topology.PrepareForRead(error);
+    if (!prepared.PrepareForRead(error)) { return false; }
+    topology = std::move(prepared);
+    return true;
 }
 
 } // namespace polyhedron

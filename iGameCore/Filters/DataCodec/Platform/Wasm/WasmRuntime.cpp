@@ -1,6 +1,7 @@
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
 
 #include <algorithm>
+#include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 
 namespace datacodec::wasm {
 
@@ -16,13 +17,8 @@ WasmRuntimeCapabilities DetectWasmRuntimeCapabilities() noexcept {
     capabilities.runtimeProfile = sizeof(void*) > 4u
         ? DataCodecRuntimeProfile::Wasm16GiB
         : DataCodecRuntimeProfile::Wasm4GiB;
-#if defined(DATACODEC_MAX_PARALLEL_WORKERS) && DATACODEC_MAX_PARALLEL_WORKERS > 0
-    capabilities.maximumDataCodecWorkers = capabilities.pthreadsAvailable
-        ? static_cast<std::size_t>(DATACODEC_MAX_PARALLEL_WORKERS)
-        : 1u;
-#else
-    capabilities.maximumDataCodecWorkers = capabilities.pthreadsAvailable ? 4u : 1u;
-#endif
+    capabilities.maximumDataCodecWorkers = ResourceComputeCapacity(
+        ProbeResources(), CodecResourceMode::Adaptive);
     return capabilities;
 }
 
@@ -31,33 +27,17 @@ DataCodecDecodeConfigurationParams MakeWasmDecodeConfiguration(
     const auto capabilities = DetectWasmRuntimeCapabilities();
     auto controls = MakeDecodeConfigurationParams(
         DataCodecDecodeOptions{
-            .tier = DataCodecDecodeTier::Fast,
             .enableDecodedResultCache = enableReuseCache,
-            .decodedResultCacheFrameLimit = 1u,
-            .enableFullInputPrefetch = enableReuseCache,
-        },
-        capabilities.runtimeProfile);
-    controls.controlParams.resourceBudget.SetTopologyBlockLanes(
-        static_cast<std::uint32_t>(capabilities.maximumDataCodecWorkers));
-    controls.decodedFrameCachePolicy.enabled = enableReuseCache;
-    controls.decodedFrameCachePolicy.residentFrameLimit = enableReuseCache ? 1u : 0u;
-    controls.decodedFrameCachePolicy.prefetchFrameCount = 0u;
-    controls.decodedFrameCachePolicy.residentLimitBytes = sizeof(void*) > 4u
-        ? 8ull * 1024ull * 1024ull * 1024ull
-        : 2ull * 1024ull * 1024ull * 1024ull;
-    if (!enableReuseCache) {
-        controls.execution.enableFullInputPrefetch = false;
-        controls.encodedInputCachePolicy.enabled = false;
-    }
+            .enableEncodedInputCache = enableReuseCache,
+        }, capabilities.runtimeProfile);
+    controls.decodedFrameCachePolicy.prefetchEnabled = false;
     return controls;
 }
 
 DataCodecEncodeConfigurationParams MakeWasmEncodeConfiguration() {
     const auto capabilities = DetectWasmRuntimeCapabilities();
     auto controls = MakeEncodeConfigurationParams(
-        DataCodecEncodeOptions{
-            .tier = DataCodecEncodeTier::TimePriority,
-        },
+        DataCodecEncodeOptions{},
         capabilities.runtimeProfile);
     return controls;
 }

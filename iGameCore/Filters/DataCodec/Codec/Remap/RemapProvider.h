@@ -26,18 +26,17 @@ public:
     [[nodiscard]] virtual bool IsIdentity() const noexcept = 0;
     [[nodiscard]] virtual std::uint64_t ResidentSizeHint() const noexcept = 0;
     virtual bool ReadAt(std::size_t index, IndexType& value, std::string* error) const = 0;
+    virtual bool ReadRange(std::uint64_t offset, std::span<IndexType> output,
+                           std::string* error = nullptr) const = 0;
     virtual bool ReadRange(
         std::uint64_t offset,
         std::uint64_t count,
         std::vector<IndexType>& output,
         std::string* error) const = 0;
-    virtual void Release() noexcept = 0;
 };
 
 class IWritableRemapProvider : public IRemapProvider {
 public:
-    virtual bool BeginWrite(std::string* error = nullptr) = 0;
-    virtual bool BeginRandomWrite(std::string* error = nullptr) = 0;
     virtual bool AppendRange(std::span<const IndexType> order, std::string* error = nullptr) = 0;
     virtual bool WriteAt(std::size_t index, IndexType value, std::string* error = nullptr) = 0;
     virtual bool EndWrite(std::string* error = nullptr) = 0;
@@ -48,7 +47,8 @@ using WritableRemapProviderFactory = std::function<std::shared_ptr<IWritableRema
     std::size_t size,
     bool randomWrite,
     std::string_view label,
-    std::string* error)>;
+    std::string* error,
+    std::span<const resource::StorageOwnerDescription> coexist)>;
 
 class IdentityRemapProvider final : public IRemapProvider {
 public:
@@ -67,6 +67,15 @@ public:
         return true;
     }
 
+    bool ReadRange(const std::uint64_t offset, const std::span<IndexType> output,
+                   std::string* error = nullptr) const override {
+        if (offset > m_size || output.size() > m_size - offset) {
+            return validation::AssignError(error, "remap range is out of bounds");
+        }
+        for (std::size_t i = 0u; i < output.size(); ++i) { output[i] = static_cast<IndexType>(offset + i); }
+        return true;
+    }
+
     bool ReadRange(
         const std::uint64_t offset,
         const std::uint64_t count,
@@ -82,8 +91,6 @@ public:
         }
         return true;
     }
-
-    void Release() noexcept override { m_size = 0; }
 
 private:
     std::size_t m_size{0};
@@ -112,6 +119,22 @@ public:
         return true;
     }
 
+    bool ReadRange(const std::uint64_t offset, const std::span<IndexType> output,
+                   std::string* error = nullptr) const override {
+        if (m_order.empty()) {
+            if (!validation::CanAddU64(offset, output.size())) {
+                return validation::AssignError(error, "remap identity range overflows");
+            }
+            for (std::size_t i = 0u; i < output.size(); ++i) { output[i] = static_cast<IndexType>(offset + i); }
+            return true;
+        }
+        if (offset > m_order.size() || output.size() > m_order.size() - offset) {
+            return validation::AssignError(error, "remap range is out of bounds");
+        }
+        std::copy_n(m_order.begin() + static_cast<std::ptrdiff_t>(offset), output.size(), output.begin());
+        return true;
+    }
+
     bool ReadRange(
         const std::uint64_t offset,
         const std::uint64_t count,
@@ -134,56 +157,18 @@ public:
         return true;
     }
 
-    void Release() noexcept override { ReleaseVectorStorage(m_order); }
-
 private:
     std::vector<IndexType> m_order;
 };
 
-class ByteStoreRemapProvider : public IWritableRemapProvider {
+class RemapStoreProvider final : public IWritableRemapProvider {
 public:
-    using ByteStoreFactory = std::function<std::shared_ptr<bytestore::IRandomAccessByteStore>(std::string*)>;
-
-    explicit ByteStoreRemapProvider(
+    RemapStoreProvider(
         const std::size_t size,
-        ByteStoreFactory sourceFactory)
-        : m_sourceFactory(std::move(sourceFactory)),
-          m_size(size) {}
-
-    ~ByteStoreRemapProvider() override { Release(); }
-
-    bool InitializeFromVector(const std::vector<IndexType>& order, std::string* error) {
-        if (order.size() != m_size) {
-            return validation::AssignError(error, "remap provider size mismatch");
-        }
-
-        ResetStorage(error);
-        return AppendRawValues(std::span<const IndexType>(order.data(), order.size()), error);
-    }
-
-    bool BeginWrite(std::string* error = nullptr) override {
-        ResetStorage(error);
-        if (m_source == nullptr) {
-            return validation::AssignError(error, "failed to create remap provider storage");
-        }
-        m_writtenSize = 0u;
-        m_writing = true;
-        return true;
-    }
-
-    bool BeginRandomWrite(std::string* error = nullptr) override {
-        ResetStorage(error);
-        if (m_source == nullptr) {
-            return validation::AssignError(error, "failed to create remap provider storage");
-        }
-        const auto byteCount = RemapByteCount(error);
-        if (byteCount == kInvalidByteCount ||
-            !m_source->ResizeBytes(byteCount, error)) {
-            return false;
-        }
-        m_randomWriting = true;
-        return true;
-    }
+        std::shared_ptr<bytestore::IRandomAccessByteStore> source,
+        const bool randomWrite)
+        : m_source(std::move(source)), m_size(size),
+          m_writing(!randomWrite), m_randomWriting(randomWrite) {}
 
     bool AppendRange(std::span<const IndexType> order, std::string* error = nullptr) override {
         if (!m_writing || m_source == nullptr) {
@@ -192,7 +177,9 @@ public:
         if (order.size() > m_size || m_writtenSize > m_size - order.size()) {
             return validation::AssignError(error, "remap provider write exceeds expected size");
         }
-        if (!AppendRawValues(order, error)) {
+        if (!m_source->WriteBytesAt(static_cast<std::uint64_t>(m_writtenSize) * sizeof(IndexType),
+                std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(order.data()),
+                    order.size() * sizeof(IndexType)), error)) {
             return false;
         }
         m_writtenSize += order.size();
@@ -221,7 +208,11 @@ public:
         if (!m_randomWriting) {
             return validation::AssignError(error, "remap provider random writer is not open");
         }
+        if (m_source == nullptr || !m_source->Seal(error)) {
+            return false;
+        }
         m_randomWriting = false;
+        m_complete = true;
         return true;
     }
 
@@ -232,8 +223,11 @@ public:
         if (m_writtenSize != m_size) {
             return validation::AssignError(error, "remap provider written size mismatch");
         }
-        m_writtenSize = 0u;
+        if (m_source == nullptr || !m_source->Seal(error)) {
+            return false;
+        }
         m_writing = false;
+        m_complete = true;
         return true;
     }
 
@@ -244,6 +238,9 @@ public:
     }
 
     bool ReadAt(const std::size_t index, IndexType& value, std::string* error) const override {
+        if (!m_complete) {
+            return validation::AssignError(error, "remap provider is not complete");
+        }
         if (index >= m_size) {
             return validation::AssignError(error, "remap read is out of range");
         }
@@ -257,12 +254,32 @@ public:
             error);
     }
 
+    bool ReadRange(const std::uint64_t offset, const std::span<IndexType> output,
+                   std::string* error = nullptr) const override {
+        if (!m_complete || m_source == nullptr) {
+            return validation::AssignError(error, "remap provider is not complete");
+        }
+        if (offset > m_size || output.size() > m_size - offset ||
+            !validation::CanMulU64(offset, sizeof(IndexType))) {
+            return validation::AssignError(error, "remap range is out of bounds");
+        }
+        std::size_t bytes = 0u;
+        if (!validation::CheckedMulSizeT(output.size(), sizeof(IndexType), bytes, "remap range", error)) {
+            return false;
+        }
+        return m_source->Read(offset * sizeof(IndexType),
+            std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(output.data()), bytes), error);
+    }
+
     bool ReadRange(
         const std::uint64_t offset,
         const std::uint64_t count,
         std::vector<IndexType>& output,
         std::string* error) const override {
         output.clear();
+        if (!m_complete) {
+            return validation::AssignError(error, "remap provider is not complete");
+        }
         if (offset > m_size || count > m_size - offset) {
             return validation::AssignError(error, "remap range is out of bounds");
         }
@@ -293,95 +310,15 @@ public:
             error);
     }
 
-    void Release() noexcept override {
-        if (m_source != nullptr) {
-            m_source->Release();
-            m_source.reset();
-        }
-        m_size = 0;
-        m_writtenSize = 0u;
-        m_writing = false;
-        m_randomWriting = false;
-    }
+    [[nodiscard]] const bytestore::IByteSource* ByteSource() const noexcept { return m_source.get(); }
 
 private:
-    static constexpr std::uint64_t kInvalidByteCount = std::numeric_limits<std::uint64_t>::max();
-
-    std::shared_ptr<bytestore::IRandomAccessByteStore> CreateSource(std::string* error) {
-        if (!m_sourceFactory) {
-            validation::AssignError(error, "remap provider source factory is missing");
-            return nullptr;
-        }
-        auto source = m_sourceFactory(error);
-        if (source == nullptr && error != nullptr && error->empty()) {
-            validation::AssignError(error, "remap provider source factory returned null");
-        }
-        return source;
-    }
-
-    void ResetStorage(std::string* error) {
-        if (m_source != nullptr) {
-            m_source->Release();
-        }
-        m_source = CreateSource(error);
-        m_writtenSize = 0u;
-        m_writing = false;
-        m_randomWriting = false;
-    }
-
-    [[nodiscard]] std::uint64_t RemapByteCount(std::string* error) const {
-        if (!validation::CanMulU64(m_size, sizeof(IndexType))) {
-            validation::AssignError(error, "remap provider exceeds addressable byte size");
-            return kInvalidByteCount;
-        }
-        return static_cast<std::uint64_t>(m_size) * sizeof(IndexType);
-    }
-
-    bool AppendRawValues(std::span<const IndexType> values, std::string* error) {
-        if (m_source == nullptr) {
-            return validation::AssignError(error, "remap provider source is missing");
-        }
-        if (!validation::CanMulU64(static_cast<std::uint64_t>(values.size()), sizeof(IndexType))) {
-            validation::AssignError(error, "remap provider append exceeds addressable byte size");
-            return false;
-        }
-        const auto byteCount = static_cast<std::uint64_t>(values.size()) * sizeof(IndexType);
-        std::size_t localByteCount = 0u;
-        if (!validation::CheckedCastSizeT(byteCount, localByteCount, "remap provider append", error)) {
-            return false;
-        }
-        return m_source->AppendBytes(
-            std::span<const std::uint8_t>(
-                reinterpret_cast<const std::uint8_t*>(values.data()),
-                localByteCount),
-            error);
-    }
-
-    ByteStoreFactory m_sourceFactory;
     std::shared_ptr<bytestore::IRandomAccessByteStore> m_source;
     std::size_t m_writtenSize{0};
     std::size_t m_size{0};
     bool m_writing{false};
     bool m_randomWriting{false};
-};
-
-class RemapStoreProvider final : public ByteStoreRemapProvider {
-public:
-    RemapStoreProvider(
-        const std::size_t size,
-        bytestore::ByteStoreSession& session,
-        std::string label = "remap",
-        const bool useMemoryStore = false)
-        : ByteStoreRemapProvider(
-              size,
-              [&session, label = std::move(label), useMemoryStore](std::string* error)
-                  -> std::shared_ptr<bytestore::IRandomAccessByteStore> {
-                  auto store = bytestore::CreateByteStore(session, label, useMemoryStore, error);
-                  if (store == nullptr) {
-                      return std::shared_ptr<bytestore::IRandomAccessByteStore>{};
-                  }
-                  return store;
-              }) {}
+    bool m_complete{false};
 };
 
 inline std::shared_ptr<IWritableRemapProvider> MakeStoreBackedWritableRemapProvider(
@@ -389,26 +326,28 @@ inline std::shared_ptr<IWritableRemapProvider> MakeStoreBackedWritableRemapProvi
     bytestore::ByteStoreSession& session,
     const bool randomWrite,
     const std::string& label,
-    const bool useMemoryStore = false,
-    std::string* error = nullptr) {
-    auto provider = std::make_shared<RemapStoreProvider>(size, session, label, useMemoryStore);
-    const auto initialized = randomWrite ? provider->BeginRandomWrite(error) : provider->BeginWrite(error);
-    if (!initialized) {
-        provider->Release();
+    std::string* error = nullptr,
+    std::span<const resource::StorageOwnerDescription> coexist = {}) {
+    std::size_t bytes = 0u;
+    if (!validation::CheckedMulSizeT(size, sizeof(IndexType), bytes, "remap provider bytes", error)) {
         return nullptr;
     }
-    return provider;
+    auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, bytes, label, error, coexist);
+    if (store == nullptr) {
+        return nullptr;
+    }
+    return std::make_shared<RemapStoreProvider>(size, std::move(store), randomWrite);
 }
 
 inline WritableRemapProviderFactory MakeStoreBackedWritableRemapProviderFactory(
     bytestore::ByteStoreSession& session,
-    std::string prefix,
-    const bool useMemoryStore = false) {
-    return [&session, prefix = std::move(prefix), useMemoryStore](
+    std::string prefix) {
+    return [&session, prefix = std::move(prefix)](
         const std::size_t size,
         const bool randomWrite,
         const std::string_view label,
-        std::string* error) {
+        std::string* error,
+        std::span<const resource::StorageOwnerDescription> coexist) {
         std::string storeLabel = prefix;
         if (!storeLabel.empty() && !label.empty()) {
             storeLabel.push_back('_');
@@ -419,8 +358,7 @@ inline WritableRemapProviderFactory MakeStoreBackedWritableRemapProviderFactory(
             session,
             randomWrite,
             storeLabel.empty() ? std::string("remap") : storeLabel,
-            useMemoryStore,
-            error);
+            error, coexist);
     };
 }
 

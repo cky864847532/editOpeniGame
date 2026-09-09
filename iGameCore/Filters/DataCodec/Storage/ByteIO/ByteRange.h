@@ -2,6 +2,9 @@
 #define DATACODEC_STORAGE_BYTEIO_BYTERANGE_H
 
 #include "DataCodec/Storage/ByteIO/ContiguousView.h"
+#include "DataCodec/Storage/ByteIO/ByteBudget.h"
+#include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
+#include "DataCodec/API/Output/EncodedBuffer.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
@@ -10,11 +13,15 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
+#include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <utility>
 #include <vector>
 namespace datacodec {
+class DataCodecExecutionResources;
 
 enum class ByteRangePrefetchStatus : std::uint8_t {
     Accepted = 0u,
@@ -95,6 +102,23 @@ public:
         std::uint64_t offset,
         std::span<std::uint8_t> output,
         std::string* error = nullptr) = 0;
+
+    // 一次只交付一个固定窗口，取消在已有 I/O 返回后和下一窗口开始前生效
+    bool ReadAtCancellable(const std::uint64_t offset, const std::span<std::uint8_t> output,
+                           const std::stop_token stop, std::string* error = nullptr) {
+        if (offset > ByteSize() || output.size() > ByteSize() - offset) {
+            return validation::AssignError(error, "cancellable byte range is outside the source");
+        }
+        std::size_t consumed = 0u;
+        while (consumed < output.size()) {
+            if (stop.stop_requested()) { return validation::AssignError(error, "byte range read cancelled"); }
+            const auto count = std::min(output.size() - consumed, kIoWindowBytes);
+            if (!ReadAt(offset + consumed, output.subspan(consumed, count), error)) { return false; }
+            consumed += count;
+        }
+        if (stop.stop_requested()) { return validation::AssignError(error, "byte range read cancelled"); }
+        return true;
+    }
 };
 
 class IByteRangeOutput {
@@ -109,18 +133,30 @@ public:
 
 class MemoryByteRangeReader final : public IByteRangeReader {
 public:
-    explicit MemoryByteRangeReader(std::span<const std::uint8_t> bytes)
-        : m_bytes(std::make_shared<const std::vector<std::uint8_t>>(bytes.begin(), bytes.end())) {}
-
-    explicit MemoryByteRangeReader(std::vector<std::uint8_t> bytes)
-        : m_bytes(std::make_shared<const std::vector<std::uint8_t>>(std::move(bytes))) {}
-
     explicit MemoryByteRangeReader(std::shared_ptr<const std::vector<std::uint8_t>> bytes)
         : m_bytes(std::move(bytes)) {}
 
-    [[nodiscard]] std::uint64_t ByteSize() const noexcept override {
-        return m_bytes == nullptr ? 0u : static_cast<std::uint64_t>(m_bytes->size());
+    explicit MemoryByteRangeReader(EncodedBuffer bytes)
+        : m_encoded(std::make_shared<const EncodedBuffer>(std::move(bytes))) {}
+
+    explicit MemoryByteRangeReader(std::shared_ptr<const EncodedBuffer> bytes)
+        : m_encoded(std::move(bytes)) {}
+
+    // 连续视图只借用传入 owner 的字节，容量归原 owner 管理
+    MemoryByteRangeReader(std::shared_ptr<const void> owner, std::span<const std::uint8_t> bytes)
+        : m_retainedOwner(std::move(owner)), m_retainedBytes(bytes) {
+        if (!m_retainedOwner && !bytes.empty()) {
+            throw std::invalid_argument("memory byte range requires a retained input owner");
+        }
     }
+
+    [[nodiscard]] std::span<const std::uint8_t> Bytes() const noexcept {
+        if (m_retainedOwner) { return m_retainedBytes; }
+        if (m_encoded) { return m_encoded->span(); }
+        return m_bytes ? std::span<const std::uint8_t>(*m_bytes) : std::span<const std::uint8_t>{};
+    }
+
+    [[nodiscard]] std::uint64_t ByteSize() const noexcept override { return Bytes().size(); }
 
     [[nodiscard]] std::shared_ptr<const std::vector<std::uint8_t>> RetainAllBytes() const noexcept override {
         return m_bytes;
@@ -129,34 +165,30 @@ public:
     [[nodiscard]] std::span<const std::uint8_t> ContiguousRange(
         const std::uint64_t offset,
         const std::uint64_t byteSize) const noexcept override {
-        if (m_bytes == nullptr ||
-            offset > m_bytes->size() ||
-            byteSize > m_bytes->size() - static_cast<std::size_t>(offset) ||
-            byteSize > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            return {};
-        }
-        return std::span<const std::uint8_t>(
-            m_bytes->data() + static_cast<std::size_t>(offset),
-            static_cast<std::size_t>(byteSize));
+        const auto bytes = Bytes();
+        if (offset > bytes.size() || byteSize > bytes.size() - offset) { return {}; }
+        return bytes.subspan(static_cast<std::size_t>(offset), static_cast<std::size_t>(byteSize));
     }
 
     bool ReadAt(
         const std::uint64_t offset,
         const std::span<std::uint8_t> output,
         std::string* error = nullptr) override {
-        if (m_bytes == nullptr ||
-            offset > m_bytes->size() ||
-            output.size() > m_bytes->size() - static_cast<std::size_t>(offset)) {
+        const auto bytes = Bytes();
+        if (offset > bytes.size() || output.size() > bytes.size() - offset) {
             return validation::AssignError(error, "memory byte range reader read range is outside the buffer");
         }
         if (!output.empty()) {
-            std::memcpy(output.data(), m_bytes->data() + static_cast<std::size_t>(offset), output.size());
+            std::memcpy(output.data(), bytes.data() + static_cast<std::size_t>(offset), output.size());
         }
         return true;
     }
 
 private:
     std::shared_ptr<const std::vector<std::uint8_t>> m_bytes;
+    std::shared_ptr<const EncodedBuffer> m_encoded;
+    std::shared_ptr<const void> m_retainedOwner;
+    std::span<const std::uint8_t> m_retainedBytes;
 };
 
 class SubrangeByteRangeReader final : public IByteRangeReader {
@@ -240,54 +272,35 @@ private:
 
 class MemoryByteRangeOutput final : public IByteRangeOutput {
 public:
-    bool WriteAt(
-        const std::uint64_t offset,
-        const std::span<const std::uint8_t> bytes,
-        std::string* error = nullptr) override {
-        std::size_t localOffset = 0u;
-        std::size_t requiredBytes = 0u;
-        if (!validation::CheckedCastSizeT(offset, localOffset, "memory byte range output range", error) ||
-            !validation::CheckedAddSizeT(localOffset, bytes.size(), requiredBytes, "memory byte range output range", error)) {
-            return false;
-        }
-        if (m_bytes.size() < requiredBytes) {
-            m_bytes.resize(requiredBytes, 0u);
-        }
-        if (!bytes.empty()) {
-            std::memcpy(m_bytes.data() + localOffset, bytes.data(), bytes.size());
-        }
-        return true;
-    }
-
-    bool Finalize(const std::uint64_t logicalSize, std::string* error = nullptr) override {
-        if (logicalSize > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            return validation::AssignError(
-                error,
-                "memory byte range output logical size exceeds local address space");
-        }
-        m_bytes.resize(static_cast<std::size_t>(logicalSize), 0u);
-        return true;
-    }
-
-    [[nodiscard]] const std::vector<std::uint8_t>& Bytes() const noexcept { return m_bytes; }
-    [[nodiscard]] std::vector<std::uint8_t> TakeBytes() noexcept { return std::move(m_bytes); }
+    explicit MemoryByteRangeOutput(DataCodecExecutionResources& run);
+    MemoryByteRangeOutput(const MemoryByteRangeOutput&) = delete;
+    MemoryByteRangeOutput& operator=(const MemoryByteRangeOutput&) = delete;
+    bool PrepareExactSize(std::uint64_t size, std::string* error = nullptr,
+                          std::span<const resource::StorageOwnerDescription> coexist = {});
+    bool WriteAt(std::uint64_t offset, std::span<const std::uint8_t> bytes, std::string* error = nullptr) override;
+    bool Finalize(std::uint64_t size, std::string* error = nullptr) override;
+    [[nodiscard]] std::span<const std::uint8_t> Bytes() const noexcept;
+    [[nodiscard]] EncodedBuffer TakeBytes() noexcept;
 
 private:
-    std::vector<std::uint8_t> m_bytes;
+    bool ZeroRange(std::uint64_t offset, std::uint64_t length, std::string* error);
+    DataCodecExecutionResources& m_run;
+    std::shared_ptr<bytestore::MemoryStore> m_store;
+    std::optional<std::uint64_t> m_preparedSize;
+    bool m_finalized{false};
+    bool m_failed{false};
 };
 
 inline bool CopyByteRangeReaderToOutput(
     IByteRangeReader& source,
     IByteRangeOutput& sink,
-    const std::size_t windowBytes,
     std::string* error = nullptr) {
     const auto byteSize = source.ByteSize();
-    const auto resolvedWindowBytes = std::max<std::size_t>(windowBytes, 1u);
-    std::vector<std::uint8_t> buffer(resolvedWindowBytes, 0u);
+    std::vector<std::uint8_t> buffer(kIoWindowBytes, 0u);
     std::uint64_t offset = 0u;
     while (offset < byteSize) {
         const auto currentBytes = static_cast<std::size_t>(
-            std::min<std::uint64_t>(byteSize - offset, static_cast<std::uint64_t>(resolvedWindowBytes)));
+            std::min<std::uint64_t>(byteSize - offset, static_cast<std::uint64_t>(kIoWindowBytes)));
         auto window = std::span<std::uint8_t>(buffer.data(), currentBytes);
         if (!source.ReadAt(offset, window, error) ||
             !sink.WriteAt(offset, std::span<const std::uint8_t>(window.data(), window.size()), error)) {

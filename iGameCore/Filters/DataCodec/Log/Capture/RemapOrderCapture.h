@@ -12,8 +12,8 @@
 namespace datacodec::log {
 
 struct RemapOrderSnapshot {
-    std::unordered_map<BlockPath, std::vector<IndexType>> pointOrders;
-    std::unordered_map<BlockPath, std::vector<IndexType>> cellOrders;
+    std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>> pointOrders;
+    std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>> cellOrders;
 };
 
 class RemapOrderCapture final : public IRunRecordSink {
@@ -27,12 +27,11 @@ public:
         if (remap == nullptr) {
             return;
         }
-        auto order = ReadOrder(remap->provider);
         std::lock_guard<std::mutex> lock(m_mutex);
         auto& orders = remap->domain == RunRemapDomain::Point
             ? m_pointOrders
             : m_cellOrders;
-        orders[remap->leafPath] = std::move(order);
+        orders[remap->leafPath] = remap->provider;
     }
 
     [[nodiscard]] RemapOrderSnapshot TakeSnapshot() {
@@ -46,21 +45,9 @@ public:
     }
 
 private:
-    [[nodiscard]] static std::vector<IndexType> ReadOrder(const IRemapProvider* provider) {
-        std::vector<IndexType> order;
-        if (provider == nullptr || provider->IsIdentity()) {
-            return order;
-        }
-        std::string error;
-        if (!provider->ReadRange(0u, provider->Size(), order, &error)) {
-            order.clear();
-        }
-        return order;
-    }
-
     std::mutex m_mutex;
-    std::unordered_map<BlockPath, std::vector<IndexType>> m_pointOrders;
-    std::unordered_map<BlockPath, std::vector<IndexType>> m_cellOrders;
+    std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>> m_pointOrders;
+    std::unordered_map<BlockPath, std::shared_ptr<const IRemapProvider>> m_cellOrders;
 };
 
 } // datacodec::log命名空间

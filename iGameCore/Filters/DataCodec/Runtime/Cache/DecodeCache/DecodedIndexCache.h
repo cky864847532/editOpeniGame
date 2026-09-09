@@ -4,7 +4,6 @@
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
-#include "DataCodec/API/Params/CodecControlParams.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,26 +24,6 @@ inline bool CalculateIndexCacheBytes(
         byteCount,
         "decoded index cache bytes",
         error);
-}
-
-inline std::shared_ptr<bytestore::IRandomAccessByteStore> CreateDecodedIndexStore(
-    bytestore::ByteStoreSession& byteStoreSession,
-    const DecodeStorageMode storageMode,
-    const std::uint64_t byteCount,
-    const std::uint64_t memoryCacheLimitBytes,
-    std::string* error = nullptr) {
-    if (storageMode == DecodeStorageMode::Memory) {
-        if (memoryCacheLimitBytes == 0u || byteCount > memoryCacheLimitBytes) {
-            validation::AssignError(error, "decoded index memory cache exceeds configured memory limit");
-            return nullptr;
-        }
-        auto store = byteStoreSession.CreateMemoryStore();
-        if (store == nullptr) {
-            validation::AssignError(error, "failed to allocate decoded index memory cache");
-        }
-        return store;
-    }
-    return byteStoreSession.CreateManagedByteStore("decoded_index", error);
 }
 
 class DecodedIndexCache final {
@@ -70,29 +49,21 @@ public:
     bool Initialize(
         const std::uint64_t count,
         bytestore::ByteStoreSession& byteStoreSession,
-        const DecodeStorageMode storageMode = DecodeStorageMode::Managed,
-        const std::uint64_t memoryCacheLimitBytes = 0u,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        std::span<const resource::StorageOwnerDescription> coexist = {},
+        const char* label = "decoded_index",
+        const std::source_location site = std::source_location::current()) {
         Release();
         std::uint64_t byteCount = 0u;
         if (!CalculateIndexCacheBytes(count, byteCount, error)) {
             return false;
         }
-        m_count = count;
-        m_written = 0u;
-        m_bytes = CreateDecodedIndexStore(
-            byteStoreSession,
-            storageMode,
-            byteCount,
-            memoryCacheLimitBytes,
-            error);
+        m_bytes = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
+            byteCount, label, error, coexist, site);
         if (m_bytes == nullptr) {
-            return validation::AssignError(error, "failed to allocate decoded index cache");
-        }
-        if (!m_bytes->ResizeBytes(byteCount, error)) {
-            Release();
             return false;
         }
+        m_count = count;
         return true;
     }
 
@@ -192,9 +163,6 @@ public:
     }
 
     void Release() noexcept {
-        if (m_bytes != nullptr) {
-            m_bytes->Release();
-        }
         m_bytes.reset();
         m_count = 0u;
         m_written = 0u;

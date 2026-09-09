@@ -2,6 +2,7 @@
 #define DATACODEC_WORKFLOW_DECODE_STAGES_DECODECOMMITSTAGE_H
 
 #include "DataCodec/Runtime/Cache/DecodedCacheCommit.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/Validation/Workflow/DecodeOutputValidator.h"
@@ -121,13 +122,13 @@ inline bool CommitDecodedTopologyIfPresent(
             *context.adapter,
             workspace.CacheResourcesRef(),
             *workspace.topology,
-            error);
+            error, MakeCapacityRecordCallback(context.runRecords));
     }
     if (!CommitTopologyCacheAndRelease(
             *context.adapter,
             workspace.CacheResourcesRef(),
             *workspace.topology,
-            error)) {
+            error, MakeCapacityRecordCallback(context.runRecords))) {
         return false;
     }
     if (workspace.topology != nullptr) {
@@ -194,15 +195,11 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
     error.clear();
     stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     SubmitCommitProgress(context, 0.940, DataCodecMessageId::DecodeCommitTopology);
-    const auto* topologyBeforeCommit = workspace.TopologyForCommit();
-    const std::string topologyCommitMode =
-        topologyBeforeCommit != nullptr ? topologyBeforeCommit->ByteStoreModeName() : std::string{};
     if (!CommitDecodedTopologyIfPresent(context, workspace, &error)) {
         RecordCommitTiming(
             context,
             "DecodeCommitStage.Topology",
-            stageStart,
-            topologyCommitMode);
+            stageStart);
         FailDecodeStage(
             context,
             workspace,
@@ -215,8 +212,7 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
     RecordCommitTiming(
         context,
         "DecodeCommitStage.Topology",
-        stageStart,
-        topologyCommitMode);
+        stageStart);
     error.clear();
     stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     SubmitCommitProgress(context, 0.970, DataCodecMessageId::DecodeCommitAttribute);
@@ -225,10 +221,7 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
             workspace.CacheResourcesRef(),
             workspace.attributes,
             uncommittedAttrIndices,
-            &error,
-            context.parallelTaskRunner,
-            workspace.ResourceBudget().AttributeCommitLaneCount(),
-            workspace.StopToken())) {
+            &error)) {
         RecordCommitTiming(context, "DecodeCommitStage.Attributes", stageStart);
         FailDecodeStage(
             context,
@@ -273,10 +266,7 @@ inline void CommitAttributeOutput(DecodeContext& context, DecodeLeafWorkspace& w
             workspace.CacheResourcesRef(),
             workspace.attributes,
             uncommittedAttrIndices,
-            &error,
-            context.parallelTaskRunner,
-            workspace.ResourceBudget().AttributeCommitLaneCount(),
-            workspace.StopToken())) {
+            &error)) {
         RecordCommitTiming(context, "DecodeCommitStage.Attributes", stageStart);
         FailDecodeStage(
             context,

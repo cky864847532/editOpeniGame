@@ -7,12 +7,14 @@
 #include "DataCodec/API/Output/DataCodecOutputSinks.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
 #include "DataCodec/Common/DataCodecTypes.h"
-#include "DataCodec/API/Params/CodecPerformancePresetParams.h"
-#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
+#include "DataCodec/Common/DataCodecError.h"
+#include "DataCodec/API/Params/CodecParamDefaults.h"
+#include "DataCodec/API/Params/CodecResourceParams.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -77,17 +79,18 @@ struct EncodeRequest {
     DataCodecEncodeConfigurationParams configuration{MakeDefaultEncodeConfigurationParams()};
     DataCodecOutputSinks outputSinks;
     std::shared_ptr<IRunRecordSink> runRecordSink;
-    DataCodecExecutionResources executionResources;
+    CodecResourceParams resources;
 };
 
 struct EncodeResult {
     bool success{false};
     bool hasEncodedOutput{false};
-    std::vector<std::uint8_t> encodedBytes;
+    EncodedBuffer encodedBytes;
     std::uint64_t encodedByteCount{0u};
     std::size_t leafCount{0u};
     EncodePackageKind packageKind{EncodePackageKind::Auto};
     std::vector<TelemetryMessageRecord> messages;
+    std::optional<CodecFailureRecord> failure;
 };
 
 [[nodiscard]] EncodeResult Encode(const EncodeRequest& request);

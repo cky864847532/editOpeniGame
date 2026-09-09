@@ -6,6 +6,7 @@
 #include "DataCodec/Runtime/Failure/EncodeFailureManagement.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
 #include "DataCodec/Codec/Remap/PointRemapBuilder.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 
 namespace datacodec {
 
@@ -13,13 +14,8 @@ class PointRemapStage final : public EncodeStage {
 public:
     static constexpr std::string_view kTypeName = "PointSpatialPartition";
 
-    explicit PointRemapStage(const EncodeStorageMode storageMode)
-        : m_storageMode(storageMode) {}
-
     const char* Name() const override {
-        return m_storageMode == EncodeStorageMode::Memory
-            ? "PointSpatialPartition.MortonMemory"
-            : "PointSpatialPartition.MortonManaged";
+        return "PointSpatialPartition.Morton";
     }
 
     // 构建几何、拓扑和点属性共享的点重排映射状态
@@ -51,24 +47,18 @@ public:
         std::string error;
         pointremap::RemapProviders result;
         auto& byteStoreSession = workspace.ByteStoreSessionRef();
-        auto& scratchBudget = workspace.CacheResourcesRef().remapScratchBudget;
-        const bool useMemoryPointRemap =
-            workspace.ResourceBudget().RemapEncodeStorageMode() == EncodeStorageMode::Memory;
         const auto providerFactory = MakeStoreBackedWritableRemapProviderFactory(
             byteStoreSession,
-            "point_remap",
-            useMemoryPointRemap);
+            "point_remap");
         if (!pointremap::BuildPointMortonRemapProviders(
             *geometry,
             result,
             &error,
             pointremap::BuildOptions{
+                .resources = context.resources,
                 .providerFactory = providerFactory,
                 .byteStoreSession = &byteStoreSession,
-                .scratchBudget = &scratchBudget,
-                .mortonLeafBudgetBytes = workspace.ResourceBudget().RemapMortonLeafBytes(),
-                .mortonRunBufferBytes = workspace.ResourceBudget().RemapMortonRunBufferBytes(),
-                .useMemoryScratchStore = useMemoryPointRemap,
+                .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
             })) {
             FailEncodeStage(
                 context,
@@ -92,8 +82,6 @@ public:
         return EncodeStageExecutionStatus::Completed;
     }
 
-private:
-    EncodeStorageMode m_storageMode{EncodeStorageMode::Managed};
 };
 
 } // namespace datacodec
