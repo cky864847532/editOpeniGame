@@ -2,6 +2,9 @@
 #define iGameDataCodecFeaturePreparedSurfaceAttributes_h
 
 #include "DataCodec/Filter/Adapter/iGamePreparedSurfaceDecodeAdapter.h"
+#include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
+#include "DataCodec/Filter/Adapter/iGameDecodeAdapter.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 #include "iGameAttributeSet.h"
 #include "iGameCellArray.h"
@@ -161,6 +164,43 @@ namespace iGame::datacodec_test {
         surface->GetActiveColorBufferElementCount() == 0u ||
         surface->GetActiveColorBufferUpdateId() == 0u) {
         std::cerr << "prepared surface cell color buffer diagnostics are invalid\n";
+        return false;
+    }
+    ::datacodec::DataCodecExecutionResources root(::datacodec::ResolvedResourceConfiguration{
+        {0u, 1u, 1u}, 0u, 1u, false, true, true});
+    const std::weak_ptr<std::vector<igIndex>> weakMap = faceToCellMap;
+    ::datacodec::IDecodedFramePayload::Pointer payload;
+    {
+        iGameFramePackageDecodeAssembly assembly;
+        ::datacodec::FramePackage frame;
+        frame.leaves.push_back(::datacodec::FramePackageLeafRecord{.path = "leaf", .name = "prepared"});
+        iGameDecodeAdapter adapter(source);
+        std::string error;
+        if (!assembly.BeginFramePackage(frame, &error) || !assembly.CommitLeaf(frame.leaves.front(), adapter, &error) ||
+            !assembly.EndFramePackage(&error)) {
+            std::cerr << "prepared source frame assembly failed: " << error << '\n';
+            return false;
+        }
+        payload = assembly.Payload();
+        source = nullptr;
+        assembly.AbortFramePackage();
+    }
+    auto nativePayload = std::dynamic_pointer_cast<iGameDecodedFramePayload>(payload);
+    if (!nativePayload || nativePayload->Output() == nullptr || weakMap.expired() || faceToCellMap.use_count() != 2u ||
+        root.StorageCapacity()->Snapshot().reservedBytes != 0u) {
+        std::cerr << "frame payload did not retain the prepared source and its shared face map after assembly retirement\n";
+        return false;
+    }
+    payload.reset();
+    nativePayload.reset();
+    if (faceToCellMap.use_count() != 1u) {
+        std::cerr << "final frame payload did not release the prepared source face map\n";
+        return false;
+    }
+    faceToCellMap.reset();
+    if (!weakMap.expired() || surface->GetNumberOfPoints() != 3u ||
+        root.StorageCapacity()->Snapshot().reservedBytes != 0u) {
+        std::cerr << "prepared map did not retire independently of the retained host surface\n";
         return false;
     }
     return true;

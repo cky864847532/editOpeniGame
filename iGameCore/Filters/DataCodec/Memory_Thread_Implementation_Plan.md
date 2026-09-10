@@ -6,6 +6,8 @@
 
 状态：实施中，逐项实现、提交与验证证据由 Memory_Thread_TODO.md 维护；本文中的历史源码核查记录保留其原始时点
 
+本次收尾范围（2026-09-09 用户更新）：继续关闭 T04—T14、T16，仅在当前 Windows 环境验收核心编解码。删除本次跨平台、Linux、WASM、实际浏览器和跨设备验收要求；后文相关平台设计保留为已有实现背景，不作为本次完成门槛。已完成的 Qt 适配、基础机制和前置任务直接沿用。根据现有运行证据补齐必要测试，集中修复实际失败，不开展额外事后静态审计。
+
 ## 1. 文档契约
 
 本文是 DataCodec 内存与线程管理改造的完整实现依据，集中规定设计边界、目标类型、接口、所有权、执行流程、自动调节、旧模块删除范围和验收要求。实现目标是简单、高效，适应不同设备与当前系统负载；对象是以生产者、块级计算和顺序消费者为主的单请求数据编解码模块。本文的 C++ 声明是目标接口轮廓，不表示当前源码已经具备这些接口。
@@ -90,6 +92,8 @@
 有限块循环放在已有 ParallelExecution 中；本次不新增独立 BlockScheduler、MemoryManager、CacheManager。新增 `.cpp` 继续加入现有 iGameCore 目标，不创建第二套 DataCodec 构建目标。
 
 ### 3.3 共用模块的职责与唯一约定位置
+
+智能指针类型统一约定：DataCodec 内部使用 C++ 标准库的 `std::unique_ptr`、`std::shared_ptr` 和 `std::weak_ptr`，不引入项目自带的 `iGame::SmartPointer` 管理内部对象。独占所有权使用 `std::unique_ptr`，确需共享寿命时使用 `std::shared_ptr`，不延长所有者寿命的反向关联使用 `std::weak_ptr`。DataCodec 外部的宿主读取代码可以使用项目自带智能指针管理宿主对象，例如 CGNS reader 使用 `iGameCGNSReader::Pointer`；其 `New()` 返回裸指针，不能依赖 `auto` 自动获得智能指针所有权。
 
 编码、解码、reference、重排、封装和 Playback 共用下表中的实现。每个共用模块只维护一份职责和状态，业务章节仅说明数据接入与调用顺序，不另建局部版本。参数或生命周期需要调整时先修改其约定章节，再同步调用点与验收要求。
 
@@ -1084,7 +1088,7 @@ driver 和 worker 在状态变化时累计 Wc/Ws/Wi/Wo 的持续时间，使用�
 
 控制线程每 250 ms 采样，平台压力通知只设置事件并唤醒。先在执行锁外采样，锁内取得流状态并计算，通过 UpdateLimits 的同一发布逻辑同时更新 gate/M/C/S，锁外通知并请求可选资源回收。锁内调用使用该入口的内部已持锁实现，不能再次取得同一执行锁。处理优先级固定为取消与失败、严重压力、普通压力及排空、信号失效、恢复、增长；先检查样本有效性，失效数值不参与水位判断。同一次更新不同时恢复和增长。
 
-完成与槽位归还事件推进排空和观察批；控制线程的定时等待推进采样、压力确认和超时。全部 worker 忙碌或全部新准入暂停时，控制循环仍可触发。任务热路径只维护必要计数和状态事件，不查询操作系统、不扫描堆、不更新逐分配预测表；平台采样与控制均独立于日志开关。
+完成与槽位归还事件推进排空和观察批；控制线程的定时等待推进采样、压力确认和超时。执行状态使用同一互斥量，worker/driver 与控制线程使用各自条件变量：NORMAL 的普通块事件仅更新计数和观察统计，控制线程在定时采样时读取；DRAIN/HOLD 的进展、原生压力通知、请求开始/结束及停止/销毁即时唤醒控制线程。类型切换仍由 driver 在排空边界同步处理。没有目标或控制状态变化的采样不额外唤醒 worker/driver。全部 worker 忙碌或全部新准入暂停时，控制循环仍可触发。任务热路径只维护必要计数和状态事件，不查询操作系统、不扫描堆、不更新逐分配预测表；平台采样与控制均独立于日志开关。
 
 压力确认、恢复留存和 trim 请求统一执行 12.1 节；本节只负责定时事件与同步发布，不定义另一份 cache/scratch 政策。driver 阻塞在 I/O 时，cache 实际回收可能延后，新准入已经关闭；不承诺同步 I/O 能被立即取消。重复通知不重复全量扫描，不重置同一请求的 HOLD 超时起点。
 
@@ -1157,7 +1161,9 @@ K = L / 2
 
 例如，256 MiB 有效容量对应 `L = 64 MiB, H = 96 MiB`；16 GiB 对应 `L = 1 GiB, H = 1.5 GiB`；1 TiB 对应 `L = 4 GiB, H = 6 GiB`。这些值是运行余量策略，不能作为满足单块分配的证明。控制器没有将可用内存降到水位附近的目标，输入有限或流水线缺少供给需求时不增长。
 
-启动取得新鲜采样后：高水位且无压力时使用 `C = 1, S = 2`；介于低水位与高水位之间时使用 `C = 1, S = 1`；低水位或已报告压力时使用 C=1/S=1，保持新块和新重型阶段准入关闭，按 14.8 节确认与处理压力。缺少可靠容量信号时按 14.10 节处理；无 pthread 配置遵守第 15 节的 C=S=1 约束。计算池按需创建 worker，不随 `P` 一次性启动全部计算线程。
+启动取得新鲜采样后：高水位且无压力时使用 `C = min(P, 8), S = C + 1`；介于低水位与高水位之间时使用 `C = 1, S = 1`；低水位或已报告压力时使用 C=1/S=1，保持新块和新重型阶段准入关闭，按 14.8 节确认与处理压力。缺少可靠容量信号时按 14.10 节处理；无 pthread 配置遵守第 15 节的 C=S=1 约束。计算池按需创建 worker，首次实际计算至多启动八个 worker。这个固定启动上界是统一执行参数，不是各模块配额，也不根据估算的块字节数换算槽位。
+
+2026-09-09 性能校准：原 C=1 启动与 500 ms/三个新样本增长门槛使由多个较短字段组成的请求长期接近单线程速度。本机 8388608 tuple 回放中原 Adaptive 约 2.54 s、Fixed 四线程约 0.87 s。随后在允许十六线程的同机实验中，Fixed 八线程约 638 ms、十六线程约 625 ms、四线程启动的 Adaptive 约 902 ms。健康启动上界校准为八个计算额度，减少短字段启动成本并限制初次并发；后续增长仍需完整观察，压力收缩、信号失效及冷却规则保持本节约定。实测与验收状态记入 Memory_Thread_Validation.md，不将该上界作为所有设备的最优值或物理内存保证。
 
 计时使用单调时钟。判定依据是持续时间，采样延迟不能通过补算若干个“连续样本”满足条件。普通采样间隔超过最大有效年龄时，连续良好时间和观察窗口失效。严重压力通知直接触发处理，不等待下次定时采样。
 
@@ -1184,7 +1190,7 @@ K = L / 2
 | `Wc` | 存在就绪任务，且活跃计算已经达到 `C` |
 | `Ws` | 仍有待读块，生产者仅因槽位用尽而等待 |
 | `Wi` | 仍有可独立处理的数据，存在闲置计算额度且没有就绪输入；排除串行依赖等待 |
-| `Wo` | 存在未消费结果，且提交端被下游容量、输出 I/O 或前序结果阻挡 |
+| `Wo` | 存在未消费结果，且提交端被下游容量、输出 I/O 或前序结果阻挡；使用完成/提交水位确认结果存在，尚无结果的首块计算等待不计入 |
 
 `Wo >= 25%` 定义为本观察窗口的持续提交拥堵。该窗口不增长。短时写入与计算重叠属于正常流水线活动。以下动作按表中顺序择一执行，动作后开始新的观察批：
 
@@ -1212,7 +1218,7 @@ Snew = min(Smax, max(S, Cnew + 1))
 
 单独增加槽位也遵守对应的增长间隔。`Snew` 保留已有有限窗口，必要时为新增计算提供一个额外供给位置；没有 `C = min(P, S)` 的反向联动。启动增长每步最多增加 4 个计算额度，压力后的增长每步最多增加 1 个。
 
-首版不增加吞吐预测器、每算法内存学习模型或第二套自动缓存扩容循环。`Qmax`、等待占比门槛和增长速度需要通过实际吞吐验证。受限试探存在启动成本，例如只考虑 500 ms 时间下界，`C` 从 1 增至 64 需要 23 次增长、至少 11.5 s；完整观察批可能延长这一过程。短请求直接在已取得的规模下完成，不等待控制器升到上限。
+首版不增加吞吐预测器、每算法内存学习模型或第二套自动缓存扩容循环。`Qmax`、等待占比门槛和增长速度需要通过实际吞吐验证。受限试探存在启动成本，例如只考虑 500 ms 时间下界，健康启动的 `C` 从 8 增至 64 需要 16 次增长、至少 8 s；完整观察批可能延长这一过程。压力收缩后遵守独立恢复速度。短请求直接在已取得的规模下完成，不等待控制器升到上限。
 
 本节只决定 C/S 的增长候选；与 M 增长同时满足条件时，按 14.4 节先处理 M，一次更新只执行一种增长。M 变化同样作废旧观察批。
 
@@ -1260,7 +1266,7 @@ C/S 收缩立即发布，同一请求中的 M 保持与硬能力处理遵守 14.
 
 一组相邻基础块的算法、标量类型、分量数、固定块规格、reference 处理路径及第三方线程参数一致时，视为同一工作类型。只保留当前类型标识及当前目标，首版不维护类型到工作集或历史配额的映射表。
 
-同类型的相邻字段、叶可以延续目标；任务尾部不为等待增长增加延迟。工作类型改变时，旧类型的在途块先完成交接，停止增长；正常准入允许开始新类型时，按 14.6 节的单计算启动值重新观察，已有更低的收缩目标继续保留。压力状态、收缩目标及冷却不会被类型切换清除。这个规则限制轻量路径学到的高并发直接作用于新的重型路径。
+同类型的相邻字段、叶可以延续目标；任务尾部不为等待增长增加延迟。工作类型改变时，旧类型的在途块先完成交接，停止增长；高水位、从未确认压力、没有信号恢复等待且冷却已结束时，按 14.6 节的至多八计算启动值重新观察。其他情况从 C=1 观察，S 不超过已有目标及当前信号允许的单计算窗口。压力状态、收缩目标及冷却不会被类型切换清除。这个规则限制轻量路径学到的高并发直接作用于新的重型路径。
 
 块级类型边界由 RunOrderedBlocks 的事前描述回调给出，只保留当前 key 和下一块 key。解码直接读取已有 layout，区分实际 bytesCodec、reference mode/kind 和分量 codec 组合；不读入 payload 以推断需求。普通尾块不因元素数较少另起类型，旧大块使用其真实规格。类型改变时停止后继准入及当前类型供给计时，队列已有记录完成提交和退休后再调用 SetWorkType，同一字段 flow 的序号继续递增。编码的 Auto reference 收益选择属于既定候选算法路径的一部分，准入使用事前计划，不按已完成候选结果回头改型或重放。
 
@@ -1517,7 +1523,7 @@ EncodeResult 和 DecodePackageResult 增加内联 `optional<CodecFailureRecord> 
 
 | 位置或符号 | 唯一处理及保留边界 |
 | --- | --- |
-| Runtime/Execution/DataCodecExecutionResources、ResolveDataCodecExecutionResources | 删除外部 IParallelTaskRunner 指针及空指针选择静态 InlineParallelTaskRunner 的生产分支；原地改为第 4—6 节的自有状态 |
+| Runtime/Execution/DataCodecExecutionResources、ResolveDataCodecExecutionResources | 删除 IParallelTaskRunner/IParallelTaskGroup、CreateGroup、ParallelTaskGroup 与 InlineParallelTaskRunner/Group，以及外部指针和空 runner 分支；原地保留第 4—6 节的自有状态、Slot/HeavyPhase 和终端执行接口，不保留无调用方的任务组兼容层 |
 | API/Entry 的 Encode/Decode 请求、Frame/Leaf 内部请求、Playback 打开请求 | 删除 executionResources、runner、外部 cache/runtime 字段和解析分支；公共入口按所选模式创建根状态，内部调用只传播已有状态 |
 | Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h、DataCodecTaskRunner、MakeDataCodecExecutionResources | 调用方迁移后删除该宿主线程池适配文件和工厂；宿主 iGameThreadPool 的非 DataCodec 用途保留 |
 | API/Adapter/IDecodedFrameCache.h、IEncodedInputCache.h | 删除管理接口；frame payload、lease 和查询协议迁入 DecodedFrameTypes，EncodedInputBuffer 的数据持有职责随 loader 的内置输入类型保留，不导出缓存设施替换入口 |
@@ -1529,7 +1535,7 @@ EncodeResult 和 DecodePackageResult 增加内联 `optional<CodecFailureRecord> 
 | ScratchByteQuotaAcquire、CacheResources 的 window/remap 预算、Codec/Reference/Common/ReferenceTypes.h 的 NumericArrayReferenceCodecEncodeInput 和 remap options 中的 quota/scratchBudget | 删除注入回调、可空预算旁路、每个集合独立造额度与重置行为；reference 预测、误差约束、重排 provider 和 scratch 复用按原职责保留 |
 | Workflow/Session/EncodeSessionWorkspace、DecodeSession、EncodeLeafWorkspace、DecodeLeafWorkspace | 删除独立 reference store 额度、外部 reference cache 配置、每叶额度复制及 InheritCacheResourceConfigFrom；按 RunBinding 和显式 owner 维护依赖与寿命 |
 | DecodedAttributeCacheSet、DecodedGeometryCache、DecodedTopologyCache 及各 typed LRU | 删除独立容量上限、重复字节决策账本、ResidentSizeHint 预算；保留 key、LRU、必要引用保护和数据访问，容量在 owner 处登记 |
-| Codec/Attributes/AttributeDecode、ParallelExecution、ParallelDecodeTopologyBlockObserver | 删除独立 cost/aging 调度、局部 inFlight/worker 配置、ParallelForChunksAllowNested 同池等待和 observer 的独立 pending 队列；执行第 5、6、11 节唯一块循环与同步提交 |
+| Codec/Attributes/AttributeDecode、ParallelExecution、ParallelDecodeTopologyBlockObserver | 删除独立 cost/aging 调度、局部 inFlight/worker 配置、ParallelForChunks/Threshold/AllowNested、ResolveParallelTaskCount/ShouldParallelizeRange、旧 TLS worker index 和 observer 的独立 pending 队列；执行第 5、6、11 节唯一块循环与同步提交，当前 worker 身份和编号直接由执行根及 WorkerContext 提供 |
 | API/Params/CodecPerformanceParams.h、CodecPerformancePresetParams.h | 删除资源 tier、逐模块份额、lane 与成组存储政策；业务 options、精度、增强、语言、日志、validation、observer 移入 DataCodecControlParams 和 CodecParamDefaults，公共资源配置归 CodecResourceParams |
 | Codec/Topology/Common/TopologyWorkBudget.h、topology.work_budget.requested | 删除虚拟工作集估计和对应 memoryCheckpoint；既有核查显示该估计仅用于记录，未通过它取得预算，不将此项描述为实际门禁迁移 |
 | Filter/Adapter/iGameDataCodecDataObjectBridge、Filter/Playback/iGameFrameSequenceDecodeBridge | 删除 bridge 的 executionResources 与 runner/cache 注入、资源适配器构造链；对象组装、属性访问、播放呈现和持续会话业务保留 |

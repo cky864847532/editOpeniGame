@@ -2,6 +2,9 @@
 #include "IQWidgets/igQtDataCodecCompressionWidget.h"
 #include "IQCore/igQtDataCodecDecodeSettings.h"
 #include <IGDC/iGameDataCodecIOSettings.h>
+#include <iGamePointSet.h>
+#include <iGameAttributeSet.h>
+#include <iGameFlatArray.h>
 
 #include <QApplication>
 #include <QSettings>
@@ -65,6 +68,40 @@ int main(int argc, char** argv) {
         auto* capacity = compression.findChild<QDoubleSpinBox*>(QStringLiteral("DataCodecOwnedStorageLimit"));
         require(mode && compute && capacity && !mode->isEnabled() && !compute->isEnabled() && !capacity->isEnabled(),
             "the real encoding panel must display disabled resource controls without a model");
+        auto points = iGame::Points::New();
+        points->AddPoint(0.0f, 1.0f, 2.0f);
+        points->AddPoint(3.0f, 4.0f, 5.0f);
+        auto pointSet = iGame::PointSet::New();
+        pointSet->SetPoints(points);
+        auto values = iGame::FloatArray::New();
+        values->SetName("resource_control_scalar");
+        values->SetDimension(1);
+        const float samples[]{1.0f, 2.0f};
+        values->AddElement(samples);
+        values->AddElement(samples + 1);
+        auto attributes = iGame::AttributeSet::New();
+        attributes->AddAttribute(IG_SCALAR, IG_POINT, values);
+        pointSet->SetAttributeSet(attributes);
+        auto model = iGame::Model::New();
+        model->SetDataObject(pointSet);
+        compression.SetModel(model);
+        QApplication::processEvents();
+        require(mode && compute && capacity && mode->isEnabled() && compute->isEnabled() && capacity->isEnabled(),
+            "loading a real point model must enable the encoding resource controls");
+        if (mode && compute && capacity) {
+            mode->setCurrentIndex(mode->findData(static_cast<int>(datacodec::CodecResourceMode::Fixed)));
+            compute->setValue(3);
+            capacity->setValue(64.0);
+            QSettings saved(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("iGame"), QStringLiteral("iGameVis"));
+            saved.beginGroup(QStringLiteral("DataCodec/Encode"));
+            const auto selected = igQtDataCodecDecodeSettingsStore::LoadResources(saved);
+            require(selected.mode == datacodec::CodecResourceMode::Fixed && selected.maxComputeThreads == 3u &&
+                selected.ownedStorageLimitBytes == 64u * MiB,
+                "editing real encoding controls must persist the exact next-request resource parameters");
+        }
+        compression.SetModel({});
+        require(mode && compute && capacity && !mode->isEnabled() && !compute->isEnabled() && !capacity->isEnabled(),
+            "removing the model must disable the resource controls again");
         compression.close();
     }
     const auto settingsPath = directory.filePath(QStringLiteral("resource.ini"));

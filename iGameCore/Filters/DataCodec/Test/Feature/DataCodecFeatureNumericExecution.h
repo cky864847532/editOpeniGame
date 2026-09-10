@@ -12,7 +12,7 @@ namespace datacodec::test {
 
 inline TestResult RunDataCodecFeatureNumericExecution() {
     TestResult result;
-    const auto checkType = [&]<typename Value>() {
+    const auto checkType = [&]<typename Value>(const bool direct) {
         constexpr auto count = 2u * numericarray::kSpatialBlockElementCount + 3u;
         constexpr std::size_t components = 3u;
         constexpr std::uint64_t limit = 32u * 1024u * 1024u;
@@ -67,12 +67,19 @@ inline TestResult RunDataCodecFeatureNumericExecution() {
                     .layout = numericarray::MakeNumericArrayLayout(meta.dataType, sizeof(Value), count, components),
                 };
                 numericarray::NumericArrayReader reader;
+                if (direct) {
+                    source.values = MakeCompactNumericArrayView(values.data(), source.values.scalarType,
+                        count, components, ViewBufferOrigin::Borrowed);
+                }
                 Require(result, numericarray::BuildNumericArrayReader(source, reader, nullptr),
                     "numeric.reader", "getter input must be accepted without full materialization");
+                Require(result, reader.SupportsParallelMemoryRead() == direct,
+                    "numeric.read-placement", "only the direct memory fixture may read inside a worker");
                 std::size_t commits = 0u;
                 std::size_t capacityExports = 0u;
                 const auto driver = std::this_thread::get_id();
                 encodeimpl::NumericArrayTransferCacheRuntime timing;
+                timing.parallelInputRead = true;
                 timing.recordCapacitySamples = [&](const std::span<const BufferCapacitySample> samples) {
                     ResourceDebugSnapshot snapshot;
                     state.valid &= std::this_thread::get_id() == driver && CopyExecutionSnapshot(root, snapshot) &&
@@ -96,7 +103,7 @@ inline TestResult RunDataCodecFeatureNumericExecution() {
                 const bool success = encodeimpl::BuildNumericArrayTransferCache(params, reader, root,
                     encoded, session, &error, "numeric_execution", &timing);
                 ResourceDebugSnapshot snapshot;
-                Require(result, success && state.valid && state.readBlocks == 3u && commits == 3u && capacityExports == 3u &&
+                Require(result, success && state.valid && state.readBlocks == (direct ? 0u : 3u) && commits == 3u && capacityExports == 3u &&
                     encoded.blockLayouts.size() == 3u && encoded.stats.encodeBlockCount == 3u &&
                     CopyExecutionSnapshot(root, snapshot) && snapshot.admittedBlocks == 0u &&
                     snapshot.activeComputeUnits == 0u && snapshot.lastRetired == 2u &&
@@ -131,9 +138,11 @@ inline TestResult RunDataCodecFeatureNumericExecution() {
             }
         }
     };
-    checkType.template operator()<float>();
-    checkType.template operator()<double>();
-    for (const unsigned fault : {0u, 1u, 2u, 3u, 4u}) {
+    for (const bool direct : {false, true}) {
+        checkType.template operator()<float>(direct);
+        checkType.template operator()<double>(direct);
+    }
+    for (const unsigned fault : {0u, 1u, 2u, 3u, 4u, 5u}) {
         const std::uint64_t limit = fault == 2u ? 0u : 1024u * 1024u;
         DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u},
             limit, 1u, true, true, false});
@@ -168,9 +177,18 @@ inline TestResult RunDataCodecFeatureNumericExecution() {
             .layout = numericarray::MakeNumericArrayLayout(DataType::Float32, sizeof(float), count, 1u),
         };
         numericarray::NumericArrayReader reader;
+        const std::vector<float> directValues(8u, 1.0f);
+        VectorRemapProvider invalidOrder({0u, 1u, 2u, 3u, 4u, 5u, 6u, 8u});
+        if (fault == 5u) {
+            // 让越界错误发生在 worker 读入阶段，验证失败后的槽位收束
+            source.values = MakeCompactNumericArrayView(directValues.data(), ScalarType::Float32, 8u, 1u,
+                ViewBufferOrigin::Borrowed);
+            source.orderProvider = &invalidOrder;
+        }
         Require(result, numericarray::BuildNumericArrayReader(source, reader, nullptr),
             "numeric.failure-reader", "the failure fixture must provide a valid numeric source");
         encodeimpl::NumericArrayTransferCacheRuntime runtime;
+        runtime.parallelInputRead = true;
         if (fault == 3u) {
             runtime.recordFloatingPointEncodeDuration = [](std::chrono::nanoseconds) { throw std::bad_alloc{}; };
         }

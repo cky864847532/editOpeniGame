@@ -37,6 +37,7 @@ public:
         EncodedLeafFieldBundle& output,
         std::uint64_t* exportedByteCount = nullptr,
         std::string* error = nullptr) {
+        ScopedRunStageTiming timing(context.runRecords, "PackageBundle.Leaf");
         output.Release();
         auto phase = WaitForHeavyPhase(context.resources);
         if (!phase) { return false; }
@@ -91,6 +92,7 @@ public:
         IByteRangeOutput* outputSink,
         std::uint64_t* encodedByteCount,
         std::string* error) {
+        ScopedRunStageTiming timing(context.runRecords, "PackageWrite.Leaf");
         if (outputSink == nullptr) {
             return validation::AssignError(
                 error,

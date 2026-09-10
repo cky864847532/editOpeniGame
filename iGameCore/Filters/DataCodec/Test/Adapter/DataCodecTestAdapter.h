@@ -97,7 +97,8 @@ public:
         output.cellTypes = m_dataset->cellTypes.empty()
             ? TopologyValueSource::Unavailable
             : TopologyValueSource::CompactArray;
-        output.cellPolynomialOrders = TopologyValueSource::Unavailable;
+        output.cellPolynomialOrders = m_dataset->cellPolynomialOrders.empty()
+            ? TopologyValueSource::Unavailable : TopologyValueSource::CompactArray;
         return true;
     }
     [[nodiscard]] std::size_t GetNumberOfCells() const override { return m_dataset->CellCount(); }
@@ -114,6 +115,9 @@ public:
     [[nodiscard]] int GetFixedCellSize() const override { return -1; }
     [[nodiscard]] const IndexType* GetCellTypesPtr() const override {
         return m_dataset->cellTypes.empty() ? nullptr : m_dataset->cellTypes.data();
+    }
+    [[nodiscard]] const std::uint16_t* GetCellPolynomialOrdersPtr() const override {
+        return m_dataset->cellPolynomialOrders.empty() ? nullptr : m_dataset->cellPolynomialOrders.data();
     }
     [[nodiscard]] std::size_t GetCellFaceBufferSize() const override { return 0u; }
 
@@ -176,8 +180,8 @@ struct DecodedTestAttribute {
 class TestDecodeAdapter final : public IDecodeAdapter {
 public:
     bool SetMeshType(const MeshType type, std::string* error = nullptr) override {
-        if (type != MeshType::PointSet) {
-            return AssignError(error, "test decode adapter expects a point set");
+        if (type != MeshType::PointSet && type != MeshType::UnstructuredMesh) {
+            return AssignError(error, "test decode adapter expects a point set or unstructured mesh");
         }
         m_meshType = type;
         return true;
@@ -363,6 +367,8 @@ public:
 
     [[nodiscard]] MeshType Mesh() const noexcept { return m_meshType; }
     [[nodiscard]] const std::vector<float>& Points() const noexcept { return m_points; }
+    [[nodiscard]] const std::vector<IndexType>& Connectivity() const noexcept { return m_connectivity; }
+    [[nodiscard]] const std::vector<IndexType>& Offsets() const noexcept { return m_offsets; }
     [[nodiscard]] const std::vector<DecodedTestAttribute>& Attributes() const noexcept {
         return m_attributes;
     }

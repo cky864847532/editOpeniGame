@@ -8,7 +8,9 @@
 #include "DataCodec/Codec/Topology/TopologyFingerprint.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
-#include "DataCodec/API/Params/CodecParamDefaults.h"
+#include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
+#include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
+#include "DataCodec/Workflow/Session/PlaybackSession.h"
 #include "DataCodec/Workflow/Encode/EncodePipelineBinding.h"
 #include "DataCodec/Workflow/Encode/EncodePipeline.h"
 #include "DataCodec/Runtime/Context/EncodeContext.h"
@@ -16,6 +18,7 @@
 #include "DataCodec/Workflow/Session/EncodeSessionWorkspace.h"
 #include "DataCodec/Workflow/Temporal/TemporalBuilder.h"
 #include "DataCodec/Workflow/FrameSequence/FrameSequenceEncodeExecutor.h"
+#include "DataCodec/Workflow/FrameSequence/FrameSequenceDependencyPlanner.h"
 #include "DataCodec/Test/Adapter/DataCodecTestAdapter.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
 
@@ -28,9 +31,48 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+// 被删除的资源模块不能通过旧头文件重新进入公共构建
+#if __has_include("DataCodec/API/Adapter/IDecodedFrameCache.h") || \
+    __has_include("DataCodec/API/Adapter/IEncodedInputCache.h") || \
+    __has_include("DataCodec/API/Params/CodecPerformanceParams.h") || \
+    __has_include("DataCodec/API/Params/CodecPerformancePresetParams.h") || \
+    __has_include("DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h") || \
+    __has_include("DataCodec/Filter/Adapter/iGameStreamingFrameCacheAdapter.h") || \
+    __has_include("DataCodec/Codec/Attributes/AttributeEncodeScheduler.h") || \
+    __has_include("DataCodec/Storage/ByteIO/Window/WindowBudget.h") || \
+    __has_include("DataCodec/Codec/Topology/Common/TopologyWorkBudget.h")
+#error "Removed DataCodec resource modules must not remain available"
+#endif
+
 namespace datacodec::test {
+
+template<class Request>
+inline constexpr bool HasExternalResourceInjection =
+    requires(Request& request) { request.executionResources; } ||
+    requires(Request& request) { request.runner; } ||
+    requires(Request& request) { request.parallelTaskRunner; } ||
+    requires(Request& request) { request.cacheRuntime; } ||
+    requires(Request& request) { request.decodeCacheRuntime; } ||
+    requires(Request& request) { request.decodedFrameCache; } ||
+    requires(Request& request) { request.encodedInputCache; };
+
+static_assert(!HasExternalResourceInjection<EncodeRequest>);
+static_assert(!HasExternalResourceInjection<DecodePackageRequest>);
+static_assert(!HasExternalResourceInjection<PlaybackOpenRequest>);
+static_assert(!HasExternalResourceInjection<PlaybackSequenceOpenRequest>);
+static_assert(!HasExternalResourceInjection<LeafEncodeRequest>);
+static_assert(!HasExternalResourceInjection<FrameEncodeRequest>);
+template<class Execution>
+inline constexpr bool HasLegacyTaskGroup = requires(Execution& execution) { execution.CreateGroup(); };
+static_assert(!HasLegacyTaskGroup<DataCodecExecutionResources>);
+static_assert(std::is_same_v<decltype(EncodeRequest::resources), CodecResourceParams>);
+static_assert(std::is_same_v<decltype(DecodePackageRequest::resources), CodecResourceParams>);
+static_assert(std::is_same_v<decltype(PlaybackOpenRequest::resources), CodecResourceParams>);
+static_assert(std::is_same_v<decltype(PlaybackSequenceOpenRequest::resources), CodecResourceParams>);
 
 inline bool HasPipelineStageName(
     const std::vector<EncodeStageId>& stageIds,
@@ -168,6 +210,144 @@ inline bool CheckTopologyReuseSpatialDependency(TestResult& result) {
             : fingerprintError);
 }
 
+inline void CheckDecodeSessionOwnerLifetime(TestResult& result, EncodedBuffer encodedBytes) {
+    constexpr std::uint64_t limit = 32u * 1024u * 1024u;
+    DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u},
+        limit, 1u, false, true, false});
+    CodecRunScope scope(root);
+    auto reader = std::make_shared<MemoryByteRangeReader>(
+        std::make_shared<const EncodedBuffer>(std::move(encodedBytes)));
+    LeafPackage leaf;
+    std::string error;
+    if (!Require(result, LeafPackageIO::ReadFromByteRange(reader, 0u, reader->ByteSize(), leaf, &error),
+            "pipeline.decode-session-input", error)) { return; }
+    class Assembly final : public IFramePackageDecodeAssembly {
+    public:
+        bool BeginFramePackage(const FramePackage&, std::string*) override { return true; }
+        bool AddBranch(const FramePackageBranchRecord&, std::string*) override { return true; }
+        std::unique_ptr<IDecodeAdapter> CreateLeafAdapter(const FramePackageLeafRecord&, const LeafPackage&, std::string*) override {
+            return std::make_unique<TestDecodeAdapter>();
+        }
+        bool CommitLeaf(const FramePackageLeafRecord&, IDecodeAdapter&, std::string*) override { ++commits; return true; }
+        bool EndFramePackage(std::string*) override { return true; }
+        std::size_t commits{0u};
+    } assembly;
+    const DecodeReferenceKey key{.source = {"session-owner-fixture", "1"}, .keyFrameIndex = 0u};
+    auto identities = std::make_shared<DecodeSession::FrameIdentityMap>();
+    identities->emplace(0u, key.source);
+    auto cache = root.Caches().ReferenceCache();
+    cache->Configure(0u);
+    auto required = cache->RequireFrame(key);
+    std::shared_ptr<DecodedAttributeCacheSet> attributeOwner;
+    std::shared_ptr<bytestore::ByteStoreSession> sessionOwner;
+    std::shared_ptr<DecodedGeometryReferenceCache> geometryOwner;
+    std::weak_ptr<DecodedAttributeCacheSet> weakWorkspace;
+    std::vector<float> expectedGeometry;
+    {
+        DecodeSession session;
+        session.ConfigureReferences(root, identities);
+        FramePackage frame;
+        frame.geometryTemporalRole = TemporalFieldRole::KeyFrame;
+        frame.attributeTemporalRole = TemporalFieldRole::KeyFrame;
+        FramePackageLeafRecord record{.path = leaf.path, .name = "owner"};
+        frame.leaves.push_back(record);
+        const bool begun = session.BeginFramePackage(frame, assembly, 0u, &error);
+        auto adapter = begun ? session.CreateLeafAdapter(record, leaf, &error) : nullptr;
+        const auto decoded = session.DecodeLeaf(LeafDecodeRequest{.adapter = adapter.get(), .leafPackage = &leaf,
+            .attributeSelection = AttributeSelectionMode::AllAvailable,
+            .attributeRequestMode = AttributeDecodeRequestMode::DecodeToCache, .resources = &root});
+        const bool complete = decoded.success && session.CommitLeaf(record, *adapter, &error) && session.EndFramePackage(&error);
+        if (!Require(result, complete && session.LeafStateCount() == 1u && assembly.commits == 1u,
+                "pipeline.decode-session-publish", decoded.failure ? FormatCodecFailure(*decoded.failure) : error)) { return; }
+        expectedGeometry = static_cast<TestDecodeAdapter*>(adapter.get())->Points();
+        auto published = cache->Find(key);
+        if (!Require(result, published && published->leaves.contains(leaf.path) &&
+                published->leaves.at(leaf.path).attribute && published->leaves.at(leaf.path).geometry,
+                "pipeline.decode-session-reference", "real session must publish geometry and aliasing attribute owners")) { return; }
+        attributeOwner = published->leaves.at(leaf.path).attribute->store;
+        sessionOwner = published->leaves.at(leaf.path).attribute->byteStoreSession;
+        geometryOwner = published->leaves.at(leaf.path).geometry->store;
+        weakWorkspace = attributeOwner;
+        FramePackage nextFrame;
+        nextFrame.frameIndex = 1u;
+        Require(result, session.BeginFramePackage(nextFrame, assembly, 1u, &error) && session.EndFramePackage(&error) &&
+            session.LeafStateCount() == 0u && session.RetainedFrameIndices().empty() && !weakWorkspace.expired(),
+            "pipeline.decode-session-prunes-predecessor", "advancing to an independent frame must retire the prior leaf state while required consumers retain its workspace");
+    }
+    required.Reset();
+    Require(result, !cache->Find(key) && !weakWorkspace.expired() && root.StorageCapacity()->Snapshot().reservedBytes != 0u,
+        "pipeline.decode-session-command-retired", "required-frame retirement and session destruction must preserve external consumers without cache retention");
+    std::vector<float> geometry(expectedGeometry.size());
+    float attribute = 0.0f;
+    Require(result, geometryOwner && geometryOwner->ReadRange(0u, geometry.size() / 3u, geometry.data(),
+            geometry.size() * sizeof(float), &error) && geometry == expectedGeometry && attributeOwner &&
+        attributeOwner->ReadRange(0u, 0u, 1u, &attribute, sizeof(attribute), &error) && std::isfinite(attribute),
+        "pipeline.decode-session-surviving-read", "real reference data must remain readable after predecessor, session and command retirement");
+    geometryOwner.reset();
+    attributeOwner.reset();
+    Require(result, !weakWorkspace.expired() && root.StorageCapacity()->Snapshot().reservedBytes != 0u,
+        "pipeline.decode-session-alias-retains-workspace", "the aliasing byte-store session must retain the actual workspace and its data");
+    sessionOwner.reset();
+    Require(result, weakWorkspace.expired() && root.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(true),
+        "pipeline.decode-session-final-owner", "the last real workspace alias must release all decoded storage capacity");
+}
+
+inline void CheckLargePlanningMetadata(TestResult& result) {
+    constexpr std::uint32_t frameCount = 4096u;
+    FrameSequenceDependencyPlanner::FramePackageMap packages;
+    FrameSequenceDependencyPlanner::FrameReaderMap readers;
+    class UnreadReader final : public IByteRangeReader {
+    public:
+        std::uint64_t ByteSize() const noexcept override { return 0u; }
+        bool ReadAt(std::uint64_t, std::span<std::uint8_t>, std::string*) override { ++reads; return false; }
+        mutable std::size_t reads{0u};
+    };
+    auto reader = std::make_shared<UnreadReader>();
+    std::uint64_t knownMetadataBodies = 0u;
+    for (std::uint32_t i = 0u; i < frameCount; ++i) {
+        auto frame = std::make_shared<FramePackage>();
+        frame->frameIndex = i;
+        frame->leaves.resize(16u);
+        knownMetadataBodies += sizeof(FramePackage) + frame->leaves.capacity() * sizeof(FramePackageLeafRecord);
+        packages.emplace(i, std::move(frame));
+        readers.emplace(i, reader);
+    }
+    auto target = std::make_shared<FramePackage>();
+    target->frameIndex = frameCount;
+    for (std::uint32_t i = 0u; i < frameCount; ++i) {
+        target->leaves.push_back(FramePackageLeafRecord{.ownerFrameIndex = i, .topologyMode = TopologyOwnershipMode::Reused});
+    }
+    knownMetadataBodies += sizeof(FramePackage) + target->leaves.capacity() * sizeof(FramePackageLeafRecord);
+    packages.emplace(frameCount, target);
+    readers.emplace(frameCount, reader);
+    std::weak_ptr<const FramePackage> weak = packages.at(0u);
+    FrameSequenceDependencyPlan plan;
+    std::string error;
+    double elapsedMs = 0.0;
+    {
+        FrameSequenceDependencyPlanner planner(readers, packages);
+        bool shared = true;
+        for (std::uint32_t i = 0u; i < frameCount; ++i) { shared &= packages.at(i).use_count() == 2u; }
+        packages.clear();
+        readers.clear();
+        const auto begin = std::chrono::steady_clock::now();
+        bool planned = planner.BuildPlan(frameCount, plan, &error);
+        elapsedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        planned &= plan.decodeOrder.size() == frameCount + 1u && plan.referenceFrames.size() == frameCount;
+        for (std::size_t i = 0u; planned && i < plan.decodeOrder.size(); ++i) { planned &= plan.decodeOrder[i] == i; }
+        for (std::size_t i = 0u; planned && i < plan.referenceFrames.size(); ++i) { planned &= plan.referenceFrames[i] == i; }
+        Require(result, planned && shared && !weak.expired() && reader->reads == 0u,
+            "pipeline.large-planning-shares-metadata", error.empty() ?
+                "large preloaded planning must preserve dependency order and share metadata and readers without reparsing" : error);
+    }
+    Require(result, weak.expired() && reader.use_count() == 1u,
+        "pipeline.large-planning-release", "planner destruction must release its shared metadata and reader map");
+    result.AddDiagnostic("planning_metadata frames=" + std::to_string(frameCount + 1u) +
+        " leaves=" + std::to_string(frameCount * 17u) + " known_object_and_leaf_array_bytes=" + std::to_string(knownMetadataBodies) +
+        " result_array_capacity_bytes=" + std::to_string((plan.decodeOrder.capacity() + plan.referenceFrames.capacity()) * sizeof(std::uint32_t)) +
+        " planning_ms=" + std::to_string(elapsedMs) + " map_nodes_strings_control_blocks_and_allocator_overhead=unmeasured");
+}
+
 inline bool CheckFormalPipelineExecution(
     TestResult& result,
     std::string* error = nullptr) {
@@ -191,7 +371,7 @@ inline bool CheckFormalPipelineExecution(
     context.attributeTargets = std::span<const AttributeTarget>(
         targets.data(),
         targets.size());
-    const auto encoded = LeafEncodeExecutor::Execute(LeafEncodeRequest{
+    auto encoded = LeafEncodeExecutor::Execute(LeafEncodeRequest{
         .context = &context,
     });
     if (!encoded.success || !encoded.hasEncodedOutput || encoded.encodedBytes.empty()) {
@@ -266,6 +446,7 @@ inline bool CheckFormalPipelineExecution(
         rawEncoded.success && rawEncoded.hasEncodedOutput && hasRaw,
         "pipeline.rawExecution",
         "raw package pipeline did not execute the explicit raw field stage");
+    CheckDecodeSessionOwnerLifetime(result, std::move(encoded.encodedBytes));
     return zstdPipelineOk && rawPipelineOk;
 }
 
@@ -818,13 +999,46 @@ inline bool CheckSampledIntraParentSelection(
             return false;
         }
     }
-    return Require(
+    const bool reused = Require(
         result,
         currentSource.tupleReadCount == kSampleCount * 3u &&
             parentSource.tupleReadCount == kSampleCount * 3u &&
             unrelatedSource.tupleReadCount == kSampleCount * 3u,
         "pipeline.reusedReferenceSamples",
         "intra-field parent selection did not reuse one sample read per field");
+    if (!reused) { return false; }
+    // 在索引、各字段样本及首条实际候选边处分别拒绝容量
+    constexpr auto indexBytes = kSampleCount * sizeof(std::size_t);
+    constexpr auto fieldBytes = kSampleCount * sizeof(float);
+    constexpr std::array<std::size_t, 5u> capacities{
+        0u, indexBytes, indexBytes + fieldBytes, indexBytes + 2u * fieldBytes,
+        indexBytes + 3u * fieldBytes};
+    for (std::size_t denied = 0u; denied < capacities.size(); ++denied) {
+        currentSource.tupleReadCount = 0u;
+        parentSource.tupleReadCount = 0u;
+        unrelatedSource.tupleReadCount = 0u;
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{
+            .initialLimits = {capacities[denied], 1u, 1u},
+            .storageCeilingBytes = capacities[denied], .computeCeiling = 1u, .threaded = false});
+        CodecRunScope scope(root);
+        bytestore::ByteStoreSession session;
+        session.BindStorage(root.StorageCapacity(), false);
+        AttrReferenceControlParams dependency;
+        dependency.intraField.sampleCount = kSampleCount;
+        EncodeAttributeReferenceSchedule schedule;
+        std::string rejection;
+        const bool built = BuildAttributeIntraFieldReferenceSchedule(metas, sources, metaIndices,
+            referenceAllowed, dependency, root, session, schedule, &rejection);
+        const auto expectedReads = denied == 4u ? kSampleCount : 0u;
+        const bool clean = !built && !schedule.initialized && !rejection.empty() &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u &&
+            currentSource.tupleReadCount == expectedReads && parentSource.tupleReadCount == expectedReads &&
+            unrelatedSource.tupleReadCount == expectedReads;
+        scope.Finish(false);
+        if (!Require(result, clean, "pipeline.sample-capacity-denial-" + std::to_string(denied),
+                "sample preparation or edge growth denial must release all owners without replay")) { return false; }
+    }
+    return true;
 }
 
 inline bool CheckForcedReferenceFailure(
@@ -1050,6 +1264,7 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
         result.AddFailure("pipeline.resolvedFormalStages", error);
     }
     CheckTopologyReuseSpatialDependency(result);
+    CheckLargePlanningMetadata(result);
     error.clear();
     if (!CheckFormalPipelineExecution(result, &error) && !error.empty()) {
         result.AddFailure("pipeline.formalExecution", error);

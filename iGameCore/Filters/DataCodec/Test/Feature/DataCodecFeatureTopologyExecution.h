@@ -6,11 +6,42 @@
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyEncode.h"
 #include "DataCodec/Test/Adapter/DataCodecTestAdapter.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureExecutionMechanism.h"
+#include "DataCodec/Workflow/Decode/Stages/TopoDecodeStage.h"
+#include "DataCodec/Workflow/Decode/Stages/DecodeCommitStage.h"
 
 namespace datacodec::test {
 
 inline TestResult RunDataCodecFeatureTopologyExecution() {
     TestResult result;
+    for (unsigned kind = 0u; kind < 3u; ++kind) {
+        DataCodecExecutionResources root(CodecResourceParams{.mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u});
+        CodecRunScope scope(root);
+        DecodeContext context(root);
+        TestDecodeAdapter adapter;
+        context.adapter = &adapter;
+        DecodeLeafWorkspace workspace;
+        RunBinding binding(workspace, root);
+        CodecStorageParams params;
+        params.meshType = kind == 1u ? MeshType::UnstructuredMesh : MeshType::PointSet;
+        params.topoParams.cellCount = kind == 0u ? 0u : 1u;
+        params.topoParams.cellBufferSize = kind == 0u ? 0u : 3u;
+        workspace.SetStorageParams(std::move(params));
+        DecodedTopologyReferenceCacheStore references;
+        context.topologyReferenceStore = &references;
+        context.topologyReferenceKey = "missing-frame-topology";
+        TopoDecodeStage stage;
+        stage.Execute(context, workspace);
+        const bool success = !root.FirstFailure().has_value();
+        const bool completeEmpty = kind == 0u && workspace.topology && workspace.topology->complete &&
+            workspace.topology->kind == DecodedTopologyCache::Kind::None &&
+            CommitDecodedTopologyIfPresent(context, workspace) &&
+            references.Get(context.topologyReferenceKey) == workspace.topology;
+        Require(result, success == (kind == 0u) &&
+            (kind == 0u ? completeEmpty : workspace.topology == nullptr) &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(success) == success,
+            kind == 0u ? "topology.pointset-no-topology-reference" : "topology.nonempty-missing-reference",
+            "topology-free point frames must not require a reference; nonempty topology must retain reference validation");
+    }
     for (const bool externalSpill : {false, true}) {
         const std::size_t size = kIoWindowBytes + 16u;
         auto capacity = std::make_shared<resource::ResidentByteBudget>(externalSpill ? 0u : size);
@@ -137,6 +168,40 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
             "topology.remap-required", "a necessary continuous remap cannot choose a different representation after rejection");
     }
 
+    for (std::size_t deniedIndex = 0u; deniedIndex < 5u; ++deniedIndex) {
+        const auto limit = deniedIndex * sizeof(IndexType);
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u}, limit, 1u, false, true, false});
+        CodecRunScope scope(root);
+        CacheResources runtime;
+        runtime.BindRun(root);
+        bytestore::ByteStoreSession session;
+        session.BindRun(root);
+        TopoStorageParams topo;
+        topo.cellCount = 1u;
+        topo.polyhedronFaceVertexCount = 1u;
+        topo.polyhedronVertexCount = 1u;
+        topo.cellBufferSize = 1u;
+        topo.polyhedronStreamLayouts.resize(5u);
+        for (std::size_t i = 0u; i < 4u; ++i) { topo.polyhedronStreamLayouts[i].encodedByteLength = 1u; }
+        struct UnreadStream {
+            std::size_t reads{0u};
+            bool ReadBytes(void*, std::size_t, std::string*) { ++reads; return false; }
+        } stream;
+        DecodedTopologyCache cache;
+        std::string error;
+        const bool decoded = polyhedron::DecodePolyhedronTopologyStreamsToCache(runtime, session, cache, topo, stream, &error);
+        ResourceDebugSnapshot snapshot;
+        Require(result, !decoded && stream.reads == 0u && !error.empty() &&
+            cache.kind == DecodedTopologyCache::Kind::None && CopyExecutionSnapshot(root, snapshot) &&
+            snapshot.failure && snapshot.capacityRejection &&
+            snapshot.capacityRejection->requestedBytes == sizeof(IndexType) &&
+            snapshot.capacityRejection->reservedBytes == limit && snapshot.capacityRejection->ownerCount == deniedIndex &&
+            snapshot.storage.reservedBytes == 0u && !snapshot.heavyPhaseAdmitted &&
+            snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u && !scope.Finish(false),
+            "polyhedron.index-capacity-denial-" + std::to_string(deniedIndex),
+            "each of the five required index allocations must reject before input I/O and roll back all preceding unpublished owners");
+    }
+
     for (const bool truncated : {false, true}) {
         constexpr std::uint64_t limit = 4096u;
         DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u}, limit, 1u, true, true, false});
@@ -257,6 +322,7 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
         for (std::size_t i = 0u; i < n; ++i) { dataset.cellConnectivity.push_back((cell + i) % 64u); }
         dataset.cellOffsets.push_back(static_cast<IndexType>(dataset.cellConnectivity.size()));
         dataset.cellTypes.push_back(7u);
+        dataset.cellPolynomialOrders.push_back(static_cast<std::uint16_t>(cell % 4u + 1u));
     }
     TestEncodeAdapter adapter(dataset);
     std::vector<IndexType> pointInverse(64u), cellOrder(61u);
@@ -280,6 +346,8 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     .data = {adapter, pointSource, cellSource}, .execution = {root, 7u}, .runtime = {session}};
                 std::size_t commits = 0u, peakSlots = 0u;
                 bool validOwnership = true;
+                bool sampledOrders = true;
+                bool sampledGrammar = true;
                 const auto driver = std::this_thread::get_id();
                 input.context.recordCapacitySamples = [&](std::span<const BufferCapacitySample> samples) {
                     ResourceDebugSnapshot snapshot;
@@ -292,6 +360,18 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     for (const auto& sample : samples) {
                         if (sample.name == "topology.grammar.main_events" || sample.name == "topology.cell_scratch") {
                             validOwnership &= sample.capacityBytes.value_or(0u) != 0u && sample.sampledAtNanoseconds != 0u;
+                        }
+                    }
+                    const auto& orders = samples[static_cast<std::size_t>(topocodec::TopologyBufferSample::PolynomialOrders)];
+                    const auto& encodedOrders = samples[static_cast<std::size_t>(topocodec::TopologyBufferSample::PolynomialOrderBytes)];
+                    const auto cellsInBlock = std::min<std::size_t>(7u, 61u - commits * 7u);
+                    sampledOrders &= orders.capacityBytes.value_or(0u) >= cellsInBlock * sizeof(std::uint16_t) &&
+                        encodedOrders.capacityBytes.value_or(0u) != 0u && orders.scopeId != encodedOrders.scopeId;
+                    for (std::size_t i = static_cast<std::size_t>(topocodec::TopologyBufferSample::GrammarOffsets);
+                         i <= static_cast<std::size_t>(topocodec::TopologyBufferSample::SeedAuxStream); ++i) {
+                        sampledGrammar &= samples[i].capacityBytes.has_value() && samples[i].sampledAtNanoseconds != 0u;
+                        for (std::size_t j = static_cast<std::size_t>(topocodec::TopologyBufferSample::GrammarOffsets); j < i; ++j) {
+                            sampledGrammar &= samples[i].scopeId != samples[j].scopeId;
                         }
                     }
                     if (++commits == 2u) {
@@ -309,6 +389,10 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     CopyExecutionSnapshot(root, final) && final.admittedBlocks == 0u && final.activeComputeUnits == 0u &&
                     final.lastRetired == 8u && session.SnapshotStats().storeCount == 1u,
                     "topology.bounded-flow", "every block must hold its slot through commit and retire while limits change");
+                Require(result, sampledOrders, "topology.polynomial-capacities",
+                    "cell orders and their encoded stream must be distinct sampled arrays inside the block slot");
+                Require(result, sampledGrammar, "topology.grammar-array-identities",
+                    "all ten grammar arrays must have distinct actual samples including zero-capacity arrays before slot retirement");
                 std::uint64_t byteOffset = 0u;
                 std::size_t decodedCells = 0u;
                 bool replayOk = success && output.transferCache != nullptr;
@@ -320,11 +404,16 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     replayOk = output.transferCache->Read(byteOffset, bytes);
                     const auto view = std::span<const std::uint8_t>(bytes);
                     std::vector<IndexType> sizes, types, connectivity;
-                    replayOk = replayOk && layout.cellOffset == decodedCells && layout.cellPolynomialOrderByteCount == 0u &&
+                    std::vector<std::uint16_t> orders;
+                    replayOk = replayOk && layout.cellOffset == decodedCells && layout.cellPolynomialOrderByteCount != 0u &&
                         topocodec::blockcodec::DecodeUnsignedSequence<IndexType>(view.subspan(layout.connectivityByteCount,
                             layout.cellSizeByteCount), layout.cellCount, sizes) &&
+                        topocodec::blockcodec::DecodeUnsignedSequence<std::uint16_t>(view.subspan(
+                            layout.connectivityByteCount + layout.cellSizeByteCount, layout.cellPolynomialOrderByteCount),
+                            layout.cellCount, orders) &&
                         topocodec::blockcodec::DecodeUnsignedSequence<IndexType>(view.subspan(
-                            layout.connectivityByteCount + layout.cellSizeByteCount, layout.cellTypeByteCount),
+                            layout.connectivityByteCount + layout.cellSizeByteCount + layout.cellPolynomialOrderByteCount,
+                            layout.cellTypeByteCount),
                             layout.cellCount, types) &&
                         topocodec::blockcodec::DecodeConnectivity(view.first(layout.connectivityByteCount), sizes,
                             64u, layout.cellCount, layout.connectivityCount, 0, connectivity);
@@ -332,7 +421,8 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     for (std::size_t i = 0u; replayOk && i < layout.cellCount; ++i) {
                         const auto old = cellOrder[decodedCells + i];
                         const auto begin = dataset.cellOffsets[old], end = dataset.cellOffsets[old + 1u];
-                        replayOk = sizes[i] == end - begin && types[i] == dataset.cellTypes[old];
+                        replayOk = sizes[i] == end - begin && types[i] == dataset.cellTypes[old] &&
+                            orders[i] == dataset.cellPolynomialOrders[old];
                         for (auto j = begin; replayOk && j < end; ++j) {
                             replayOk = offset < connectivity.size() && connectivity[offset++] == pointInverse[dataset.cellConnectivity[j]];
                         }
@@ -407,7 +497,8 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                                     capacityValid &= sample.capacityBytes == 0u;
                                 }
                                 if (sample.name == "topology.encoded.connectivity" ||
-                                    sample.name == "topology.grammar.offsets" || sample.name == "topology.adjusted_offsets") {
+                                    sample.name == "topology.grammar.offsets" || sample.name == "topology.adjusted_offsets" ||
+                                    sample.name == "topology.encoded.polynomial_orders" || sample.name == "topology.polynomial_orders") {
                                     capacityValid &= sample.capacityBytes.value_or(0u) != 0u;
                                 }
                             }

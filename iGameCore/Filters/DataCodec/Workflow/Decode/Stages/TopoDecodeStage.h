@@ -44,6 +44,13 @@ inline bool BindTopologyReferenceIfAvailable(DecodeContext& context, DecodeLeafW
 }
 
 inline bool DecodeTopologyWithoutField(DecodeContext& context, DecodeLeafWorkspace& workspace) {
+    const auto& storage = workspace.StorageParams();
+    // 无单元点集发布完整空拓扑状态，供帧级依赖正常提交和复用
+    if (storage.meshType == MeshType::PointSet && storage.topoParams.cellCount == 0u &&
+        storage.topoParams.cellBufferSize == 0u) {
+        workspace.MutableTopology().InitializeEmpty();
+        return true;
+    }
     if (workspace.StorageParams().topoParams.isStructured) {
         (void)DecodeStructuredTopologyToCache(
             workspace.StorageParams(),

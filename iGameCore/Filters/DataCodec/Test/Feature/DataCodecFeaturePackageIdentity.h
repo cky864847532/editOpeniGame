@@ -45,6 +45,116 @@ inline bool CheckPackageIdentityTestHeader(
         inspection.sourceIdentity.IsStable();
 }
 
+inline void RunMultiLeafOwnerCase(TestResult& result) {
+    for (const bool denyOutput : {false, true}) {
+        constexpr std::uint64_t limit = 16u * 1024u * 1024u;
+        const std::array<std::size_t, 3u> sizes{kIoWindowBytes + 11u, 16384u, 8192u};
+        const auto payloadBytes = sizes[0] + sizes[1] + sizes[2];
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u},
+            limit, 1u, false, true, false});
+        CodecRunScope scope(root);
+        bytestore::ByteStoreSession session;
+        session.BindRun(root);
+        FramePackage frame;
+        frame.rootName = "multi-owner";
+        std::vector<std::shared_ptr<LeafPackage>> leaves;
+        std::vector<FramePackageIO::LeafPackageWriter> writers;
+        std::array<std::weak_ptr<bytestore::IByteSource>, 3u> weak;
+        std::shared_ptr<bytestore::IByteSource> retained;
+        std::string error;
+        bool prepared = true;
+        std::size_t appendCalls = 0u;
+        for (std::size_t i = 0u; prepared && i < sizes.size(); ++i) {
+            auto source = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, sizes[i], "multi_leaf_payload", &error);
+            const std::vector<std::uint8_t> input(sizes[i], static_cast<std::uint8_t>(i + 11u));
+            prepared = source && source->WriteAt(0u, input, &error) && source->Seal(&error);
+            if (!prepared) { break; }
+            weak[i] = source;
+            if (i == 2u) { retained = source; }
+            auto leaf = std::make_shared<LeafPackage>();
+            leaf->path = "/" + std::to_string(i);
+            const auto fields = i == 0u ? 2u : 1u;
+            leaf->rawFieldBytes = leafpackagewire::ComputeRawLeafPackageSize(fields, fields * sizes[i]);
+            for (std::size_t field = 0u; field < fields; ++field) {
+                leaf->fields.push_back(LeafPackage::Field{.type = FieldType::Attribute,
+                    .compressionType = EncodedFieldCompressionType::None, .rawSize = sizes[i], .source = source});
+            }
+            FramePackageIO::LeafPackageWriter writer;
+            prepared = FramePackageIO::MakeFrameLeafPackageWriter(leaf, writer, &error);
+            const auto append = std::move(writer.appendLeafPackage);
+            writer.appendLeafPackage = [&, append](bytestore::IByteWriter& sink, std::string* failure) {
+                ++appendCalls;
+                return append(sink, failure);
+            };
+            frame.leaves.push_back(FramePackageLeafRecord{.path = leaf->path, .name = "leaf"});
+            leaves.push_back(std::move(leaf));
+            writers.push_back(std::move(writer));
+        }
+        std::uint64_t frameBytes = 0u;
+        prepared &= FramePackageIO::ComputeFramePackageByteSize(frame, writers, frameBytes, &error);
+        Require(result, prepared && root.StorageCapacity()->Snapshot().reservedBytes == payloadBytes,
+            "packageIdentity.multi-leaf-shared-input", "leaf descriptors and segmented writers must share the three real payload owners without duplicate reservations");
+        if (!prepared) { continue; }
+        session.ReleaseAll();
+        MemoryByteRangeOutput output(root);
+        if (denyOutput) {
+            root.UpdateLimits({payloadBytes + frameBytes - 1u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck);
+            ResourceDebugSnapshot snapshot;
+            Require(result, !output.PrepareExactSize(frameBytes, &error) && appendCalls == 0u &&
+                root.TryCopyResourceDebugSnapshot(snapshot) && snapshot.capacityRejection &&
+                snapshot.capacityRejection->requestedBytes == frameBytes &&
+                snapshot.storage.reservedBytes == payloadBytes,
+                "packageIdentity.multi-leaf-output-denied", "complete output must reject before consuming any leaf when live inputs and output cannot coexist");
+            writers.clear();
+            leaves.clear();
+            retained.reset();
+            Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u && !scope.Finish(false),
+                "packageIdentity.multi-leaf-denied-cleanup", "rejected output must release all leaf owners during failure cleanup");
+            continue;
+        }
+        const bool written = output.PrepareExactSize(frameBytes, &error) &&
+            FramePackageIO::WriteToSink(frame, writers, output, nullptr, &error);
+        Require(result, written && appendCalls == 3u &&
+            root.StorageCapacity()->Snapshot().reservedBytes == payloadBytes + frameBytes,
+            "packageIdentity.multi-leaf-output-overlap", "exact complete output and all retained leaf inputs must coexist at their measured capacities");
+        auto owner = std::make_shared<const EncodedBuffer>(output.TakeBytes());
+        writers.clear();
+        std::uint64_t remaining = payloadBytes;
+        for (std::size_t i = 0u; i < leaves.size(); ++i) {
+            leaves[i].reset();
+            if (i != 2u) { remaining -= sizes[i]; }
+            Require(result, weak[i].expired() == (i != 2u) &&
+                root.StorageCapacity()->Snapshot().reservedBytes == remaining + frameBytes,
+                "packageIdentity.multi-leaf-retire-" + std::to_string(i),
+                "each final leaf reference must release its own capacity while an external consumer remains valid");
+        }
+        std::array<std::uint8_t, 1u> tail{};
+        Require(result, retained->Read(sizes[2] - 1u, tail, &error) && tail[0] == 13u,
+            "packageIdentity.multi-leaf-last-input", "session release and frame submission must preserve the final input consumer");
+        retained.reset();
+        auto reader = std::make_shared<MemoryByteRangeReader>(owner);
+        FramePackage decoded;
+        bool replayed = written && FramePackageIO::ReadMetadata(*reader, decoded, &error) && decoded.leaves.size() == 3u;
+        std::vector<LeafPackage> parsed(3u);
+        for (std::size_t i = 0u; replayed && i < parsed.size(); ++i) {
+            const auto& record = decoded.leaves[i];
+            replayed = LeafPackageIO::ReadFromByteRange(reader, record.leafPackageByteOffset,
+                record.leafPackageByteSize, parsed[i], &error) && parsed[i].fields.size() == (i == 0u ? 2u : 1u);
+            for (const auto& field : parsed[i].fields) {
+                replayed &= field.source && field.source->Read(sizes[i] - 1u, tail, &error) && tail[0] == i + 11u;
+            }
+        }
+        owner.reset();
+        reader.reset();
+        Require(result, replayed && scope.Finish(written) &&
+            root.StorageCapacity()->Snapshot().reservedBytes == frameBytes,
+            "packageIdentity.parsed-ranges-share-output", "parsed field ranges must retain exactly one complete output after the request and original reader retire");
+        parsed.clear();
+        Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "packageIdentity.parsed-ranges-final-release", "the final parsed range must release the complete encoded buffer");
+    }
+}
+
 [[nodiscard]] inline TestResult RunDataCodecFeaturePackageIdentity() noexcept {
     TestResult result;
     PackageIdentityBuilder firstBuilder("package-identity-test");
@@ -290,6 +400,7 @@ inline bool CheckPackageIdentityTestHeader(
         frameIdentityContract,
         "packageIdentity.frameDeterministic",
         "frame package identity is not deterministic or name-sensitive");
+    RunMultiLeafOwnerCase(result);
     return result;
 }
 

@@ -43,6 +43,7 @@ struct NumericArrayTransferCacheResult {
 struct NumericArrayTransferCacheRuntime {
     std::function<void(std::chrono::nanoseconds)> recordFloatingPointEncodeDuration;
     callback::CapacityCallback recordCapacitySamples;
+    bool parallelInputRead{false};
 };
 
 inline bool FinalizeNumericArrayTransferCacheResult(
@@ -80,13 +81,16 @@ struct NumericEncodeCursor {
     std::size_t nextOffset{0u};
 
     bool HasMore() const noexcept { return nextOffset < reader.source.layout.elementCount; }
-    bool ReadNext(NumericEncodeBlockInput& block, ScratchByteBufferPool& scratch, std::string* error) {
+    bool ReadNext(NumericEncodeBlockInput& block, ScratchByteBufferPool& scratch, std::string* error,
+                  const bool readValues = true) {
         block.elementOffset = static_cast<std::uint32_t>(nextOffset);
         block.elementCount = static_cast<std::uint32_t>(std::min<std::size_t>(
             numericarray::kSpatialBlockElementCount, reader.source.layout.elementCount - nextOffset));
         auto* orderSample = block.capacitySamples ? &block.capacitySamples->values[
             static_cast<std::size_t>(numericarray::NumericBufferSample::ReaderOrder)] : nullptr;
-        if (!reader.ReadElements(nextOffset, block.elementCount, scratch, block.raw, error, orderSample)) { return false; }
+        if (readValues && !reader.ReadElements(nextOffset, block.elementCount, scratch, block.raw, error, orderSample)) {
+            return false;
+        }
         block.regionRuns = numericarray::FindIntersectingRegionRuns(
             sortedRegionRuns, block.elementOffset, block.elementCount);
         nextOffset += block.elementCount;
@@ -276,6 +280,7 @@ inline bool BuildNumericArrayTransferCache(
     const bool collectTiming = runtime != nullptr && runtime->recordFloatingPointEncodeDuration &&
         !numericarray::IsIntegerNumericArrayDataType(params.dataType);
     NumericEncodeCursor cursor{reader, regions.runs};
+    const bool parallelRead = runtime != nullptr && runtime->parallelInputRead && reader.SupportsParallelMemoryRead();
     bytestore::AppendableByteStoreWriter transferWriter(bodyTransferCache, resources);
     std::size_t committedElements = 0u;
     phase.reset();
@@ -291,10 +296,20 @@ inline bool BuildNumericArrayTransferCache(
         [&] { return cursor.HasMore(); },
         [&](NumericEncodeBlockInput& block) {
             if (runtime != nullptr && runtime->recordCapacitySamples) { block.capacitySamples.emplace(); }
-            return cursor.ReadNext(block, resources.Scratch(), error);
+            return cursor.ReadNext(block, resources.Scratch(), error, !parallelRead);
         },
-        [&](const NumericEncodeBlockInput& block, NumericEncodeBlockOutput& output, WorkerContext& worker) {
+        [&](NumericEncodeBlockInput& block, NumericEncodeBlockOutput& output, WorkerContext& worker) {
             std::string localError;
+            if (parallelRead) {
+                auto* sample = block.capacitySamples ? &block.capacitySamples->values[
+                    static_cast<std::size_t>(numericarray::NumericBufferSample::ReaderOrder)] : nullptr;
+                if (!reader.ReadElements(block.elementOffset, block.elementCount, worker.Scratch(), block.raw,
+                        &localError, sample)) {
+                    resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                        "numeric-block-read", "BuildNumericArrayTransferCache", localError));
+                    return false;
+                }
+            }
             output.capacitySamples = block.capacitySamples;
             if (!ComputeNumericEncodeBlock(params, block, regions.precision, output,
                     worker.Scratch(), collectTiming, &localError, &worker.NumericCompressor())) {

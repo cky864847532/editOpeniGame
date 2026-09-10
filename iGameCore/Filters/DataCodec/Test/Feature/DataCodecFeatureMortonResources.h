@@ -156,8 +156,15 @@ inline TestResult RunDataCodecFeatureMortonResources() {
         std::size_t keyCalls = 0u;
         std::uint64_t observedCache = 0u;
         bool sampledRun = false;
+        std::array<std::uint64_t, static_cast<std::size_t>(MortonArraySample::Count)> peaks{};
+        bool sampledInsidePhase = true;
         MortonRemapOptions options{.resources = root,
             .recordCapacitySamples = [&](std::span<const BufferCapacitySample> samples) {
+                ResourceDebugSnapshot snapshot;
+                sampledInsidePhase &= root.TryCopyResourceDebugSnapshot(snapshot) && snapshot.heavyPhaseAdmitted;
+                for (std::size_t i = 0u; i < samples.size(); ++i) {
+                    peaks[i] = std::max(peaks[i], samples[i].sampledPeakBytes.value_or(0u));
+                }
                 const auto& window = samples[static_cast<std::size_t>(MortonArraySample::RunReadWindow)];
                 if (window.capacityBytes) {
                     sampledRun = *window.capacityBytes >= kMortonRunBufferBytes - kMortonRunRecordBytes &&
@@ -186,6 +193,22 @@ inline TestResult RunDataCodecFeatureMortonResources() {
             root.StorageCapacity()->Snapshot().reservedBytes ==
                 (cacheAllowedByCapacity ? 2u * largeCount * sizeof(IndexType) : 0u),
             "morton.external-sort", "fixed external leaves must preserve duplicates and use the one selected cache mode");
+        const auto peak = [&](MortonArraySample sample) { return peaks[static_cast<std::size_t>(sample)]; };
+        const auto tableBytes = kMortonBucketCount16 * sizeof(std::size_t);
+        Require(result, sampledInsidePhase &&
+            peak(MortonArraySample::HighCounts) == tableBytes &&
+            peak(MortonArraySample::HighOffsets) == tableBytes &&
+            peak(MortonArraySample::HighWriteOffsets) == tableBytes &&
+            peak(MortonArraySample::LowCounts) == tableBytes &&
+            peak(MortonArraySample::LowOffsets) == tableBytes &&
+            peak(MortonArraySample::TouchedLowBuckets) == kMortonBucketCount16 * sizeof(std::uint32_t) &&
+            peak(MortonArraySample::Leaves) == sizeof(MortonLowKeyLeaf),
+            "morton.fixed-table-capacities", "fixed bucket tables and the single-key leaf descriptor must report actual arrays inside the heavy phase");
+        Require(result,
+            peak(MortonArraySample::Scratch) == ResolveLeafBudgetElements() * sizeof(IndexType) &&
+            peak(MortonArraySample::OrderedElements) == ResolveLeafBudgetElements() * sizeof(IndexType) &&
+            peak(MortonArraySample::LowBuckets) == ResolveLeafBudgetElements() * sizeof(std::uint16_t),
+            "morton.leaf-array-capacities", "external sorting scratch arrays must stay at the fixed leaf capacity across the tail leaf");
         output = {};
         Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u,
             "morton.external-release", "all external sorting capacity must be returned after output consumption");

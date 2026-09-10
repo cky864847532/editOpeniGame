@@ -382,6 +382,16 @@ BuildTelemetryProcessNodes(const std::vector<TelemetrySession>& sessions, const 
             const auto groupIndex = static_cast<std::size_t>(group);
             auto& groupNode = groups[groupIndex];
             used[groupIndex] = true;
+            if (stage.scope == "module-wall") {
+                // 保留具名区间，不把嵌套区间相加推算分类或请求总耗时
+                DataCodecProcessNode module;
+                module.name = stage.name;
+                module.success = session.success;
+                module.elapsedMs = stage.elapsedMs;
+                module.details.emplace_back("timing.scope", "inclusive-wall-including-waits");
+                module.details.emplace_back("timing.failure", "partial-duration-on-failed-run");
+                groupNode.children.push_back(std::move(module));
+            }
             if (stage.elapsedMs > 0.0) {
                 groupNode.longestMeasuredTaskMs = std::max(
                     groupNode.longestMeasuredTaskMs,
@@ -407,7 +417,7 @@ BuildTelemetryProcessNodes(const std::vector<TelemetrySession>& sessions, const 
         }
         for (std::size_t groupIndex = 0u; groupIndex < groups.size(); ++groupIndex) {
             if (used[groupIndex] && (groups[groupIndex].measuredTaskCount > 0u || groups[groupIndex].memory.valid ||
-                                     !groups[groupIndex].details.empty())) {
+                                     !groups[groupIndex].details.empty() || !groups[groupIndex].children.empty())) {
                 node.children.push_back(std::move(groups[groupIndex]));
             }
         }

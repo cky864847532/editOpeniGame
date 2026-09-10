@@ -73,7 +73,10 @@ struct ExecutionState {
             debug.admittedBlocks >= debug.limits.slotLimit && !debug.singleRecordFlow;
         waitInput = moreIndependentBlocks && debug.gateOpen && debug.queuedTasks == 0u &&
             debug.activeComputeUnits < debug.limits.computeLimit && !debug.heavyPhaseAdmitted;
-        waitOutput = debug.admittedBlocks != 0u &&
+        // 首块仍在计算时没有结果积压，不能把计算等待归为输出拥堵
+        const bool hasUnconsumedResult = debug.maxCompleted &&
+            (!debug.lastCommitted || *debug.maxCompleted > *debug.lastCommitted);
+        waitOutput = hasUnconsumedResult &&
             (debug.waiting == ResourceWaitReason::OrderedCommit ||
              debug.waiting == ResourceWaitReason::OutputIO ||
              debug.waiting == ResourceWaitReason::OwnerConsumption);
@@ -111,6 +114,13 @@ struct ExecutionState {
         if (debug.eventCount < debug.events.size()) { ++debug.eventCount; }
         else { ++debug.overwrittenEvents; }
         ++debug.eventEpoch;
+        // 正常块流由定时采样观察，排空与请求生命周期即时唤醒控制线程
+        if (configuration.mode == CodecResourceMode::Adaptive &&
+            (debug.controlPhase != ResourceControlPhase::Normal ||
+             kind == ResourceEventKind::BeginRequest || kind == ResourceEventKind::EndRequest ||
+             kind == ResourceEventKind::Failure || kind == ResourceEventKind::Stop || kind == ResourceEventKind::Close)) {
+            controllerChanged.notify_all();
+        }
     }
 
     bool FailLocked(const CodecFailureRecord& failure, bool close = false) noexcept {
@@ -201,6 +211,7 @@ struct ExecutionState {
 
     mutable std::mutex mutex;
     std::condition_variable changed;
+    std::condition_variable controllerChanged;
     const ResolvedResourceConfiguration configuration;
     std::shared_ptr<resource::ResidentByteBudget> capacity;
     std::vector<Admission> admissions;
@@ -288,8 +299,12 @@ DataCodecExecutionResources::DataCodecExecutionResources(const ResolvedResourceC
     if (config.mode == CodecResourceMode::Adaptive && config.threaded) {
         m_impl->pressureMonitor = std::make_unique<ResourcePressureMonitor>([](void* context) noexcept {
             auto& impl = *static_cast<Impl*>(context);
-            impl.pressureSignal.store(true, std::memory_order_release);
-            impl.state->changed.notify_all();
+            {
+                // 与控制线程的条件检查同步，避免通知发生在进入等待之前
+                std::lock_guard lock(impl.state->mutex);
+                impl.pressureSignal.store(true, std::memory_order_release);
+            }
+            impl.state->controllerChanged.notify_all();
         }, m_impl.get());
         m_impl->pressureMonitor->Observe(config.initialSample);
         m_impl->controllerThread = std::thread([this] { ControlMain(); });
@@ -590,7 +605,6 @@ bool DataCodecExecutionResources::Submit(const SlotLease& slot, const std::share
 void DataCodecExecutionResources::WorkerMain(std::size_t index) noexcept {
     auto state = m_impl->state;
     WorkerContext worker(m_impl->scratch, index);
-    ParallelWorkerIndexScope workerIndex(index);
     {
         std::lock_guard lock(state->mutex);
         state->workerIds[index] = std::this_thread::get_id();
@@ -745,14 +759,15 @@ void DataCodecExecutionResources::ControlMain() noexcept {
     auto nextSampleAt = ResourceClock::now();
     for (;;) {
         std::unique_lock lock(state.mutex);
-        state.changed.wait(lock, [&] {
+        state.controllerChanged.wait(lock, [&] {
             return state.debug.closing || (state.debug.runActive && !state.debug.runStopped);
         });
         if (state.debug.closing) { return; }
         const auto requestId = state.debug.requestId;
         auto now = ResourceClock::now();
         ResourceSample sample = state.debug.resourceSample;
-        if (now >= nextSampleAt || m_impl->pressureSignal.exchange(false, std::memory_order_acq_rel)) {
+        const bool pressureNotified = m_impl->pressureSignal.exchange(false, std::memory_order_acq_rel);
+        if (now >= nextSampleAt || pressureNotified) {
             lock.unlock();
             try { sample = ProbeResources(); }
             catch (...) {
@@ -766,17 +781,19 @@ void DataCodecExecutionResources::ControlMain() noexcept {
             if (state.debug.closing) { return; }
             if (!state.debug.runActive || state.debug.runStopped || state.debug.requestId != requestId) { continue; }
         }
+        const auto before = state.debug.eventEpoch;
         const auto failure = ApplyControlLocked(now, sample);
         const auto observed = state.debug.eventEpoch;
         lock.unlock();
         // 控制线程只回收纯自有空闲 scratch，宿主缓存留给 driver
         m_impl->scratch.TrimRetained();
         if (failure) { RecordFailure(*failure); }
-        state.changed.notify_all();
+        if (observed != before || failure) { state.changed.notify_all(); }
         lock.lock();
-        state.changed.wait_until(lock, nextSampleAt, [&] {
+        state.controllerChanged.wait_until(lock, nextSampleAt, [&] {
             return state.debug.closing || !state.debug.runActive || state.debug.runStopped ||
-                state.debug.requestId != requestId || state.debug.eventEpoch != observed ||
+                state.debug.requestId != requestId ||
+                (state.debug.controlPhase != ResourceControlPhase::Normal && state.debug.eventEpoch != observed) ||
                 m_impl->pressureSignal.load(std::memory_order_acquire);
         });
     }

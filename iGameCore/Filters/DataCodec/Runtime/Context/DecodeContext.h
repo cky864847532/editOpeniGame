@@ -28,7 +28,6 @@
 namespace datacodec {
 
 class TelemetryMemoryTraceRecorder;
-class IParallelTaskRunner;
 
 struct DecodeContextInitializeResult {
     bool success{true};

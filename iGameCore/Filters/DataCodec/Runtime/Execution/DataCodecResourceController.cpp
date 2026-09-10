@@ -136,8 +136,8 @@ ControlDecision Advance(ResourceControllerState& state, ResourceClock::time_poin
     }
     if (!state.initialized) {
         state.initialized = true;
-        decision.limits.computeLimit = 1u;
-        decision.limits.slotLimit = state.threaded && high ? 2u : 1u;
+        decision.limits.computeLimit = high ? std::min(p, healthyStartupComputeLimit) : 1u;
+        decision.limits.slotLimit = high ? decision.limits.computeLimit + 1u : 1u;
         decision.gateOpen = !severe && !nativeLow && !low;
     }
 
@@ -279,9 +279,12 @@ ControlDecision Advance(ResourceControllerState& state, ResourceClock::time_poin
             return decision;
         }
         state.workType = flow.workType;
-        decision.limits.computeLimit = 1u;
-        decision.limits.slotLimit = std::min<std::size_t>(decision.limits.slotLimit,
-            state.threaded && high ? 2u : 1u);
+        // 健康环境采用有限初始并发，压力与信号恢复仍遵守收缩和冷却
+        const bool healthyStartup = high && !state.everConfirmedPressure &&
+            !state.signalRecoveryPending && now >= state.cooldownUntil;
+        decision.limits.computeLimit = healthyStartup ? std::min(p, healthyStartupComputeLimit) : 1u;
+        decision.limits.slotLimit = healthyStartup ? decision.limits.computeLimit + 1u :
+            std::min<std::size_t>(decision.limits.slotLimit, state.threaded && high ? 2u : 1u);
         decision.reason = ResourceDecisionReason::WorkTypeChanged;
         ResetObservation(state, decision);
     }
@@ -429,8 +432,10 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
     } else {
         const bool pressure = sample.pressure == PressureLevel::Low || sample.pressure == PressureLevel::Critical;
         result.gateOpen = !pressure && (!available || !total || *available >= marks.low);
-        result.initialLimits = {memoryInitial, 1u,
-            result.threaded && total && available && *available >= marks.high && !pressure ? 2u : 1u};
+        const bool healthy = result.threaded && total && *total != 0u && available &&
+            *available >= marks.high && !pressure;
+        const auto compute = healthy ? std::min(result.computeCeiling, resource_control::healthyStartupComputeLimit) : 1u;
+        result.initialLimits = {memoryInitial, compute, healthy ? compute + 1u : 1u};
         if (!result.threaded) { result.gateOpen = true; }
     }
     return result;

@@ -419,7 +419,7 @@ private:
             });
             context.AddInfo(assemblyName, "stage result=Completed");
         }
-        RecordAttributeRuntimeResourceUsage(context, workspace);
+        RecordAttributeEncodeTiming(context, workspace);
         RecordStoreRuntimeResourceUsage(context, workspace);
         result.success = true;
         if (!context.HasFailure()) {
@@ -992,17 +992,18 @@ private:
             stageName == "CellAttributeStage";
     }
 
-    static void RecordAttributeRuntimeResourceUsage(
+    static void RecordAttributeEncodeTiming(
         EncodeContext& context,
         const EncodeLeafWorkspace& workspace) {
-        if (!context.runRecords.Wants(RunRecordKind::ResourceUsage)) {
+        if (!context.runRecords.Wants(RunRecordKind::StageTiming)) {
             return;
         }
         const auto stats = workspace.AttributeEncodeTimingRef().SnapshotStats();
         context.runRecords.TryExport([&] {
         context.AddInfo(
             "AttributeEncodeTiming",
-            "numeric blocks=" + std::to_string(stats.count) +
+            "ordinary floating-point blocks=" + std::to_string(stats.count) +
+                ";aggregation=worker-elapsed-sum-not-wall-time;" +
                 " totalNs=" + std::to_string(stats.totalNanoseconds) +
                 " maxNs=" + std::to_string(stats.maxNanoseconds));
         });
@@ -1102,6 +1103,7 @@ private:
         EncodeContext& context,
         EncodeLeafWorkspace& workspace,
         const bool prepareGeometrySource = true) const {
+        ScopedRunStageTiming timing(context.runRecords, "EncodePrepare", TelemetryStageCategory::Params);
         workspace.Reset();
         if (!m_options.binding.has_value()) {
             FailEncodePipeline(

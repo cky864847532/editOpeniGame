@@ -23,20 +23,6 @@ class WorkerContext;
 struct ExecutionState;
 struct ControlDecision;
 
-class IParallelTaskGroup {
-public:
-    virtual ~IParallelTaskGroup() = default;
-    virtual void Submit(std::function<void()> task) = 0;
-    virtual void Wait() = 0;
-};
-
-class IParallelTaskRunner {
-public:
-    virtual ~IParallelTaskRunner() = default;
-    virtual std::unique_ptr<IParallelTaskGroup> CreateGroup(std::stop_token stop = {}) = 0;
-    virtual std::size_t Concurrency() const noexcept = 0;
-};
-
 using ResourceClock = std::chrono::steady_clock;
 
 struct RuntimeResourceLimits {
@@ -232,15 +218,14 @@ private:
     std::uint64_t m_generation{0u};
 };
 
-class DataCodecExecutionResources final : public IParallelTaskRunner {
+class DataCodecExecutionResources final {
 public:
     explicit DataCodecExecutionResources(const ResolvedResourceConfiguration&);
     explicit DataCodecExecutionResources(const CodecResourceParams&);
     DataCodecExecutionResources(const DataCodecExecutionResources&) = delete;
     DataCodecExecutionResources& operator=(const DataCodecExecutionResources&) = delete;
     ~DataCodecExecutionResources();
-    std::unique_ptr<IParallelTaskGroup> CreateGroup(std::stop_token stop = {}) override;
-    std::size_t Concurrency() const noexcept override;
+    std::size_t Concurrency() const noexcept;
     bool Threaded() const noexcept;
     bool IsDriverThread() const noexcept;
     bool ExternalSpillAvailable() const noexcept;

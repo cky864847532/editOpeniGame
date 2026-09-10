@@ -5,6 +5,7 @@
 #include "DataCodec/Workflow/Temporal/TemporalBuilder.h"
 #include "DataCodec/Runtime/Cache/DecodeReferenceCache.h"
 #include "DataCodec/Storage/ByteIO/ByteBudget.h"
+#include "DataCodec/Test/Common/DataCodecTestResult.h"
 
 #include <cstdint>
 #include <iostream>
@@ -199,13 +200,13 @@ namespace datacodec::test
 
 inline int RunDataCodecFeatureDecodeReferenceCache() {
     using namespace feature_decode_reference_cache;
-    if (!TestReferenceCacheUsesActualKeyFrameLRU() ||
-        !TestTrimPreservesReferenceConsumer() ||
-        !TestRequiredReferencesSurviveRetentionDisabled() ||
-        !TestReferenceKindsMergeForOneKeyFrame() ||
-        !TestReferenceRevisionSeparatesEntries() ||
-        !TestDirectReferenceDependencyPlanning() ||
-        !TestKeyFrameAllocationIsDirect()) {
+    if (!RunNamedCheck("referenceCache.keyframe-lru", TestReferenceCacheUsesActualKeyFrameLRU) ||
+        !RunNamedCheck("referenceCache.live-consumer", TestTrimPreservesReferenceConsumer) ||
+        !RunNamedCheck("referenceCache.required-retention-disabled", TestRequiredReferencesSurviveRetentionDisabled) ||
+        !RunNamedCheck("referenceCache.merged-kinds", TestReferenceKindsMergeForOneKeyFrame) ||
+        !RunNamedCheck("referenceCache.revision", TestReferenceRevisionSeparatesEntries) ||
+        !RunNamedCheck("referenceCache.direct-dependency", TestDirectReferenceDependencyPlanning) ||
+        !RunNamedCheck("referenceCache.direct-keyframe", TestKeyFrameAllocationIsDirect)) {
         std::cerr << "DataCodec decode reference cache feature test failed\n";
         return 1;
     }

@@ -145,6 +145,7 @@ inline bool PrepareDirectAttributeDecodeStores(
     DecodeContext& context,
     DecodeLeafWorkspace& workspace,
     std::string* error = nullptr) {
+    ScopedRunStageTiming timing(context.runRecords, "AttributeStorePrepare", TelemetryStageCategory::Attribute);
     if (context.adapter == nullptr || !context.adapter->SupportsAttributeDecodeStore()) {
         return true;
     }

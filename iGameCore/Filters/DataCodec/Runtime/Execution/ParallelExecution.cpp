@@ -30,75 +30,6 @@ void RecordExecutionException(DataCodecExecutionResources& run, std::string_view
 
 namespace {
 
-class ParallelTaskGroup final : public IParallelTaskGroup {
-    struct Record {
-        SlotLease slot;
-        std::shared_ptr<TerminalWork> work;
-    };
-    struct Cancel {
-        DataCodecExecutionResources& run;
-        void operator()() const noexcept { run.RequestStop(); }
-    };
-public:
-    ParallelTaskGroup(DataCodecExecutionResources& run, std::stop_token stop)
-        : m_run(run), m_cancel(stop, Cancel{run}) {
-        if (!run.BeginFlow()) { throw std::runtime_error("task group requires a driver flow"); }
-    }
-    ~ParallelTaskGroup() override {
-        try { Wait(); }
-        catch (...) { m_run.CancelAndWaitRun(); }
-    }
-    void Submit(std::function<void()> task) override {
-        if (!task) { return; }
-        for (;;) {
-            const auto epoch = m_run.EventEpoch();
-            DrainReady();
-            if (m_run.Stopped()) { throw std::runtime_error("task group stopped"); }
-            if (auto slot = m_run.TryAcquireSlot()) {
-                auto work = std::make_shared<TerminalWork>([task = std::move(task)](WorkerContext&) {
-                    task();
-                    return true;
-                });
-                m_records.push_back(Record{std::move(*slot), work});
-                if (!m_run.SubmitTerminal(m_records.back().slot, work)) {
-                    throw std::runtime_error("terminal task submission failed");
-                }
-                return;
-            }
-            m_run.SetWaitReason(m_records.empty() ? ResourceWaitReason::SlotCapacity : ResourceWaitReason::OrderedCommit,
-                m_records.empty() ? nullptr : &m_records.front().slot);
-            m_run.WaitForChange(epoch);
-            m_run.SetWaitReason(ResourceWaitReason::None);
-        }
-    }
-    void Wait() override {
-        while (!m_records.empty()) {
-            const auto epoch = m_run.EventEpoch();
-            DrainReady();
-            if (m_run.Stopped()) {
-                m_run.CancelAndWaitRun();
-                m_records.clear();
-                throw std::runtime_error("task group stopped");
-            }
-            if (!m_records.empty()) {
-                m_run.SetWaitReason(ResourceWaitReason::OrderedCommit, &m_records.front().slot);
-                m_run.WaitForChange(epoch);
-                m_run.SetWaitReason(ResourceWaitReason::None);
-            }
-        }
-    }
-private:
-    void DrainReady() {
-        while (!m_records.empty() && m_run.Completion(*m_records.front().work) == BlockCompletion::Succeeded) {
-            if (!m_run.CommitSlot(m_records.front().slot)) { return; }
-            m_records.pop_front();
-        }
-    }
-    DataCodecExecutionResources& m_run;
-    std::stop_callback<Cancel> m_cancel;
-    std::deque<Record> m_records;
-};
-
 template<class Admission>
 bool RunTerminal(DataCodecExecutionResources& run, const Admission& admission,
                  TerminalWork::Function function, TerminalWorkKind kind) noexcept {
@@ -123,10 +54,6 @@ bool RunTerminal(DataCodecExecutionResources& run, const Admission& admission,
     return false;
 }
 
-}
-
-std::unique_ptr<IParallelTaskGroup> DataCodecExecutionResources::CreateGroup(std::stop_token stop) {
-    return std::make_unique<ParallelTaskGroup>(*this, stop);
 }
 
 bool RunTerminalWork(DataCodecExecutionResources& run, const SlotLease& admission,

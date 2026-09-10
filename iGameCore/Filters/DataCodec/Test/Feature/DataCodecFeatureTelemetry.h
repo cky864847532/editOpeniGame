@@ -143,6 +143,61 @@ inline TestResult TestSessionCaptureAndProcessReport() {
     return result;
 }
 
+inline TestResult TestModuleTimingScopes() {
+    TestResult result;
+    TelemetrySessionSink sink(kRunLifecycleRecordMask | RunRecordKind::StageTiming,
+        0u, TelemetrySessionDetail::ProcessSummary);
+    RunRecordEmitter records;
+    records.Reset(RunRecordInfo{.runKind = TelemetryRunKind::Encode, .objectName = "module-timing"}, &sink);
+    records.BeginRun();
+    const auto earlyReturn = [&] {
+        ScopedRunStageTiming timing(records, "PackageWrite.Test");
+        return false;
+    };
+    (void)earlyReturn();
+    try {
+        ScopedRunStageTiming timing(records, "EncodePrepare", TelemetryStageCategory::Params);
+        throw 1;
+    } catch (int) {}
+    records.EndRun(RunEndRecord{.success = false, .elapsedMs = 42.0});
+    const auto session = sink.TakeSession(records.RunId());
+    Require(result, session && session->stages.size() == 2u &&
+        std::all_of(session->stages.begin(), session->stages.end(), [](const auto& stage) {
+            return stage.scope == "module-wall" && stage.elapsedMs >= 0.0;
+        }), "telemetry.module-return-unwind", "early return and exception must retain one partial wall interval each");
+    if (session) {
+        auto nodes = BuildTelemetryProcessNodes({*session}, TelemetryRunKind::Encode);
+        Require(result, nodes.size() == 1u && nodes[0].elapsedMs == 42.0 && nodes[0].children.size() == 2u &&
+            std::all_of(nodes[0].children.begin(), nodes[0].children.end(), [](const auto& group) {
+                return !group.elapsedMsValid && group.children.size() == 1u &&
+                    group.children[0].elapsedMsValid && !group.children[0].success;
+            }), "telemetry.module-report-boundary", "module timings must survive summary capture without inventing summed group or run time");
+        const auto json = SerializeDataCodecProcessReportJson(DataCodecProcessReport{
+            .operation = TelemetryRunKind::Encode, .processes = std::move(nodes)});
+        Require(result, json.find("PackageWrite.Test") != std::string::npos &&
+            json.find("inclusive-wall-including-waits") != std::string::npos,
+            "telemetry.module-json", "existing JSON report must retain module identity and timing semantics");
+    }
+
+    TelemetrySessionSink statusOnly;
+    records.Reset(RunRecordInfo{}, &statusOnly);
+    {
+        RejectAllocationsScope reject;
+        ScopedRunStageTiming timing(records, "PackageWrite.Disabled");
+    }
+    Require(result, records.ExportFailureCount() == 0u && rejectedAllocationCount == 0u,
+        "telemetry.module-disabled", "disabled module timing must not allocate or emit records");
+
+    records.Reset(RunRecordInfo{}, &sink);
+    {
+        RejectAllocationsScope reject;
+        ScopedRunStageTiming timing(records, "PackageWrite.OptionalDiagnosticAllocationFailure");
+    }
+    Require(result, records.ExportFailureCount() != 0u,
+        "telemetry.module-export-failure", "optional timing formatting failure must remain inside diagnostic export handling");
+    return result;
+}
+
 inline TestResult TestTelemetryRetention() {
     TestResult result;
     TelemetrySessionSink sessions(kTelemetrySessionRecordMask);
@@ -233,6 +288,7 @@ inline TestResult RunDataCodecFeatureTelemetry() {
         result.AppendDiagnostics(addition.diagnostics);
     };
     appendResult(feature_telemetry::TestSessionCaptureAndProcessReport());
+    appendResult(feature_telemetry::TestModuleTimingScopes());
     appendResult(feature_telemetry::TestStageCategoryResolution());
     appendResult(feature_telemetry::TestTelemetryRetention());
     appendResult(RunDataCodecFeatureDiagnosticExport());

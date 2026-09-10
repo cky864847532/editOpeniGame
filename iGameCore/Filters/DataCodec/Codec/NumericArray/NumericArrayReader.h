@@ -21,6 +21,20 @@ struct NumericArrayReader {
 
     [[nodiscard]] std::size_t ElementBytes() const noexcept { return source.ElementBytes(); }
 
+    // 只允许无回调的连续视图及内部只读内存排列进入并行读入
+    [[nodiscard]] bool SupportsParallelMemoryRead() const noexcept {
+        if (source.values.layout != ArrayLayout::CompactAOS || source.values.data == nullptr) { return false; }
+        const auto* provider = source.orderProvider;
+        if (provider == nullptr || dynamic_cast<const IdentityRemapProvider*>(provider) ||
+            dynamic_cast<const VectorRemapProvider*>(provider)) {
+            return true;
+        }
+        const auto* storeProvider = dynamic_cast<const RemapStoreProvider*>(provider);
+        const auto* memory = storeProvider != nullptr
+            ? dynamic_cast<const bytestore::MemoryStore*>(storeProvider->ByteSource()) : nullptr;
+        return memory != nullptr && memory->CanRead();
+    }
+
     [[nodiscard]] bool ReadElements(
         const std::uint64_t elementOffset,
         const std::uint64_t elementCount,

@@ -3,11 +3,16 @@
 
 #include "DataCodec/API/Params/NumericArrayParams.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayRegionPlan.h"
+#include "DataCodec/Codec/NumericArray/NumericArrayBlockDecode.h"
 #include "DataCodec/Runtime/Cache/TransferCache/Common/NumericArrayTransferCacheBuilder.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureExecutionMechanism.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
 
 #include <span>
+#include <array>
+#include <cmath>
+#include <cstring>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -41,6 +46,74 @@ inline NumericArrayRegionControlParams MakeRegionPrecisionTestControl(
 
 [[nodiscard]] inline TestResult RunDataCodecFeatureRegionPrecision() noexcept {
     TestResult result;
+    const auto checkLayeredBlock = [&]<typename Value>() {
+        constexpr std::uint32_t count = 33u, components = 3u;
+        std::vector<Value> input(count * components);
+        for (std::size_t i = 0u; i < input.size(); ++i) {
+            input[i] = static_cast<Value>(std::sin(static_cast<double>(i) * 0.37) * 10.0 + i * 0.013);
+        }
+        auto control = MakeRegionPrecisionTestControl(0.1, 0.01);
+        control.regions.push_back(MakeNumericArrayRegionPrecision(MakeRegionPrecisionTestCompressor(0.001)));
+        const std::array<RegionRun, 2u> runs{{{3u, 7u, 1u}, {19u, 9u, 2u}}};
+        auto params = numericarray::MakeNumericArrayBlockParams(numericarray::MakeNumericArrayLayout(
+            std::is_same_v<Value, float> ? DataType::Float32 : DataType::Float64, sizeof(Value), count, components));
+        params.regionControl = &control;
+        numericarray::PreparedRegionPrecision prepared;
+        numericarray::NumericArrayBlockCapacitySamples encodeSamples, decodeSamples;
+        params.capacitySamples = &encodeSamples;
+        ScratchByteBufferPool scratch(0u);
+        std::vector<std::uint8_t> encoded, decoded;
+        NumericArrayBytesCodec codec;
+        NumericArrayBlockLayoutParams layout;
+        std::string error;
+        const bool encodedOk = numericarray::PrepareRegionPrecision(control, prepared, &error) &&
+            numericarray::ResolveEncodedLayeredResidualNumericArrayBlockBytes(params, prepared, 0u, count,
+                {reinterpret_cast<const std::uint8_t*>(input.data()), input.size() * sizeof(Value)},
+                runs, encoded, codec, layout, &error, &scratch);
+        params.capacitySamples = &decodeSamples;
+        const bool decodedOk = encodedOk && numericarray::ResolveDecodedLayeredResidualNumericArrayBlockBytes(
+            params, count, layout.backgroundCompressor, layout.backgroundEncodedByteLength,
+            layout.componentLayouts, layout.regionLayers, encoded, decoded, &error);
+        bool precise = decodedOk && decoded.size() == input.size() * sizeof(Value);
+        for (std::size_t tuple = 0u; precise && tuple < count; ++tuple) {
+            const double tolerance = tuple >= 19u && tuple < 28u ? 0.00101 :
+                tuple >= 3u && tuple < 10u ? 0.01001 : 0.10001;
+            for (std::size_t component = 0u; precise && component < components; ++component) {
+                const auto index = tuple * components + component;
+                Value actual{};
+                std::memcpy(&actual, decoded.data() + index * sizeof(Value), sizeof(Value));
+                precise &= std::abs(static_cast<double>(actual) - input[index]) <= tolerance;
+            }
+        }
+        std::uint64_t largestLayer = 0u;
+        for (const auto& layer : layout.regionLayers) { largestLayer = std::max<std::uint64_t>(largestLayer, layer.refinedElementCount); }
+        const auto sample = [](const auto& samples, numericarray::NumericBufferSample kind) {
+            return samples.values[static_cast<std::size_t>(kind)].sampledPeakBytes.value_or(0u);
+        };
+        Require(result, precise && layout.regionLayers.size() == 2u && largestLayer != 0u &&
+            sample(encodeSamples, numericarray::NumericBufferSample::BaseDecoded) >= count * sizeof(Value) &&
+            sample(encodeSamples, numericarray::NumericBufferSample::ResidualRaw) >= largestLayer * sizeof(Value) &&
+            sample(encodeSamples, numericarray::NumericBufferSample::ResidualDecoded) >= largestLayer * sizeof(Value) &&
+            sample(encodeSamples, numericarray::NumericBufferSample::Output) == encoded.capacity() &&
+            sample(decodeSamples, numericarray::NumericBufferSample::ResidualDecoded) >= largestLayer * components * sizeof(Value) &&
+            scratch.SnapshotStats().activeBlockCount == 0u,
+            std::is_same_v<Value, float> ? "regionPrecision.layered-capacity-float32" : "regionPrecision.layered-capacity-float64",
+            "encoded=" + std::to_string(encodedOk) + ";decoded=" + std::to_string(decodedOk) +
+            ";precise=" + std::to_string(precise) + ";layers=" + std::to_string(layout.regionLayers.size()) +
+            ";largest=" + std::to_string(largestLayer) +
+            ";residual_raw_peak=" + std::to_string(sample(encodeSamples, numericarray::NumericBufferSample::ResidualRaw)) +
+            ";residual_decoded_peak=" + std::to_string(sample(decodeSamples, numericarray::NumericBufferSample::ResidualDecoded)) +
+            ";error=" + error);
+        if (encodedOk && !encoded.empty()) {
+            encoded.pop_back();
+            Require(result, !numericarray::ResolveDecodedLayeredResidualNumericArrayBlockBytes(params, count,
+                layout.backgroundCompressor, layout.backgroundEncodedByteLength, layout.componentLayouts,
+                layout.regionLayers, encoded, decoded, &error),
+                "regionPrecision.truncated-layer", "a truncated final residual must fail without accepting the background as a complete block");
+        }
+    };
+    checkLayeredBlock.template operator()<float>();
+    checkLayeredBlock.template operator()<double>();
     std::vector<RegionRun> customRuns{
         RegionRun{.begin = 2u, .count = 2u, .regionId = 1u},
     };

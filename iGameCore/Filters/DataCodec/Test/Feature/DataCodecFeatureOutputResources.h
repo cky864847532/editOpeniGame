@@ -14,6 +14,52 @@ namespace datacodec::test {
 
 inline TestResult RunDataCodecFeatureOutputResources() {
     TestResult result;
+    for (const int mode : {0, 1, 2}) {
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{{0u, 1u, 1u}, 0u, 1u, false, true, true});
+        CodecRunScope request(root);
+        auto phase = WaitForHeavyPhase(root);
+        class ProbeSource final : public bytestore::IByteSource {
+        public:
+            ProbeSource(DataCodecExecutionResources& root, int mode) : root(root), mode(mode) {}
+            std::uint64_t ByteSizeHint() const noexcept override { return detail::kPackageFieldZstdProbeThresholdBytes + 13u; }
+            bool CanRead() const noexcept override { return true; }
+            bool CopyTo(bytestore::IByteWriter&, std::string*) override { return false; }
+            bool Read(std::uint64_t offset, std::span<std::uint8_t> bytes, std::string*) const override {
+                ++reads;
+                ResourceDebugSnapshot snapshot;
+                bounded &= offset == 0u && bytes.size() == detail::kPackageFieldZstdProbeBytes &&
+                    root.TryCopyResourceDebugSnapshot(snapshot) && snapshot.heavyPhaseAdmitted && snapshot.activeComputeUnits == 1u &&
+                    root.Scratch().SnapshotStats().activeBlockCount == 1u;
+                if (mode == 2) { return false; }
+                std::uint64_t random = 0x9265af724e9b531dull;
+                for (auto& byte : bytes) {
+                    random ^= random << 13u;
+                    random ^= random >> 7u;
+                    random ^= random << 17u;
+                    byte = mode == 0 ? 13u : static_cast<std::uint8_t>(random >> 32u);
+                }
+                return true;
+            }
+            DataCodecExecutionResources& root;
+            int mode;
+            mutable std::size_t reads{0u};
+            mutable bool bounded{true};
+        } source(root, mode);
+        bool compress = false;
+        std::string error;
+        const bool success = phase && RunTerminalWork(root, *phase, [&](WorkerContext&) {
+            return detail::ShouldCompressLeafPackageField(source, FieldType::Topology, PackageFieldEncodingParams{},
+                {.run = root, .phase = *phase}, source.ByteSizeHint(), compress, &error);
+        });
+        Require(result, success == (mode != 2) && source.reads == 1u && source.bounded &&
+            (mode == 2 || compress == (mode == 0)) && root.Scratch().SnapshotStats().activeBlockCount == 0u &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "output.package-probe-window-" + std::to_string(mode),
+            "large topology probe must read one fixed scratch window, select compression by its result and release scratch on read failure");
+        phase.reset();
+        Require(result, request.Finish(success) == success, "output.package-probe-retirement",
+            "probe completion and failure must retire the admitted phase without retaining active scratch");
+    }
     for (const bool externalSpill : {false, true}) {
         const auto limit = externalSpill ? 0u : 8u;
         DataCodecExecutionResources root(ResolvedResourceConfiguration{

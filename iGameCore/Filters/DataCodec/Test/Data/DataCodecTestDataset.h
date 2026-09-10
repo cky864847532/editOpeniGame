@@ -29,6 +29,7 @@ struct TestDataset {
     std::vector<IndexType> cellConnectivity;
     std::vector<IndexType> cellOffsets;
     std::vector<IndexType> cellTypes;
+    std::vector<std::uint16_t> cellPolynomialOrders;
     std::vector<TestNumericField> pointFields;
     std::vector<TestNumericField> cellFields;
 

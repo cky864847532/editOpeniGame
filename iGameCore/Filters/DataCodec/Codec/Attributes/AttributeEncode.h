@@ -1249,7 +1249,7 @@ inline bool BuildReferenceTransferCache(
         cache.byteStoreSession,
         blockLayouts,
         error,
-        storeLabel, cache.recordCapacitySamples);
+        storeLabel, cache.recordCapacitySamples, true);
 }
 
 inline bool EncodeNonReferenceField(
@@ -1273,6 +1273,7 @@ inline bool EncodeNonReferenceField(
     const auto& controlParams = ResolveAttributeControlParams(field.controlParams, fallbackControl);
     numericarray::ApplyNumericArrayControlParams(blockParams, controlParams);
     NumericArrayTransferCacheRuntime transferRuntime;
+    transferRuntime.parallelInputRead = true;
     transferRuntime.recordCapacitySamples = runtime.context.recordCapacitySamples;
     if (runtime.schedule.attributeTiming.CollectTiming()) {
         transferRuntime.recordFloatingPointEncodeDuration =

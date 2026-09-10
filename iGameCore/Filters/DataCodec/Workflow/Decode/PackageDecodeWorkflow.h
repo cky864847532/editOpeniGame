@@ -416,7 +416,11 @@ inline void SubmitDecodePackageProgress(
 
     PackageInspection packageInspection;
     std::string headerError;
-    if (!InspectPackage(*request.inputReader, packageInspection, &headerError, resources.StopToken())) {
+    const bool inspected = [&] {
+        ScopedRunStageTiming timing(packageRecords, "DecodePackageInspect", TelemetryStageCategory::Params);
+        return InspectPackage(*request.inputReader, packageInspection, &headerError, resources.StopToken());
+    }();
+    if (!inspected) {
         DecodePackageResult result;
         result.inputBytes = request.inputReader->ByteSize();
         AddDecodePackageMessage(

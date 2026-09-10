@@ -2,10 +2,21 @@
 #define DATACODEC_TEST_COMMON_DATACODECTESTRESULT_H
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace datacodec::test {
+
+// 仅由显式验收入口在测试开始前安装，测试收束后移除
+using TestCheckObserver = void (*)(bool, std::string_view) noexcept;
+inline TestCheckObserver testCheckObserver{nullptr};
+
+inline bool RunNamedCheck(const char* name, bool (*check)()) {
+    const bool passed = check();
+    if (testCheckObserver) { testCheckObserver(passed, name); }
+    return passed;
+}
 
 struct TestFailure {
     std::string check;
@@ -35,6 +46,7 @@ struct TestResult {
 };
 
 inline bool Require(TestResult& result, const bool condition, std::string check, std::string message) {
+    if (testCheckObserver) { testCheckObserver(condition, check); }
     if (condition) {
         return true;
     }

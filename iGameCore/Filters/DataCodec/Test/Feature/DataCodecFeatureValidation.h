@@ -24,8 +24,50 @@
 
 namespace datacodec::test {
 
+template<class Value>
+inline void CheckFiniteValidationWindows(TestResult& result) {
+    constexpr std::size_t valueCount = 2u * 65536u + 7u;
+    class Store final : public bytestore::IRandomAccessByteStore {
+    public:
+        explicit Store(int mode) : mode(mode) {}
+        std::uint64_t ByteSizeHint() const noexcept override { return valueCount * sizeof(Value); }
+        bool CanRead() const noexcept override { return true; }
+        bool CopyTo(bytestore::IByteWriter&, std::string*) override { return false; }
+        bool AppendBytes(std::span<const std::uint8_t>, std::string*) override { return false; }
+        bool ResizeBytes(std::uint64_t, std::string*) override { return false; }
+        bool WriteBytesAt(std::uint64_t, std::span<const std::uint8_t>, std::string*) override { return false; }
+        bool Seal(std::string*) override { return true; }
+        bool Read(std::uint64_t offset, std::span<std::uint8_t> bytes, std::string*) const override {
+            const auto expected = std::min<std::size_t>(65536u, valueCount - readValues);
+            bounded &= offset == readValues * sizeof(Value) && bytes.size() == expected * sizeof(Value);
+            ++reads;
+            if (mode == 2 && reads == 2u) { return false; }
+            for (std::size_t i = 0u; i < expected; ++i) {
+                const Value value = mode == 1 && readValues + i == valueCount - 1u
+                    ? std::numeric_limits<Value>::quiet_NaN() : static_cast<Value>(0.5);
+                std::memcpy(bytes.data() + i * sizeof(Value), &value, sizeof(value));
+            }
+            readValues += expected;
+            return true;
+        }
+        int mode;
+        mutable std::size_t reads{0u}, readValues{0u};
+        mutable bool bounded{true};
+    };
+    for (const int mode : {0, 1, 2}) {
+        auto source = std::make_shared<Store>(mode);
+        const auto validated = validation::ValidateFiniteNumericStore<Value>(source, valueCount,
+            validation::ValidationDomain::Geometry, "finite-window-fixture");
+        Require(result, validated.success == (mode == 0) && source->bounded && source->reads == (mode == 2 ? 2u : 3u),
+            "validation.finite-window-" + std::to_string(sizeof(Value)) + "-" + std::to_string(mode),
+            "finite validation must scan fixed value windows and stop at a tail NaN or failed range without loading the whole field");
+    }
+}
+
 [[nodiscard]] inline TestResult RunDataCodecFeatureValidation() noexcept {
     TestResult result;
+    CheckFiniteValidationWindows<float>(result);
+    CheckFiniteValidationWindows<double>(result);
 
     Require(
         result,

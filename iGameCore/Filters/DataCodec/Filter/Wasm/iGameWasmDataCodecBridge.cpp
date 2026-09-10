@@ -7,7 +7,6 @@
 #include "DataCodec/Platform/Wasm/WasmBrowserFileByteRangeReader.h"
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
 #include "DataCodec/Storage/Package/PackageBinaryHeader.h"
-#include "iGameThreadPool.h"
 
 #include <exception>
 #include <filesystem>
@@ -56,7 +55,8 @@ void SetWasmDecodeError(
 } // 匿名命名空间
 
 std::future<void> SubmitiGameWasmDataCodecTask(std::function<void()> task) {
-    return ThreadPool::Instance()->Commit(std::move(task));
+    // 顶层请求使用自有后台 driver，块计算由请求内部资源根执行
+    return std::async(std::launch::async, std::move(task));
 }
 
 bool ResolveiGameWasmPackageSourceIdentity(

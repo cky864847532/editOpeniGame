@@ -368,11 +368,15 @@ inline bool RunBoundedProbePreparedPayloadCase(TestResult& result) {
     };
     DataCodecExecutionResources root(CodecResourceParams{});
     CodecRunScope scope(root);
-    ScratchByteBufferPool scratchBytePool;
     bytestore::ByteStoreSession byteStoreSession;
-    byteStoreSession.BindStorage(std::make_shared<resource::ResidentByteBudget>(8u * 1024u * 1024u), true);
+    byteStoreSession.BindRun(root);
     std::shared_ptr<bytestore::IByteSource> transferCache;
     std::vector<NumericArrayBlockLayoutParams> blockLayouts;
+    using Sample = numericarray::NumericBufferSample;
+    std::array<std::array<std::uint64_t, 4u>, 2u> capacities{};
+    std::array<std::uint64_t, 2u> rawScopeIds{};
+    std::size_t sampleCalls = 0u;
+    bool samplesHeldSlot = true;
     const auto built = numericarrayreference::BuildNumericArrayReferenceTransferCache(
         meta,
         MakeAbsoluteErrorNumericArrayCompressor(1.0e-3),
@@ -389,7 +393,28 @@ inline bool RunBoundedProbePreparedPayloadCase(TestResult& result) {
         byteStoreSession,
         &blockLayouts,
         &error,
-        "reference_bounded_probe_test");
+        "reference_bounded_probe_test",
+        [&](std::span<const BufferCapacitySample> samples) {
+            ResourceDebugSnapshot snapshot;
+            samplesHeldSlot &= CopyExecutionSnapshot(root, snapshot) && snapshot.admittedBlocks != 0u;
+            if (sampleCalls < capacities.size()) {
+                const std::array kinds{Sample::Raw, Sample::ReferencePrimary,
+                    Sample::OrdinaryCandidate, Sample::ReferenceCandidate};
+                for (std::size_t i = 0u; i < kinds.size(); ++i) {
+                    capacities[sampleCalls][i] = samples[static_cast<std::size_t>(kinds[i])].sampledPeakBytes.value_or(0u);
+                }
+                rawScopeIds[sampleCalls] = samples[static_cast<std::size_t>(Sample::Raw)].scopeId;
+            }
+            ++sampleCalls;
+        });
+    constexpr auto fullBytes = kTupleCount * kComponentCount * sizeof(float);
+    constexpr auto probeBytes = numericarrayreference::kReferenceProbeElementCount * kComponentCount * sizeof(float);
+    Require(result, sampleCalls == 2u && samplesHeldSlot && rawScopeIds[0] != rawScopeIds[1] &&
+        capacities[0][0] == fullBytes && capacities[0][1] == fullBytes &&
+        (capacities[0][2] != 0u || capacities[0][3] != 0u) &&
+        capacities[1][0] == probeBytes && capacities[1][1] == probeBytes &&
+        capacities[1][2] != 0u && capacities[1][3] != 0u,
+        "referenceCodec.boundedProbe.capacities", "full staging and bounded probe must have distinct sample identities and owned candidates inside the slot");
     return Require(
                result,
                built,
@@ -508,12 +533,26 @@ inline void RunReferenceBlockFlowCase(TestResult& result) {
         std::shared_ptr<bytestore::IByteSource> output;
         std::vector<NumericArrayBlockLayoutParams> layouts;
         std::string error;
+        std::size_t sampledBlocks = 0u;
+        bool sampledCandidates = true;
         const bool success = numericarrayreference::BuildNumericArrayReferenceTransferCache(meta,
             MakeAbsoluteErrorNumericArrayCompressor(0.001), source, reference,
             NumericArrayReferenceCodecId::Wavelet,
             numericarrayreference::NumericArrayReferenceTransferControl{
                 .selectionMode = ReferenceSelectionMode::Forced},
-            root, output, session, &layouts, &error);
+            root, output, session, &layouts, &error, "reference_block_flow",
+            [&](std::span<const BufferCapacitySample> samples) {
+                using Sample = numericarray::NumericBufferSample;
+                const auto expectedBytes = (sampledBlocks < 2u ? numericarray::kSpatialBlockElementCount : 7u) * sizeof(float);
+                ResourceDebugSnapshot current;
+                sampledCandidates &= CopyExecutionSnapshot(root, current) && current.admittedBlocks != 0u &&
+                    samples[static_cast<std::size_t>(Sample::Raw)].capacityBytes.value_or(0u) >= expectedBytes &&
+                    samples[static_cast<std::size_t>(Sample::ReferencePrimary)].capacityBytes.value_or(0u) >= expectedBytes &&
+                    samples[static_cast<std::size_t>(Sample::ReferenceCandidate)].sampledPeakBytes.value_or(0u) != 0u;
+                ++sampledBlocks;
+            });
+        Require(result, sampledBlocks == 3u && sampledCandidates,
+            "referenceCodec.candidate-capacities", "each full reference candidate and staging array must be sampled before its slot retires");
         ResourceDebugSnapshot snapshot;
         Require(result, success && state.valid && layouts.size() == 3u &&
             layouts.back().elementCount == 7u && scope.Finish(success) && CopyExecutionSnapshot(root, snapshot) &&

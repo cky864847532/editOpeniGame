@@ -88,8 +88,17 @@ inline TestResult RunDataCodecFeatureRemapAnalysis() {
             observed->bounded && observed->reads == 2u,
             "analysis.windowed-precision", "analysis must read the surviving owner in one full window and a tail");
         observed->reads = 0u;
-        observed->failRead = 2u;
         log::NumericFieldSignature signature;
+        log::LogAnalysisResult signatureStatus;
+        Require(result, log::BuildNumericFieldSignature("values", view(original), {.maxTuplesPerField = count},
+            signature, signatureStatus, "analysis", observed.get()) && signatureStatus.passed &&
+            observed->bounded && observed->reads == 2u && signature.sampledTupleCount == count &&
+            signature.sums == std::vector<double>{static_cast<double>(count) * (count - 1u) / 2.0} &&
+            signature.minimums == std::vector<double>{0.0} && signature.maximums == std::vector<double>{count - 1.0} &&
+            signature.sums.capacity() == 1u && signature.minimums.capacity() == 1u && signature.maximums.capacity() == 1u,
+            "analysis.signature-window-and-summary", "signature must traverse fixed remap windows and keep only per-component summary arrays");
+        observed->reads = 0u;
+        observed->failRead = 2u;
         log::LogAnalysisResult failure;
         Require(result, !log::BuildNumericFieldSignature("values", view(original),
             {.maxTuplesPerField = count}, signature, failure, "analysis", observed.get()) && !failure.passed,

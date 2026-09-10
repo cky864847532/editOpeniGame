@@ -2,10 +2,14 @@
 #define iGameDataCodecFeatureRemap_h
 
 #include <DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h>
+#include <DataCodec/Filter/Adapter/iGameDecodeAdapter.h>
 #include <DataCodec/Common/Views/ArrayViews.h>
 #include <DataCodec/Test/Common/DataCodecTestResult.h>
 #include <DataCodec/Filter/Test/Common/iGameIGDCFileRoundTrip.h>
 #include <DataCodec/Log/Capture/RemapOrderCapture.h>
+#include <DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyEncode.h>
+#include <DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamDecode.h>
+#include <DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyEmit.h>
 
 #include "iGameAttributeSet.h"
 #include "iGameCellArray.h"
@@ -195,6 +199,124 @@ inline DataObject::Pointer BuildRemapSemanticPolyhedronObject() {
     mesh->SetAttributeSet(attributes);
 
     return mesh;
+}
+
+inline bool TestNativePolyhedronResourceBoundary() {
+    TestResult result;
+    constexpr auto cellCount = numericarray::kSpatialBlockElementCount + 1u;
+    auto mesh = VolumeMesh::New();
+    auto points = Points::New();
+    points->AddPoint(0.0f, 0.0f, 0.0f);
+    points->AddPoint(1.0f, 0.0f, 0.0f);
+    points->AddPoint(0.0f, 1.0f, 0.0f);
+    mesh->SetPoints(points);
+    auto faces = CellArray::New();
+    const igIndex triangle[]{0, 1, 2};
+    for (std::size_t i = 0u; i < 9u; ++i) { faces->AddCellIds(triangle, 3); }
+    auto cells = CellArray::New();
+    const igIndex faceIds[]{0, 1, 2, 3, 4, 5, 6, 7, 8};
+    for (std::size_t i = 0u; i < cellCount; ++i) { cells->AddCellIds(faceIds, 9); }
+    mesh->InitVolumesWithPolyhedron(faces, cells);
+    iGameEncodeAdapter adapter(mesh);
+    const auto original = RemapOrderSource::Original();
+    for (const std::uint64_t limit : {8ull, 9ull, 64ull * 1024ull * 1024ull}) {
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 2u},
+            limit, 1u, true, true, true});
+        CodecRunScope scope(root);
+        bytestore::ByteStoreSession session;
+        session.BindRun(root);
+        bool sampled = true;
+        std::size_t blockSamples = 0u;
+        polyhedron::PolyhedronTopologyEncodeInput input{
+            .data = {adapter, original, original}, .execution = {root}, .cache = {session}};
+        input.context.recordCapacitySamples = [&](std::span<const BufferCapacitySample> samples) {
+            using Sample = polyhedron::PolyhedronBufferSample;
+            const auto& unique = samples[static_cast<std::size_t>(Sample::UniqueIds)];
+            if (!unique.capacityBytes) { return; }
+            ++blockSamples;
+            ResourceDebugSnapshot snapshot;
+            sampled &= root.TryCopyResourceDebugSnapshot(snapshot) && snapshot.admittedBlocks != 0u &&
+                snapshot.storage.reservedBytes == 3u * sizeof(IndexType) &&
+                unique.capacityBytes == 3u * sizeof(IndexType) &&
+                samples[static_cast<std::size_t>(Sample::FaceVertexCounts)].capacityBytes == 9u * sizeof(IndexType) &&
+                samples[static_cast<std::size_t>(Sample::LocalIds)].capacityBytes == 27u * sizeof(IndexType) &&
+                samples[static_cast<std::size_t>(Sample::OverflowPoints)].capacityBytes == 27u * sizeof(IndexType) &&
+                samples[static_cast<std::size_t>(Sample::OverflowLocals)].capacityBytes == 27u * sizeof(IndexType);
+        };
+        polyhedron::PolyhedronTopologyEncodeResult encoded;
+        std::string error;
+        const bool success = polyhedron::EncodePolyhedronTopologyToTransferCache(input, encoded, &error);
+        ResourceDebugSnapshot snapshot;
+        if (limit < 24u) {
+            Require(result, !success && blockSamples == 0u && !encoded.transferCache &&
+                root.TryCopyResourceDebugSnapshot(snapshot) && snapshot.capacityRejection &&
+                snapshot.capacityRejection->requestedBytes == (limit == 8u ? 9u : 3u * sizeof(IndexType)) &&
+                snapshot.capacityRejection->reservedBytes == 0u && snapshot.storage.reservedBytes == 0u &&
+                !snapshot.heavyPhaseAdmitted && !scope.Finish(false),
+                "polyhedron.native-required-owner-" + std::to_string(limit),
+                "visited faces and local index table must reject before block admission and release the prior phase owner");
+            continue;
+        }
+        Require(result, success && sampled && blockSamples == 2u &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "polyhedron.native-cell-work-capacities", error.empty() ?
+                "two fixed batches must share one exact local table and sample bounded single-cell and overflow arrays" : error);
+        if (!success) { continue; }
+        CacheResources runtime;
+        runtime.BindRun(root);
+        struct Stream {
+            bytestore::IByteSource& source;
+            std::size_t offset{0u};
+            bool bounded{true};
+            bool ReadBytes(void* target, std::size_t count, std::string* error) {
+                bounded &= count <= kIoWindowBytes;
+                if (!source.Read(offset, {static_cast<std::uint8_t*>(target), count}, error)) { return false; }
+                offset += count;
+                return true;
+            }
+        } stream{*encoded.transferCache};
+        DecodedTopologyCache cache;
+        const bool decoded = polyhedron::DecodePolyhedronTopologyStreamsToCache(runtime, session, cache, encoded.topo, stream, &error);
+        Require(result, decoded && stream.bounded, "polyhedron.native-complete-indices", error);
+        if (!decoded) { continue; }
+        const auto& p = cache.polyhedron;
+        polyhedron::PolyhedronTopologyStreamHeader header{.cellCount = p.cellCount, .faceCount = p.faceCount,
+            .uniqueVertexIdCount = p.uniqueVertexIdCount, .localFaceVertexIdCount = p.localFaceVertexIdCount};
+        iGameDecodeAdapter output;
+        bool emitted = output.SetMeshType(MeshType::PolyhedronMesh, &error) && output.BeginPoints(3u, 3u, &error);
+        const auto controlledBeforeEmit = root.StorageCapacity()->Snapshot().reservedBytes;
+        std::uint64_t batches = 0u;
+        std::size_t sampleGroups = 0u;
+        bool windows = true;
+        emitted = emitted && polyhedron::EmitPolyhedronCacheToAdapter(runtime, output, header,
+            p.uniqueVertexCounts, p.cellFaceCounts, p.faceVertexCounts, p.cellUniqueVertexIds, p.localFaceVertexIds,
+            batches, &error, [&](std::span<const BufferCapacitySample> samples) {
+                using Sample = polyhedron::PolyhedronBufferSample;
+                const auto count = sampleGroups++ == 0u ? numericarray::kSpatialBlockElementCount : 1u;
+                const auto faceCount = count * 9u;
+                ResourceDebugSnapshot current;
+                windows &= root.TryCopyResourceDebugSnapshot(current) && current.admittedBlocks != 0u &&
+                    samples[static_cast<std::size_t>(Sample::FaceCountWindow)].capacityBytes ==
+                        std::min<std::size_t>(faceCount * sizeof(IndexType), kIoWindowBytes) &&
+                    samples[static_cast<std::size_t>(Sample::FaceVertexOffsets)].capacityBytes == (faceCount + 1u) * sizeof(IndexType) &&
+                    samples[static_cast<std::size_t>(Sample::LocalIds)].capacityBytes == count * 27u * sizeof(IndexType);
+            });
+        Require(result, emitted && windows && batches == 2u && sampleGroups == 2u &&
+            root.StorageCapacity()->Snapshot().reservedBytes == controlledBeforeEmit,
+            "polyhedron.native-emit-windows", error.empty() ?
+                "native emission must cross the fixed cell boundary with a 1 MiB face scan and exempt host output" : error);
+        iGameEncodeAdapter replay(output.TakeDataObject());
+        Require(result, emitted && replay.GetNumberOfCells() == cellCount && replay.GetNumberOfPoints() == 3u &&
+            replay.GetCellFaceOffsetPtr()[cellCount] == cellCount * 9u,
+            "polyhedron.native-emit-counts", "the native output must contain every cell and its nine faces including the tail batch");
+        cache.Release();
+        encoded = {};
+        output.Abort();
+        Require(result, scope.Finish(emitted) && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "polyhedron.native-final-release", "complete indices and outputs must retire all controlled owners");
+    }
+    PrintResult(result);
+    return result.passed;
 }
 
 inline const IEncodeAttrView* FindPointAttribute(const IEncodeAdapter& adapter, const std::string& name) {
@@ -675,6 +797,100 @@ inline void RemoveRemapOutput(const std::filesystem::path& directory) {
     std::filesystem::remove_all(directory, errorCode);
 }
 
+inline bool TestNativeResourceExemptions() {
+    TestResult result;
+    DataCodecExecutionResources root(ResolvedResourceConfiguration{{0u, 1u, 1u}, 0u, 1u, false, true, true});
+    CodecRunScope scope(root);
+    auto object = BuildRemapSemanticSurfaceObject();
+    iGameEncodeAdapter input(object);
+    NumericArrayView geometry;
+    TopologyView topology;
+    bool borrowed = input.BuildGeometryView(geometry) && geometry.origin == ViewBufferOrigin::Borrowed &&
+        geometry.data == input.TryGetPointsF32() && input.BuildTopologyView(topology);
+    for (std::size_t i = 0u; i < input.GetNumberOfPointAttrs(); ++i) {
+        EncodeAttributeView attr;
+        borrowed &= input.BuildPointAttributeView(i, attr) && attr.values.origin == ViewBufferOrigin::Borrowed &&
+            attr.values.data == input.GetPointAttr(i).TryGetRawPtr();
+    }
+    Require(result, borrowed && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+        "native.borrowed-input-exempt", "native geometry and attributes must remain borrowed with a zero controlled budget");
+    auto unstructured = UnstructuredMesh::New();
+    auto points = Points::New();
+    points->AddPoint(0.0f, 0.0f, 0.0f);
+    points->AddPoint(1.0f, 0.0f, 0.0f);
+    points->AddPoint(0.0f, 1.0f, 0.0f);
+    points->AddPoint(0.0f, 0.0f, 1.0f);
+    unstructured->SetPoints(points);
+    igIndex tetra[]{4, 3, 0, 1, 2, 3, 0, 1, 3, 3, 1, 2, 3, 3, 2, 0, 3};
+    unstructured->AddCell(tetra, 17, IG_POLYHEDRON);
+    iGameEncodeAdapter converted(unstructured);
+    const bool convertedFaces = converted.GetFaceIdBufferPtr() != nullptr &&
+        converted.GetCellFaceOffsetPtr() != nullptr && converted.GetFaceIdOffsetPtr() != nullptr;
+    const auto samples = converted.CapacitySamples();
+    Require(result, convertedFaces && converted.GetNumberOfFaces() == 4u && samples.size() == 4u &&
+        samples[2].capacityBytes == 0u && samples[2].sampledPeakBytes.value_or(0u) >= 3u * sizeof(igIndex) &&
+        samples[3].capacityBytes == 0u && samples[3].sampledPeakBytes.value_or(0u) >= 12u * sizeof(igIndex),
+        "native.converted-face-key-retirement", "derived face-key arrays must record actual peaks and release storage when conversion returns");
+    converted.ReleaseConvertedInputs();
+    Require(result, samples[0].capacityBytes == 0u && samples[1].capacityBytes == 0u &&
+        root.StorageCapacity()->Snapshot().reservedBytes == 0u && unstructured->GetNumberOfCells() == 1u,
+        "native.converted-input-release", "derived offset capacity must return to zero while the host input remains intact");
+    for (const bool abort : {false, true}) {
+        iGameDecodeAdapter output;
+        std::string error;
+        const std::array<std::uint16_t, 17u> orders{2u, 3u, 4u};
+        const bool prepared = output.SetMeshType(MeshType::UnstructuredMesh, &error) &&
+            output.BeginTopology(orders.size(), 3u * orders.size(), false, &error) &&
+            output.WriteCellPolynomialOrdersRange(0u, orders.data(), orders.size(), &error);
+        const auto sample = output.CapacitySamples().front();
+        Require(result, prepared && sample.capacityBytes == sizeof(orders) &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "native.polynomial-storage-exempt", "native high-order staging must expose its real capacity without consuming controlled storage");
+        if (abort) { output.Abort(); }
+        else { output.BeginTopology(0u, 0u, false, &error); }
+        Require(result, output.CapacitySamples().front().capacityBytes == 0u &&
+            output.CapacitySamples().front().sampledPeakBytes == sizeof(orders),
+            "native.polynomial-storage-retired", "abort and the next topology must release high-order staging while preserving its observed peak");
+    }
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    const auto directory = MakeRemapOutputDirectory("mapped_owner");
+    std::filesystem::create_directories(directory);
+    const auto file = directory / "source.bin";
+    {
+        std::vector<std::uint8_t> bytes(2u * kIoWindowBytes + 13u);
+        for (std::size_t i = 0u; i < bytes.size(); ++i) { bytes[i] = static_cast<std::uint8_t>(i % 251u); }
+        std::string error;
+        iGameFileByteRangeOutput output(file);
+        const bool written = output.WriteAt(0u, bytes, &error) && output.Finalize(bytes.size(), &error);
+        auto reader = std::make_shared<iGameFileByteRangeReader>(file);
+        std::weak_ptr<IByteRangeReader> weak = reader;
+        auto range = std::make_shared<SubrangeByteRangeReader>(reader, kIoWindowBytes - 3u, kIoWindowBytes + 7u);
+        auto slot = root.TryAcquireSlot();
+        const auto prefetched = range->PrefetchRange(0u, kIoWindowBytes);
+        std::span<const std::uint8_t> mapped;
+        const auto status = range->PrepareContiguousRange(0u, kIoWindowBytes, mapped, &error);
+        Require(result, written && slot && prefetched.IsAccepted() && status == ContiguousViewStatus::Ready &&
+            mapped.size() == kIoWindowBytes && mapped.front() == bytes[kIoWindowBytes - 3u] &&
+            mapped.back() == bytes[2u * kIoWindowBytes - 4u] && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "native.mapping-prefetch-admitted-window", "Windows must accept a prefetch hint for the admitted mapped window without reserving process pages as controlled storage");
+        reader.reset();
+        std::array<std::uint8_t, 7u> tail{};
+        Require(result, !weak.expired() && range->ReadAt(kIoWindowBytes, tail, &error) &&
+            tail.back() == bytes[2u * kIoWindowBytes + 3u] && range->PrefetchRange(kIoWindowBytes + 7u, 1u).IsError(),
+            "native.mapping-range-lifetime", "the final range must retain the file mapping and reject out-of-range prefetch");
+        mapped = {};
+        range.reset();
+        slot.reset();
+        Require(result, weak.expired(), "native.mapping-last-owner", "the final range release must retire the mapping reader");
+    }
+    RemoveRemapOutput(directory);
+#endif
+    Require(result, scope.Finish(true) && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+        "native.exempt-request-finish", "exempt native operations must leave no controlled reservations");
+    PrintResult(result);
+    return result.passed;
+}
+
 inline DataCodecEncodeConfigurationParams MakeRemapSemanticConfiguration() {
     auto configuration = MakeEncodeConfigurationParams(
         DataCodecEncodeOptions{
@@ -766,6 +982,8 @@ using namespace ::datacodec::test;
 
 inline int RunDataCodecFeatureRemap() {
     bool passed = true;
+    if (!feature_remap::TestNativeResourceExemptions()) { passed = false; }
+    if (!feature_remap::TestNativePolyhedronResourceBoundary()) { passed = false; }
     if (!feature_remap::TestRemapPreservesMeshSemantics(
             "surface",
             feature_remap::BuildRemapSemanticSurfaceObject())) {

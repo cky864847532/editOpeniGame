@@ -236,6 +236,7 @@ public:
                         fieldBundle,
                         request.pipelineControl.packageFields,
                         resources,
+                        runRecords,
                         [&](const std::uint64_t completedBytes, const std::uint64_t totalBytes) {
                             const auto normalized = totalBytes == 0u
                                 ? leafPackageEnd
@@ -350,7 +351,9 @@ public:
                 FinalizeRun(result, runRecords, false, runStart);
                 return result;
             }
-            if (!FramePackageIO::WriteToSink(
+            const bool frameWritten = [&] {
+                ScopedRunStageTiming timing(runRecords, "PackageWrite.Frame");
+                return FramePackageIO::WriteToSink(
                     framePlan.framePackage,
                     leafPackageWriters,
                     *outputSink,
@@ -372,7 +375,9 @@ public:
                                 DataCodecMessageId::None,
                                 false);
                         }
-                    })) {
+                    });
+            }();
+            if (!frameWritten) {
                 AddError(result, runRecords, "FrameEncodeExecutor", "failed to write frame package: " + writeError);
                 SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, DataCodecMessageId::None, false);
                 FinalizeRun(result, runRecords, false, runStart);
@@ -525,8 +530,10 @@ private:
         EncodedLeafFieldBundle& fieldBundle,
         const PackageFieldEncodingParams& packageFields,
         DataCodecExecutionResources& resources,
+        RunRecordEmitter& runRecords,
         const std::function<void(std::uint64_t, std::uint64_t)>& progressCallback,
         std::string* error) {
+        ScopedRunStageTiming timing(runRecords, "PackageFields.Frame");
         if (fieldBundle.byteStoreSession == nullptr) {
             return validation::AssignError(error, "encoded leaf field bundle has no byte store session");
         }

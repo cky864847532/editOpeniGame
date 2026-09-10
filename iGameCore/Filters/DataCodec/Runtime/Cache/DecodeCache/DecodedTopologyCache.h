@@ -201,6 +201,11 @@ struct DecodedTopologyCache {
         return true;
     }
 
+    void InitializeEmpty() noexcept {
+        Release();
+        complete = true;
+    }
+
     void InitializeStructured(const std::array<int, 3>& axisSize) {
         Release();
         kind = Kind::Structured;

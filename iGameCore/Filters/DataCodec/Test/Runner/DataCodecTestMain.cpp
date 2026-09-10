@@ -6,6 +6,10 @@
 #include "DataCodec/Log/Report/DataCodecProcessReportJson.h"
 #include "DataCodec/Test/Suite/DataCodecTestSuite.h"
 #include "DataCodec/Test/Experiment/DataCodecResourcePerformance.h"
+#include "DataCodec/Test/Experiment/DataCodecResourceEnvironment.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureEncodedInputCache.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureDecodedFrameCache.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureDecodeReferenceCache.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
 #include "IGDC/iGameIGDCReader.h"
 #include "IGDC/iGameIGDCWriter.h"
@@ -13,16 +17,59 @@
 
 #include <chrono>
 #include <charconv>
+#include <array>
+#include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace {
+
+struct ObservedTestCheck {
+    std::array<char, 192u> name{};
+    bool passed{};
+};
+
+// 固定存储采集实际执行的断言，不在分配失败注入期间分配或输出
+std::array<ObservedTestCheck, 16384u> observedTestChecks;
+std::atomic_size_t observedTestCheckCount{0u};
+std::atomic_size_t omittedTestCheckCount{0u};
+
+void ObserveTestCheck(bool passed, std::string_view name) noexcept {
+    const auto index = observedTestCheckCount.fetch_add(1u, std::memory_order_relaxed);
+    if (index >= observedTestChecks.size() || name.size() >= observedTestChecks[0].name.size()) {
+        omittedTestCheckCount.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    auto& item = observedTestChecks[index];
+    std::memcpy(item.name.data(), name.data(), name.size());
+    item.name[name.size()] = '\0';
+    item.passed = passed;
+}
+
+bool PrintObservedTestChecks() {
+    std::map<std::string, std::pair<std::size_t, std::size_t>> counts;
+    const auto end = std::min(observedTestChecks.size(), observedTestCheckCount.load());
+    for (std::size_t i = 0u; i < end; ++i) {
+        const auto& item = observedTestChecks[i];
+        if (item.name[0] == '\0') { continue; }
+        auto& count = counts[item.name.data()];
+        if (item.passed) { ++count.first; } else { ++count.second; }
+    }
+    for (const auto& [name, count] : counts) {
+        std::cout << "executed_check," << name << ',' << count.first << ',' << count.second << '\n';
+    }
+    std::cout << "executed_check_summary,total=" << observedTestCheckCount.load()
+        << ",unique=" << counts.size() << ",omitted=" << omittedTestCheckCount.load() << '\n';
+    return omittedTestCheckCount.load() == 0u;
+}
 
 void PrintResult(const datacodec::test::TestResult& result) {
     for (const auto& diagnostic : result.diagnostics) {
@@ -321,12 +368,38 @@ int WriteBrowserFixture(const std::filesystem::path& outputPath) {
 }
 
 int main(const int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--resource-coverage") {
+        datacodec::test::testCheckObserver = ObserveTestCheck;
+        const auto result = datacodec::test::RunDataCodecSelfTest();
+        const bool inputCache = datacodec::test::RunDataCodecFeatureEncodedInputCache() == 0;
+        const bool frameCache = datacodec::test::RunDataCodecFeatureDecodedFrameCache() == 0;
+        const bool referenceCache = datacodec::test::RunDataCodecFeatureDecodeReferenceCache() == 0;
+        datacodec::test::testCheckObserver = nullptr;
+        PrintResult(result);
+        const bool completeTrace = PrintObservedTestChecks();
+        return result.passed && inputCache && frameCache && referenceCache && completeTrace ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--resource-environment") {
+        try {
+            const auto result = datacodec::test::RunDataCodecResourceEnvironment();
+            PrintResult(result);
+            return result.passed ? 0 : 1;
+        } catch (const std::exception& failure) {
+            std::cerr << "resource environment experiment failed: " << failure.what() << '\n';
+            return 1;
+        }
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--remap-contract") {
         return iGame::datacodec_test::RunDataCodecFeatureRemap();
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--resource-overhead") {
+        const auto result = datacodec::test::RunDataCodecResourceOverhead();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
     if (argc >= 2 && std::string_view(argv[1]) == "--resource-performance") {
-        if (argc != 7) {
-            std::cerr << "usage: --resource-performance tuples repetitions storage_MiB max_threads audit_0_or_1\n";
+        if (argc != 7 && argc != 8) {
+            std::cerr << "usage: --resource-performance tuples repetitions storage_MiB max_threads audit_0_or_1 [points|many-fields|correlated-fields|variable-topology|morton]\n";
             return 2;
         }
         std::array<std::uint64_t, 5u> values{};
@@ -341,7 +414,8 @@ int main(const int argc, char** argv) {
             values[3] > std::numeric_limits<std::size_t>::max() || values[4] > 1u) { return 2; }
         try {
             const auto result = datacodec::test::RunDataCodecResourcePerformance(
-                values[0], values[1], values[2] * MiB, values[3], values[4] != 0u);
+                values[0], values[1], values[2] * MiB, values[3], values[4] != 0u,
+                argc == 8 ? std::string_view(argv[7]) : std::string_view("points"));
             PrintResult(result);
             return result.passed ? 0 : 1;
         } catch (const std::exception& failure) {
@@ -413,6 +487,10 @@ int main(const int argc, char** argv) {
     }
 
     if (TestDataCodecReportFileContract() != 0) {
+        return 1;
+    }
+
+    if (datacodec::test::RunDataCodecFeatureEncodedInputCache() != 0) {
         return 1;
     }
 

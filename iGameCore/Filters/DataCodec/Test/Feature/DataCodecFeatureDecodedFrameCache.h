@@ -3,6 +3,7 @@
 
 #include "DataCodec/Workflow/Session/PlaybackPrefetchPlanner.h"
 #include "DataCodec/Runtime/Cache/DecodedFrameLruCache.h"
+#include "DataCodec/Test/Common/DataCodecTestResult.h"
 
 #include <cstdint>
 #include <iostream>
@@ -144,12 +145,12 @@ namespace datacodec::test
 
 inline int RunDataCodecFeatureDecodedFrameCache() {
     using namespace feature_decoded_frame_cache;
-    if (!TestLeastRecentlyUsedFrameIsEvicted() ||
-        !TestTrimPreservesConsumerAndIgnoresSizeHint() ||
-        !TestSourceRevisionSeparatesEntries() ||
-        !TestDisableClearsAndBlocksFrameCaching() ||
-        !TestDirectionalPrefetchIsIndependentFromEviction() ||
-        !TestInvalidCacheAccessIsReportedAsError()) {
+    if (!RunNamedCheck("frameCache.lru", TestLeastRecentlyUsedFrameIsEvicted) ||
+        !RunNamedCheck("frameCache.consumer-hint-exemption", TestTrimPreservesConsumerAndIgnoresSizeHint) ||
+        !RunNamedCheck("frameCache.revision", TestSourceRevisionSeparatesEntries) ||
+        !RunNamedCheck("frameCache.disable", TestDisableClearsAndBlocksFrameCaching) ||
+        !RunNamedCheck("frameCache.prefetch-direction", TestDirectionalPrefetchIsIndependentFromEviction) ||
+        !RunNamedCheck("frameCache.invalid-access", TestInvalidCacheAccessIsReportedAsError)) {
         std::cerr << "DataCodec decoded frame cache feature test failed\n";
         return 1;
     }

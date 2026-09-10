@@ -10,6 +10,7 @@
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamEncoder.h"
+#include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyRemap.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 
 #include <algorithm>

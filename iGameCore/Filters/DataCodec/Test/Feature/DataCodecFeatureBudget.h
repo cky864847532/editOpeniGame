@@ -406,6 +406,7 @@ inline bool TestAttributePayloadSizedStorage() {
         const auto limit = externalSpill ? 0u : static_cast<std::uint64_t>(input.size());
         DataCodecExecutionResources root(ResolvedResourceConfiguration{
             {limit, 1u, 1u}, static_cast<std::uint64_t>(input.size()), 1u, false, true, externalSpill});
+        CodecRunScope request(root);
         DecodeLeafWorkspace workspace;
         RunBinding binding(workspace, root);
         auto source = std::make_shared<WindowCheckedSource>(encoded);
@@ -415,26 +416,40 @@ inline bool TestAttributePayloadSizedStorage() {
         field.compressionType = EncodedFieldCompressionType::ZSTD;
         std::shared_ptr<bytestore::IByteSource> owner;
         std::span<const std::uint8_t> payload;
-        const auto prepared = SpoolAttributePayloadToByteStore(field, workspace, owner, payload, &error);
+        const auto prepared = decodefield::PrepareLeafPackageFieldPayload(field, workspace.CacheResourcesRef(),
+            workspace.ByteStoreSessionRef(), owner, &error);
         Require(result, prepared && owner && owner->ByteSizeHint() == input.size() &&
             root.StorageCapacity()->Snapshot().reservedBytes == limit &&
             source->maxReadBytes <= kIoWindowBytes,
             "payload.sized-owner", "full attribute payload must use the root sized store and bounded source reads");
         if (!prepared || !owner) { continue; }
         WindowCheckedWriter replay;
+        const auto view = owner->PrepareContiguousBytes(payload, &error);
         Require(result, CopyByteSourceByWindow(*owner, replay, root.Scratch(), &error) && replay.bytes == input &&
-            payload.empty() == externalSpill,
+            view == (externalSpill ? ContiguousViewStatus::Unavailable : ContiguousViewStatus::Ready),
             "payload.range-replay", "both fixed backends must expose the same decoded bytes");
         payload = {};
         owner.reset();
         Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u,
             "payload.release", "last payload owner must release the complete controlled capacity");
+        LeafPackageField rawField;
+        rawField.source = std::make_shared<WindowCheckedSource>(input);
+        rawField.rawSize = input.size();
+        rawField.compressionType = EncodedFieldCompressionType::None;
+        Require(result, decodefield::PrepareLeafPackageFieldPayload(rawField, workspace.CacheResourcesRef(),
+            workspace.ByteStoreSessionRef(), owner, &error) && owner == rawField.source &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "payload.raw-borrowed", "raw payload preparation must retain its existing source without a controlled copy");
+        owner.reset();
         if (!externalSpill) {
             const auto readCount = source->readCount;
             Require(result, root.UpdateLimits({0u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck) &&
-                !SpoolAttributePayloadToByteStore(field, workspace, owner, payload, &error) &&
-                source->readCount == readCount && !owner,
+                !decodefield::PrepareLeafPackageFieldPayload(field, workspace.CacheResourcesRef(),
+                    workspace.ByteStoreSessionRef(), owner, &error) &&
+                source->readCount == readCount && !owner && root.FirstFailure() && !request.Finish(false),
                 "payload.admit-before-read", "capacity rejection must happen before reading compressed input");
+        } else {
+            Require(result, request.Finish(true), "payload.request-finish", "successful payload preparation must release its phase");
         }
     }
     PrintResult(result);

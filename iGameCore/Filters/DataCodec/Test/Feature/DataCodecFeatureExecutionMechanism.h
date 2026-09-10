@@ -50,6 +50,56 @@ inline TestResult RunDataCodecFeatureExecutionMechanism() {
     result.failures.insert(result.failures.end(), workTypes.failures.begin(), workTypes.failures.end());
     result.AppendDiagnostics(workTypes.diagnostics);
     const ResolvedResourceConfiguration fixed{{64u, 2u, 4u}, 128u, 4u, true, true};
+    {
+        auto config = ResolveResourceConfiguration(
+            {.mode = CodecResourceMode::Adaptive, .maxComputeThreads = 1u, .ownedStorageLimitBytes = 64u},
+            ProbeResources());
+        DataCodecExecutionResources run(config);
+        run.BeginRun();
+        run.UpdateLimits({64u, 1u, 2u}, true, ResourceDecisionReason::MechanismCheck);
+        run.BeginFlow(false);
+        auto first = run.TryAcquireSlot();
+        auto second = run.TryAcquireSlot();
+        if (first && second) {
+            std::latch started(1), release(1);
+            auto slow = std::make_shared<TerminalWork>([&](WorkerContext&) {
+                started.count_down();
+                release.wait();
+                return true;
+            });
+            auto next = std::make_shared<TerminalWork>([](WorkerContext&) { return true; });
+            const bool submitted = run.SubmitTerminal(*first, slow) && run.SubmitTerminal(*second, next);
+            ResourceDebugSnapshot computing, ready;
+            if (submitted) {
+                started.wait();
+                run.SetWaitReason(ResourceWaitReason::OrderedCommit, &*first);
+                Require(result, CopyExecutionSnapshot(run, computing) &&
+                    computing.observationWaits[0] > ResourceClock::duration::zero() &&
+                    computing.observationWaits[3] == ResourceClock::duration::zero(),
+                    "execution.compute-is-not-output", "a queued block behind a computing first block must not count as output congestion");
+            }
+            release.count_down();
+            const bool completed = submitted && WaitForTerminal(run, *slow) && WaitForTerminal(run, *next);
+            Require(result, completed && CopyExecutionSnapshot(run, ready) &&
+                ready.observationWaits[3] > ResourceClock::duration::zero(),
+                "execution.completed-output-wait", "completed unconsumed blocks must contribute to output congestion");
+            if (completed) { run.CommitSlot(*first); run.CommitSlot(*second); }
+            // 故障分支同样在被终端捕获的同步对象析构前收束
+            run.CancelAndWaitRun();
+        } else {
+            Require(result, false, "execution.wait-classification-admission", "the wait classification fixture must acquire both slots");
+        }
+        first.reset(); second.reset();
+        run.SetWaitReason(ResourceWaitReason::None);
+        run.CancelAndWaitRun();
+        run.EndRun();
+        const bool restarted = run.BeginRun();
+        auto phase = restarted ? run.TryAcquireHeavyPhase() : std::nullopt;
+        const bool reused = phase && RunTerminalWork(run, *phase, [](WorkerContext&) { return true; });
+        phase.reset();
+        Require(result, restarted && reused && run.EndRun(),
+            "execution.adaptive-controller-restart", "an idle adaptive controller must wake for the next request after cancellation");
+    }
     for (const bool threaded : {false, true}) {
         auto config = fixed;
         config.threaded = threaded;
@@ -276,6 +326,47 @@ inline TestResult RunDataCodecFeatureExecutionMechanism() {
         release.join();
         Require(result, success && bounded && committed == std::vector<unsigned>({0u,1u,2u,3u,4u,5u,6u,7u}) && run.EndRun(),
             "execution.ordered-bounded-flow", "slow first blocks must preserve bounded reads and ordered final commit");
+    }
+    {
+        DataCodecExecutionResources run(fixed);
+        run.BeginRun();
+        auto slot = run.TryAcquireSlot();
+        bool ran = false, destroyedOutsideLock = false;
+        struct Capture {
+            DataCodecExecutionResources& run;
+            bool& destroyedOutsideLock;
+            ~Capture() {
+                ResourceDebugSnapshot snapshot;
+                destroyedOutsideLock = run.TryCopyResourceDebugSnapshot(snapshot);
+            }
+        };
+        auto capture = std::make_shared<Capture>(run, destroyedOutsideLock);
+        auto task = std::make_shared<TerminalWork>([capture, &ran](WorkerContext&) {
+            ran = true;
+            return true;
+        });
+        capture.reset();
+        bool submitted = false, ended = false;
+        std::size_t rejected = 0u;
+        ResourceDebugSnapshot snapshot;
+        {
+            // 拒绝 worker 创建所需的真实堆申请，并保持拒绝直到队列与线程清理结束
+            RejectAllocationsScope reject;
+            submitted = run.SubmitTerminal(*slot, task);
+            run.CancelAndWaitRun();
+            slot.reset();
+            ended = run.EndRun();
+            run.ShutdownAndJoin();
+            rejected = rejectedAllocationCount;
+        }
+        const auto failure = run.FirstFailure();
+        Require(result, !submitted && !ran && destroyedOutsideLock && ended && rejected == 1u &&
+            failure && std::string_view(failure->reason.data()) == "allocation-failed" &&
+            CopyExecutionSnapshot(run, snapshot) && snapshot.closing && snapshot.createdWorkers == 0u &&
+            snapshot.queuedTasks == 0u && snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u &&
+            !run.BeginRun(),
+            "execution.worker-creation-allocation-failure",
+            "worker creation allocation failure must close the root, destroy queued captures outside its lock and finish without further allocations or replay");
     }
     {
         DataCodecExecutionResources run(fixed);

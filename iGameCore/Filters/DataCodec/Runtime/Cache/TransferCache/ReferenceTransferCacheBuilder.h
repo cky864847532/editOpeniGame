@@ -560,7 +560,8 @@ inline bool BuildNumericArrayReferenceTransferCache(
     std::vector<NumericArrayBlockLayoutParams>* blockLayouts = nullptr,
     std::string* error = nullptr,
     const std::string& storeLabel = "numeric_array_reference_transfer",
-    const callback::CapacityCallback& recordCapacitySamples = {}) {
+    const callback::CapacityCallback& recordCapacitySamples = {},
+    const bool parallelInputRead = false) {
     transferCache.reset();
     if (blockLayouts != nullptr) { blockLayouts->clear(); }
     numericarray::NumericArrayReader currentReader, referenceReader;
@@ -595,6 +596,21 @@ inline bool BuildNumericArrayReferenceTransferCache(
     }
     bytestore::AppendableByteStoreWriter writer(bodyTransferCache, resources);
     std::size_t nextOffset = 0u, committedElements = 0u;
+    const bool parallelRead = parallelInputRead && currentReader.SupportsParallelMemoryRead() &&
+        referenceReader.SupportsParallelMemoryRead();
+    const auto readInputs = [&](ReferenceEncodeBlockInput& block, ScratchByteBufferPool& scratch,
+                                std::string* readError) {
+        const auto sample = [&](const numericarray::NumericBufferSample kind) -> BufferCapacitySample* {
+            return block.capacitySamples ? &block.capacitySamples->values[static_cast<std::size_t>(kind)] : nullptr;
+        };
+        if (!currentReader.ReadElements(block.elementOffset, block.elementCount, scratch, block.current, readError,
+                sample(numericarray::NumericBufferSample::ReaderOrder)) ||
+            !ValidateNumericArrayRawByteSpan(meta, block.current.Span(), block.elementCount,
+                "current numeric array spatial block", readError)) { return false; }
+        return codecId == NumericArrayReferenceCodecId::Predictor ||
+            referenceReader.ReadElements(block.elementOffset, block.elementCount, scratch, block.reference, readError,
+                sample(numericarray::NumericBufferSample::ReferenceReaderOrder));
+    };
     phase.reset();
     resources.SetWorkType({.path = ResourceWorkPath::ReferenceEncode,
         .codec = static_cast<std::uint32_t>(codecId),
@@ -610,23 +626,17 @@ inline bool BuildNumericArrayReferenceTransferCache(
             block.elementCount = static_cast<std::uint32_t>(std::min<std::size_t>(
                 numericarray::kSpatialBlockElementCount, elementCount - nextOffset));
             if (recordCapacitySamples) { block.capacitySamples.emplace(); }
-            const auto sample = [&](const numericarray::NumericBufferSample kind) -> BufferCapacitySample* {
-                return block.capacitySamples ? &block.capacitySamples->values[static_cast<std::size_t>(kind)] : nullptr;
-            };
-            if (!currentReader.ReadElements(nextOffset, block.elementCount, resources.Scratch(), block.current, error,
-                    sample(numericarray::NumericBufferSample::ReaderOrder)) ||
-                !ValidateNumericArrayRawByteSpan(meta, block.current.Span(), block.elementCount,
-                    "current numeric array spatial block", error)) { return false; }
-            if (codecId != NumericArrayReferenceCodecId::Predictor &&
-                !referenceReader.ReadElements(nextOffset, block.elementCount, resources.Scratch(), block.reference, error,
-                    sample(numericarray::NumericBufferSample::ReferenceReaderOrder))) {
-                return false;
-            }
+            if (!parallelRead && !readInputs(block, resources.Scratch(), error)) { return false; }
             nextOffset += block.elementCount;
             return true;
         },
-        [&](const ReferenceEncodeBlockInput& block, ReferenceEncodeBlockOutput& output, WorkerContext& worker) {
+        [&](ReferenceEncodeBlockInput& block, ReferenceEncodeBlockOutput& output, WorkerContext& worker) {
             std::string localError;
+            if (parallelRead && !readInputs(block, worker.Scratch(), &localError)) {
+                resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                    "reference-block-read", "BuildNumericArrayReferenceTransferCache", localError));
+                return false;
+            }
             output.capacitySamples = block.capacitySamples;
             if (!ComputeReferenceEncodeBlock(meta, defaultCompressor, referenceData, referenceReader, codecId,
                     control, block, output, worker.Scratch(), &localError, &worker.NumericCompressor())) {

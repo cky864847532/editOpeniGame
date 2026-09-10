@@ -13,6 +13,7 @@ struct ResourceWatermarks {
 };
 
 namespace resource_control {
+inline constexpr std::size_t healthyStartupComputeLimit = 8u;
 inline constexpr auto sampleInterval = std::chrono::milliseconds(250);
 inline constexpr auto maximumSampleAge = std::chrono::seconds(1);
 inline constexpr auto pendingConfirmation = std::chrono::milliseconds(500);

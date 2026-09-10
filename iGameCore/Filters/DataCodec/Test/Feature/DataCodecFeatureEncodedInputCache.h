@@ -3,6 +3,7 @@
 
 #include "DataCodec/Runtime/Cache/DecodeCacheRuntime.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Test/Common/DataCodecTestResult.h"
 
 #include <algorithm>
 #include <array>
@@ -148,15 +149,30 @@ inline bool TestNecessaryStorageReclaimsOnlyReleasedOwners() {
     if (!phase) { return false; }
     auto denied = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 1u, "denied", &error);
     if (denied || runtime.DefaultEncodedInputCache()->Statistics().residentInputs != 0u ||
+        run.StorageCapacity()->Snapshot().reservedBytes != 64u ||
+        !run.Stopped() || !run.FirstFailure() || error.empty()) { return false; }
+    // 必要容量拒绝终止当前请求，外部消费者在失败收束后仍持有真实数组
+    stores.UnbindRun();
+    phase.reset();
+    if (scope.Finish(false)) { return false; }
+    std::array<std::uint8_t, 1u> tail{};
+    if (!retained->ReadAt(63u, tail) || tail[0] != 5u ||
         run.StorageCapacity()->Snapshot().reservedBytes != 64u) { return false; }
     retained.reset();
+    if (run.StorageCapacity()->Snapshot().reservedBytes != 0u) { return false; }
+    // 独立后续请求复用根，首错和停止状态由 BeginRun 重置
+    CodecRunScope nextScope(run);
+    if (!nextScope || run.FirstFailure() || run.Stopped()) { return false; }
+    stores.BindRun(run);
+    phase = WaitForHeavyPhase(run);
+    if (!phase) { return false; }
     error.clear();
     auto acquired = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 64u, "necessary", &error);
     if (!acquired || !error.empty() || run.StorageCapacity()->Snapshot().reservedBytes != 64u) { return false; }
     acquired.reset();
     stores.UnbindRun();
     phase.reset();
-    return run.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(true);
+    return run.StorageCapacity()->Snapshot().reservedBytes == 0u && nextScope.Finish(true);
 }
 
 inline bool TestStartedReadFailureDoesNotReplay() {
@@ -178,10 +194,12 @@ inline bool TestStartedReadFailureDoesNotReplay() {
 namespace datacodec::test {
 inline int RunDataCodecFeatureEncodedInputCache() {
     using namespace feature_encoded_input_cache;
-    if (!TestCountAndActiveConsumer() || !TestBorrowedInputAndRootIsolation() ||
-        !TestExactCapacityWindowsAndLifetime() || !TestAdmissionDenialDoesNotStartRead() ||
-        !TestNecessaryStorageReclaimsOnlyReleasedOwners() ||
-        !TestStartedReadFailureDoesNotReplay()) {
+    if (!RunNamedCheck("encodedInputCache.count-consumer", TestCountAndActiveConsumer) ||
+        !RunNamedCheck("encodedInputCache.borrowed-root-isolation", TestBorrowedInputAndRootIsolation) ||
+        !RunNamedCheck("encodedInputCache.exact-windows-last-owner", TestExactCapacityWindowsAndLifetime) ||
+        !RunNamedCheck("encodedInputCache.denied-before-read", TestAdmissionDenialDoesNotStartRead) ||
+        !RunNamedCheck("encodedInputCache.necessary-live-owner", TestNecessaryStorageReclaimsOnlyReleasedOwners) ||
+        !RunNamedCheck("encodedInputCache.read-failure-no-replay", TestStartedReadFailureDoesNotReplay)) {
         std::cerr << "DataCodec encoded input cache feature test failed\n";
         return 1;
     }

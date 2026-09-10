@@ -3,6 +3,7 @@
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Common/DataCodecError.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 #include <algorithm>
@@ -297,6 +298,32 @@ private:
     mutable std::mutex m_messageMutex;
     std::vector<TelemetryMessageRecord> m_messages;
     TelemetryRetentionStats m_messageRetention;
+};
+
+// 粗粒度墙钟区间，包含区间内的等待和子调用，失败退出也记录已消耗时间
+// 名称使用静态字符串，关闭计时时不读取时钟、不分配字符串
+class ScopedRunStageTiming final {
+public:
+    ScopedRunStageTiming(RunRecordEmitter& records, const std::string_view name,
+        const TelemetryStageCategory category = TelemetryStageCategory::General) noexcept
+        : m_records(records), m_name(name), m_category(category),
+          m_enabled(records.Wants(RunRecordKind::StageTiming)),
+          m_start(callback::StartTiming(m_enabled)) {}
+    ScopedRunStageTiming(const ScopedRunStageTiming&) = delete;
+    ScopedRunStageTiming& operator=(const ScopedRunStageTiming&) = delete;
+    ~ScopedRunStageTiming() noexcept {
+        if (!m_enabled) { return; }
+        const auto elapsedMs = callback::ElapsedMilliseconds(m_start);
+        m_records.TryExport([&] {
+            m_records.RecordStageTiming(std::string(m_name), elapsedMs, m_category, "module-wall");
+        });
+    }
+private:
+    RunRecordEmitter& m_records;
+    std::string_view m_name;
+    TelemetryStageCategory m_category;
+    bool m_enabled;
+    callback::PhaseTimePoint m_start;
 };
 
 } // 命名空间 datacodec

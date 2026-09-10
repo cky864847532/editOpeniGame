@@ -5,12 +5,14 @@
 #include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
 #include "DataCodec/Log/Telemetry/TelemetryResidentSet.h"
 #include "DataCodec/Platform/ResourceProbe.h"
+#include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Test/Adapter/DataCodecTestAdapter.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <optional>
@@ -40,7 +42,7 @@ private:
     std::optional<std::uint64_t> m_peak;
 };
 
-inline TestDataset MakeDataset(std::size_t tuples) {
+inline TestDataset MakeDataset(std::size_t tuples, std::string_view profile = "points") {
     TestDataset data;
     data.name = "resource_performance_float32";
     data.points.resize(tuples * 3u);
@@ -59,18 +61,77 @@ inline TestDataset MakeDataset(std::size_t tuples) {
                 static_cast<float>((i * (c + 3u) + c * 11u) % 8191u) / 64.0f;
         }
     }
+    if (profile == "many-fields" || profile == "correlated-fields") {
+        const auto fields = profile == "many-fields" ? 128u : 8u;
+        data.pointFields.clear();
+        for (std::size_t f = 0u; f < fields; ++f) {
+            TestNumericField field{.name = "field_" + std::to_string(f), .role = AttrRole::Scalar};
+            field.values.resize(tuples);
+            for (std::size_t i = 0u; i < tuples; ++i) {
+                const auto base = static_cast<float>((i * 17u) % 4093u) / 32.0f;
+                field.values[i] = profile == "correlated-fields"
+                    ? base * static_cast<float>(f + 1u) + static_cast<float>(f) / 16.0f
+                    : static_cast<float>((i * (17u + f * 2u) + f) % 4093u) / 32.0f;
+            }
+            data.pointFields.push_back(std::move(field));
+        }
+    }
+    if (profile == "variable-topology") {
+        data.meshType = MeshType::UnstructuredMesh;
+        data.cellOffsets.push_back(0u);
+        for (std::size_t cell = 0u; cell < tuples; ++cell) {
+            const auto count = 3u + cell % 2u;
+            for (std::size_t j = 0u; j < count; ++j) {
+                data.cellConnectivity.push_back(static_cast<IndexType>((cell + j) % tuples));
+            }
+            data.cellOffsets.push_back(static_cast<IndexType>(data.cellConnectivity.size()));
+        }
+    }
+    if (profile == "morton") {
+        TestNumericField identity{.name = "original_point", .role = AttrRole::Scalar};
+        identity.values.resize(tuples);
+        for (std::size_t i = 0u; i < tuples; ++i) { identity.values[i] = static_cast<float>(i); }
+        data.pointFields.push_back(std::move(identity));
+    }
     return data;
 }
 
-inline bool Matches(const TestDataset& input, const TestDecodeAdapter& output) {
-    if (!output.Committed() || output.Points() != input.points ||
+inline bool Matches(const TestDataset& input, const TestDecodeAdapter& output, bool reordered = false) {
+    if (!output.Committed() || output.Mesh() != input.meshType ||
+        output.Points().size() != input.points.size() ||
+        output.Connectivity() != input.cellConnectivity || output.Offsets() != input.cellOffsets ||
         output.Attributes().size() != input.pointFields.size()) { return false; }
     for (std::size_t i = 0u; i < input.pointFields.size(); ++i) {
         const auto& expected = input.pointFields[i];
         const auto& actual = output.Attributes()[i];
         if (!actual.complete || actual.metadata.name != expected.name ||
-            actual.bytes.size() != expected.values.size() * sizeof(float) ||
-            std::memcmp(actual.bytes.data(), expected.values.data(), actual.bytes.size()) != 0) { return false; }
+            actual.bytes.size() != expected.values.size() * sizeof(float)) { return false; }
+        if (!reordered && std::memcmp(actual.bytes.data(), expected.values.data(), actual.bytes.size()) != 0) {
+            return false;
+        }
+    }
+    if (!reordered) { return output.Points() == input.points; }
+    // 通过随同重排的唯一点号核对排列、几何和全部属性，不把置换误报为数值错误
+    const auto& identities = output.Attributes().back().bytes;
+    std::vector<bool> seen(input.PointCount(), false);
+    for (std::size_t i = 0u; i < input.PointCount(); ++i) {
+        float identity{};
+        std::memcpy(&identity, identities.data() + i * sizeof(float), sizeof(float));
+        if (!std::isfinite(identity) || identity < 0.0f || identity >= static_cast<double>(input.PointCount())) {
+            return false;
+        }
+        const auto original = static_cast<std::size_t>(identity);
+        if (static_cast<float>(original) != identity || seen[original]) { return false; }
+        seen[original] = true;
+        if (!std::equal(output.Points().begin() + i * 3u, output.Points().begin() + (i + 1u) * 3u,
+                input.points.begin() + original * 3u)) { return false; }
+        for (std::size_t f = 0u; f < input.pointFields.size(); ++f) {
+            const auto& field = input.pointFields[f];
+            if (std::memcmp(output.Attributes()[f].bytes.data() + i * field.componentCount * sizeof(float),
+                    field.values.data() + original * field.componentCount, field.componentCount * sizeof(float)) != 0) {
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -91,17 +152,23 @@ inline double Milliseconds(std::chrono::steady_clock::duration elapsed) {
 }
 
 inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_t repetitions,
-    std::uint64_t storageBytes, std::size_t maxThreads, bool audit = true) {
+    std::uint64_t storageBytes, std::size_t maxThreads, bool audit = true,
+    std::string_view profile = "points") {
     using namespace resource_experiment;
     TestResult result;
-    if (tuples == 0u || tuples > std::numeric_limits<std::size_t>::max() / (7u * sizeof(float)) ||
+    const bool knownProfile = profile == "points" || profile == "many-fields" ||
+        profile == "correlated-fields" || profile == "variable-topology" || profile == "morton";
+    if (!knownProfile || tuples == 0u || tuples > std::numeric_limits<std::size_t>::max() / (131u * sizeof(float)) ||
+        (profile == "morton" && tuples > (1u << 24u)) ||
+        (profile == "variable-topology" && (tuples < 4u || tuples > std::numeric_limits<IndexType>::max() / 4u)) ||
         repetitions == 0u || repetitions > 100u || maxThreads == 0u) {
         result.AddFailure("resourcePerformance.arguments", "invalid experiment size, repetition count or thread limit");
         return result;
     }
     const auto environment = ProbeResources();
-    const auto data = MakeDataset(tuples);
-    std::vector<AttributeTarget> targets{{.attrIndex = 0u}, {.attrIndex = 1u}};
+    const auto data = MakeDataset(tuples, profile);
+    std::vector<AttributeTarget> targets;
+    for (std::size_t i = 0u; i < data.pointFields.size(); ++i) { targets.push_back({.attrIndex = i}); }
     struct Configuration { const char* name; CodecResourceParams params; };
     const std::array configs{
         Configuration{"fixed_low", {CodecResourceMode::Fixed, 1u, storageBytes}},
@@ -118,7 +185,8 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
     Number(environmentRow, environment.availableBytes);
     environmentRow << ",allowed_threads=";
     if (environment.allowedComputeThreads) { environmentRow << *environment.allowedComputeThreads; }
-    environmentRow << ",external_spill=" << environment.externalSpillAvailable << ",audit=" << audit;
+    environmentRow << ",external_spill=" << environment.externalSpillAvailable << ",audit=" << audit
+        << ",profile=" << profile << ",fields=" << data.pointFields.size() << ",cells=" << data.CellCount();
     result.AddDiagnostic(environmentRow.str());
     result.AddDiagnostic("resource_csv,configuration,iteration,warmup,tuples,requested_threads,storage_limit,success,encoded_bytes,encode_ms,decode_ms,total_ms,encode_max_scope_array_peak,decode_max_scope_array_peak,process_rss_before,process_rss_after_encode,process_rss_after_decode,failure_reason");
     // 首轮预热单列，随后轮换配置顺序，全部请求包括线程启动与最终交付
@@ -131,11 +199,14 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
             TestEncodeAdapter encodeAdapter(data);
             TestDecodeAdapter decodeAdapter;
             EncodeRequest encodeRequest;
-            encodeRequest.input = EncodeInput::LeafAdapter(&encodeAdapter, {}, data.name, "PointSet");
+            encodeRequest.input = EncodeInput::LeafAdapter(&encodeAdapter, {}, data.name,
+                data.meshType == MeshType::PointSet ? "PointSet" : "UnstructuredMesh");
             encodeRequest.output = EncodeOutput::Memory(EncodePackageKind::LeafPackage);
             encodeRequest.resources = config.params;
-            // 此实验按原始顺序核对数值，重排语义由独立宿主用例验证
-            encodeRequest.configuration.pipelineControl.pointOrder = EncodePointOrderMode::Original;
+            encodeRequest.configuration.pipelineControl.pointOrder = profile == "morton"
+                ? EncodePointOrderMode::Morton : EncodePointOrderMode::Original;
+            encodeRequest.configuration.pipelineControl.cellOrder = EncodeCellOrderMode::Original;
+            if (profile == "many-fields") { encodeRequest.configuration.controlParams.attrReference.enabled = false; }
             encodeRequest.runRecordSink = encodeSink;
             const auto rssBefore = ResidentSample();
             const auto encodeBegin = std::chrono::steady_clock::now();
@@ -157,7 +228,7 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
                 const auto begin = std::chrono::steady_clock::now();
                 decoded = DecodePackage(decodeRequest);
                 decodeMs = Milliseconds(std::chrono::steady_clock::now() - begin);
-                matches = decoded.success && Matches(data, decodeAdapter);
+                matches = decoded.success && Matches(data, decodeAdapter, profile == "morton");
             }
             const auto rssDecoded = ResidentSample();
             const auto encodeMs = Milliseconds(encodeEnd - encodeBegin);
@@ -198,6 +269,81 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
             summary << (times.size() % 2u ? times[middle] : (times[middle - 1u] + times[middle]) / 2.0);
         }
         result.AddDiagnostic(summary.str());
+    }
+    return result;
+}
+
+// 拆开固定管理成本，计时区间内不生成诊断字符串
+inline TestResult RunDataCodecResourceOverhead() {
+    using namespace resource_experiment;
+    TestResult result;
+    constexpr std::size_t repetitions = 100u;
+    const auto report = [&](const char* name, std::vector<double>& values) {
+        std::sort(values.begin(), values.end());
+        std::ostringstream row;
+        row << "resource_overhead," << name << ",samples=" << values.size()
+            << ",median_ms=" << (values[49u] + values[50u]) / 2.0;
+        result.AddDiagnostic(row.str());
+    };
+    std::vector<double> probes;
+    probes.reserve(repetitions);
+    ResourceSample sample;
+    for (std::size_t i = 0u; i <= repetitions; ++i) {
+        const auto begin = ResourceClock::now();
+        sample = ProbeResources();
+        const auto elapsed = Milliseconds(ResourceClock::now() - begin);
+        if (i != 0u) { probes.push_back(elapsed); }
+    }
+    report("probe", probes);
+    std::array<std::vector<double>, 3u> monitorTimes;
+    for (auto& values : monitorTimes) { values.reserve(repetitions); }
+    for (std::size_t i = 0u; i <= repetitions; ++i) {
+        const auto begin = ResourceClock::now();
+        auto monitor = std::make_unique<ResourcePressureMonitor>(nullptr, nullptr);
+        const auto constructed = ResourceClock::now();
+        monitor->Observe(sample);
+        const auto observed = ResourceClock::now();
+        monitor.reset();
+        const auto destroyed = ResourceClock::now();
+        if (i != 0u) {
+            monitorTimes[0].push_back(Milliseconds(constructed - begin));
+            monitorTimes[1].push_back(Milliseconds(observed - constructed));
+            monitorTimes[2].push_back(Milliseconds(destroyed - observed));
+        }
+    }
+    report("monitor_create", monitorTimes[0]);
+    report("monitor_observe", monitorTimes[1]);
+    report("monitor_destroy", monitorTimes[2]);
+    for (const auto mode : {CodecResourceMode::Fixed, CodecResourceMode::Adaptive}) {
+        std::array<std::vector<double>, 4u> times;
+        for (auto& values : times) { values.reserve(repetitions); }
+        for (std::size_t i = 0u; i <= repetitions; ++i) {
+            const auto begin = ResourceClock::now();
+            auto run = std::make_unique<DataCodecExecutionResources>(CodecResourceParams{
+                mode, 1u, 16u * 1024u * 1024u});
+            const auto constructed = ResourceClock::now();
+            const bool began = run->BeginRun();
+            const auto started = ResourceClock::now();
+            const bool ended = began && run->EndRun();
+            const auto finished = ResourceClock::now();
+            run.reset();
+            const auto destroyed = ResourceClock::now();
+            if (!began || !ended) {
+                result.AddFailure("resourceOverhead.lifecycle", "empty request lifecycle failed");
+                return result;
+            }
+            if (i != 0u) {
+                times[0].push_back(Milliseconds(constructed - begin));
+                times[1].push_back(Milliseconds(started - constructed));
+                times[2].push_back(Milliseconds(finished - started));
+                times[3].push_back(Milliseconds(destroyed - finished));
+            }
+        }
+        const bool fixed = mode == CodecResourceMode::Fixed;
+        report(fixed ? "fixed_create" : "adaptive_create", times[0]);
+        report(fixed ? "fixed_begin" : "adaptive_begin", times[1]);
+        report(fixed ? "fixed_end" : "adaptive_end", times[2]);
+        report(fixed ? "fixed_destroy" : "adaptive_destroy", times[3]);
     }
     return result;
 }
