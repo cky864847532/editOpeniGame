@@ -2,12 +2,14 @@
 #define DATACODEC_CODEC_ATTRIBUTES_ATTRIBUTEDECODE_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Codec/Attributes/AttributeDecodePlan.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedAttributeCacheSet.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/ReferenceCacheNumericArraySource.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Codec/Reference/DecodedReference.h"
 #include "DataCodec/Codec/Reference/NumericArrayReferenceBytes.h"
 #include "DataCodec/Codec/Reference/ReferenceCodec.h"
+#include "DataCodec/Codec/Reference/PreparedDecodeReference.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockReader.h"
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
@@ -36,15 +38,17 @@ namespace detail {
 inline bool ResolveDecodedBlockBytes(
     const AttrStorageParams& meta,
     const ParsedNumericArrayBlock& block,
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     std::string* error = nullptr,
     numericarray::NumericArrayCompressorState* compressorState = nullptr,
-    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
+    ArrayWorkspace* workspace = nullptr) {
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
     params.capacitySamples = capacitySamples;
+    params.workspace = workspace;
     if (block.header.mode == NumericArrayBlockMode::LayeredResidual) {
         return numericarray::ResolveDecodedLayeredResidualNumericArrayBlockBytes(
             params,
@@ -252,74 +256,6 @@ inline bool ResolveAttributePayloadRanges(
     return true;
 }
 
-inline bool BuildDecodedAttributeReferenceRangeBytes(
-    const DecodedAttributeCacheSet& cacheSet,
-    const std::size_t referenceAttrIndex,
-    const AttrStorageParams& referenceMeta,
-    const AttrStorageParams& targetMeta,
-    const std::size_t targetElementOffset,
-    const std::size_t targetElementCount,
-    ScratchByteBufferPool& scratchBytePool,
-    ScratchByteBuffer& outputBytes,
-    std::string* error = nullptr) {
-    outputBytes.Release();
-    numericarray::NumericArraySource referenceSource;
-    if (!BuildDecodedAttributeCacheNumericArraySource(cacheSet, referenceAttrIndex, referenceMeta, referenceSource, error)) {
-        return false;
-    }
-    numericarray::NumericArrayReader referenceReader;
-    if (!numericarray::BuildNumericArrayReader(referenceSource, referenceReader, error)) {
-        return false;
-    }
-    if (!numericarrayreference::BuildNumericArrayReferenceRangeBytes(
-            referenceReader,
-            referenceMeta,
-            targetMeta,
-            scratchBytePool,
-            targetElementOffset,
-            targetElementCount,
-            outputBytes,
-            error)) {
-        return false;
-    }
-    return true;
-}
-
-inline bool BuildDecodedAttributePredictorReferenceBlockBytes(
-    const DecodedAttributeCacheSet& cacheSet,
-    const std::size_t referenceAttrIndex,
-    const AttrStorageParams& referenceMeta,
-    const AttrStorageParams& targetMeta,
-    const std::size_t elementOffset,
-    const std::size_t elementCount,
-    const std::int32_t predictorOffset,
-    ScratchByteBufferPool& scratchBytePool,
-    ScratchByteBuffer& outputBytes,
-    std::string* error = nullptr) {
-    outputBytes.Release();
-    numericarray::NumericArraySource referenceSource;
-    if (!BuildDecodedAttributeCacheNumericArraySource(cacheSet, referenceAttrIndex, referenceMeta, referenceSource, error)) {
-        return false;
-    }
-    numericarray::NumericArrayReader referenceReader;
-    if (!numericarray::BuildNumericArrayReader(referenceSource, referenceReader, error)) {
-        return false;
-    }
-    if (!numericarrayreference::BuildNumericArrayPredictorReferenceBlockBytes(
-        referenceReader,
-        referenceMeta,
-        targetMeta,
-        scratchBytePool,
-        elementOffset,
-        elementCount,
-        predictorOffset,
-        outputBytes,
-        error)) {
-        return false;
-    }
-    return true;
-}
-
 inline bool WriteDecodedAttributeBlock(
     DecodedAttributeCacheSet& attributes,
     const std::size_t attrIndex,
@@ -416,7 +352,7 @@ inline void ObserveAttributeReferenceRange(
     const NumericArrayStorageParams& referenceMeta,
     const NumericArrayStorageParams& targetMeta,
     const ParsedNumericArrayBlock& block,
-    const ScratchByteBuffer& referenceBytes,
+    const auto& referenceBytes,
     AttributeReferenceRangeObservation* observation) {
     if (observation == nullptr) {
         return;
@@ -469,134 +405,6 @@ inline void ObserveAttributeReferenceRange(
     }
     observation->predictorBoundaryClamp = true;
     observation->predictorShiftedCopyBytes = observation->worksetBytes;
-}
-
-inline bool ResolveReferenceBytesForBlock(
-    const CodecStorageParams& storageParams,
-    const DecodedAttributeCacheSet& decodedAttrs,
-    const ParsedNumericArrayBlock& block,
-    const AttrStorageParams& meta,
-    const DecodedAttributeReference* attrKeyFrameLeafReference,
-    ScratchByteBufferPool& scratchBytePool,
-    const ScratchByteBuffer*& referenceBytes,
-    ScratchByteBuffer& intraReferenceBytes,
-    ScratchByteBuffer& resampledReferenceBytes,
-    ScratchByteBuffer& shiftedPredictorBlockBytes,
-    std::size_t& referenceElementOffset,
-    AttributeReferenceRangeObservation* rangeObservation = nullptr,
-    std::string* error = nullptr) {
-    referenceBytes = nullptr;
-    referenceElementOffset = static_cast<std::size_t>(block.header.elementOffset);
-    if (numericarray::IsIntegerNumericArrayDataType(meta.dataType) &&
-        block.header.codecId != NumericArrayReferenceCodecId::Wavelet) {
-        return validation::AssignError(error, "integer attribute reference requires wavelet codec");
-    }
-    if (block.header.referenceKind == NumericArrayReferenceKind::IntraArray) {
-        const auto referenceAttrIndex = static_cast<std::size_t>(block.header.localParentFieldIndex);
-        if (referenceAttrIndex >= storageParams.attrParams.size()) {
-            return validation::AssignError(error, "intra-field reference index is out of range");
-        }
-        const auto& referenceMeta = storageParams.attrParams[referenceAttrIndex];
-        if (!BuildDecodedAttributeReferenceRangeBytes(
-                decodedAttrs,
-                referenceAttrIndex,
-                referenceMeta,
-                meta,
-                static_cast<std::size_t>(block.header.elementOffset),
-                static_cast<std::size_t>(block.header.elementCount),
-                scratchBytePool,
-                intraReferenceBytes,
-                error)) {
-            if (error != nullptr && error->empty()) {
-                return validation::AssignError(error, "failed to resolve intra-field reference range");
-            }
-            return false;
-        }
-        referenceBytes = &intraReferenceBytes;
-        referenceElementOffset = 0u;
-        ObserveAttributeReferenceRange(
-            block.header.referenceKind,
-            block.header.codecId,
-            referenceMeta,
-            meta,
-            block,
-            *referenceBytes,
-            rangeObservation);
-        return true;
-    }
-
-    if (block.header.referenceKind == NumericArrayReferenceKind::TemporalKeyFrame) {
-        if (attrKeyFrameLeafReference == nullptr ||
-            attrKeyFrameLeafReference->store == nullptr) {
-            return validation::AssignError(error, "key frame reference store is not ready");
-        }
-
-        std::size_t referenceAttrIndex = 0u;
-        if (!TryFindReferenceAttrIndex(
-                attrKeyFrameLeafReference->reference.storageParams,
-                meta,
-                referenceAttrIndex)) {
-            return validation::AssignError(error, "failed to resolve reference attr from key frame");
-        }
-        auto& store = *attrKeyFrameLeafReference->store;
-        if (!store.Complete(referenceAttrIndex)) {
-            return validation::AssignError(error, "key frame reference field is not ready");
-        }
-        const auto& referenceMeta =
-            attrKeyFrameLeafReference->reference.storageParams.attrParams[referenceAttrIndex];
-        if (block.header.codecId != NumericArrayReferenceCodecId::Predictor) {
-            if (!BuildDecodedAttributeReferenceRangeBytes(
-                    store,
-                    referenceAttrIndex,
-                    referenceMeta,
-                    meta,
-                    static_cast<std::size_t>(block.header.elementOffset),
-                    static_cast<std::size_t>(block.header.elementCount),
-                    scratchBytePool,
-                    resampledReferenceBytes,
-                    error)) {
-                return false;
-            }
-            referenceBytes = &resampledReferenceBytes;
-            referenceElementOffset = 0u;
-            ObserveAttributeReferenceRange(
-                block.header.referenceKind,
-                block.header.codecId,
-                referenceMeta,
-                meta,
-                block,
-                *referenceBytes,
-                rangeObservation);
-            return true;
-        }
-
-        if (!BuildDecodedAttributePredictorReferenceBlockBytes(
-                store,
-                referenceAttrIndex,
-                referenceMeta,
-                meta,
-                static_cast<std::size_t>(block.header.elementOffset),
-                static_cast<std::size_t>(block.header.elementCount),
-                block.header.predictorOffset,
-                scratchBytePool,
-                shiftedPredictorBlockBytes,
-                error)) {
-            return false;
-        }
-        referenceBytes = &shiftedPredictorBlockBytes;
-        referenceElementOffset = 0u;
-        ObserveAttributeReferenceRange(
-            block.header.referenceKind,
-            block.header.codecId,
-            referenceMeta,
-            meta,
-            block,
-            *referenceBytes,
-            rangeObservation);
-        return true;
-    }
-
-    return validation::AssignError(error, "delta block is missing a valid reference kind");
 }
 
 struct AttributeDecodeTimingDetail {
@@ -838,35 +646,10 @@ struct AttributePayloadDecodeRuntime {
     AttributeDecodeContext context;
 };
 
-inline bool ResolveAttributeIntraParents(
-    const CodecStorageParams& storageParams,
-    const std::size_t attrIndex,
-    std::vector<std::size_t>& parents,
-    std::string* error = nullptr) {
-    parents.clear();
-    if (attrIndex >= storageParams.attrParams.size()) {
-        return validation::AssignError(error, "attribute dependency index is out of range");
-    }
-    const auto& meta = storageParams.attrParams[attrIndex];
-    for (const auto& layout : meta.blockLayouts) {
-        if (layout.referenceKind != NumericArrayReferenceKind::IntraArray) {
-            continue;
-        }
-        const auto parentIndex = static_cast<std::size_t>(layout.localParentFieldIndex);
-        if (parentIndex >= storageParams.attrParams.size() || parentIndex == attrIndex) {
-            return validation::AssignError(error, "attribute intra-field parent index is invalid");
-        }
-        if (std::find(parents.begin(), parents.end(), parentIndex) == parents.end()) {
-            parents.push_back(parentIndex);
-        }
-    }
-    return true;
-}
-
 struct AttributeDecodedBlock {
     std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
     NumericArrayBlockHeader header;
-    ScratchByteBuffer bytes;
+    FixedScratchBuffer bytes;
     AttributeDecodeWorkBreakdown work;
 };
 
@@ -904,10 +687,13 @@ inline bool ComputeAttributeDecodedBlock(
     const CodecStorageParams& storageParams, const AttrStorageParams& meta,
     const DecodedAttributeCacheSet& attributes, DecodedAttributeReference* attributeKeyFrameReference,
     const numericarray::NumericArrayBlockPayload& input, AttributeDecodedBlock& output,
-    WorkerContext& worker, const bool collectTiming, std::string* error) {
+    WorkerContext& worker, DecodeBlockWorkspace& workspace, const bool collectTiming, std::string* error) {
+    auto scratchBytes = workspace.View<std::uint8_t>(input.memory.scratch);
+    scratchBytes.resize(scratchBytes.capacity());
+    ArrayWorkspace scratch(scratchBytes.Span());
     const auto block = numericarray::MakeParsedBlockView(input);
     output.header = input.header;
-    output.bytes = worker.Scratch().Acquire(0u);
+    output.bytes = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.raw));
     auto& decodedBlockBytes = output.bytes.Bytes();
     auto* capacitySamples = output.capacitySamples ? &*output.capacitySamples : nullptr;
     if (capacitySamples != nullptr) {
@@ -916,7 +702,7 @@ inline bool ComputeAttributeDecodedBlock(
     auto* workBreakdown = collectTiming ? &output.work : nullptr;
     if (UsesNonReferenceCodec(block)) {
         const auto decodeStart = callback::StartTiming(workBreakdown != nullptr);
-        if (!ResolveDecodedBlockBytes(meta, block, decodedBlockBytes, error, &worker.NumericCompressor(), capacitySamples)) {
+        if (!ResolveDecodedBlockBytes(meta, block, decodedBlockBytes, error, &worker.NumericCompressor(), capacitySamples, &scratch)) {
             return false;
         }
         if (workBreakdown != nullptr) {
@@ -926,40 +712,37 @@ inline bool ComputeAttributeDecodedBlock(
                 static_cast<ParamSize>(decodedBlockBytes.size()));
         }
     } else {
-        const ScratchByteBuffer* referenceBytes = nullptr;
-        ScratchByteBuffer intraReferenceBytes;
-        ScratchByteBuffer resampledReferenceBytes;
-        ScratchByteBuffer shiftedPredictorBlockBytes;
-        std::size_t referenceElementOffset = 0u;
         const auto referenceResolveStart = callback::StartTiming(workBreakdown != nullptr);
-        if (block.header.referenceKind == NumericArrayReferenceKind::IntraArray) {
-            const auto parentIndex = static_cast<std::size_t>(block.header.localParentFieldIndex);
-            if (parentIndex >= storageParams.attrParams.size() || !attributes.Complete(parentIndex)) {
-                return validation::AssignError(error, "attribute intra-field parent is not decoded");
+        const auto referenceRangeResolveStart = referenceResolveStart;
+        std::size_t referenceIndex = block.header.localParentFieldIndex;
+        const DecodedAttributeCacheSet* referenceStore = &attributes;
+        const CodecStorageParams* referenceStorage = &storageParams;
+        if (block.header.referenceKind == NumericArrayReferenceKind::TemporalKeyFrame) {
+            if (!attributeKeyFrameReference || !attributeKeyFrameReference->store ||
+                !TryFindReferenceAttrIndex(attributeKeyFrameReference->reference.storageParams, meta, referenceIndex)) {
+                return validation::AssignError(error, "temporal attribute reference is unavailable");
             }
+            referenceStore = attributeKeyFrameReference->store.get();
+            referenceStorage = &attributeKeyFrameReference->reference.storageParams;
         }
+        if (referenceIndex >= referenceStorage->attrParams.size() || !referenceStore->Complete(referenceIndex)) {
+            return validation::AssignError(error, "attribute reference must be complete before admission");
+        }
+        const auto& referenceMeta = referenceStorage->attrParams[referenceIndex];
+        numericarray::NumericArraySource referenceSource;
+        numericarray::NumericArrayReader referenceReader;
+        auto preparedReference = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.reference));
+        if (!BuildDecodedAttributeCacheNumericArraySource(*referenceStore, referenceIndex, referenceMeta, referenceSource, error) ||
+            !numericarray::BuildNumericArrayReader(referenceSource, referenceReader, error) ||
+            !PrepareDecodeReference(referenceReader, referenceMeta, meta, block.header,
+                preparedReference.Bytes(), scratch, error)) { return false; }
+        const auto* referenceBytes = &preparedReference;
+        const std::size_t referenceElementOffset = 0u;
         AttributeReferenceRangeObservation rangeObservation;
-        const auto referenceRangeResolveStart = callback::StartTiming(workBreakdown != nullptr);
-        if (!ResolveReferenceBytesForBlock(
-                storageParams,
-                attributes,
-                block,
-                meta,
-                attributeKeyFrameReference,
-                worker.Scratch(),
-                referenceBytes,
-                intraReferenceBytes,
-                resampledReferenceBytes,
-                shiftedPredictorBlockBytes,
-                referenceElementOffset,
-                &rangeObservation,
-                error)) {
-            return false;
-        }
+        ObserveAttributeReferenceRange(block.header.referenceKind, block.header.codecId,
+            referenceMeta, meta, block, preparedReference, &rangeObservation);
         if (capacitySamples != nullptr) {
-            capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, intraReferenceBytes.Bytes());
-            capacitySamples->Observe(numericarray::NumericBufferSample::ReferenceResampled, resampledReferenceBytes.Bytes());
-            capacitySamples->Observe(numericarray::NumericBufferSample::ReferenceShifted, shiftedPredictorBlockBytes.Bytes());
+            capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, preparedReference.Bytes());
         }
         if (workBreakdown != nullptr) {
             workBreakdown->referenceResolveMs += callback::ElapsedMilliseconds(referenceResolveStart);
@@ -986,6 +769,7 @@ inline bool ComputeAttributeDecodedBlock(
                     .telemetry = workBreakdown != nullptr ? &codecTelemetry : nullptr,
                     .compressorState = &worker.NumericCompressor(),
                     .capacitySamples = capacitySamples,
+                    .workspace = &scratch,
                 },
                 decodedBlockBytes,
                 error)) {
@@ -1083,19 +867,20 @@ inline bool DecodeSingleAttributeRangeToCache(
     if (params.elementCount == 0u) { return attributes.EndAttribute(payloadRange.attrIndex, error); }
     ParamSize committed = 0u;
     phase.reset();
+    numericarray::NumericDecodeMemoryLayout nextMemory;
     return RunOrderedBlocks<numericarray::NumericArrayBlockPayload, AttributeDecodedBlock>(
         root, [&] { return cursor.HasMore(); },
-        [&](numericarray::NumericArrayBlockPayload& input) {
+        [&](numericarray::NumericArrayBlockPayload& input, const SlotLease&, DecodeBlockWorkspace& workspace) {
             const auto start = callback::StartTiming(workBreakdown != nullptr);
-            if (!cursor.ReadNext(input, error)) { return false; }
+            if (!cursor.ReadNext(input, nextMemory, workspace, error)) { return false; }
             if (workBreakdown != nullptr) { workBreakdown->payloadBlockReadMs += callback::ElapsedMilliseconds(start); }
             return true;
         },
-        [&](const numericarray::NumericArrayBlockPayload& input, AttributeDecodedBlock& output, WorkerContext& worker) {
+        [&](const numericarray::NumericArrayBlockPayload& input, AttributeDecodedBlock& output, WorkerContext& worker, DecodeBlockWorkspace& workspace) {
             std::string localError;
             if (recordCapacitySamples) { output.capacitySamples.emplace(); }
             if (!ComputeAttributeDecodedBlock(storageParams, meta, attributes, attributeKeyFrameReference,
-                    input, output, worker, workBreakdown != nullptr, &localError)) {
+                    input, output, worker, workspace, workBreakdown != nullptr, &localError)) {
                 root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "attribute-block-decode", "ComputeAttributeDecodedBlock", localError));
                 return false;
@@ -1126,7 +911,22 @@ inline bool DecodeSingleAttributeRangeToCache(
                 return validation::AssignError(error, "attribute decode consumed an unexpected payload size");
             }
             return attributes.EndAttribute(payloadRange.attrIndex, error);
-        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::AttributeDecode); });
+        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::AttributeDecode); }, [&] {
+            const auto& layout = meta.blockLayouts[cursor.nextBlock];
+            const AttrStorageParams* referenceMeta = nullptr;
+            if (layout.referenceKind == NumericArrayReferenceKind::IntraArray) {
+                referenceMeta = &storageParams.attrParams.at(layout.localParentFieldIndex);
+            } else if (layout.referenceKind == NumericArrayReferenceKind::TemporalKeyFrame) {
+                std::size_t index = 0u;
+                if (!attributeKeyFrameReference ||
+                    !TryFindReferenceAttrIndex(attributeKeyFrameReference->reference.storageParams, meta, index)) {
+                    throw std::invalid_argument("attribute memory plan reference is unavailable");
+                }
+                referenceMeta = &attributeKeyFrameReference->reference.storageParams.attrParams[index];
+            }
+            nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, layout, referenceMeta, false);
+            return nextMemory;
+        });
 }
 
 template<typename TPayloadBacking, typename TReferenceDecoder>
@@ -1168,47 +968,14 @@ inline bool DecodeAttributePayloadRangesToCache(
         hasRange[range.attrIndex] = 1u;
     }
 
-    std::vector<std::vector<std::size_t>> parentsByAttr(attrCount);
     for (std::size_t attrIndex = 0; attrIndex < attrCount; ++attrIndex) {
         if (hasRange[attrIndex] == 0u) {
             return validation::AssignError(error, "attribute payload range is missing");
         }
-        if (!ResolveAttributeIntraParents(storageParams, attrIndex, parentsByAttr[attrIndex], error)) {
-            return false;
-        }
     }
 
     std::vector<std::size_t> executionOrder;
-    executionOrder.reserve(attrCount);
-    std::vector<std::uint8_t> required(attrCount, 0u);
-    std::vector<std::uint8_t> visiting(attrCount, 0u);
-    std::function<bool(std::size_t)> requireAttribute;
-    requireAttribute = [&](const std::size_t attrIndex) {
-        if (attrIndex >= attrCount) {
-            return validation::AssignError(error, "attribute target index is out of range");
-        }
-        if (required[attrIndex] != 0u) {
-            return true;
-        }
-        if (visiting[attrIndex] != 0u) {
-            return validation::AssignError(error, "attribute dependency graph contains a cycle");
-        }
-        visiting[attrIndex] = 1u;
-        for (const auto parentIndex : parentsByAttr[attrIndex]) {
-            if (!requireAttribute(parentIndex)) {
-                return false;
-            }
-        }
-        visiting[attrIndex] = 0u;
-        required[attrIndex] = 1u;
-        executionOrder.push_back(attrIndex);
-        return true;
-    };
-    for (const auto attrIndex : targetAttrIndices) {
-        if (!requireAttribute(attrIndex)) {
-            return false;
-        }
-    }
+    if (!ResolveAttributeExecutionOrder(storageParams, targetAttrIndices, executionOrder, error)) { return false; }
 
     const bool collectTiming = static_cast<bool>(timingCallback);
     for (const auto attrIndex : executionOrder) {

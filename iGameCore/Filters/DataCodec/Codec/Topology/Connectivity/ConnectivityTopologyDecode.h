@@ -101,10 +101,10 @@ inline bool DecodeConnectivityTopologyBlock(
     const std::size_t connectivityCount,
     const int fixedCellSize,
     const bool hasCellTypes,
-    ConnectivityDecodedBlock& output,
+    auto& output,
     std::string* error = nullptr,
     const ConnectivityTopologyDecodeTimingCallback& timingCallback = {},
-    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
+    TopologyBlockCapacitySamples* capacitySamples = nullptr, ArrayWorkspace* workspace = nullptr) {
     const auto& metadata = encoded.Metadata();
     const auto inputStart = callback::StartTiming(timingCallback);
     ConnectivityEncodedStreamView connectivityStream;
@@ -156,8 +156,9 @@ inline bool DecodeConnectivityTopologyBlock(
     const auto auxiliaryStart = callback::StartTiming(timingCallback);
     const bool hasOffsets = fixedCellSize <= 0;
     const bool hasCellPolynomialOrders = metadata.cellPolynomialOrderByteCount != 0u;
-    output = {};
-    std::vector<IndexType> cellSizes;
+    output.connectivity.clear(); output.offsets.clear(); output.cellTypes.clear(); output.polynomialOrders.clear();
+    ArrayWorkspace::Scope blockScope(workspace);
+    WorkingArray<IndexType> cellSizes(workspace, hasOffsets ? cellCount : 0u);
     auto& offsets = output.offsets;
     if (hasOffsets) {
         if (!blockcodec::DecodeUnsignedSequence<IndexType>(
@@ -216,7 +217,7 @@ inline bool DecodeConnectivityTopologyBlock(
             connectivityCount,
             fixedCellSize,
             connectivity,
-            error, capacitySamples)) {
+            error, capacitySamples, workspace)) {
         return false;
     }
     RecordConnectivityTopologyDecodeTiming(

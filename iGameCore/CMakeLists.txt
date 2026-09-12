@@ -22,6 +22,9 @@ igame_check_datacodec_dependencies(${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec
 file(GLOB_RECURSE IGAME_CORE_FILE CONFIGURE_DEPENDS ./*.h ./*.cpp)
 set(IGAME_DATACODEC_TEST_RUNNER_SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecTestMain.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecStorageAnalysisTests.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecEncodeStorageAnalysisTests.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecCpuControlTests.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecTestAllocation.cpp")
 list(FILTER IGAME_CORE_FILE EXCLUDE REGEX
         "Filters/DataCodec/Test/Runner/[^/]+\\.cpp$")
@@ -38,6 +41,10 @@ if (UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
     if (OpenMP_CXX_FOUND)
         target_link_libraries(${MODULE_NAME} PUBLIC OpenMP::OpenMP_CXX)
     endif ()
+endif ()
+
+if (WIN32)
+    target_link_libraries(${MODULE_NAME} PRIVATE pdh)
 endif ()
 
 # add rendering core
@@ -112,6 +119,10 @@ if (IGAME_DATACODEC_BUILD_TESTS)
     add_executable(iGameDataCodecTests ${IGAME_DATACODEC_TEST_RUNNER_SOURCE})
     target_link_libraries(iGameDataCodecTests PRIVATE ${MODULE_NAME})
     add_test(NAME DataCodec.All COMMAND iGameDataCodecTests)
+    add_test(NAME DataCodec.StorageAnalysis COMMAND iGameDataCodecTests --storage-analysis)
+    add_test(NAME DataCodec.EncodeStorageAnalysis COMMAND iGameDataCodecTests --encode-storage-analysis)
+    set_tests_properties(DataCodec.EncodeStorageAnalysis PROPERTIES TIMEOUT 60)
+    set_tests_properties(DataCodec.StorageAnalysis PROPERTIES TIMEOUT 180)
     add_test(NAME DataCodec.FailureContract COMMAND iGameDataCodecTests --failure-contract)
     add_test(NAME DataCodec.StorageOwnership COMMAND iGameDataCodecTests --storage-ownership)
     add_test(NAME DataCodec.MortonResources COMMAND iGameDataCodecTests --morton-resources)
@@ -125,6 +136,8 @@ if (IGAME_DATACODEC_BUILD_TESTS)
     add_test(NAME DataCodec.TaskCoordinator COMMAND iGameDataCodecTests --task-coordinator)
     add_test(NAME DataCodec.ExecutionMechanism COMMAND iGameDataCodecTests --execution-mechanism)
     add_test(NAME DataCodec.ResourceModes COMMAND iGameDataCodecTests --resource-mode-contract)
+    add_test(NAME DataCodec.CpuControl COMMAND iGameDataCodecTests --cpu-control)
+    set_tests_properties(DataCodec.CpuControl PROPERTIES TIMEOUT 60)
     set_tests_properties(DataCodec.ResourceModes PROPERTIES TIMEOUT 120)
     set_tests_properties(DataCodec.TaskCoordinator PROPERTIES TIMEOUT 30)
     set_tests_properties(DataCodec.ExecutionMechanism PROPERTIES TIMEOUT 30)

@@ -4,6 +4,7 @@
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
+#include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,26 +13,6 @@
 #include <string>
 #include <utility>
 namespace datacodec {
-
-inline bool CalculateGeometryCacheBytes(
-    const std::size_t count,
-    const std::size_t dimension,
-    std::uint64_t& byteCount,
-    std::string* error = nullptr) {
-    std::uint64_t valueCount = 0u;
-    return validation::CheckedMulU64(
-               static_cast<std::uint64_t>(count),
-               static_cast<std::uint64_t>(dimension),
-               valueCount,
-               "decoded geometry value count",
-               error) &&
-        validation::CheckedMulU64(
-            valueCount,
-            static_cast<std::uint64_t>(sizeof(float)),
-            byteCount,
-            "decoded geometry cache bytes",
-            error);
-}
 
 struct DecodedGeometryCache {
     DecodedGeometryCache() = default;
@@ -69,7 +50,7 @@ struct DecodedGeometryCache {
         }
         bytes = byteStoreSession.CreateSizedStore(
             bytestore::ByteStorePurpose::Ranged,
-            byteCount,
+            byteCount, ::datacodec::MemoryDemandKind::RequiredContinuation,
             "decoded_geometry",
             error);
         if (bytes == nullptr) {
@@ -163,12 +144,11 @@ public:
             return validation::AssignError(error, "decoded geometry reference tuple size is invalid");
         }
         std::uint64_t totalBytes = 0u;
-        if (!validation::CheckedMulU64(localElementCount, tupleBytes, totalBytes,
-                "decoded geometry reference bytes", error)) {
+        if (!CalculateDecodedNumericStorageBytes(storageParams, totalBytes, error)) {
             return false;
         }
         auto bytes = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-            totalBytes, "decoded_geometry_reference", error);
+            totalBytes, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_geometry_reference", error);
         if (bytes == nullptr) {
             return false;
         }

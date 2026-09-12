@@ -137,7 +137,7 @@ int main() {
             Config{"fixed_1", {CodecResourceMode::Fixed, 1u, storageBytes}},
             Config{"fixed_2", {CodecResourceMode::Fixed, 2u, storageBytes}},
             Config{"fixed_4", {CodecResourceMode::Fixed, 4u, storageBytes}},
-            Config{"adaptive_4", {CodecResourceMode::Adaptive, 4u, storageBytes}},
+            Config{"adaptive_4", {CodecResourceMode::Adaptive, 4u}},
         };
         std::array<std::vector<double>, 4u> times;
         std::array<std::size_t, 4u> failures{};

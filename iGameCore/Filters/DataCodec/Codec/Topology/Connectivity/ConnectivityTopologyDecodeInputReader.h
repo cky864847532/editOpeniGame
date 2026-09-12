@@ -2,6 +2,7 @@
 #define DATACODEC_CODEC_TOPOLOGY_CONNECTIVITY_CONNECTIVITYTOPOLOGYDECODEINPUTREADER_H
 
 #include "DataCodec/Runtime/Cache/CacheResources.h"
+#include "DataCodec/Codec/Topology/Connectivity/ConnectivityDecodeMemoryPlan.h"
 #include "DataCodec/Codec/Topology/Connectivity/ConnectivityTopologyTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include <algorithm>
@@ -27,7 +28,8 @@ public:
 
     template<typename TStream>
     bool LoadFrom(TStream& stream, const ConnectivityTopologyEncodedMetadata& metadata,
-        const CacheResources& runtime, std::string* error = nullptr) {
+        const CacheResources& runtime, DecodeBlockWorkspace& workspace,
+        const ConnectivityDecodeMemoryLayout& memory, std::string* error = nullptr) {
         m_metadata = metadata;
         const std::array<std::uint64_t, 4> sizes{metadata.connectivityByteCount, metadata.cellSizeByteCount,
             metadata.cellPolynomialOrderByteCount, metadata.cellTypeByteCount};
@@ -40,6 +42,7 @@ public:
         }
         for (std::size_t i = 0u; i < sizes.size(); ++i) {
             auto& bytes = m_streams[i];
+            bytes = workspace.View<std::uint8_t>(memory.input[i]);
             bytes.resize(static_cast<std::size_t>(sizes[i]));
             for (std::size_t offset = 0u; offset < bytes.size();) {
                 if (runtime.Run().Stopped()) { return false; }
@@ -96,7 +99,7 @@ public:
 
 private:
     ConnectivityTopologyEncodedMetadata m_metadata{};
-    std::array<std::vector<std::uint8_t>, 4> m_streams;
+    std::array<FixedArrayView<std::uint8_t>, 4> m_streams;
 };
 
 } // 拓扑编解码命名空间

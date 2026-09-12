@@ -282,7 +282,8 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecFile(
     const iGameWasmTopologyOutputMode topologyOutputMode,
     const std::optional<bool> enableEncodedInputCache,
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink,
-    ::datacodec::DecodeSourceIdentity sourceIdentity) {
+    ::datacodec::DecodeSourceIdentity sourceIdentity,
+    ::datacodec::CodecResourceParams resources) {
     if (filePath.empty()) {
         iGameWasmDataCodecDecodeResult result;
         SetWasmDecodeError(
@@ -298,6 +299,7 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecFile(
         .enableReuseCache = enableReuseCache,
         .enableEncodedInputCache = enableEncodedInputCache,
         .topologyOutputMode = topologyOutputMode,
+        .resources = resources,
         .runRecordSink = std::move(runRecordSink),
     });
 }
@@ -307,7 +309,8 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecMemory(
     const std::span<const std::uint8_t> bytes,
     const bool enableReuseCache,
     const iGameWasmTopologyOutputMode topologyOutputMode,
-    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink) {
+    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink,
+    ::datacodec::CodecResourceParams resources) {
     if (inputOwner == nullptr || bytes.empty()) {
         iGameWasmDataCodecDecodeResult result;
         SetWasmDecodeError(
@@ -320,6 +323,7 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecMemory(
         .inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(std::move(inputOwner), bytes),
         .enableReuseCache = enableReuseCache,
         .topologyOutputMode = topologyOutputMode,
+        .resources = resources,
         .runRecordSink = std::move(runRecordSink),
     });
 }
@@ -330,7 +334,8 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmBrowserFile(
     const bool enableReuseCache,
     const iGameWasmTopologyOutputMode topologyOutputMode,
     const std::optional<bool> enableEncodedInputCache,
-    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink) {
+    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink,
+    ::datacodec::CodecResourceParams resources) {
     std::string readerError;
     auto reader = ::datacodec::wasm::CreateWasmBrowserFileByteRangeReader(
         browserFileId,
@@ -349,6 +354,7 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmBrowserFile(
         .enableReuseCache = enableReuseCache,
         .enableEncodedInputCache = enableEncodedInputCache,
         .topologyOutputMode = topologyOutputMode,
+        .resources = resources,
         .runRecordSink = std::move(runRecordSink),
     });
 }

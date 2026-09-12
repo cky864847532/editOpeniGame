@@ -1,4 +1,7 @@
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
+#include "DataCodec/API/Entry/EncodeStorageAnalysis.h"
+#include "DataCodec/Workflow/Encode/EncodeStoragePlan.h"
+#include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 #include "DataCodec/Workflow/Session/CodecRunEntry.h"
 #include "DataCodec/Runtime/Output/DataCodecOutputRouter.h"
 #include "DataCodec/Runtime/Record/RunRecordDispatcher.h"
@@ -172,6 +175,53 @@ EncodeResult MakeFrameEncodeResult(
 
 } // 匿名命名空间
 
+EncodeStorageAnalysisResult AnalyzeEncodeStorage(const EncodeRequest& request, const std::stop_token stop) {
+    EncodeStorageAnalysisResult result;
+    const auto fail = [&](const std::string& error) {
+        result.success = false;
+        result.cancelled = stop.stop_requested();
+        result.provenLowerBoundBytes.reset();
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::InvalidInput,
+            result.cancelled ? "encode.storage-analysis.cancelled" : "encode.storage-analysis",
+            "EncodeStorageAnalysis", result.cancelled ? "encode storage analysis cancelled" : error, result.cancelled);
+        return result;
+    };
+    try {
+        if (stop.stop_requested()) { return fail({}); }
+        const auto leafEntry = std::get_if<IEncodeAdapter*>(&request.input.adapter);
+        const auto treeEntry = std::get_if<IBlockTreeAdapter*>(&request.input.adapter);
+        auto* leaf = leafEntry ? *leafEntry : nullptr;
+        auto* tree = treeEntry ? *treeEntry : nullptr;
+        if ((!leaf && !tree) || (request.output.packageKind == EncodePackageKind::LeafPackage && !leaf) ||
+            (request.output.packageKind == EncodePackageKind::FramePackage && !tree)) {
+            return fail("encode storage analysis requires a compatible input adapter and package kind");
+        }
+        std::string error;
+        std::vector<AttributeTarget> targets;
+        if (!ResolveEncodeAttributeTargets(request, leaf, tree, targets, error)) { return fail(error); }
+        result.success = true;
+        result.provenLowerBoundBytes = 0u;
+        const auto analyze = [&](const IEncodeAdapter& adapter, const BlockPath& path) {
+            return encodestorage::AnalyzeLeaf(adapter, request.configuration.controlParams,
+                request.configuration.pipelineControl, targets, request.input.frameIndex, path, true,
+                TemporalFieldRole::SingleFrame, stop);
+        };
+        if (leaf) { return analyze(*leaf, request.input.leafPath); }
+        for (const auto& record : tree->GetLeafRecords()) {
+            if (stop.stop_requested()) { return fail({}); }
+            auto adapter = tree->GetLeaf(record.path);
+            if (!adapter) { return fail("block tree adapter failed to create a leaf for storage analysis"); }
+            encodestorage::Merge(result, analyze(*adapter, record.path));
+            if (!result.success) { return result; }
+        }
+        return result;
+    } catch (const std::exception& exception) {
+        return fail(exception.what());
+    } catch (...) {
+        return fail("unknown encode storage analysis exception");
+    }
+}
+
 EncodeResult EncodeInRun(const EncodeRequest& request, DataCodecExecutionResources& resources) try {
     const auto packageKind = request.output.packageKind;
     const auto outputSinkEntry = std::get_if<IByteRangeOutput*>(&request.output.target);
@@ -272,7 +322,16 @@ EncodeResult Encode(const EncodeRequest& request) try {
     if ((leaf == nullptr || *leaf == nullptr) && (tree == nullptr || *tree == nullptr)) {
         return MakeEncodeEntryFailure(CodecErrorCode::InvalidInput, "encode.request.contract", "encode input is unavailable");
     }
-    DataCodecExecutionResources resources(request.resources);
+    const auto configuration = ResolveResourceConfiguration(request.resources, ProbeResources());
+    if (request.resources.mode == CodecResourceMode::Fixed) {
+        const auto analysis = AnalyzeEncodeStorage(request);
+        if (auto failure = CheckEncodeStorageLowerBound(analysis, configuration.initialLimits.ownedStorageLimitBytes)) {
+            EncodeResult result;
+            result.failure = std::move(failure);
+            return result;
+        }
+    }
+    DataCodecExecutionResources resources(configuration);
     if (!resources.BeginRun()) {
         EncodeResult result;
         result.failure = resources.FirstFailure();

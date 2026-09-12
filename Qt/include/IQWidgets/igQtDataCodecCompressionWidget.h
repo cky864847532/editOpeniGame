@@ -19,6 +19,7 @@
 
 namespace datacodec {
 struct CodecResourceParams;
+struct DataCodecEncodeOptions;
 struct CodecControlParams;
 struct CompressorConfig;
 }
@@ -236,6 +237,7 @@ private:
     void refreshPerformanceControls();
     void persistPerformanceSettings() const;
     [[nodiscard]] ::datacodec::CodecResourceParams selectedResources() const;
+    [[nodiscard]] ::datacodec::DataCodecEncodeOptions selectedEncodeOptions() const;
     bool hasNumericFields() const;
     bool hasSelectedFields() const;
     std::vector<::datacodec::AttributeTarget> selectedAttributeTargets() const;

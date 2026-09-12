@@ -233,10 +233,10 @@ inline bool BuildWaveletDeltaScratchTyped(
     return true;
 }
 
-inline bool ReadBlobWithLength(
+inline bool ReadBlobViewWithLength(
     const std::span<const std::uint8_t> input,
     std::size_t& cursor,
-    std::vector<std::uint8_t>& bytes,
+    std::span<const std::uint8_t>& bytes,
     std::string* error = nullptr) {
     std::uint64_t size = 0u;
     if (!detail::ReadScalar(input, cursor, size, error)) {
@@ -249,10 +249,7 @@ inline bool ReadBlobWithLength(
     if (cursor > input.size() || localSize > input.size() - cursor) {
         return validation::AssignError(error, "unexpected end of bytes while reading wavelet blob");
     }
-    bytes.resize(localSize);
-    if (localSize > 0u) {
-        std::memcpy(bytes.data(), input.data() + cursor, localSize);
-    }
+    bytes = input.subspan(cursor, localSize);
     if (!validation::CheckedAddSizeT(cursor, localSize, cursor, "wavelet blob cursor", error)) {
         return false;
     }
@@ -295,11 +292,11 @@ inline bool CompressWaveletScalars(
 }
 
 inline bool DecompressWaveletScalars(
-    const std::vector<std::uint8_t>& blobBytes,
+    const std::span<const std::uint8_t> blobBytes,
     const std::size_t elementCount,
     const std::size_t valueSize,
     const CompressorConfig& compressor,
-    std::vector<double>& values,
+    MutableArray<double> values,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     values.clear();
     if (elementCount == 0u) {
@@ -332,11 +329,10 @@ inline bool DecompressWaveletScalars(
         if (bytes.size() != expectedBytes) {
             return validation::AssignError(error, "wavelet raw blob size mismatch");
         }
-        std::vector<double> buffer(elementCount, 0.0);
+        values.resize(elementCount);
         if (!bytes.empty()) {
-            std::memcpy(buffer.data(), bytes.data(), bytes.size());
+            std::memcpy(values.data(), bytes.data(), bytes.size());
         }
-        values = std::move(buffer);
         return true;
     }
 
@@ -346,16 +342,15 @@ inline bool DecompressWaveletScalars(
 
     const auto layout = MakeWaveletNumericArrayLayout(sizeof(double), elementCount, 1);
 
-    std::vector<double> buffer(elementCount, 0.0);
+    values.resize(elementCount);
     if (!numericarray::NumericArrayDecode::Decompress(
             bytes,
             layout,
             compressor,
-            numericarray::MutableNumericArrayBufferView{buffer.data(), layout},
+            numericarray::MutableNumericArrayBufferView{values.data(), layout},
             error, compressorState)) {
         return false;
     }
-    values = std::move(buffer);
     return true;
 }
 
@@ -587,15 +582,14 @@ inline bool ReadIntegerWaveletResidualBlobWithLength(
     std::size_t& cursor,
     const std::size_t expectedCount,
     const std::size_t valueSize,
-    std::vector<std::uint64_t>& residuals,
+    MutableArray<std::uint64_t> residuals,
     std::string* error = nullptr,
     numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
     const numericarray::NumericBufferSample payloadKind = numericarray::NumericBufferSample::WaveletLowBlob) {
-    std::vector<std::uint8_t> payload;
-    if (!ReadBlobWithLength(input, cursor, payload, error)) {
+    std::span<const std::uint8_t> payload;
+    if (!ReadBlobViewWithLength(input, cursor, payload, error)) {
         return false;
     }
-    if (capacitySamples != nullptr) { capacitySamples->Observe(payloadKind, payload); }
     return numericarray::DecodeIntegerResidualLiteralRunVarint(
         std::span<const std::uint8_t>(payload.data(), payload.size()),
         expectedCount,
@@ -754,9 +748,10 @@ inline bool DecodeIntegerWaveletDeltaBlockBytes(
     const DataType dataType,
     const std::size_t valueSize,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedBlockBytes,
+    MutableArray<std::uint8_t> decodedBlockBytes,
     std::string* error = nullptr,
-    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
+    ArrayWorkspace* workspace = nullptr) {
     decodedBlockBytes.clear();
     if (!ValidateIntegerWaveletDataTypeSize(dataType, valueSize, error)) {
         return false;
@@ -800,96 +795,48 @@ inline bool DecodeIntegerWaveletDeltaBlockBytes(
     std::size_t cursor = 0u;
     const auto pairCount = static_cast<std::size_t>(elementCount) / 2u;
     for (std::size_t componentIndex = 0u; componentIndex < componentCount; ++componentIndex) {
-        IntegerHaarLevel1Decomposition referenceWavelet;
-        if (!BuildIntegerWaveletComponent(
-                referenceBytes,
-                referenceOffset,
-                elementCount,
-                componentCount,
-                componentIndex,
-                dataType,
-                valueSize,
-                referenceWavelet,
-                error)) {
-            decodedBlockBytes.clear();
+        ArrayWorkspace::Scope componentScope(workspace);
+        WorkingArray<std::uint64_t> lowResiduals(workspace, pairCount);
+        WorkingArray<std::uint64_t> highResiduals(workspace, pairCount);
+        if (!ReadIntegerWaveletResidualBlobWithLength(bytes, cursor, pairCount, valueSize, lowResiduals, error) ||
+            !ReadIntegerWaveletResidualBlobWithLength(bytes, cursor, pairCount, valueSize, highResiduals, error)) {
             return false;
         }
-
-        std::vector<std::uint64_t> lowResiduals;
-        std::vector<std::uint64_t> highResiduals;
-        std::vector<std::uint64_t> low;
-        std::vector<std::uint64_t> high;
-        if (!ReadIntegerWaveletResidualBlobWithLength(
-                bytes,
-                cursor,
-                referenceWavelet.low.size(),
-                valueSize,
-                lowResiduals,
-                error, capacitySamples, numericarray::NumericBufferSample::WaveletLowBlob) ||
-            !ApplyIntegerWaveletResiduals(
-                std::span<const std::uint64_t>(referenceWavelet.low.data(), referenceWavelet.low.size()),
-                std::span<const std::uint64_t>(lowResiduals.data(), lowResiduals.size()),
-                valueSize,
-                low,
-                error) ||
-            !ReadIntegerWaveletResidualBlobWithLength(
-                bytes,
-                cursor,
-                referenceWavelet.high.size(),
-                valueSize,
-                highResiduals,
-                error, capacitySamples, numericarray::NumericBufferSample::WaveletHighBlob) ||
-            !ApplyIntegerWaveletResiduals(
-                std::span<const std::uint64_t>(referenceWavelet.high.data(), referenceWavelet.high.size()),
-                std::span<const std::uint64_t>(highResiduals.data(), highResiduals.size()),
-                valueSize,
-                high,
-                error)) {
-            decodedBlockBytes.clear();
-            return false;
-        }
-
-        if (capacitySamples != nullptr) {
-            using Sample = numericarray::NumericBufferSample;
-            capacitySamples->Observe(Sample::WaveletReferenceLow, referenceWavelet.low);
-            capacitySamples->Observe(Sample::WaveletReferenceHigh, referenceWavelet.high);
-            capacitySamples->Observe(Sample::WaveletLowDelta, lowResiduals);
-            capacitySamples->Observe(Sample::WaveletHighDelta, highResiduals);
-            capacitySamples->Observe(Sample::WaveletLow, low);
-            capacitySamples->Observe(Sample::WaveletHigh, high);
-        }
-        auto writeCode = [&](const std::size_t localElementIndex, const std::uint64_t code) {
-            const auto rawValue = numericarray::FromIntegerOrderCode(dataType, code, valueSize);
-            numericarray::WriteIntegerStorageValue(
-                rawValue,
-                decodedBlockBytes.data() + localElementIndex * tupleBytes + componentIndex * valueSize,
-                valueSize);
+        const auto readCode = [&](std::size_t index) {
+            return numericarray::ToIntegerOrderCode(dataType, numericarray::ReadIntegerStorageValue(
+                referenceBytes.data() + (referenceElementOffset + index) * tupleBytes + componentIndex * valueSize,
+                valueSize), valueSize);
         };
-        for (std::size_t pairIndex = 0u; pairIndex < pairCount; ++pairIndex) {
-            const auto half = numericarray::SignedModuloFloorHalf(high[pairIndex], valueSize);
-            const auto evenCode = numericarray::AddSignedOffsetModulo(low[pairIndex], -half, valueSize);
-            const auto oddCode = (evenCode + high[pairIndex]) & mask;
-            writeCode(pairIndex * 2u, evenCode);
-            writeCode(pairIndex * 2u + 1u, oddCode);
+        const auto writeCode = [&](std::size_t index, std::uint64_t code) {
+            numericarray::WriteIntegerStorageValue(numericarray::FromIntegerOrderCode(dataType, code, valueSize),
+                decodedBlockBytes.data() + index * tupleBytes + componentIndex * valueSize, valueSize);
+        };
+        for (std::size_t i = 0u; i < pairCount; ++i) {
+            const auto even = readCode(2u * i), odd = readCode(2u * i + 1u);
+            const auto referenceHigh = (odd - even) & mask;
+            const auto referenceLow = numericarray::AddSignedOffsetModulo(even,
+                numericarray::SignedModuloFloorHalf(referenceHigh, valueSize), valueSize);
+            std::uint64_t lowDelta = 0u, highDelta = 0u;
+            if (!numericarray::ZigZagToSignedModulo(lowResiduals[i], valueSize, lowDelta, error) ||
+                !numericarray::ZigZagToSignedModulo(highResiduals[i], valueSize, highDelta, error)) { return false; }
+            const auto low = (referenceLow + lowDelta) & mask;
+            const auto high = (referenceHigh + highDelta) & mask;
+            const auto currentEven = numericarray::AddSignedOffsetModulo(low,
+                -numericarray::SignedModuloFloorHalf(high, valueSize), valueSize);
+            writeCode(2u * i, currentEven);
+            writeCode(2u * i + 1u, (currentEven + high) & mask);
         }
-        if ((elementCount % 2u) != 0u) {
-            std::vector<std::uint64_t> tailResidual;
-            if (!ReadIntegerWaveletResidualBlobWithLength(
-                    bytes,
-                    cursor,
-                    1u,
-                    valueSize,
-                    tailResidual,
-                    error)) {
-                decodedBlockBytes.clear();
-                return false;
-            }
-            std::uint64_t tailDelta = 0u;
-            if (!numericarray::ZigZagToSignedModulo(tailResidual[0], valueSize, tailDelta, error)) {
-                decodedBlockBytes.clear();
-                return false;
-            }
-            writeCode(pairCount * 2u, (referenceWavelet.tail + tailDelta) & mask);
+        if (elementCount % 2u != 0u) {
+            std::uint64_t tailStorage[1]{};
+            FixedArrayView<std::uint64_t> tail{std::span<std::uint64_t>(tailStorage)};
+            if (!ReadIntegerWaveletResidualBlobWithLength(bytes, cursor, 1u, valueSize, tail, error)) { return false; }
+            std::uint64_t delta = 0u;
+            if (!numericarray::ZigZagToSignedModulo(tail[0], valueSize, delta, error)) { return false; }
+            writeCode(pairCount * 2u, (readCode(pairCount * 2u) + delta) & mask);
+        }
+        if (capacitySamples != nullptr) {
+            capacitySamples->Observe(numericarray::NumericBufferSample::WaveletLowDelta, lowResiduals);
+            capacitySamples->Observe(numericarray::NumericBufferSample::WaveletHighDelta, highResiduals);
         }
     }
 
@@ -962,10 +909,11 @@ inline bool DecodeWaveletDeltaBlockBytesTyped(
     const std::size_t componentCount,
     const CompressorConfig& compressor,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedBlockBytes,
+    MutableArray<std::uint8_t> decodedBlockBytes,
     NumericArrayReferenceCodecDecodeTelemetry* telemetry = nullptr,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr,
-    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
+    ArrayWorkspace* workspace = nullptr) {
     decodedBlockBytes.clear();
     if (componentCount == 0u) {
         return validation::AssignError(error, "wavelet delta component count is invalid");
@@ -1020,60 +968,41 @@ inline bool DecodeWaveletDeltaBlockBytesTyped(
         total += added;
     };
     std::size_t cursor = 0u;
-    for (std::size_t componentIndex = 0; componentIndex < componentCount; ++componentIndex) {
-        std::vector<std::uint8_t> lowBlobBytes;
-        std::vector<std::uint8_t> highBlobBytes;
-        if (!ReadBlobWithLength(bytes, cursor, lowBlobBytes, error) ||
-            !ReadBlobWithLength(bytes, cursor, highBlobBytes, error)) {
-            return false;
-        }
+    for (std::size_t componentIndex = 0u; componentIndex < componentCount; ++componentIndex) {
+        ArrayWorkspace::Scope componentScope(workspace);
+        std::span<const std::uint8_t> lowBlobBytes, highBlobBytes;
+        if (!ReadBlobViewWithLength(bytes, cursor, lowBlobBytes, error) ||
+            !ReadBlobViewWithLength(bytes, cursor, highBlobBytes, error)) { return false; }
         if (telemetry != nullptr) {
             addTelemetryBytes(telemetry->waveletLowBlobBytes, lowBlobBytes.size());
             addTelemetryBytes(telemetry->waveletHighBlobBytes, highBlobBytes.size());
         }
-
-        const auto referenceComponent = ExtractBlockComponentAsDoubleTyped(
-            referenceValues,
-            elementCount,
-            componentCount,
-            componentIndex);
-        const auto referenceWavelet = HaarDecomposeLevel1(referenceComponent);
-        std::vector<double> lowDelta;
-        std::vector<double> highDelta;
-        if (!DecompressWaveletScalars(lowBlobBytes, referenceWavelet.low.size(), sizeof(TValue), compressor, lowDelta, error, compressorState) ||
-            !DecompressWaveletScalars(highBlobBytes, referenceWavelet.high.size(), sizeof(TValue), compressor, highDelta, error, compressorState)) {
-            return false;
+        const auto pairs = static_cast<std::size_t>(elementCount) / 2u;
+        WorkingArray<double> lowDelta(workspace, pairs + elementCount % 2u);
+        WorkingArray<double> highDelta(workspace, pairs);
+        if (!DecompressWaveletScalars(lowBlobBytes, pairs + elementCount % 2u, sizeof(TValue),
+                compressor, lowDelta, error, compressorState) ||
+            !DecompressWaveletScalars(highBlobBytes, pairs, sizeof(TValue),
+                compressor, highDelta, error, compressorState)) { return false; }
+        constexpr double inverseSqrtTwo = 0.70710678118654752440;
+        for (std::size_t i = 0u; i < pairs; ++i) {
+            const auto evenIndex = 2u * i * componentCount + componentIndex;
+            const auto oddIndex = evenIndex + componentCount;
+            const auto even = static_cast<double>(referenceValues[evenIndex]);
+            const auto odd = static_cast<double>(referenceValues[oddIndex]);
+            const auto low = (even + odd) * inverseSqrtTwo + lowDelta[i];
+            const auto high = (even - odd) * inverseSqrtTwo + highDelta[i];
+            outputValues[evenIndex] = static_cast<TValue>((low + high) * inverseSqrtTwo);
+            outputValues[oddIndex] = static_cast<TValue>((low - high) * inverseSqrtTwo);
         }
-
-        std::vector<double> low(referenceWavelet.low.size(), 0.0);
-        std::vector<double> high(referenceWavelet.high.size(), 0.0);
-        for (std::size_t index = 0; index < low.size(); ++index) {
-            low[index] = referenceWavelet.low[index] + lowDelta[index];
+        if (elementCount % 2u != 0u) {
+            const auto index = pairs * 2u * componentCount + componentIndex;
+            outputValues[index] = static_cast<TValue>(static_cast<double>(referenceValues[index]) + lowDelta[pairs]);
         }
-        for (std::size_t index = 0; index < high.size(); ++index) {
-            high[index] = referenceWavelet.high[index] + highDelta[index];
-        }
-
-        const auto reconstructed = HaarReconstructLevel1(low, high, elementCount);
         if (capacitySamples != nullptr) {
-            using Sample = numericarray::NumericBufferSample;
-            capacitySamples->Observe(Sample::WaveletLowBlob, lowBlobBytes);
-            capacitySamples->Observe(Sample::WaveletHighBlob, highBlobBytes);
-            capacitySamples->Observe(Sample::WaveletReferenceComponent, referenceComponent);
-            capacitySamples->Observe(Sample::WaveletReferenceLow, referenceWavelet.low);
-            capacitySamples->Observe(Sample::WaveletReferenceHigh, referenceWavelet.high);
-            capacitySamples->Observe(Sample::WaveletLowDelta, lowDelta);
-            capacitySamples->Observe(Sample::WaveletHighDelta, highDelta);
-            capacitySamples->Observe(Sample::WaveletLow, low);
-            capacitySamples->Observe(Sample::WaveletHigh, high);
-            capacitySamples->Observe(Sample::WaveletReconstructed, reconstructed);
+            capacitySamples->Observe(numericarray::NumericBufferSample::WaveletLowDelta, lowDelta);
+            capacitySamples->Observe(numericarray::NumericBufferSample::WaveletHighDelta, highDelta);
         }
-        WriteBlockComponentFromDoubleTyped(
-            outputValues,
-            elementCount,
-            componentCount,
-            componentIndex,
-            reconstructed);
     }
 
     if (cursor != bytes.size()) {
@@ -1093,10 +1022,11 @@ inline bool DecodeWaveletDeltaBlockBytes(
     const std::size_t valueSize,
     const CompressorConfig& compressor,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedBlockBytes,
+    MutableArray<std::uint8_t> decodedBlockBytes,
     NumericArrayReferenceCodecDecodeTelemetry* telemetry = nullptr,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr,
-    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
+    ArrayWorkspace* workspace = nullptr) {
     if (numericarray::IsIntegerNumericArrayDataType(dataType)) {
         return DecodeIntegerWaveletDeltaBlockBytes(
             referenceBytes,
@@ -1107,7 +1037,7 @@ inline bool DecodeWaveletDeltaBlockBytes(
             valueSize,
             bytes,
             decodedBlockBytes,
-            error, capacitySamples);
+            error, capacitySamples, workspace);
     }
     if (dataType == DataType::Float32 && valueSize == sizeof(float)) {
         return DecodeWaveletDeltaBlockBytesTyped<float>(
@@ -1119,7 +1049,7 @@ inline bool DecodeWaveletDeltaBlockBytes(
             bytes,
             decodedBlockBytes,
             telemetry,
-            error, compressorState, capacitySamples);
+            error, compressorState, capacitySamples, workspace);
     }
     if (dataType == DataType::Float64 && valueSize == sizeof(double)) {
         return DecodeWaveletDeltaBlockBytesTyped<double>(
@@ -1131,7 +1061,7 @@ inline bool DecodeWaveletDeltaBlockBytes(
             bytes,
             decodedBlockBytes,
             telemetry,
-            error, compressorState, capacitySamples);
+            error, compressorState, capacitySamples, workspace);
     }
 
     decodedBlockBytes.clear();
@@ -1346,7 +1276,7 @@ public:
 
     [[nodiscard]] bool DecodeBlock(
         const NumericArrayReferenceCodecDecodeInput& input,
-        std::vector<std::uint8_t>& decodedBlockBytes,
+        MutableArray<std::uint8_t> decodedBlockBytes,
         std::string* error = nullptr) const override {
         const auto componentCount = static_cast<std::size_t>(std::max(input.meta.dimension, 0));
         return DecodeWaveletDeltaBlockBytes(
@@ -1360,7 +1290,7 @@ public:
             input.block.bytes,
             decodedBlockBytes,
             input.telemetry,
-            error, input.compressorState, input.capacitySamples);
+            error, input.compressorState, input.capacitySamples, input.workspace);
     }
 };
 

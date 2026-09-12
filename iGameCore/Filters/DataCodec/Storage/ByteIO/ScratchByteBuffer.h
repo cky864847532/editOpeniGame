@@ -10,6 +10,7 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include "DataCodec/Storage/ByteIO/FixedByteBuffer.h"
 
 namespace datacodec {
 
@@ -30,7 +31,10 @@ struct ScratchByteBufferPoolStats {
 namespace scratchdetail {
 
 struct PoolState {
-    explicit PoolState(std::size_t ceiling) : retainedLimit(ceiling) { freeBlocks.reserve(ceiling); }
+    explicit PoolState(std::size_t ceiling) : retainedLimit(ceiling) {
+        freeBlocks.reserve(ceiling);
+        fixedBlocks.reserve(ceiling);
+    }
 
     void Return(std::vector<std::uint8_t> block, std::uint64_t generation) noexcept {
         block.clear();
@@ -49,6 +53,7 @@ struct PoolState {
 
     mutable std::mutex mutex;
     std::vector<std::vector<std::uint8_t>> freeBlocks;
+    std::vector<FixedByteBacking> fixedBlocks;
     std::size_t retainedLimit;
     std::size_t activeBlockCount{0u};
     std::uint64_t acquiredBytes{0u};
@@ -114,6 +119,62 @@ public:
     ScratchByteBufferPool& operator=(const ScratchByteBufferPool&) = delete;
     ~ScratchByteBufferPool() { Close(); }
 
+    // 准入尝试独占取出精确匹配项，调用方失败时归还整组
+    FixedByteBacking TakeFixed(std::size_t bytes) {
+        std::lock_guard lock(m_state->mutex);
+        for (auto it = m_state->fixedBlocks.begin(); it != m_state->fixedBlocks.end(); ++it) {
+            if (it->size != bytes) { continue; }
+            auto result = std::move(*it);
+            m_state->fixedBlocks.erase(it);
+            m_state->retainedBytes -= bytes;
+            ++m_state->reusedBlockCount;
+            return result;
+        }
+        return {};
+    }
+    FixedByteBacking AllocateFixed(resource::ResidentByteBudget& budget,
+                                   resource::ResidentByteBudget::Lease lease) {
+        if (!budget.Owns(lease)) { throw std::logic_error("foreign workspace lease"); }
+        const auto bytes = lease.Bytes();
+        auto array = budget.Allocate(lease);
+        if (bytes != 0u && array == nullptr) { throw std::bad_alloc(); }
+        {
+            std::lock_guard lock(m_state->mutex);
+            ++m_state->allocationCount;
+            m_state->acquiredBytes += bytes;
+        }
+        return {std::move(lease), std::move(array), static_cast<std::size_t>(bytes)};
+    }
+    void ReturnFixed(FixedByteBacking block) noexcept {
+        {
+            std::lock_guard lock(m_state->mutex);
+            if (!m_state->closed && block.size != 0u && block.size <= kMaxRetainedScratchBlockBytes &&
+                m_state->fixedBlocks.size() + m_state->freeBlocks.size() < m_state->retainedLimit &&
+                m_state->fixedBlocks.size() < m_state->fixedBlocks.capacity()) {
+                m_state->retainedBytes += block.size;
+                m_state->fixedBlocks.push_back(std::move(block));
+            }
+        }
+    }
+    void ClearFixed() noexcept {
+        for (;;) {
+            FixedByteBacking retired;
+            {
+                std::lock_guard lock(m_state->mutex);
+                if (m_state->fixedBlocks.empty()) { return; }
+                retired = std::move(m_state->fixedBlocks.back());
+                m_state->fixedBlocks.pop_back();
+                m_state->retainedBytes -= retired.size;
+            }
+        }
+    }
+    std::uint64_t RetainedFixedBytes() const noexcept {
+        std::lock_guard lock(m_state->mutex);
+        std::uint64_t bytes = 0u;
+        for (const auto& block : m_state->fixedBlocks) { bytes += block.size; }
+        return bytes;
+    }
+
     // 发布只修改数量，不析构数组；根在发布目标后于锁外调用 TrimRetained
     void SetRetainedCount(std::size_t count) noexcept {
         std::lock_guard lock(m_state->mutex);
@@ -154,6 +215,7 @@ public:
     }
 
     void TrimRetained() noexcept {
+        ClearFixed();
         for (;;) {
             std::vector<std::uint8_t> retired;
             {
@@ -167,6 +229,7 @@ public:
     }
 
     void Clear() noexcept {
+        ClearFixed();
         {
             std::lock_guard lock(m_state->mutex);
             ++m_state->returnGeneration;
@@ -197,7 +260,7 @@ public:
         return ScratchByteBufferPoolStats{
             .maxRetainedBlockCount = m_state->retainedLimit,
             .activeBlockCount = m_state->activeBlockCount,
-            .retainedBlockCount = m_state->freeBlocks.size(),
+            .retainedBlockCount = m_state->freeBlocks.size() + m_state->fixedBlocks.size(),
             .acquiredBytes = m_state->acquiredBytes,
             .retainedBytes = m_state->retainedBytes,
             .reusedBlockCount = m_state->reusedBlockCount,

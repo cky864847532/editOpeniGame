@@ -2,6 +2,7 @@
 #define DATACODEC_RUNTIME_EXECUTION_PARALLELEXECUTION_H
 
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
+#include "DataCodec/Runtime/Execution/DecodeBlockWorkspace.h"
 
 #include <algorithm>
 #include <deque>
@@ -64,6 +65,7 @@ inline std::optional<HeavyPhaseLease> WaitForHeavyPhase(DataCodecExecutionResour
 template<class Input, class Output>
 struct BlockRecord {
     SlotLease slot;
+    std::unique_ptr<DecodeBlockWorkspace> workspace;
     std::optional<Input> input;
     std::optional<Output> output;
     std::shared_ptr<TerminalWork> work;
@@ -72,6 +74,7 @@ struct BlockRecord {
         work.reset();
         output.reset();
         input.reset();
+        workspace.reset();
         slot.Reset();
     }
 };
@@ -91,14 +94,16 @@ private:
 void RecordExecutionException(DataCodecExecutionResources&, std::string_view origin) noexcept;
 
 template<class Input, class Output, class More, class Read, class Compute, class Commit,
-         class DescribeWork = std::nullptr_t>
+         class DescribeWork = std::nullptr_t, class DescribeMemory = std::nullptr_t>
 bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read,
                       Compute&& compute, Commit&& commit, const bool singleRecord = false,
-                      DescribeWork&& describeWork = nullptr) noexcept {
+                      DescribeWork&& describeWork = nullptr, DescribeMemory&& describeMemory = nullptr) noexcept {
     try {
         std::deque<std::shared_ptr<BlockRecord<Input, Output>>> records;
         std::optional<ResourceWorkType> activeWorkType;
         std::optional<ResourceWorkType> nextWorkType;
+        std::unique_ptr<DecodeBlockWorkspace> nextWorkspace;
+        std::uint64_t nextBytes = 0u;
         RunDrainGuard drain(run);
         try {
         if (!run.BeginFlow(singleRecord)) { return false; }
@@ -122,7 +127,12 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                 auto& record = *records.front();
                 // 最后一块的 End/Seal 由提交函数完成，完成后才归还槽位
                 run.SetWaitReason(ResourceWaitReason::OutputIO, &record.slot);
-                if (!commit(*record.output) || !run.CommitSlot(record.slot)) {
+                const bool committed = [&] {
+                    if constexpr (std::is_invocable_r_v<bool, Commit&, Output&, DecodeBlockWorkspace&>) {
+                        return commit(*record.output, *record.workspace);
+                    } else { return commit(*record.output); }
+                }();
+                if (!committed || !run.CommitSlot(record.slot)) {
                     run.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
                         "block-commit-failed", "RunOrderedBlocks", "block commit failed"));
                     return false;
@@ -134,21 +144,37 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                 // 已从独立读取游标识别的下一块类型保留到实际读入
                 continue;
             }
-            if (hasMore && (!changingType || records.empty())) {
+            if (hasMore && (!changingType || records.empty()) && (!singleRecord || records.empty())) {
                 if (changingType) {
                     run.SetWorkType(*nextWorkType);
                     if (run.Stopped()) { return false; }
                     activeWorkType = nextWorkType;
                     run.SetFlowProgress(true);
                 }
-                if (auto slot = run.TryAcquireSlot()) {
+                if constexpr (!std::is_same_v<std::remove_cvref_t<DescribeMemory>, std::nullptr_t>) {
+                    if (!nextWorkspace) {
+                        auto plan = describeMemory();
+                        nextWorkspace = std::make_unique<DecodeBlockWorkspace>(run.Scratch(), plan);
+                        nextBytes = nextWorkspace->TakeReusable();
+                    }
+                    run.ReclaimOptionalStorage(nextBytes);
+                    if (!run.CheckNecessaryCapacity(nextBytes)) { return false; }
+                }
+                resource::ResidentByteBudget::Lease reservation;
+                if (auto slot = run.TryAcquireSlot(nextBytes, reservation)) {
                     auto record = std::make_shared<BlockRecord<Input, Output>>();
                     record->slot = std::move(*slot);
+                    if (nextWorkspace) {
+                        nextWorkspace->Allocate(*run.StorageCapacity(), std::move(reservation));
+                        record->workspace = std::move(nextWorkspace);
+                    }
                     record->input.emplace();
                     record->output.emplace();
                     run.SetWaitReason(ResourceWaitReason::InputIO, &record->slot);
                     const bool readSucceeded = [&] {
-                        if constexpr (std::is_invocable_r_v<bool, Read&, Input&, const SlotLease&>) {
+                        if constexpr (std::is_invocable_r_v<bool, Read&, Input&, const SlotLease&, DecodeBlockWorkspace&>) {
+                            return read(*record->input, record->slot, *record->workspace);
+                        } else if constexpr (std::is_invocable_r_v<bool, Read&, Input&, const SlotLease&>) {
                             return read(*record->input, record->slot);
                         } else {
                             return read(*record->input);
@@ -163,7 +189,11 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                     nextWorkType.reset();
                     auto* current = record.get();
                     record->work = std::make_shared<TerminalWork>([current, &compute](WorkerContext& worker) {
-                        return compute(*current->input, *current->output, worker);
+                        if constexpr (std::is_invocable_r_v<bool, Compute&, Input&, Output&, WorkerContext&, DecodeBlockWorkspace&>) {
+                            return compute(*current->input, *current->output, worker, *current->workspace);
+                        } else {
+                            return compute(*current->input, *current->output, worker);
+                        }
                     });
                     // 先将记录放入受 guard 保护的窗口，再发布终端任务
                     records.push_back(std::move(record));
@@ -172,13 +202,18 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                 }
             }
             if (!progressed) {
-                run.SetWaitReason(records.empty() ? ResourceWaitReason::SlotCapacity : ResourceWaitReason::OrderedCommit,
+                ResourceDebugSnapshot snapshot;
+                run.TryCopyResourceDebugSnapshot(snapshot);
+                run.SetWaitReason(snapshot.byteWaiting ? ResourceWaitReason::ByteCapacity :
+                    records.empty() ? ResourceWaitReason::SlotCapacity : ResourceWaitReason::OrderedCommit,
                     records.empty() ? nullptr : &records.front()->slot);
                 run.WaitForChange(observed);
                 run.SetWaitReason(ResourceWaitReason::None);
             }
         }
         run.SetFlowProgress(false);
+        run.ClearByteWait();
+        run.Scratch().ClearFixed();
         drain.Complete();
         return !run.Stopped();
         } catch (...) {

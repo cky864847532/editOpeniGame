@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cmath>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -22,13 +24,20 @@ CodecFailureRecord ExecutionFailure(std::string_view reason, std::string_view me
 }
 
 bool ValidLimits(const RuntimeResourceLimits& limits, const ResolvedResourceConfiguration& config) noexcept {
+    if (config.threadMode != CodecThreadMode::Fixed && config.threadMode != CodecThreadMode::Adaptive) { return false; }
+    if (config.threadMode == CodecThreadMode::Adaptive && (!config.threaded || !CpuUsageProbe::Supported() ||
+        !std::isfinite(config.targetCpuIdleRatio) || config.targetCpuIdleRatio < 0.0 || config.targetCpuIdleRatio >= 1.0)) { return false; }
     const auto p = config.computeCeiling;
     const auto q = std::min<std::size_t>(p, 8u);
+    const bool unlimited = config.mode == CodecResourceMode::Unlimited;
+    const bool validStorage = unlimited
+        ? !config.storageCeilingBytes && !limits.ownedStorageLimitBytes
+        : config.storageCeilingBytes && limits.ownedStorageLimitBytes &&
+            (config.mode == CodecResourceMode::Adaptive || *limits.ownedStorageLimitBytes <= *config.storageCeilingBytes);
     return p != 0u && p <= std::numeric_limits<std::size_t>::max() / 2u - q - 1u &&
-        limits.ownedStorageLimitBytes <= config.storageCeilingBytes &&
+        validStorage &&
         limits.computeLimit >= 1u && limits.computeLimit <= p &&
-        limits.slotLimit >= limits.computeLimit && limits.slotLimit <= p + q &&
-        limits.slotLimit <= limits.computeLimit + q &&
+        limits.slotLimit >= 1u && limits.slotLimit <= p + q &&
         (config.threaded || (limits.computeLimit == 1u && limits.slotLimit == 1u));
 }
 
@@ -55,12 +64,69 @@ struct ExecutionState {
         debug.mode = config.mode;
         debug.resourceSample = config.initialSample;
         InitializeResourceController(controller, config, ResourceClock::now());
+        ResetCpuLocked(ResourceClock::now());
+    }
+
+    bool AutomaticCpu() const noexcept { return configuration.threadMode == CodecThreadMode::Adaptive; }
+    bool HasController() const noexcept { return AutomaticCpu() || configuration.mode == CodecResourceMode::Adaptive; }
+    void DemandLocked(std::uint64_t bytes, MemoryDemandKind kind, resource::StorageOwnerTag owner = {}) noexcept {
+        const bool changedDemand = !debug.byteWaiting || debug.nextWorkBytes != bytes || debug.memoryDemandKind != kind;
+        if (!debug.byteWaiting) { debug.byteWaitStarted = ResourceClock::now(); }
+        debug.byteWaiting = true;
+        debug.nextWorkBytes = bytes;
+        debug.memoryDemandKind = kind;
+        debug.memoryRequester = owner;
+        if (changedDemand) {
+            if (debug.memoryDemandId == std::numeric_limits<std::uint64_t>::max()) {
+                FailLocked(ExecutionFailure("memory-demand-overflow", "memory demand identity exhausted"));
+                return;
+            }
+            ++debug.memoryDemandId;
+            memoryControlRequested = true;
+            controllerChanged.notify_all();
+        }
+    }
+    void ClearDemandLocked() noexcept {
+        if (debug.byteWaiting) { debug.byteWaitDuration += ResourceClock::now() - debug.byteWaitStarted; }
+        debug.byteWaiting = false;
+        debug.nextWorkBytes = 0u;
+    }
+    void ReservedLocked(std::uint64_t bytes, std::optional<std::uint64_t> sequence = {}) noexcept {
+        const auto now = ResourceClock::now();
+        if (controller.grant.demandId == debug.memoryDemandId && !controller.grant.used) {
+            controller.grant.sequence = sequence;
+            controller.grant.flowId = debug.flowId;
+        }
+        NoteMemoryReservation(controller, bytes, debug.memoryDemandId, now);
+        if (controller.phase == ResourceControlPhase::Normal) { controller.memory.waitSince.reset(); }
+        ClearDemandLocked();
+    }
+    void ResetCpuLocked(ResourceClock::time_point now) noexcept {
+        cpuController.Reset(configuration.threadMode, configuration.targetCpuIdleRatio, configuration.computeCeiling, now);
+        debug.cpu = cpuController.Snapshot();
+        cpuBudget.Reset(debug.cpu.quota, now);
+        debug.cpuThrottleDuration = {};
+        cpuUpdatedAt = now;
+    }
+    std::size_t EffectiveComputeLocked() const noexcept {
+        return AutomaticCpu() ? std::min(debug.limits.computeLimit,
+            static_cast<std::size_t>(std::ceil(debug.cpu.quota))) : debug.limits.computeLimit;
+    }
+    bool CpuAdmissionOpen() const noexcept { return !AutomaticCpu() || debug.cpu.quota > 0.0; }
+    void AccrueCpuLocked(ResourceClock::time_point now) noexcept {
+        if (!AutomaticCpu()) { return; }
+        if (debug.runActive && !debug.runStopped && debug.queuedTasks != 0u &&
+            (!cpuBudget.Available() || EffectiveComputeLocked() == 0u)) {
+            debug.cpuThrottleDuration += now - cpuUpdatedAt;
+        }
+        cpuBudget.Accrue(now, debug.activeComputeUnits);
+        cpuUpdatedAt = now;
     }
 
     void AccumulateWaits(ResourceClock::time_point now) noexcept {
         const auto elapsed = now - waitsUpdatedAt;
         if (waitCompute) { observation.waits.compute += elapsed; }
-        if (waitSlots) { observation.waits.slots += elapsed; }
+        if (waitSlots) { observation.waits.slotCapacity += elapsed; }
         if (waitInput) { observation.waits.input += elapsed; }
         if (waitOutput) { observation.waits.output += elapsed; }
         waitsUpdatedAt = now;
@@ -96,26 +162,38 @@ struct ExecutionState {
         AccumulateWaits(now);
         return {debug.limits, debug.admittedBlocks, debug.activeComputeUnits,
             debug.heavyPhaseAdmitted, moreIndependentBlocks,
-            moreIndependentBlocks || pendingHeavyPhase, debug.gateOpen,
+            moreIndependentBlocks || pendingHeavyPhase || debug.byteWaiting, debug.gateOpen,
             debug.runActive, debug.runStopped || debug.closing,
-            debug.singleRecordFlow, debug.requestId, workType, observation};
+            debug.singleRecordFlow, debug.requestId, workType, observation,
+            debug.nextWorkBytes, debug.byteWaiting, debug.byteWaitStarted,
+            debug.byteWaitDuration + (debug.byteWaiting ? now - debug.byteWaitStarted : ResourceClock::duration{}),
+            capacity->Snapshot().reservedBytes, debug.queuedTasks, debug.memoryDemandId, debug.memoryDemandKind};
     }
 
     void Event(ResourceEventKind kind, std::uint64_t sequence = 0u,
                ResourceDecisionReason reason = ResourceDecisionReason::NoChange,
-               RuntimeResourceLimits before = {}) noexcept {
+               RuntimeResourceLimits before = {}, std::optional<std::uint64_t> reservedBytes = {}) noexcept {
         const auto now = ResourceClock::now();
         AccumulateWaits(now);
         RefreshWaits();
         auto& event = debug.events[debug.nextEvent];
         event = ResourceEvent{kind, reason, now, debug.requestId,
             debug.flowId, sequence, before, debug.limits, debug.admittedBlocks, debug.activeComputeUnits};
+        if (kind == ResourceEventKind::MemoryControl || kind == ResourceEventKind::Limits ||
+            kind == ResourceEventKind::EndRequest || kind == ResourceEventKind::Failure) {
+            // 发布额度时调用方已持有容量锁，事件只接收同一事务取得的确定值
+            event.reservedBytes = reservedBytes;
+            event.grantEpoch = controller.memory.grantEpoch;
+            event.memoryGain = controller.memory.gain;
+            event.memoryCalibration = controller.memory.calibration;
+            event.memoryPhase = controller.phase;
+        }
         debug.nextEvent = (debug.nextEvent + 1u) % debug.events.size();
         if (debug.eventCount < debug.events.size()) { ++debug.eventCount; }
         else { ++debug.overwrittenEvents; }
         ++debug.eventEpoch;
         // 正常块流由定时采样观察，排空与请求生命周期即时唤醒控制线程
-        if (configuration.mode == CodecResourceMode::Adaptive &&
+        if (HasController() &&
             (debug.controlPhase != ResourceControlPhase::Normal ||
              kind == ResourceEventKind::BeginRequest || kind == ResourceEventKind::EndRequest ||
              kind == ResourceEventKind::Failure || kind == ResourceEventKind::Stop || kind == ResourceEventKind::Close)) {
@@ -124,6 +202,8 @@ struct ExecutionState {
     }
 
     bool FailLocked(const CodecFailureRecord& failure, bool close = false) noexcept {
+        FinishMemoryMeasurement(controller, ResourceClock::now(),
+            failure.cancelled ? ResourceDecisionReason::RequestCancelled : ResourceDecisionReason::RequestEnded);
         const bool first = !debug.failure.has_value();
         if (first) { debug.failure = failure; }
         else { ++debug.secondaryFailures; }
@@ -139,14 +219,16 @@ struct ExecutionState {
             std::find(workerIds.begin(), workerIds.end(), id) != workerIds.end();
     }
 
-    bool CanStartLocked() const noexcept {
+    bool CanStartLocked() noexcept {
+        AccrueCpuLocked(ResourceClock::now());
         if (debug.runStopped || debug.closing || debug.queuedTasks == 0u || debug.exclusiveUnits != 0u) {
             return false;
         }
+        if (AutomaticCpu() && !cpuBudget.Available()) { return false; }
         const auto& work = queue[queueHead];
         return work->m_kind == TerminalWorkKind::ExclusivePackage
             ? debug.activeComputeUnits == 0u
-            : debug.activeComputeUnits < debug.limits.computeLimit;
+            : debug.activeComputeUnits < EffectiveComputeLocked();
     }
 
     std::shared_ptr<TerminalWork> PopLocked() noexcept {
@@ -157,9 +239,11 @@ struct ExecutionState {
     }
 
     std::size_t StartLocked(TerminalWork& work) noexcept {
-        const auto units = work.m_kind == TerminalWorkKind::ExclusivePackage && debug.limits.computeLimit >= 3u
-            ? debug.limits.computeLimit : 1u;
+        AccrueCpuLocked(ResourceClock::now());
+        const auto compute = EffectiveComputeLocked();
+        const auto units = work.m_kind == TerminalWorkKind::ExclusivePackage && compute >= 3u ? compute : 1u;
         debug.activeComputeUnits += units;
+        debug.peakActiveComputeUnits = std::max(debug.peakActiveComputeUnits, debug.activeComputeUnits);
         ++runningTasks;
         if (work.m_kind == TerminalWorkKind::ExclusivePackage) { debug.exclusiveUnits = units; }
         work.m_completion = BlockCompletion::Running;
@@ -181,6 +265,11 @@ struct ExecutionState {
             return;
         }
         admission.active = false;
+        controller.progressAt = ResourceClock::now();
+        if (controller.grant.used && controller.grant.flowId == debug.flowId &&
+            controller.grant.sequence == admission.sequence && index + 1u < admissions.size()) {
+            controller.grant.completedAt = controller.progressAt;
+        }
         if (index == admissions.size() - 1u) {
             debug.heavyPhaseAdmitted = false;
         } else {
@@ -194,6 +283,7 @@ struct ExecutionState {
     }
 
     void CompleteLocked(TerminalWork& work, std::size_t units, bool success) noexcept {
+        AccrueCpuLocked(ResourceClock::now());
         auto& admission = admissions[work.m_admission];
         work.m_completion = debug.runStopped ? BlockCompletion::Cancelled : BlockCompletion::Succeeded;
         if (!success) { work.m_completion = BlockCompletion::Failed; }
@@ -225,10 +315,14 @@ struct ExecutionState {
     std::optional<std::size_t> waitingAdmission;
     std::uint64_t waitingGeneration{0u};
     ResourceControllerState controller;
+    DataCodecCpuController cpuController;
+    CpuPermitBudget cpuBudget;
+    ResourceClock::time_point cpuUpdatedAt{};
     ObservationBatch observation;
     ResourceClock::time_point waitsUpdatedAt{ResourceClock::now()};
     bool moreIndependentBlocks{false};
     bool pendingHeavyPhase{false};
+    bool memoryControlRequested{false};
     ResourceWorkType workType;
     bool waitCompute{false};
     bool waitSlots{false};
@@ -250,6 +344,7 @@ struct DataCodecExecutionResources::Impl {
     std::vector<std::thread> workers;
     std::thread controllerThread;
     std::unique_ptr<ResourcePressureMonitor> pressureMonitor;
+    std::unique_ptr<CpuUsageProbe> cpuProbe;
     std::atomic_bool pressureSignal{false};
     std::unique_ptr<DecodeCacheRuntime> caches;
     std::uint64_t servicedTrimEpoch{0u};
@@ -292,11 +387,20 @@ void HeavyPhaseLease::Reset() noexcept { m_admission.Reset(); }
 DataCodecExecutionResources::DataCodecExecutionResources(const ResolvedResourceConfiguration& config) {
     if (!ValidLimits(config.initialLimits, config)) { throw std::invalid_argument("invalid resource configuration"); }
     m_impl = std::make_unique<Impl>(config);
+    m_impl->state->capacity->SetReleaseNotification([weak = std::weak_ptr(m_impl->state)]() noexcept {
+        if (auto state = weak.lock()) {
+            {
+                std::lock_guard lock(state->mutex);
+                ++state->debug.eventEpoch;
+            }
+            state->changed.notify_all();
+        }
+    });
     m_impl->caches = std::make_unique<DecodeCacheRuntime>(*this);
     if (!UpdateLimits(config.initialLimits, config.gateOpen, ResourceDecisionReason::Initialize)) {
         throw std::invalid_argument("resource initialization failed");
     }
-    if (config.mode == CodecResourceMode::Adaptive && config.threaded) {
+    if (config.mode == CodecResourceMode::Adaptive) {
         m_impl->pressureMonitor = std::make_unique<ResourcePressureMonitor>([](void* context) noexcept {
             auto& impl = *static_cast<Impl*>(context);
             {
@@ -307,12 +411,22 @@ DataCodecExecutionResources::DataCodecExecutionResources(const ResolvedResourceC
             impl.state->controllerChanged.notify_all();
         }, m_impl.get());
         m_impl->pressureMonitor->Observe(config.initialSample);
+    }
+    if (config.threadMode == CodecThreadMode::Adaptive) { m_impl->cpuProbe = std::make_unique<CpuUsageProbe>(); }
+    if (m_impl->state->HasController()) {
         m_impl->controllerThread = std::thread([this] { ControlMain(); });
     }
 }
 DataCodecExecutionResources::~DataCodecExecutionResources() { ShutdownAndJoin(); }
 DataCodecExecutionResources::DataCodecExecutionResources(const CodecResourceParams& params)
     : DataCodecExecutionResources(ResolveResourceConfiguration(params, ProbeResources())) {}
+
+std::optional<std::uint64_t> DataCodecExecutionResources::FixedStorageLimitBytes() const noexcept {
+    auto& state = *m_impl->state;
+    std::lock_guard lock(state.mutex);
+    return state.configuration.mode == CodecResourceMode::Fixed
+        ? state.capacity->Snapshot().limitBytes : std::nullopt;
+}
 
 bool DataCodecExecutionResources::BeginRun() noexcept {
     try {
@@ -351,12 +465,18 @@ bool DataCodecExecutionResources::BeginRun() noexcept {
         state.debug.waitContext = {};
         state.waitingAdmission.reset();
         ++state.debug.requestId;
+        state.ResetCpuLocked(ResourceClock::now());
+        state.ClearDemandLocked();
+        state.debug.memoryDemandId = 0u;
+        state.memoryControlRequested = false;
         state.moreIndependentBlocks = false;
         state.pendingHeavyPhase = false;
         state.ResetObservationLocked(ResourceClock::now());
         std::optional<CodecFailureRecord> controlFailure;
         if (state.configuration.mode == CodecResourceMode::Adaptive) {
-            controlFailure = ApplyControlLocked(ResourceClock::now(), sample);
+            controlFailure = ValidPhysicalMemorySample(sample, ResourceClock::now())
+                ? ApplyControlLocked(ResourceClock::now(), sample)
+                : std::optional(ExecutionFailure("memory-observation-unavailable", "physical memory observation unavailable at request start"));
         }
         m_impl->scratch.SetRetainedCount(state.debug.limits.ownedStorageLimitBytes != 0u &&
             !state.debug.optionalRetentionPausedByPressure
@@ -384,6 +504,7 @@ bool DataCodecExecutionResources::EndRun() noexcept {
             state.debug.admittedBlocks != 0u || state.runningTasks != 0u ||
             state.debug.queuedTasks != 0u || state.debug.heavyPhaseAdmitted;
         if (!failed) {
+            FinishMemoryMeasurement(state.controller, ResourceClock::now(), ResourceDecisionReason::RequestEnded);
             state.debug.runActive = false;
             state.debug.waiting = ResourceWaitReason::None;
             state.moreIndependentBlocks = false;
@@ -442,9 +563,6 @@ void DataCodecExecutionResources::SetWorkType(const ResourceWorkType& key) noexc
         } else {
             state.workType = key;
             state.ResetObservationLocked(ResourceClock::now());
-            if (state.configuration.mode == CodecResourceMode::Adaptive) {
-                failure = ApplyControlLocked(ResourceClock::now(), state.debug.resourceSample);
-            }
             state.Event(ResourceEventKind::Wake);
         }
     }
@@ -454,6 +572,16 @@ void DataCodecExecutionResources::SetWorkType(const ResourceWorkType& key) noexc
 }
 
 std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot() {
+    resource::ResidentByteBudget::Lease reservation;
+    return TryAcquireSlot(0u, reservation);
+}
+
+std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot(
+    std::uint64_t bytes, resource::ResidentByteBudget::Lease& reservation) {
+    if (reservation) {
+        RecordFailure(ExecutionFailure("live-admission-reservation", "admission output lease must be empty"));
+        return std::nullopt;
+    }
     auto state = m_impl->state;
     std::unique_lock lock(state->mutex);
     auto& debug = state->debug;
@@ -463,7 +591,8 @@ std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot() {
         RecordFailure(ExecutionFailure("invalid-admission-driver", "block admission requires the active driver"), true);
         return std::nullopt;
     }
-    if (!debug.gateOpen ||
+    if (!debug.gateOpen) { state->DemandLocked(bytes, MemoryDemandKind::Block); return std::nullopt; }
+    if (!state->CpuAdmissionOpen() ||
         debug.admittedBlocks >= debug.limits.slotLimit || debug.heavyPhaseAdmitted ||
         (debug.singleRecordFlow && debug.admittedBlocks != 0u)) { return std::nullopt; }
     for (std::size_t i = 0u; i + 1u < state->admissions.size(); ++i) {
@@ -475,9 +604,17 @@ std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot() {
             RecordFailure(ExecutionFailure("admission-overflow", "block admission sequence exhausted"), true);
             return std::nullopt;
         }
+        auto lease = state->capacity->TryReserve(bytes);
+        if (!lease) {
+            state->DemandLocked(bytes, MemoryDemandKind::Block);
+            return std::nullopt;
+        }
+        state->ReservedLocked(bytes, debug.lastAdmitted ? *debug.lastAdmitted + 1u : 0u);
+        reservation = std::move(*lease);
         admission = ExecutionState::Admission{admission.generation + 1u,
             debug.lastAdmitted ? *debug.lastAdmitted + 1u : 0u, true};
         ++debug.admittedBlocks;
+        debug.peakAdmittedBlocks = std::max(debug.peakAdmittedBlocks, debug.admittedBlocks);
         debug.lastAdmitted = admission.sequence;
         if (state->observation.admitted < state->observation.required) {
             ++state->observation.admitted;
@@ -491,6 +628,117 @@ std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot() {
     lock.unlock();
     RecordFailure(ExecutionFailure("slot-state-invalid", "slot state has no available record"), true);
     return std::nullopt;
+}
+
+bool DataCodecExecutionResources::CheckNecessaryCapacity(std::uint64_t bytes,
+    const resource::CapacityRejection* details, MemoryDemandKind kind) {
+    resource::CapacityRejection rejection = details ? *details : resource::CapacityRejection{};
+    bool fatal = false;
+    {
+        auto& state = *m_impl->state;
+        std::lock_guard lock(state.mutex);
+        if (state.debug.runStopped || state.debug.closing) { return false; }
+        const auto capacity = state.capacity->Snapshot();
+        if (state.debug.gateOpen && capacity.CanReserve(bytes)) { return true; }
+        state.DemandLocked(bytes, kind, rejection.requester);
+        if (!state.debug.storageCeilingBytes) { return true; }
+        const auto ceiling = *state.debug.storageCeilingBytes;
+        // 提交中的共存申请仍持有自己的槽位，只等待真实排队或运行的终端任务
+        const bool canProgress = state.runningTasks != 0u || state.debug.queuedTasks != 0u ||
+            (kind == MemoryDemandKind::Block && state.debug.admittedBlocks != 0u);
+        if (bytes <= ceiling && canProgress) { return true; }
+        fatal = bytes > ceiling || (state.configuration.mode == CodecResourceMode::Fixed && !capacity.CanReserve(bytes)) ||
+            capacity.reservedBytes > ceiling || bytes > ceiling - capacity.reservedBytes ||
+            (state.controller.memory.waitSince && ResourceClock::now() - *state.controller.memory.waitSince >= resource_control::holdTimeout);
+        rejection.requestedBytes = bytes;
+        rejection.reservedBytes = capacity.reservedBytes;
+        rejection.limitBytes = capacity.limitBytes;
+        rejection.checkedAt = ResourceClock::now();
+    }
+    if (fatal) {
+        RecordCapacityRejection(rejection, true, "DecodeMemoryAdmission");
+        return false;
+    }
+    return true;
+}
+
+void DataCodecExecutionResources::ClearByteWait() noexcept {
+    auto& state = *m_impl->state;
+    std::lock_guard lock(state.mutex);
+    if (state.controller.grant.demandId == state.debug.memoryDemandId && !state.controller.grant.used) {
+        state.controller.grant.used = true;
+        state.controller.grant.completedAt = ResourceClock::now();
+    }
+    state.ClearDemandLocked();
+    if (state.controller.phase == ResourceControlPhase::Normal) { state.controller.memory.waitSince.reset(); }
+}
+
+std::optional<resource::ResidentByteBudget::Lease> DataCodecExecutionResources::TryAcquireStorage(
+    std::uint64_t bytes, MemoryDemandKind kind, resource::CapacityRejection* rejection,
+    resource::StorageOwnerTag owner, std::span<const resource::StorageOwnerDescription> coexist,
+    std::uint64_t preferredBytes) {
+    auto& state = *m_impl->state;
+    std::lock_guard lock(state.mutex);
+    if (state.debug.runStopped || state.debug.closing) { return std::nullopt; }
+    if (!state.debug.runActive || state.driver != std::this_thread::get_id() || state.IsWorkerLocked()) {
+        throw std::logic_error("necessary storage admission requires the driver");
+    }
+    const auto capacity = state.capacity->Snapshot();
+    if (!state.debug.gateOpen || !capacity.CanReserve(bytes)) {
+        if (rejection) {
+            *rejection = {};
+            rejection->requestedBytes = bytes;
+            rejection->reservedBytes = capacity.reservedBytes;
+            rejection->limitBytes = capacity.limitBytes;
+            rejection->requester = owner;
+            rejection->checkedAt = ResourceClock::now();
+            rejection->ownerCount = std::min(coexist.size(), rejection->owners.size());
+            rejection->ownerListTruncated = coexist.size() > rejection->owners.size();
+            std::copy_n(coexist.begin(), rejection->ownerCount, rejection->owners.begin());
+        }
+        state.DemandLocked(bytes, kind, owner);
+        return std::nullopt;
+    }
+    auto lease = state.capacity->TryReserveGrowth(bytes, std::max(bytes, preferredBytes), rejection, owner, coexist);
+    if (lease) { state.ReservedLocked(lease->Bytes()); }
+    else { state.DemandLocked(bytes, kind, owner); }
+    return lease;
+}
+
+std::optional<resource::ResidentByteBudget::Lease> DataCodecExecutionResources::WaitForStorage(
+    std::uint64_t bytes, MemoryDemandKind kind, resource::StorageOwnerTag owner,
+    std::span<const resource::StorageOwnerDescription> coexist, std::uint64_t preferredBytes) {
+    if (!IsDriverThread()) {
+        RecordFailure(ExecutionFailure("worker-resource-wait", "storage waiting requires the driver"));
+        return std::nullopt;
+    }
+    for (;;) {
+        ServiceDriverEvents();
+        ReclaimOptionalStorage(bytes);
+        const auto epoch = EventEpoch();
+        if (Stopped()) { return std::nullopt; }
+        resource::CapacityRejection rejection;
+        if (auto lease = TryAcquireStorage(bytes, kind, &rejection, owner, coexist, preferredBytes)) {
+            SetWaitReason(ResourceWaitReason::None);
+            return lease;
+        }
+        if (!CheckNecessaryCapacity(bytes, &rejection, kind)) { return std::nullopt; }
+        SetWaitReason(ResourceWaitReason::ByteCapacity);
+        WaitForChange(epoch);
+    }
+}
+
+void DataCodecExecutionResources::CompleteMemoryPreparation() noexcept {
+    auto& state = *m_impl->state;
+    std::lock_guard lock(state.mutex);
+    const auto now = ResourceClock::now();
+    state.controller.memory.lastPreparationAt = now;
+    state.controller.progressAt = now;
+    if (state.controller.grant.used && !state.controller.grant.sequence) {
+        state.controller.grant.completedAt = now;
+    }
+    state.Event(ResourceEventKind::Complete);
+    state.changed.notify_all();
 }
 
 std::optional<HeavyPhaseLease> DataCodecExecutionResources::TryAcquireHeavyPhase() {
@@ -509,7 +757,7 @@ std::optional<HeavyPhaseLease> DataCodecExecutionResources::TryAcquireHeavyPhase
         RecordFailure(ExecutionFailure("phase-not-drained", "phase admission requires all previous admissions to retire"), true);
         return std::nullopt;
     }
-    if (!debug.gateOpen) {
+    if (!debug.gateOpen || !state->CpuAdmissionOpen()) {
         if (!state->pendingHeavyPhase) {
             state->pendingHeavyPhase = true;
             state->Event(ResourceEventKind::Wait);
@@ -614,7 +862,11 @@ void DataCodecExecutionResources::WorkerMain(std::size_t index) noexcept {
         std::size_t units = 0u;
         {
             std::unique_lock lock(state->mutex);
-            state->changed.wait(lock, [&] { return state->debug.closing || state->CanStartLocked(); });
+            while (!state->debug.closing && !state->CanStartLocked()) {
+                if (state->AutomaticCpu() && state->debug.queuedTasks != 0u && !state->debug.runStopped) {
+                    state->changed.wait_until(lock, state->cpuBudget.NextWake(ResourceClock::now(), state->debug.activeComputeUnits));
+                } else { state->changed.wait(lock); }
+            }
             if (state->debug.closing) { break; }
             work = state->PopLocked();
             units = state->StartLocked(*work);
@@ -685,6 +937,10 @@ std::optional<CodecFailureRecord> DataCodecExecutionResources::PublishLimitsLock
     if (!ValidLimits(limits, state.configuration)) {
         return ExecutionFailure("invalid-limits", "resource targets exceed configured capabilities");
     }
+    if (state.configuration.mode == CodecResourceMode::Adaptive &&
+        *limits.ownedStorageLimitBytes > state.controller.memory.absoluteCapacityBytes) {
+        return ExecutionFailure("invalid-limits", "memory limit exceeds current absolute capacity");
+    }
     std::lock_guard capacityLock(state.capacity->m_state->mutex);
     const auto before = RuntimeResourceLimits{state.capacity->m_state->limitBytes,
         state.debug.limits.computeLimit, state.debug.limits.slotLimit};
@@ -699,7 +955,7 @@ std::optional<CodecFailureRecord> DataCodecExecutionResources::PublishLimitsLock
         state.debug.limits = limits;
         state.debug.gateOpen = gateOpen;
         ++state.debug.targetEpoch;
-        state.Event(ResourceEventKind::Limits, 0u, reason, before);
+        state.Event(ResourceEventKind::Limits, 0u, reason, before, state.capacity->m_state->reservedBytes);
     } else if (reason != ResourceDecisionReason::NoChange && reason != ResourceDecisionReason::MechanismCheck) {
         state.Event(ResourceEventKind::Wake, 0u, reason, before);
     }
@@ -739,24 +995,62 @@ std::optional<CodecFailureRecord> DataCodecExecutionResources::ApplyControlLocke
     ResourceClock::time_point now, const ResourceSample& sample) noexcept {
     auto& state = *m_impl->state;
     state.debug.resourceSample = sample;
-    const auto decision = Advance(state.controller, now, sample, state.FlowLocked(now));
+    const auto previousCalibration = state.controller.memory.calibration;
+    const auto previousGainUpdates = state.controller.memory.gainUpdates;
+    const auto previousPhase = state.controller.phase;
+    const auto flow = state.FlowLocked(now);
+    const auto decision = Advance(state.controller, now, sample, flow);
     state.debug.controlPhase = state.controller.phase;
     state.debug.pressurePending = state.controller.pressurePending;
     state.debug.signalValid = state.controller.signalValid;
     state.debug.cooldownUntil = state.controller.cooldownUntil;
-    state.debug.holdSince = state.controller.holdSince;
+    state.debug.holdSince = state.controller.memory.waitSince;
+    state.debug.storageCeilingBytes = state.controller.memory.absoluteCapacityBytes;
+    state.debug.memory = state.controller.memory;
     auto failure = PublishLimitsLocked(decision.limits, decision.gateOpen, decision.reason,
         decision.optionalRetentionPausedByPressure, decision.trimOptionalRetention, decision.resetObservation);
     if (failure) { return failure; }
+    if (previousCalibration != state.controller.memory.calibration ||
+        previousGainUpdates != state.controller.memory.gainUpdates || previousPhase != state.controller.phase) {
+        state.Event(ResourceEventKind::MemoryControl, 0u, decision.reason, {}, flow.reservedBytes);
+    }
+    if (decision.failForCapacityBound) {
+        return ExecutionFailure("memory-capacity-bound", "necessary coexisting storage exceeds current absolute capacity");
+    }
     if (decision.failForSustainedPressure) {
         return ExecutionFailure("sustained-memory-pressure", "memory pressure did not recover within the request hold deadline");
     }
     return std::nullopt;
 }
 
+std::optional<CodecFailureRecord> DataCodecExecutionResources::ApplyCpuControlLocked(
+    ResourceClock::time_point now, const CpuUsageSample& sample) noexcept {
+    auto& state = *m_impl->state;
+    state.AccrueCpuLocked(now);
+    const CpuControlFlow flow{
+        state.debug.limits.computeLimit,
+        state.runningTasks != 0u || state.debug.queuedTasks != 0u,
+        state.debug.queuedTasks != 0u || state.moreIndependentBlocks || state.pendingHeavyPhase,
+        !state.debug.gateOpen || state.debug.byteWaiting ||
+            state.debug.waiting == ResourceWaitReason::InputIO || state.debug.waiting == ResourceWaitReason::OutputIO};
+    const auto decision = state.cpuController.Advance(now, sample, flow);
+    state.debug.cpu = state.cpuController.Snapshot();
+    state.debug.cpuDecision = decision.reason;
+    state.cpuBudget.SetQuota(state.debug.cpu.quota, now, state.debug.activeComputeUnits);
+    // CPU 采样只唤醒执行器，不重置内存控制器的观察批次
+    ++state.debug.eventEpoch;
+    if (decision.sampleFailure) {
+        return ExecutionFailure("cpu-sample-unavailable", "system CPU idle sampling was unavailable for one second");
+    }
+    return GrowWorkersLocked();
+}
+
 void DataCodecExecutionResources::ControlMain() noexcept {
     auto& state = *m_impl->state;
     auto nextSampleAt = ResourceClock::now();
+    auto nextCpuAt = nextSampleAt;
+    std::uint64_t cpuRequest = 0u;
+    const bool memoryAdaptive = state.configuration.mode == CodecResourceMode::Adaptive;
     for (;;) {
         std::unique_lock lock(state.mutex);
         state.controllerChanged.wait(lock, [&] {
@@ -766,33 +1060,50 @@ void DataCodecExecutionResources::ControlMain() noexcept {
         const auto requestId = state.debug.requestId;
         auto now = ResourceClock::now();
         ResourceSample sample = state.debug.resourceSample;
+        CpuUsageSample cpuSample;
+        const bool resetCpu = state.AutomaticCpu() && cpuRequest != requestId;
+        const bool sampleCpu = state.AutomaticCpu() && (resetCpu || now >= nextCpuAt);
         const bool pressureNotified = m_impl->pressureSignal.exchange(false, std::memory_order_acq_rel);
-        if (now >= nextSampleAt || pressureNotified) {
+        const bool demandNotified = std::exchange(state.memoryControlRequested, false);
+        const bool memoryDue = memoryAdaptive && (now >= nextSampleAt || pressureNotified);
+        if ((memoryAdaptive && (now >= nextSampleAt || pressureNotified)) || sampleCpu) {
+            const bool sampleMemory = memoryAdaptive && (now >= nextSampleAt || pressureNotified);
             lock.unlock();
-            try { sample = ProbeResources(); }
-            catch (...) {
-                sample = {};
-                sample.sampledAt = ResourceClock::now();
+            if (sampleMemory) {
+                try { sample = ProbeResources(); }
+                catch (...) { sample = {}; sample.sampledAt = ResourceClock::now(); }
+                m_impl->pressureMonitor->Observe(sample);
+                nextSampleAt = ResourceClock::now() + resource_control::sampleInterval;
             }
-            m_impl->pressureMonitor->Observe(sample);
+            if (sampleCpu) {
+                if (resetCpu) {
+                    m_impl->cpuProbe->Reset();
+                    cpuRequest = requestId;
+                } else { cpuSample = m_impl->cpuProbe->Sample(); }
+                nextCpuAt = ResourceClock::now() + cpu_control::sampleInterval;
+            }
             now = ResourceClock::now();
-            nextSampleAt = now + resource_control::sampleInterval;
             lock.lock();
             if (state.debug.closing) { return; }
             if (!state.debug.runActive || state.debug.runStopped || state.debug.requestId != requestId) { continue; }
         }
         const auto before = state.debug.eventEpoch;
-        const auto failure = ApplyControlLocked(now, sample);
+        auto failure = memoryAdaptive && (memoryDue || demandNotified || state.debug.controlPhase != ResourceControlPhase::Normal)
+            ? ApplyControlLocked(now, sample) : std::optional<CodecFailureRecord>{};
+        if (!failure && sampleCpu && !resetCpu) { failure = ApplyCpuControlLocked(now, cpuSample); }
         const auto observed = state.debug.eventEpoch;
         lock.unlock();
         // 控制线程只回收纯自有空闲 scratch，宿主缓存留给 driver
         m_impl->scratch.TrimRetained();
         if (failure) { RecordFailure(*failure); }
-        if (observed != before || failure) { state.changed.notify_all(); }
+        if (observed != before || failure || memoryDue) { state.changed.notify_all(); }
         lock.lock();
-        state.controllerChanged.wait_until(lock, nextSampleAt, [&] {
+        const auto wakeAt = std::min(memoryAdaptive ? nextSampleAt : ResourceClock::time_point::max(),
+            state.AutomaticCpu() ? nextCpuAt : ResourceClock::time_point::max());
+        state.controllerChanged.wait_until(lock, wakeAt, [&] {
             return state.debug.closing || !state.debug.runActive || state.debug.runStopped ||
                 state.debug.requestId != requestId ||
+                state.memoryControlRequested ||
                 (state.debug.controlPhase != ResourceControlPhase::Normal && state.debug.eventEpoch != observed) ||
                 m_impl->pressureSignal.load(std::memory_order_acquire);
         });
@@ -801,7 +1112,7 @@ void DataCodecExecutionResources::ControlMain() noexcept {
 
 std::optional<CodecFailureRecord> DataCodecExecutionResources::GrowWorkersLocked() noexcept {
     auto& state = *m_impl->state;
-    const auto needed = std::min(state.debug.limits.computeLimit, state.runningTasks + state.debug.queuedTasks);
+    const auto needed = std::min(state.EffectiveComputeLocked(), state.runningTasks + state.debug.queuedTasks);
     try {
         while (m_impl->workers.size() < needed) {
             const auto index = m_impl->workers.size();
@@ -863,6 +1174,7 @@ void DataCodecExecutionResources::CancelAndWaitRun() noexcept {
             state.FailLocked(ExecutionFailure("invalid-drain-driver", "only the active driver may drain the request"), true);
         }
         state.debug.runStopped = true;
+        FinishMemoryMeasurement(state.controller, ResourceClock::now(), ResourceDecisionReason::RequestCancelled);
         m_impl->scratch.SetRetainedCount(0u);
         state.Event(ResourceEventKind::Stop);
         stop = state.stopSource;
@@ -949,15 +1261,23 @@ void DataCodecExecutionResources::WaitForChange(std::uint64_t observedEpoch, std
         state.changed.notify_all();
     });
     std::unique_lock lock(state.mutex);
-    state.changed.wait(lock, [&] {
+    const auto changed = [&] {
         return state.debug.eventEpoch != observedEpoch || state.debug.runStopped || state.debug.closing || stop.stop_requested();
-    });
+    };
+    if (state.debug.byteWaiting) { state.changed.wait_for(lock, resource_control::sampleInterval, changed); }
+    else { state.changed.wait(lock, changed); }
 }
 void DataCodecExecutionResources::SetWaitReason(ResourceWaitReason reason,
     const SlotLease* slot, const TerminalWork* work) noexcept {
     std::lock_guard lock(m_impl->state->mutex);
     auto& state = *m_impl->state;
     std::optional<std::size_t> index;
+    if (state.AutomaticCpu() &&
+        (reason == ResourceWaitReason::SlotCapacity || reason == ResourceWaitReason::PressureRecovery ||
+         reason == ResourceWaitReason::TerminalWork) &&
+        (!state.CpuAdmissionOpen() || (state.debug.queuedTasks != 0u && !state.cpuBudget.Available()))) {
+        reason = ResourceWaitReason::CpuThrottle;
+    }
     std::uint64_t generation = 0u;
     if (reason != ResourceWaitReason::None) {
         if (slot != nullptr && slot->m_state.get() == &state) {
@@ -985,6 +1305,7 @@ void DataCodecExecutionResources::SetWaitReason(ResourceWaitReason reason,
     switch (reason) {
     case ResourceWaitReason::None: break;
     case ResourceWaitReason::SlotCapacity: context.expected = ResourceWakeEvent::AdmissionAvailable; break;
+    case ResourceWaitReason::ByteCapacity: context.expected = ResourceWakeEvent::AdmissionAvailable; break;
     case ResourceWaitReason::TerminalWork:
     case ResourceWaitReason::OrderedCommit: context.expected = ResourceWakeEvent::TerminalCompleted; break;
     case ResourceWaitReason::OwnerConsumption:
@@ -993,6 +1314,7 @@ void DataCodecExecutionResources::SetWaitReason(ResourceWaitReason reason,
     case ResourceWaitReason::InputIO: context.expected = ResourceWakeEvent::ReaderReturned; break;
     case ResourceWaitReason::OutputIO: context.expected = ResourceWakeEvent::WriterReturned; break;
     case ResourceWaitReason::RunDrain: context.expected = ResourceWakeEvent::RunDrained; break;
+    case ResourceWaitReason::CpuThrottle: context.expected = ResourceWakeEvent::CpuSample; break;
     }
     if (index) {
         context.heavyPhase = *index == state.admissions.size() - 1u;
@@ -1013,7 +1335,16 @@ bool DataCodecExecutionResources::TryCopyResourceDebugSnapshot(ResourceDebugSnap
     std::unique_lock allocationLock(state.capacity->m_state->allocationMutex, std::try_to_lock);
     if (!allocationLock.owns_lock()) { return false; }
     output = state.debug;
+    output.cpu = state.cpuController.Snapshot();
+    output.effectiveComputeLimit = state.EffectiveComputeLocked();
+    output.cpuPermitCredit = state.cpuBudget.Credit();
+    output.memory = state.controller.memory;
     output.capturedAt = ResourceClock::now();
+    if (output.memory.calibration == MemoryCalibrationResult::Measuring) {
+        output.memory.calibrationElapsed = output.capturedAt - output.memory.calibrationStarted;
+    }
+    output.memory.measuredReservationBytes = state.controller.gainPhase >= 2u
+        ? state.controller.measurementBytes : output.memory.measuredReservationBytes;
     output.allocatedStorage = state.capacity->m_state->allocated;
     output.allocatedStorage.capturedAt = output.capturedAt;
     output.workType = state.workType;
@@ -1034,7 +1365,7 @@ bool DataCodecExecutionResources::TryCopyResourceDebugSnapshot(ResourceDebugSnap
         const auto elapsed = output.capturedAt - state.waitsUpdatedAt;
         const auto& waits = state.observation.waits;
         output.observationWaits = {waits.compute + (state.waitCompute ? elapsed : ResourceClock::duration{}),
-            waits.slots + (state.waitSlots ? elapsed : ResourceClock::duration{}),
+            waits.slotCapacity + (state.waitSlots ? elapsed : ResourceClock::duration{}),
             waits.input + (state.waitInput ? elapsed : ResourceClock::duration{}),
             waits.output + (state.waitOutput ? elapsed : ResourceClock::duration{})};
     }
@@ -1047,10 +1378,12 @@ bool DataCodecExecutionResources::TryCopyResourceDebugSnapshot(ResourceDebugSnap
     return true;
 }
 void DataCodecExecutionResources::RecordCapacityRejection(
-    const resource::CapacityRejection& rejection, const bool fatal) noexcept {
+    const resource::CapacityRejection& rejection, const bool fatal, std::string_view origin) noexcept {
+    std::optional<std::uint64_t> ceiling;
     {
         auto& state = *m_impl->state;
         std::lock_guard lock(state.mutex);
+        ceiling = state.debug.storageCeilingBytes;
         // 终止性拒绝保留至请求交付，可选后端选择不得覆盖它
         if (!state.debug.capacityRejectionFatal) {
             state.debug.capacityRejection = rejection;
@@ -1063,8 +1396,16 @@ void DataCodecExecutionResources::RecordCapacityRejection(
         state.debug.eventEpoch = epoch;
     }
     if (fatal) {
+        std::array<char, 160u> message{};
+        if (ceiling) {
+            std::snprintf(message.data(), message.size(),
+                "required controlled execution capacity is unavailable; allowedCeilingBytes=%llu",
+                static_cast<unsigned long long>(*ceiling));
+        } else {
+            std::snprintf(message.data(), message.size(), "unexpected capacity rejection in Unlimited mode");
+        }
         auto failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
-            "capacity-admission-rejected", "MemoryStore", "required owned storage capacity is unavailable");
+            "capacity-admission-rejected", origin, message.data());
         failure.requestedBytes = rejection.requestedBytes;
         failure.reservedBytes = rejection.reservedBytes;
         failure.limitBytes = rejection.limitBytes;
@@ -1096,14 +1437,14 @@ void DataCodecExecutionResources::ReclaimOptionalStorage(const std::uint64_t req
     ServiceDriverEvents();
     const auto enough = [&] {
         const auto current = StorageCapacity()->Snapshot();
-        return requiredBytes == 0u || (current.reservedBytes <= current.limitBytes &&
-            requiredBytes <= current.limitBytes - current.reservedBytes);
+        return current.CanReserve(requiredBytes);
     };
+    if (!enough()) { m_impl->scratch.ClearFixed(); }
     while (!enough() && m_impl->caches->TrimOne()) {}
 }
 std::size_t DataCodecExecutionResources::Concurrency() const noexcept {
     std::lock_guard lock(m_impl->state->mutex);
-    return m_impl->state->debug.limits.computeLimit;
+    return std::max<std::size_t>(1u, m_impl->state->EffectiveComputeLocked());
 }
 bool DataCodecExecutionResources::Threaded() const noexcept { return m_impl->state->configuration.threaded; }
 bool DataCodecExecutionResources::IsDriverThread() const noexcept {

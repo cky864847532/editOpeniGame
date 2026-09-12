@@ -60,7 +60,7 @@ public:
         RecordVectorCapacitySample(context.runRecords, "params.encode.serialized_bytes", paramsBytes);
         RecordCodecStorageParamsCapacity(context.runRecords, workspace.StorageParams());
         auto params = workspace.ByteStoreSessionRef().CreateSizedStore(
-            bytestore::ByteStorePurpose::Ranged, paramsBytes.size(), "encoded_params", &error);
+            bytestore::ByteStorePurpose::Ranged, paramsBytes.size(), ::datacodec::MemoryDemandKind::RequiredContinuation, "encoded_params", &error);
         if (!params) {
             FailEncodeStage(context, workspace, kTypeName, CodecErrorCode::EncodeFailure,
                 "failed to prepare params owner: " + error);

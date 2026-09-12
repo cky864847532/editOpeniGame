@@ -7,6 +7,8 @@
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockWireFormat.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBuffer.h"
 
+#include "DataCodec/Storage/ByteIO/ArrayWorkspace.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -158,6 +160,7 @@ struct NumericArrayReferenceCodecDecodeInput {
     NumericArrayReferenceCodecDecodeTelemetry* telemetry{nullptr};
     numericarray::NumericArrayCompressorState* compressorState{nullptr};
     numericarray::NumericArrayBlockCapacitySamples* capacitySamples{nullptr};
+    ArrayWorkspace* workspace{nullptr};
 };
 
 struct AffineReferenceBlockFields {

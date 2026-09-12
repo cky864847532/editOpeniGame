@@ -4,6 +4,7 @@
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
 #include "DataCodec/Filter/Localization/iGameDataCodecHostMessage.h"
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
+#include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Params/DecodedFrameCacheParams.h"
 #include "DataCodec/API/Params/EncodedInputCacheParams.h"
@@ -12,6 +13,7 @@
 #include "iGameFileReader.h"
 
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -28,6 +30,10 @@ class IGDCReader : public FileReader {
 public:
     I_OBJECT(IGDCReader);
     static Pointer New();
+
+    // 与文件解码共享帧依赖发现，结果为全内存路径门槛，允许文件存储时仅作建议
+    [[nodiscard]] static ::datacodec::DecodeStorageAnalysisResult AnalyzeFileStorage(
+        const std::filesystem::path& path, bool loadAllAttributes, std::stop_token stop = {});
 
     bool Execute() override;
     bool Parsing() override;

@@ -147,7 +147,7 @@ inline bool TestNecessaryStorageReclaimsOnlyReleasedOwners() {
     stores.BindRun(run);
     auto phase = WaitForHeavyPhase(run);
     if (!phase) { return false; }
-    auto denied = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 1u, "denied", &error);
+    auto denied = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 1u, ::datacodec::MemoryDemandKind::RequiredContinuation, "denied", &error);
     if (denied || runtime.DefaultEncodedInputCache()->Statistics().residentInputs != 0u ||
         run.StorageCapacity()->Snapshot().reservedBytes != 64u ||
         !run.Stopped() || !run.FirstFailure() || error.empty()) { return false; }
@@ -167,7 +167,7 @@ inline bool TestNecessaryStorageReclaimsOnlyReleasedOwners() {
     phase = WaitForHeavyPhase(run);
     if (!phase) { return false; }
     error.clear();
-    auto acquired = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 64u, "necessary", &error);
+    auto acquired = stores.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 64u, ::datacodec::MemoryDemandKind::RequiredContinuation, "necessary", &error);
     if (!acquired || !error.empty() || run.StorageCapacity()->Snapshot().reservedBytes != 64u) { return false; }
     acquired.reset();
     stores.UnbindRun();

@@ -4,6 +4,7 @@
 #include "DataCodec/API/Params/CodecResourceParams.h"
 #include "DataCodec/Common/DataCodecError.h"
 #include "DataCodec/Storage/ByteIO/ByteBudget.h"
+#include "DataCodec/Runtime/Execution/DataCodecCpuController.h"
 
 #include <array>
 #include <chrono>
@@ -26,7 +27,7 @@ struct ControlDecision;
 using ResourceClock = std::chrono::steady_clock;
 
 struct RuntimeResourceLimits {
-    std::uint64_t ownedStorageLimitBytes{0u};
+    std::optional<std::uint64_t> ownedStorageLimitBytes{0u};
     std::size_t computeLimit{1u};
     std::size_t slotLimit{1u};
     bool operator==(const RuntimeResourceLimits&) const = default;
@@ -35,36 +36,44 @@ struct RuntimeResourceLimits {
 // 平台和模式层解析一次，执行机制只接受确定目标
 struct ResolvedResourceConfiguration {
     RuntimeResourceLimits initialLimits;
-    std::uint64_t storageCeilingBytes{0u};
+    std::optional<std::uint64_t> storageCeilingBytes{0u};
     std::size_t computeCeiling{1u};
     bool threaded{true};
     bool gateOpen{true};
     bool externalSpillAvailable{false};
     CodecResourceMode mode{CodecResourceMode::Fixed};
     ResourceSample initialSample;
+    CodecThreadMode threadMode{CodecThreadMode::Fixed};
+    double targetCpuIdleRatio{0.0};
+    double targetAvailableMemoryRatio{0.20};
 };
 
 enum class ResourceDecisionReason : std::uint8_t {
     NoChange, Initialize, BeginRequest, MechanismCheck, PressurePending,
     PressureConfirmed, PressureEscalated, Drained, PressureCleared,
     SignalLost, SignalRestored, HardCapabilityChanged, WorkTypeChanged,
-    StorageGrowth, ComputeGrowth, SlotGrowth, RetentionRestored, PressureTimeout,
+    RetentionRestored, PressureTimeout,
+    ReserveTargetLow, NativeMemoryPressure, RuntimeHeadroomLow, RequiredGrowth,
+    RequiredContinuation, SampleUnavailable, RetainedStoragePreventingProgress,
+    WaitDeadlineExceeded, CapacityBoundExceeded, MemoryGainUpdated,
+    RequestEnded, RequestCancelled, MeasurementUnusable,
 };
 
 enum class ResourceEventKind : std::uint8_t {
     BeginRequest, EndRequest, Limits, Admit, Complete, Commit, Retire,
-    Wait, Wake, TrimRequested, TrimCompleted, CapacityRejected, Failure, Stop, Close,
+    Wait, Wake, TrimRequested, TrimCompleted, CapacityRejected, Failure, Stop, Close, MemoryControl,
 };
 
 enum class ResourceWaitReason : std::uint8_t {
     None, SlotCapacity, TerminalWork, OrderedCommit, OwnerConsumption,
     PressureDrain, PressureRecovery, InputIO, OutputIO, RunDrain,
+    ByteCapacity, CpuThrottle,
 };
 
 enum class BlockCompletion : std::uint8_t { Pending, Queued, Running, Succeeded, Failed, Cancelled };
 enum class ResourceWakeEvent : std::uint8_t {
     None, AdmissionAvailable, TerminalCompleted, OwnerRetired, PressureSample,
-    ReaderReturned, WriterReturned, RunDrained,
+    ReaderReturned, WriterReturned, RunDrained, CpuSample,
 };
 struct ResourceWaitContext {
     ResourceWakeEvent expected{ResourceWakeEvent::None};
@@ -75,7 +84,36 @@ struct ResourceWaitContext {
     std::optional<BlockCompletion> completion;
 };
 enum class TerminalWorkKind : std::uint8_t { Ordinary, ExclusivePackage };
-enum class ResourceControlPhase : std::uint8_t { Normal, Drain, Hold };
+enum class ResourceControlPhase : std::uint8_t { Normal, Drain, Hold, Recover };
+enum class MemoryDemandKind : std::uint8_t { Block, RequiredContinuation };
+enum class MemoryCalibrationResult : std::uint8_t { Pending, Measuring, Estimated, Unusable, TimedOut };
+const char* MemoryCalibrationResultName(MemoryCalibrationResult) noexcept;
+const char* MemoryDecisionReasonName(ResourceDecisionReason) noexcept;
+
+struct MemoryControlSnapshot {
+    double targetRatio{0.20};
+    std::optional<std::uint64_t> physicalTotalBytes;
+    std::optional<std::uint64_t> availableBytes;
+    std::optional<std::uint64_t> environmentRemainingBytes;
+    std::uint64_t reserveBytes{0u};
+    std::uint64_t recoveryBytes{0u};
+    std::uint64_t absoluteCapacityBytes{0u};
+    std::uint64_t growthHeadroomBytes{0u};
+    double gain{0.5};
+    std::optional<double> response;
+    MemoryCalibrationResult calibration{MemoryCalibrationResult::Pending};
+    ResourceClock::time_point calibrationStarted{};
+    ResourceClock::duration calibrationElapsed{};
+    std::optional<double> baselineAvailable;
+    std::optional<double> responseAvailable;
+    std::uint64_t measuredReservationBytes{0u};
+    std::uint64_t gainUpdates{0u};
+    std::uint64_t grantEpoch{0u};
+    ResourceDecisionReason reason{ResourceDecisionReason::NoChange};
+    ResourceDecisionReason calibrationEndReason{ResourceDecisionReason::NoChange};
+    std::optional<ResourceClock::time_point> waitSince;
+    std::optional<ResourceClock::time_point> lastPreparationAt;
+};
 enum class ResourceWorkPath : std::uint8_t {
     None, NumericEncode, ReferenceEncode, GeometryDecode, AttributeDecode,
     ConnectivityEncode, ConnectivityDecode, PolyhedronEncode, PolyhedronEmit,
@@ -104,6 +142,11 @@ struct ResourceEvent {
     RuntimeResourceLimits after;
     std::size_t admitted{0u};
     std::size_t computing{0u};
+    std::optional<std::uint64_t> reservedBytes;
+    std::uint64_t grantEpoch{0u};
+    double memoryGain{0.5};
+    MemoryCalibrationResult memoryCalibration{MemoryCalibrationResult::Pending};
+    ResourceControlPhase memoryPhase{ResourceControlPhase::Normal};
 };
 static_assert(sizeof(ResourceEvent) <= 256u);
 
@@ -112,8 +155,17 @@ struct ResourceDebugSnapshot {
     RuntimeResourceLimits limits;
     resource::CapacitySnapshot storage;
     resource::StorageAllocationSnapshot allocatedStorage;
-    std::uint64_t storageCeilingBytes{0u};
+    std::optional<std::uint64_t> storageCeilingBytes{0u};
     std::size_t computeCeiling{1u};
+    CpuControlSnapshot cpu;
+    CpuDecisionReason cpuDecision{CpuDecisionReason::NoChange};
+    std::size_t effectiveComputeLimit{1u};
+    double cpuPermitCredit{0.0};
+    ResourceClock::duration cpuThrottleDuration{};
+    MemoryControlSnapshot memory;
+    MemoryDemandKind memoryDemandKind{MemoryDemandKind::Block};
+    resource::StorageOwnerTag memoryRequester;
+    std::uint64_t memoryDemandId{0u};
     std::size_t admittedBlocks{0u};
     std::size_t activeComputeUnits{0u};
     std::size_t queuedTasks{0u};
@@ -137,6 +189,12 @@ struct ResourceDebugSnapshot {
     ResourceWaitReason waiting{ResourceWaitReason::None};
     ResourceClock::time_point waitStarted{};
     ResourceWaitContext waitContext;
+    std::uint64_t nextWorkBytes{0u};
+    bool byteWaiting{false};
+    ResourceClock::time_point byteWaitStarted{};
+    ResourceClock::duration byteWaitDuration{};
+    std::size_t peakAdmittedBlocks{0u};
+    std::size_t peakActiveComputeUnits{0u};
     ResourceWorkType workType;
     std::optional<std::uint64_t> nextQueuedBlock;
     std::optional<BlockCompletion> nextQueuedCompletion;
@@ -229,6 +287,8 @@ public:
     bool Threaded() const noexcept;
     bool IsDriverThread() const noexcept;
     bool ExternalSpillAvailable() const noexcept;
+    // 预检只比较固定额度，动态额度继续由运行期准入处理
+    std::optional<std::uint64_t> FixedStorageLimitBytes() const noexcept;
 
     bool BeginRun() noexcept;
     bool EndRun() noexcept;
@@ -236,6 +296,19 @@ public:
     void SetFlowProgress(bool moreIndependentBlocks) noexcept;
     void SetWorkType(const ResourceWorkType&) noexcept;
     std::optional<SlotLease> TryAcquireSlot();
+    std::optional<SlotLease> TryAcquireSlot(std::uint64_t bytes,
+        resource::ResidentByteBudget::Lease& reservation);
+    bool CheckNecessaryCapacity(std::uint64_t bytes,
+        const resource::CapacityRejection* details = nullptr,
+        MemoryDemandKind = MemoryDemandKind::Block);
+    std::optional<resource::ResidentByteBudget::Lease> TryAcquireStorage(std::uint64_t,
+        MemoryDemandKind, resource::CapacityRejection* = nullptr, resource::StorageOwnerTag = {},
+        std::span<const resource::StorageOwnerDescription> = {}, std::uint64_t preferredBytes = 0u);
+    std::optional<resource::ResidentByteBudget::Lease> WaitForStorage(std::uint64_t,
+        MemoryDemandKind, resource::StorageOwnerTag = {},
+        std::span<const resource::StorageOwnerDescription> = {}, std::uint64_t preferredBytes = 0u);
+    void CompleteMemoryPreparation() noexcept;
+    void ClearByteWait() noexcept;
     std::optional<HeavyPhaseLease> TryAcquireHeavyPhase();
     bool SubmitTerminal(const SlotLease&, const std::shared_ptr<TerminalWork>&) noexcept;
     bool SubmitTerminal(const HeavyPhaseLease&, const std::shared_ptr<TerminalWork>&) noexcept;
@@ -257,7 +330,8 @@ public:
     void SetWaitReason(ResourceWaitReason, const SlotLease* slot = nullptr,
                        const TerminalWork* work = nullptr) noexcept;
     bool TryCopyResourceDebugSnapshot(ResourceDebugSnapshot&) const noexcept;
-    void RecordCapacityRejection(const resource::CapacityRejection&, bool fatal) noexcept;
+    void RecordCapacityRejection(const resource::CapacityRejection&, bool fatal,
+        std::string_view origin = "MemoryStore") noexcept;
     void RecordDiagnosticExportFailure() noexcept;
     std::shared_ptr<resource::ResidentByteBudget> StorageCapacity() const noexcept;
     ScratchByteBufferPool& Scratch() noexcept;
@@ -278,6 +352,8 @@ private:
         bool resetObservation = false) noexcept;
     std::optional<CodecFailureRecord> ApplyControlLocked(ResourceClock::time_point,
                                                         const ResourceSample&) noexcept;
+    std::optional<CodecFailureRecord> ApplyCpuControlLocked(ResourceClock::time_point,
+                                                           const CpuUsageSample&) noexcept;
     void ControlMain() noexcept;
 };
 

@@ -239,6 +239,11 @@ inline void InvokeConnectivityProgress(
 }
 
 
+inline bool CalculateTopologyRemapStorageBytes(
+    const std::size_t count, std::size_t& bytes, std::string* error = nullptr) {
+    return validation::CheckedMulSizeT(count, sizeof(IndexType), bytes, "topology remap bytes", error);
+}
+
 inline bool PrepareTopologyRemapValues(
     const IRemapProvider* provider, const std::size_t count,
     bytestore::ByteStoreSession& session,
@@ -251,11 +256,11 @@ inline bool PrepareTopologyRemapValues(
         return validation::AssignError(error, "topology remap size does not match its domain");
     }
     std::size_t byteSize = 0u;
-    if (!validation::CheckedMulSizeT(count, sizeof(IndexType), byteSize, "topology remap array", error)) {
+    if (!CalculateTopologyRemapStorageBytes(count, byteSize, error)) {
         return false;
     }
     auto prepared = std::static_pointer_cast<bytestore::MemoryStore>(
-        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, byteSize, "topology_remap", error));
+        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, byteSize, ::datacodec::MemoryDemandKind::RequiredContinuation, "topology_remap", error));
     if (!prepared) { return false; }
     auto bytes = prepared->WritableBytes();
     if (bytes.size() != byteSize || reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(IndexType) != 0u) {

@@ -6,6 +6,8 @@
 #include "DataCodec/Codec/Topology/Connectivity/ConnectivityTopologyTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
+#include "DataCodec/Storage/ByteIO/ArrayWorkspace.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -194,7 +196,7 @@ template<typename TValue>
 bool DecodeUnsignedSequence(
     const std::span<const std::uint8_t> input,
     const std::size_t valueCount,
-    std::vector<TValue>& output,
+    MutableArray<TValue> output,
     std::string* error = nullptr) {
     static_assert(std::is_unsigned_v<TValue>);
     output.clear();
@@ -804,7 +806,7 @@ inline bool BuildCellOffsets(
     const int fixedCellSize,
     const std::span<const IndexType> cellSizes,
     const std::size_t connectivityCount,
-    std::vector<std::size_t>& offsets,
+    MutableArray<std::size_t> offsets,
     std::string* error = nullptr) {
     offsets.assign(cellCount + 1u, 0u);
     if (fixedCellSize > 0) {
@@ -1167,9 +1169,9 @@ inline bool DecodeConnectivityGrammar(
     const std::size_t cellCount,
     const std::size_t connectivityCount,
     const int fixedCellSize,
-    std::vector<IndexType>& output,
+    MutableArray<IndexType> output,
     std::string* error = nullptr,
-    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
+    TopologyBlockCapacitySamples* capacitySamples = nullptr, ArrayWorkspace* workspace = nullptr) {
     output.clear();
     if (input.size() < 6u) {
         return validation::AssignError(error, "topology grammar header is incomplete");
@@ -1254,7 +1256,8 @@ inline bool DecodeConnectivityGrammar(
         !seedAuxReader.Reset(seedAuxStream, seedAuxSymbolCount, error)) {
         return false;
     }
-    std::vector<std::size_t> cellOffsets;
+    ArrayWorkspace::Scope grammarScope(workspace);
+    WorkingArray<std::size_t> cellOffsets(workspace, DecodeBlockMemoryPlan::Add(cellCount, 1u));
     if (!BuildCellOffsets(
             cellCount,
             fixedCellSize,
@@ -1520,9 +1523,9 @@ inline bool DecodeConnectivity(
     const std::size_t cellCount,
     const std::size_t connectivityCount,
     const int fixedCellSize,
-    std::vector<IndexType>& output,
+    MutableArray<IndexType> output,
     std::string* error = nullptr,
-    TopologyBlockCapacitySamples* capacitySamples = nullptr) {
+    TopologyBlockCapacitySamples* capacitySamples = nullptr, ArrayWorkspace* workspace = nullptr) {
     return DecodeConnectivityGrammar(
         input,
         cellSizes,
@@ -1531,7 +1534,7 @@ inline bool DecodeConnectivity(
         connectivityCount,
         fixedCellSize,
         output,
-        error, capacitySamples);
+        error, capacitySamples, workspace);
 }
 
 } // namespace datacodec::topocodec::blockcodec

@@ -425,6 +425,25 @@ public:
         "outputSinks.decodeConfiguration",
         "adaptive report must leave unresolved startup limits absent");
 
+    for (const auto operation : {TelemetryRunKind::Encode, TelemetryRunKind::Decode}) {
+        const CodecResourceParams unlimited{.mode = CodecResourceMode::Unlimited, .maxComputeThreads = 2u};
+        DataCodecProcessReport report{
+            .operation = operation,
+            .configuration = operation == TelemetryRunKind::Encode
+                ? MakeDataCodecEncodeReportConfiguration(unlimited, true, encodeDefinition)
+                : MakeDataCodecDecodeReportConfiguration(unlimited, decodeDefinition, true),
+        };
+        const auto json = SerializeDataCodecProcessReportJson(report);
+        rapidjson::Document document;
+        document.Parse(json.data(), json.size());
+        const bool valid = !document.HasParseError() && document.HasMember("configuration") &&
+            std::string(document["configuration"]["resourceMode"].GetString()) == "Unlimited" &&
+            document["configuration"]["resourceLimits"]["ownedStorageLimitBytes"].IsNull() &&
+            document["configuration"]["resourceLimits"]["storageCeilingBytes"].IsNull() &&
+            document["configuration"]["resourceLimits"]["maxComputeThreads"].GetUint64() == 2u;
+        Require(result, valid, "outputSinks.unlimited", "Unlimited reports use null byte limits and retain thread configuration");
+    }
+
     DataCodecProcessReport workflowMemoryReport{
         .operation = TelemetryRunKind::Encode,
         .generatedAtUtc = "2026-01-01T00:00:00Z",

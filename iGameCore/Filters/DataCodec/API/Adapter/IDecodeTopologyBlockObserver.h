@@ -5,7 +5,8 @@
 
 #include <cstddef>
 #include <string>
-#include <vector>
+#include <memory>
+#include <span>
 
 namespace datacodec {
 
@@ -22,9 +23,10 @@ struct DecodedConnectivityTopologyBlock {
     std::size_t blockIndex{0u};
     std::size_t cellOffset{0u};
     int fixedCellSize{0};
-    std::vector<IndexType> connectivity;
-    std::vector<IndexType> offsets;
-    std::vector<IndexType> cellTypes;
+    std::unique_ptr<std::uint8_t[]> owner;
+    std::span<const IndexType> connectivity;
+    std::span<const IndexType> offsets;
+    std::span<const IndexType> cellTypes;
 };
 
 class IDecodeTopologyBlockObserver {

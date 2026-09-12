@@ -47,7 +47,7 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
         auto capacity = std::make_shared<resource::ResidentByteBudget>(externalSpill ? 0u : size);
         bytestore::ByteStoreSession session;
         session.BindStorage(capacity, externalSpill);
-        auto source = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, size, "range_source");
+        auto source = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, size, ::datacodec::MemoryDemandKind::RequiredContinuation, "range_source");
         std::vector<std::uint8_t> payload(size);
         for (std::size_t i = 0u; i < size; ++i) { payload[i] = static_cast<std::uint8_t>(i % 251u); }
         Require(result, source && source->WriteBytesAt(0u, payload) && source->Seal(),
@@ -246,7 +246,7 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     snapshot.heavyPhaseAdmitted && snapshot.activeComputeUnits == 0u;
                 for (const auto& sample : samples) {
                     if (sample.name == "polyhedron.index_write_window" && sample.capacityBytes) {
-                        samplesValid &= *sample.capacityBytes == kIoWindowBytes;
+                        samplesValid &= *sample.capacityBytes <= kIoWindowBytes;
                     }
                 }
             });
@@ -255,21 +255,28 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
             polyhedron::PolyhedronBatchOutput batch;
             batch.capacitySamples.emplace();
             auto phase = WaitForHeavyPhase(root);
+            const polyhedron::PolyhedronBatchRange range{0u, 1u, 0u, 0u, 0u, 1u, 1u, 1u};
+            const auto memory = polyhedron::MakePolyhedronBatchMemoryLayout(range);
+            DecodeBlockWorkspace blockWorkspace(root.Scratch(), memory);
+            auto reservation = root.StorageCapacity()->TryReserve(blockWorkspace.TakeReusable());
+            if (!reservation) { return result; }
+            blockWorkspace.Allocate(*root.StorageCapacity(), std::move(*reservation));
             valid = valid && phase && RunTerminalWork(root, *phase, [&](WorkerContext&) {
                 const auto& p = cache.polyhedron;
-                return polyhedron::BuildPolyhedronCellBatch(root, {0u, 1u, 0u, 0u, 0u},
+                return polyhedron::BuildPolyhedronCellBatch(root, range,
                     p.uniqueVertexCounts, p.cellFaceCounts, p.faceVertexCounts,
-                    p.cellUniqueVertexIds, p.localFaceVertexIds, batch, &error);
-            }) && batch.scratch.cellUniqueVertexIds == std::vector<IndexType>{42u} &&
-                batch.scratch.localFaceVertexIds == std::vector<IndexType>{0u} &&
-                batch.scratch.faceVertexOffsets == std::vector<IndexType>({0u, 1u});
+                    p.cellUniqueVertexIds, p.localFaceVertexIds, batch, blockWorkspace, &error);
+            }) && std::ranges::equal(batch.scratch.cellUniqueVertexIds, std::vector<IndexType>{42u}) &&
+                std::ranges::equal(batch.scratch.localFaceVertexIds, std::vector<IndexType>{0u}) &&
+                std::ranges::equal(batch.scratch.faceVertexOffsets, std::vector<IndexType>({0u, 1u}));
             const auto& offsets = batch.capacitySamples->values[
                 static_cast<std::size_t>(polyhedron::PolyhedronBufferSample::FaceVertexOffsets)];
             const auto& counts = batch.capacitySamples->values[
                 static_cast<std::size_t>(polyhedron::PolyhedronBufferSample::UniqueCounts)];
-            valid &= offsets.capacityBytes == VectorCapacityBytes(batch.scratch.faceVertexOffsets) &&
+            valid &= offsets.capacityBytes == batch.scratch.faceVertexOffsets.capacity() * sizeof(IndexType) &&
                 counts.capacityBytes.value_or(0u) >= sizeof(IndexType) && offsets.scopeId != counts.scopeId;
         }
+        root.Scratch().ClearFixed();
         scope.Finish(decoded);
         cache.Release();
         ResourceDebugSnapshot snapshot;

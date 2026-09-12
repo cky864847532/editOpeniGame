@@ -28,6 +28,10 @@ struct BufferCapacitySample {
     void Observe(const std::vector<T, Allocator>& values) noexcept {
         Observe(static_cast<std::uint64_t>(values.capacity()) * sizeof(T));
     }
+    template<class Array> requires requires(const Array& array) { typename Array::value_type; array.capacity(); array.data(); }
+    void Observe(const Array& values) noexcept {
+        Observe(static_cast<std::uint64_t>(values.capacity()) * sizeof(typename Array::value_type));
+    }
 
     std::string_view name;
     std::uint64_t scopeId{0u};

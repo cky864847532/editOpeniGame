@@ -1,417 +1,447 @@
 #include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
 namespace datacodec {
-
 namespace {
-
-std::optional<std::uint64_t> EffectiveTotal(const ResourceSample& sample) noexcept {
-    if (!sample.physicalTotalBytes || *sample.physicalTotalBytes == 0u) { return std::nullopt; }
-    return std::min(*sample.physicalTotalBytes,
-        sample.hardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max()));
+constexpr std::uint64_t MiB = 1024u * 1024u;
+std::uint64_t Sub(std::uint64_t a, std::uint64_t b) noexcept { return a - std::min(a, b); }
+bool Elapsed(const std::optional<ResourceClock::time_point>& at, ResourceClock::time_point now,
+    ResourceClock::duration interval) noexcept { return at && now >= *at && now - *at >= interval; }
+std::optional<std::uint64_t> Remaining(const ResourceSample& s) noexcept {
+    std::optional<std::uint64_t> result;
+    for (auto value : {s.hardRemainingBytes, s.commitRemainingBytes, s.processRemainingBytes,
+            s.jobRemainingBytes, s.addressSpaceRemainingBytes, s.cgroupRemainingBytes}) {
+        if (value) { result = result ? std::min(*result, *value) : value; }
+    }
+    return result;
+}
+std::uint64_t Absolute(const ResourceSample& s) noexcept {
+    auto value = std::min(s.physicalTotalBytes.value_or(0u),
+        static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()));
+    for (auto bound : {s.hardLimitBytes, s.processLimitBytes, s.jobLimitBytes, s.addressSpaceLimitBytes, s.cgroupLimitBytes}) {
+        if (bound) { value = std::min(value, *bound); }
+    }
+    return value;
+}
+std::uint64_t Scale(std::uint64_t bytes, double factor) noexcept {
+    return static_cast<std::uint64_t>(std::min(static_cast<long double>(bytes),
+        std::floor(static_cast<long double>(bytes) * factor)));
+}
+void ResetGainWindow(ResourceControllerState& state, ResourceClock::time_point now) noexcept {
+    state.gainWindowStarted = now;
+    state.availableSum = 0.0;
+    state.availableSamples = 0u;
+}
+void ObserveGain(ResourceControllerState& state, ResourceClock::time_point now, bool newSample) noexcept {
+    auto& m = state.memory;
+    if (state.initialMeasurement && m.calibration == MemoryCalibrationResult::Measuring &&
+        now - m.calibrationStarted >= resource_control::calibrationDeadline) {
+        m.calibration = MemoryCalibrationResult::TimedOut;
+        m.calibrationElapsed = now - m.calibrationStarted;
+        m.calibrationEndReason = ResourceDecisionReason::WaitDeadlineExceeded;
+        state.gainPhase = 0u;
+        state.initialMeasurement = false;
+    }
+    if (!newSample || (state.gainPhase != 1u && state.gainPhase != 3u)) { return; }
+    state.availableSum += static_cast<double>(*m.availableBytes);
+    ++state.availableSamples;
+    if (now - state.gainWindowStarted < resource_control::gainWindow) { return; }
+    const double average = state.availableSum / static_cast<double>(state.availableSamples);
+    if (state.gainPhase == 1u) {
+        m.baselineAvailable = average;
+        state.measurementBytes = 0u;
+        state.gainPhase = 2u;
+        return;
+    }
+    m.responseAvailable = average;
+    m.measuredReservationBytes = state.measurementBytes;
+    const double response = state.measurementBytes != 0u
+        ? (*m.baselineAvailable - average) / static_cast<double>(state.measurementBytes) : 0.0;
+    const bool usable = std::isfinite(response) && response >= 1e-6;
+    if (usable) {
+        m.response = response;
+        m.gain = std::clamp(resource_control::responseAlpha / response,
+            resource_control::minimumGain, resource_control::maximumGain);
+        ++m.gainUpdates;
+    }
+    if (state.initialMeasurement) {
+        m.calibration = usable ? MemoryCalibrationResult::Estimated : MemoryCalibrationResult::Unusable;
+        m.calibrationElapsed = now - m.calibrationStarted;
+        m.calibrationEndReason = usable ? ResourceDecisionReason::MemoryGainUpdated : ResourceDecisionReason::MeasurementUnusable;
+    }
+    state.gainPhase = 0u;
+    state.initialMeasurement = false;
+}
 }
 
-std::optional<std::uint64_t> EffectiveAvailable(const ResourceSample& sample) noexcept {
-    if (!sample.availableBytes) { return std::nullopt; }
-    return std::min(*sample.availableBytes,
-        sample.hardRemainingBytes.value_or(std::numeric_limits<std::uint64_t>::max()));
+const char* MemoryCalibrationResultName(MemoryCalibrationResult result) noexcept {
+    switch (result) {
+    case MemoryCalibrationResult::Pending: return "Pending";
+    case MemoryCalibrationResult::Measuring: return "Measuring";
+    case MemoryCalibrationResult::Estimated: return "Estimated";
+    case MemoryCalibrationResult::Unusable: return "Unusable";
+    case MemoryCalibrationResult::TimedOut: return "TimedOut";
+    }
+    return "Unknown";
+}
+const char* MemoryDecisionReasonName(ResourceDecisionReason reason) noexcept {
+    switch (reason) {
+    case ResourceDecisionReason::ReserveTargetLow: return "ReserveTargetLow";
+    case ResourceDecisionReason::NativeMemoryPressure: return "NativeMemoryPressure";
+    case ResourceDecisionReason::RuntimeHeadroomLow: return "RuntimeHeadroomLow";
+    case ResourceDecisionReason::RequiredGrowth: return "RequiredGrowth";
+    case ResourceDecisionReason::RequiredContinuation: return "RequiredContinuation";
+    case ResourceDecisionReason::SampleUnavailable: return "SampleUnavailable";
+    case ResourceDecisionReason::RetainedStoragePreventingProgress: return "RetainedStoragePreventingProgress";
+    case ResourceDecisionReason::WaitDeadlineExceeded: return "WaitDeadlineExceeded";
+    case ResourceDecisionReason::CapacityBoundExceeded: return "CapacityBoundExceeded";
+    case ResourceDecisionReason::HardCapabilityChanged: return "HardCapabilityChanged";
+    case ResourceDecisionReason::PressureCleared: return "PressureCleared";
+    case ResourceDecisionReason::RetentionRestored: return "RetentionRestored";
+    case ResourceDecisionReason::MemoryGainUpdated: return "MemoryGainUpdated";
+    case ResourceDecisionReason::BeginRequest: return "BeginRequest";
+    case ResourceDecisionReason::RequestEnded: return "RequestEnded";
+    case ResourceDecisionReason::RequestCancelled: return "RequestCancelled";
+    case ResourceDecisionReason::MeasurementUnusable: return "MeasurementUnusable";
+    default: return "NoChange";
+    }
 }
 
-bool Elapsed(const std::optional<ResourceClock::time_point>& since,
-             ResourceClock::time_point now, ResourceClock::duration duration) noexcept {
-    return since && now >= *since && now - *since >= duration;
+bool ValidPhysicalMemorySample(const ResourceSample& sample, ResourceClock::time_point now) noexcept {
+    return sample.physicalTotalBytes && *sample.physicalTotalBytes != 0u && sample.availableBytes &&
+        *sample.availableBytes <= *sample.physicalTotalBytes && sample.sampledAt <= now &&
+        now - sample.sampledAt <= resource_control::maximumSampleAge;
 }
 
-void ResetObservation(ResourceControllerState& state, ControlDecision& decision) noexcept {
-    state.firstObservationSampleAt.reset();
-    state.observationSampleCount = 0u;
-    decision.resetObservation = true;
+ResourceWatermarks MakeReserveWatermarks(std::uint64_t total, double ratio) noexcept {
+    const auto reserve = static_cast<std::uint64_t>(std::min(static_cast<long double>(total),
+        std::ceil(static_cast<long double>(total) * ratio)));
+    const auto hysteresis = std::min(Sub(total, reserve) / 2u,
+        std::clamp(total / 200u, 16u * MiB, 256u * MiB));
+    return {reserve, reserve + hysteresis, reserve / 2u};
 }
 
-void ClearContinuousSamples(ResourceControllerState& state, ControlDecision& decision) noexcept {
-    state.highSince.reset();
-    state.lowSince.reset();
-    state.pendingClearSince.reset();
-    ResetObservation(state, decision);
-}
-
-bool FractionAtLeast(ResourceClock::duration part, ResourceClock::duration whole,
-                     unsigned percent) noexcept {
-    return whole > ResourceClock::duration::zero() &&
-        std::chrono::duration<double>(part).count() >=
-            std::chrono::duration<double>(whole).count() * static_cast<double>(percent) / 100.0;
-}
-
+// Fixed 的旧默认值独立保留
+ResourceWatermarks MakeResourceWatermarks(std::uint64_t total) noexcept {
+    const auto low = std::min(total / 4u, std::clamp(total / 16u, 128u * MiB, 4096u * MiB));
+    return {low, low + low / 2u, low / 2u};
 }
 
 void InitializeResourceController(ResourceControllerState& state,
-                                  const ResolvedResourceConfiguration& configuration,
-                                  ResourceClock::time_point now) noexcept {
+    const ResolvedResourceConfiguration& config, ResourceClock::time_point) noexcept {
     state = {};
-    state.storageCeilingBytes = configuration.storageCeilingBytes;
-    state.computeCeiling = configuration.computeCeiling;
-    state.currentComputeCeiling = configuration.computeCeiling;
-    state.threaded = configuration.threaded;
-    state.lastGrowthAt = now;
-    state.lastStorageGrowthAt = now;
+    state.memory.targetRatio = config.targetAvailableMemoryRatio;
+    state.memory.absoluteCapacityBytes = config.storageCeilingBytes.value_or(0u);
+    state.normalSlotLimit = config.threaded ? config.computeCeiling + 1u : 1u;
+}
+
+void FinishMemoryMeasurement(ResourceControllerState& state, ResourceClock::time_point now,
+    ResourceDecisionReason reason) noexcept {
+    if (state.gainPhase >= 2u) { state.memory.measuredReservationBytes = state.measurementBytes; }
+    if (state.initialMeasurement) {
+        state.memory.calibration = MemoryCalibrationResult::Unusable;
+        state.memory.calibrationElapsed = now - state.memory.calibrationStarted;
+    }
+    if (state.gainPhase != 0u) { state.memory.calibrationEndReason = reason; }
+    state.gainPhase = 0u;
+    state.initialMeasurement = false;
+}
+
+void NoteMemoryReservation(ResourceControllerState& state, std::uint64_t bytes,
+    std::uint64_t demandId, ResourceClock::time_point now) noexcept {
+    if (state.gainPhase >= 2u) {
+        if (bytes > std::numeric_limits<std::uint64_t>::max() - state.measurementBytes) {
+            FinishMemoryMeasurement(state, now, ResourceDecisionReason::CapacityBoundExceeded);
+        } else { state.measurementBytes += bytes; }
+    }
+    if (state.grant.demandId != 0u && state.grant.demandId == demandId && !state.grant.used) {
+        state.grant.used = true;
+        if (state.gainPhase == 2u && (state.grant.probe || !state.initialMeasurement)) {
+            state.gainPhase = 3u;
+            ResetGainWindow(state, now);
+        }
+    }
 }
 
 ControlDecision Advance(ResourceControllerState& state, ResourceClock::time_point now,
-                        const ResourceSample& sample, const FlowSnapshot& flow) noexcept {
+    const ResourceSample& sample, const FlowSnapshot& flow) noexcept {
     using namespace resource_control;
     ControlDecision decision;
     decision.limits = flow.limits;
     decision.gateOpen = flow.gateOpen;
     decision.optionalRetentionPausedByPressure = state.optionalRetentionPausedByPressure;
-    if (flow.stopped || !flow.runActive) { return decision; }
-
+    if (flow.stopped || !flow.runActive || !flow.limits.ownedStorageLimitBytes) { return decision; }
     const bool newRequest = state.requestId != flow.requestId;
     if (newRequest) {
+        const auto ratio = state.memory.targetRatio;
+        const auto slots = state.normalSlotLimit;
+        const auto bound = state.memory.absoluteCapacityBytes;
+        state = {};
+        state.memory.targetRatio = ratio;
+        state.memory.absoluteCapacityBytes = bound;
+        state.normalSlotLimit = slots;
         state.requestId = flow.requestId;
-        state.holdSince.reset();
-        state.lastGrowthAt = now;
-        state.lastStorageGrowthAt = now;
-        ClearContinuousSamples(state, decision);
         decision.reason = ResourceDecisionReason::BeginRequest;
     }
-    const bool fresh = sample.sampledAt <= now && now - sample.sampledAt <= maximumSampleAge;
-    const bool newSample = fresh && (!state.lastSampleAt || sample.sampledAt > *state.lastSampleAt);
-    const bool gap = newSample && state.lastSampleAt &&
-        sample.sampledAt - *state.lastSampleAt > maximumSampleAge;
-    const auto total = EffectiveTotal(sample);
-    const auto available = EffectiveAvailable(sample);
-    const bool valid = state.threaded && fresh && total && *total != 0u && available;
-    const auto marks = total ? MakeResourceWatermarks(*total) : ResourceWatermarks{};
-    const bool wasValid = state.signalValid;
-    if (gap) { ClearContinuousSamples(state, decision); }
-    if (newSample) {
-        state.lastSampleAt = sample.sampledAt;
-        if (sample.pressure == PressureLevel::Normal) { state.nativePressureActive = false; }
-        if (sample.pressure == PressureLevel::Low || sample.pressure == PressureLevel::Critical) {
-            state.nativePressureActive = true;
-        }
-    }
-    const bool severe = state.threaded && fresh && (sample.pressure == PressureLevel::Critical ||
-        (valid && *available < marks.critical));
-    const bool nativeLow = state.threaded && fresh && sample.pressure == PressureLevel::Low;
-    const bool low = valid && *available < marks.low;
-    const bool high = valid && *available >= marks.high && !state.nativePressureActive;
+    auto& m = state.memory;
+    const bool valid = ValidPhysicalMemorySample(sample, now);
+    const bool newSample = valid && (!state.lastSampleAt || sample.sampledAt > *state.lastSampleAt);
+    const bool gap = newSample && state.lastSampleAt && sample.sampledAt - *state.lastSampleAt > maximumSampleAge;
+    if (gap) { state.previousAvailableBytes.reset(); state.highSince.reset(); state.lowSince.reset(); }
     state.signalValid = valid;
-
-    // 当前硬能力单独保存，样本未知时保持最后一次已知值
-    bool capabilityChanged = false;
-    if (fresh && sample.hardLimitBytes &&
-        state.currentHardLimitBytes != sample.hardLimitBytes) {
-        state.currentHardLimitBytes = sample.hardLimitBytes;
-        capabilityChanged = true;
-    }
-    if (fresh && sample.allowedComputeThreads) {
-        const auto allowed = state.threaded
-            ? std::max<std::size_t>(1u, std::min(state.computeCeiling,
-                ResourceComputeCapacity(sample, CodecResourceMode::Adaptive))) : 1u;
-        if (allowed != state.currentComputeCeiling) {
-            state.currentComputeCeiling = allowed;
-            capabilityChanged = true;
+    const auto previousTotal = m.physicalTotalBytes;
+    const auto previousBound = m.absoluteCapacityBytes;
+    if (valid) {
+        m.physicalTotalBytes = sample.physicalTotalBytes;
+        m.availableBytes = sample.availableBytes;
+        m.environmentRemainingBytes = Remaining(sample);
+        m.absoluteCapacityBytes = Absolute(sample);
+        const auto marks = MakeReserveWatermarks(*sample.physicalTotalBytes, m.targetRatio);
+        m.reserveBytes = marks.low;
+        m.recoveryBytes = marks.high;
+        if (newSample) {
+            state.recentAvailableAverage = static_cast<double>(*sample.availableBytes);
+            if (state.previousAvailableBytes && state.lastSampleAt && sample.sampledAt - *state.lastSampleAt <= gainWindow) {
+                state.recentAvailableAverage = (state.recentAvailableAverage + static_cast<double>(*state.previousAvailableBytes)) / 2.0;
+            }
+            state.growthAvailableBytes = std::min(*sample.availableBytes,
+                state.previousAvailableBytes.value_or(*sample.availableBytes));
+            state.previousAvailableBytes = sample.availableBytes;
+            state.lastSampleAt = sample.sampledAt;
         }
+        m.growthHeadroomBytes = std::min({Sub(state.growthAvailableBytes, m.recoveryBytes),
+            m.environmentRemainingBytes.value_or(std::numeric_limits<std::uint64_t>::max()),
+            Sub(m.absoluteCapacityBytes, flow.reservedBytes)});
+    } else {
+        m.availableBytes.reset();
+        m.environmentRemainingBytes.reset();
+        m.growthHeadroomBytes = 0u;
+        state.previousAvailableBytes.reset();
+        state.highSince.reset();
     }
-    const auto memoryBound = std::min(state.storageCeilingBytes,
-        state.currentHardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max()));
-    const auto p = state.currentComputeCeiling;
-    const auto q = std::min<std::size_t>(p, 8u);
-    const auto slotMaximum = state.threaded ? p + q : 1u;
-    if (capabilityChanged) {
-        decision.limits.ownedStorageLimitBytes = std::min(decision.limits.ownedStorageLimitBytes, memoryBound);
-        decision.limits.computeLimit = std::min(decision.limits.computeLimit, p);
-        decision.limits.slotLimit = std::min({decision.limits.slotLimit, slotMaximum,
-            decision.limits.computeLimit + q});
-        ResetObservation(state, decision);
+    const bool capacityChanged = previousTotal && (previousTotal != m.physicalTotalBytes || previousBound != m.absoluteCapacityBytes);
+    if (capacityChanged) {
+        FinishMemoryMeasurement(state, now, ResourceDecisionReason::HardCapabilityChanged);
         decision.reason = ResourceDecisionReason::HardCapabilityChanged;
     }
-    if (newRequest && fresh && total && available) {
-        decision.limits.ownedStorageLimitBytes = std::min(memoryBound,
-            (*available - std::min(*available, marks.high)) / 2u);
+    const bool native = valid && (sample.pressure == PressureLevel::Low || sample.pressure == PressureLevel::Critical);
+    const bool low = valid && *sample.availableBytes < m.reserveBytes;
+    const bool runtimeLow = valid && (m.environmentRemainingBytes == 0u || flow.reservedBytes > m.absoluteCapacityBytes);
+    const bool pressure = !valid || native || low || runtimeLow;
+    const bool high = valid && *sample.availableBytes >= m.recoveryBytes && !native && !runtimeLow;
+    if (newSample) {
+        if (high) { if (!state.highSince) { state.highSince = sample.sampledAt; } }
+        else { state.highSince.reset(); }
+        if (low) { if (!state.lowSince) { state.lowSince = sample.sampledAt; } }
+        else { state.lowSince.reset(); }
     }
+    const bool safeBoundary = flow.activeComputeUnits == 0u && flow.queuedTasks == 0u && flow.admittedBlocks == 0u;
+    const auto beginWait = [&] { if (!m.waitSince) { m.waitSince = now; } };
+    const auto expire = [&] {
+        if (Elapsed(m.waitSince, now, holdTimeout)) {
+            decision.failForSustainedPressure = true;
+            decision.reason = ResourceDecisionReason::WaitDeadlineExceeded;
+        }
+    };
     if (!state.initialized) {
         state.initialized = true;
-        decision.limits.computeLimit = high ? std::min(p, healthyStartupComputeLimit) : 1u;
-        decision.limits.slotLimit = high ? decision.limits.computeLimit + 1u : 1u;
-        decision.gateOpen = !severe && !nativeLow && !low;
+        const auto window = std::min(Scale(m.growthHeadroomBytes, m.gain),
+            std::max(MiB, m.physicalTotalBytes.value_or(0u) / 16u));
+        decision.limits.ownedStorageLimitBytes = flow.reservedBytes > m.absoluteCapacityBytes
+            ? m.absoluteCapacityBytes : flow.reservedBytes + (pressure ? 0u : window);
+        decision.limits.slotLimit = state.normalSlotLimit;
+        decision.gateOpen = !pressure;
     }
-
-    if (newSample) {
-        if (high) {
-            if (!state.highSince) { state.highSince = sample.sampledAt; }
-        } else { state.highSince.reset(); }
-        if (low) {
-            if (!state.lowSince) { state.lowSince = sample.sampledAt; }
-        } else { state.lowSince.reset(); }
+    if (valid) {
+        const auto allowed = flow.reservedBytes > m.absoluteCapacityBytes ? m.absoluteCapacityBytes :
+            flow.reservedBytes + m.growthHeadroomBytes;
+        decision.limits.ownedStorageLimitBytes = std::min(*decision.limits.ownedStorageLimitBytes, allowed);
     }
-
-    const auto confirmPressure = [&](bool critical) {
-        const bool firstEvent = !state.pressureConfirmed;
-        const bool escalation = critical && !state.severePressure;
-        if (firstEvent) {
-            if (state.lastRecoveryAt && now - *state.lastRecoveryAt <= repeatPressureWindow) {
-                state.cooldown = std::min<ResourceClock::duration>(maximumCooldown, state.cooldown * 2);
-            } else { state.cooldown = initialCooldown; }
-            state.lastPressureAt = now;
-            state.everConfirmedPressure = true;
-            state.pressureConfirmed = true;
-            state.optionalRetentionPausedByPressure = true;
-            decision.optionalRetentionPausedByPressure = true;
+    if (pressure) {
+        beginWait();
+        decision.reason = !valid ? ResourceDecisionReason::SampleUnavailable : native ? ResourceDecisionReason::NativeMemoryPressure :
+            low ? ResourceDecisionReason::ReserveTargetLow : ResourceDecisionReason::RuntimeHeadroomLow;
+        FinishMemoryMeasurement(state, now, decision.reason);
+        state.phase = safeBoundary ? ResourceControlPhase::Hold : ResourceControlPhase::Drain;
+        decision.gateOpen = false;
+        decision.limits.ownedStorageLimitBytes = std::min(flow.reservedBytes, m.absoluteCapacityBytes);
+        const bool severe = valid && (sample.pressure == PressureLevel::Critical || *sample.availableBytes < m.reserveBytes / 2u);
+        const bool confirmed = native || severe || (newSample && low && Elapsed(state.lowSince, now, pendingConfirmation));
+        if (confirmed && (!state.pressureConfirmed || (severe && !state.severePressure))) {
             decision.trimOptionalRetention = true;
-            decision.reason = ResourceDecisionReason::PressureConfirmed;
+            state.optionalRetentionPausedByPressure = true;
+            state.pressureConfirmed = true;
         }
-        if (critical) {
-            decision.limits.computeLimit = 1u;
-            decision.limits.slotLimit = 1u;
-            if (!firstEvent && !state.severePressure) {
-                decision.reason = ResourceDecisionReason::PressureEscalated;
-            }
-            state.severePressure = true;
-        } else if (firstEvent) {
-            const auto compute = std::max<std::size_t>(1u, decision.limits.computeLimit / 2u);
-            decision.limits.computeLimit = compute;
-            decision.limits.slotLimit = std::max(compute, std::min(decision.limits.slotLimit, compute + 1u));
-        }
-        state.pressurePending = false;
-        state.pendingSince.reset();
-        state.pendingClearSince.reset();
+        state.severePressure |= severe;
+        state.pressurePending = low && !state.pressureConfirmed;
+    } else if (state.phase == ResourceControlPhase::Drain || state.phase == ResourceControlPhase::Hold) {
         decision.gateOpen = false;
-        if (state.phase == ResourceControlPhase::Normal) { state.phase = ResourceControlPhase::Drain; }
-        if (firstEvent || escalation) { ResetObservation(state, decision); }
-    };
-
-    if (severe) { confirmPressure(true); }
-    else if (nativeLow) { confirmPressure(false); }
-    else if (state.phase == ResourceControlPhase::Normal && !state.pressureConfirmed) {
-        if (low && !state.pressurePending) {
-            state.pressurePending = true;
-            state.pendingSince = now;
-            state.pendingClearSince.reset();
-            decision.gateOpen = false;
-            decision.reason = ResourceDecisionReason::PressurePending;
-            ResetObservation(state, decision);
-        }
-        if (state.pressurePending) {
-            decision.gateOpen = false;
-            if (newSample && valid && !low && !state.nativePressureActive) {
-                if (!state.pendingClearSince) { state.pendingClearSince = sample.sampledAt; }
-            } else if (newSample) { state.pendingClearSince.reset(); }
-            if (newSample && Elapsed(state.pendingClearSince, sample.sampledAt, pendingConfirmation)) {
-                state.pressurePending = false;
-                state.pendingSince.reset();
-                state.lowSince.reset();
-                state.pendingClearSince.reset();
-                decision.gateOpen = true;
-                decision.reason = ResourceDecisionReason::PressureCleared;
-                ResetObservation(state, decision);
-            } else if ((newSample && low && Elapsed(state.lowSince, sample.sampledAt, pendingConfirmation)) ||
-                       Elapsed(state.pendingSince, now, pendingMaximum)) {
-                confirmPressure(false);
-            }
-        }
-    }
-
-    if (!valid) {
-        if (wasValid || newRequest) { ClearContinuousSamples(state, decision); }
-        if (wasValid) {
-            state.signalRecoveryPending = true;
-            decision.limits.computeLimit = 1u;
+        if (safeBoundary) { state.phase = ResourceControlPhase::Hold; }
+        if (newSample && high && Elapsed(state.highSince, sample.sampledAt, recoveryConfirmation)) {
+            state.phase = ResourceControlPhase::Recover;
+            state.recoveryStartedAt = now;
+            state.cooldownUntil = now + recoveryCooldown;
+            decision.gateOpen = true;
             decision.limits.slotLimit = 1u;
-            decision.gateOpen = false;
-            if (state.phase == ResourceControlPhase::Normal) { state.phase = ResourceControlPhase::Drain; }
-            decision.reason = ResourceDecisionReason::SignalLost;
-        }
-    }
-    const bool drained = flow.admittedBlocks == 0u && flow.activeComputeUnits == 0u &&
-        !flow.heavyPhaseAdmitted;
-    if (state.phase == ResourceControlPhase::Drain && drained) {
-        if (state.pressureConfirmed || state.pressurePending) {
-            if (flow.pendingNecessaryWork) {
-                state.phase = ResourceControlPhase::Hold;
-                if (!state.holdSince) { state.holdSince = now; }
-                state.highSince.reset();
-                decision.reason = ResourceDecisionReason::Drained;
-            }
-        } else {
-            state.phase = ResourceControlPhase::Normal;
-            decision.gateOpen = true;
-            decision.reason = ResourceDecisionReason::Drained;
-            ResetObservation(state, decision);
-        }
-    }
-    if (state.phase == ResourceControlPhase::Hold) {
-        decision.gateOpen = false;
-        if (newRequest && !state.holdSince && flow.pendingNecessaryWork) { state.holdSince = now; }
-        if (newSample && high && Elapsed(state.highSince, sample.sampledAt, recoveryConfirmation) &&
-            state.holdSince && state.highSince && *state.highSince >= *state.holdSince) {
-            state.phase = ResourceControlPhase::Normal;
-            state.pressureConfirmed = false;
-            state.pressurePending = false;
-            state.severePressure = false;
-            state.holdSince.reset();
-            state.pendingSince.reset();
-            state.lastRecoveryAt = now;
-            state.cooldownUntil = now + state.cooldown;
-            state.lastGrowthAt = now;
-            decision.gateOpen = true;
             decision.reason = ResourceDecisionReason::PressureCleared;
-            ResetObservation(state, decision);
-            return decision;
         }
-        if (flow.pendingNecessaryWork && Elapsed(state.holdSince, now, holdTimeout)) {
-            decision.failForSustainedPressure = true;
-            decision.reason = ResourceDecisionReason::PressureTimeout;
+    } else { decision.gateOpen = true; }
+    if (state.phase == ResourceControlPhase::Recover) {
+        decision.limits.slotLimit = 1u;
+        if (state.progressAt && state.recoveryStartedAt && *state.progressAt >= *state.recoveryStartedAt) {
+            m.waitSince.reset();
+            if (newSample && high && sample.sampledAt > *state.progressAt && now >= state.cooldownUntil) {
+                state.phase = ResourceControlPhase::Normal;
+                state.pressureConfirmed = state.pressurePending = state.severePressure = false;
+                state.optionalRetentionPausedByPressure = false;
+                decision.limits.slotLimit = state.normalSlotLimit;
+                decision.reason = ResourceDecisionReason::RetentionRestored;
+            }
         }
+    }
+    decision.optionalRetentionPausedByPressure = state.optionalRetentionPausedByPressure;
+    if (valid && safeBoundary && (flow.reservedBytes > m.absoluteCapacityBytes ||
+        (flow.byteWaiting && flow.nextWorkBytes > Sub(m.absoluteCapacityBytes, flow.reservedBytes)))) {
+        decision.failForCapacityBound = true;
+        decision.reason = ResourceDecisionReason::CapacityBoundExceeded;
+    }
+    if (!decision.gateOpen || decision.failForCapacityBound) {
+        expire();
+        m.reason = decision.reason;
         return decision;
     }
-    if (state.phase != ResourceControlPhase::Normal || state.pressurePending || state.pressureConfirmed) {
-        return decision;
+    // 未消费的授权被收回时取消该授权，新的授权仍需新鲜样本
+    if (state.grant.demandId && !state.grant.used && flow.byteWaiting &&
+        *decision.limits.ownedStorageLimitBytes < flow.reservedBytes + std::min(flow.nextWorkBytes, Sub(m.absoluteCapacityBytes, flow.reservedBytes))) {
+        state.grant.used = true;
+        state.grant.completedAt = now;
     }
-
-    if (state.workType != flow.workType) {
-        if (!drained) {
-            ResetObservation(state, decision);
-            return decision;
+    const auto gainBefore = m.gainUpdates;
+    ObserveGain(state, now, newSample);
+    if (gainBefore != m.gainUpdates) { decision.reason = ResourceDecisionReason::MemoryGainUpdated; }
+    const auto unused = Sub(*decision.limits.ownedStorageLimitBytes, flow.reservedBytes);
+    if (flow.byteWaiting && flow.nextWorkBytes > unused) {
+        beginWait();
+        if (state.phase == ResourceControlPhase::Normal && m.calibration == MemoryCalibrationResult::Pending) {
+            m.calibration = MemoryCalibrationResult::Measuring;
+            m.calibrationStarted = now;
+            state.initialMeasurement = true;
+            state.gainPhase = 1u;
+            ResetGainWindow(state, now);
         }
-        state.workType = flow.workType;
-        // 健康环境采用有限初始并发，压力与信号恢复仍遵守收缩和冷却
-        const bool healthyStartup = high && !state.everConfirmedPressure &&
-            !state.signalRecoveryPending && now >= state.cooldownUntil;
-        decision.limits.computeLimit = healthyStartup ? std::min(p, healthyStartupComputeLimit) : 1u;
-        decision.limits.slotLimit = healthyStartup ? decision.limits.computeLimit + 1u :
-            std::min<std::size_t>(decision.limits.slotLimit, state.threaded && high ? 2u : 1u);
-        decision.reason = ResourceDecisionReason::WorkTypeChanged;
-        ResetObservation(state, decision);
-    }
-    if (!valid || !high) {
-        if (state.firstObservationSampleAt || state.observationSampleCount != 0u) {
-            ResetObservation(state, decision);
+        const bool continuation = flow.demandKind == MemoryDemandKind::RequiredContinuation;
+        bool grantReady = state.grant.demandId == 0u;
+        if (continuation) {
+            grantReady = flow.activeComputeUnits == 0u && flow.queuedTasks == 0u &&
+                (!m.lastPreparationAt || sample.sampledAt > *m.lastPreparationAt) &&
+                (state.grant.demandId == 0u || state.grant.used);
+        } else if (state.grant.used && state.grant.completedAt) {
+            grantReady = sample.sampledAt > *state.grant.completedAt &&
+                now - state.grant.grantedAt >= initialGrowthInterval;
         }
-        return decision;
-    }
-    if (state.signalRecoveryPending) {
-        if (newSample && Elapsed(state.highSince, sample.sampledAt, recoveryConfirmation)) {
-            state.signalRecoveryPending = false;
-            state.cooldownUntil = now + initialCooldown;
-            decision.reason = ResourceDecisionReason::SignalRestored;
-            ResetObservation(state, decision);
-        }
-        return decision;
-    }
-    if (state.lastPressureAt && now - *state.lastPressureAt >= repeatPressureWindow) {
-        state.cooldown = initialCooldown;
-    }
-    if (state.optionalRetentionPausedByPressure && now >= state.cooldownUntil &&
-        newSample && Elapsed(state.highSince, sample.sampledAt, recoveryConfirmation)) {
-        state.optionalRetentionPausedByPressure = false;
-        decision.optionalRetentionPausedByPressure = false;
-        decision.reason = ResourceDecisionReason::RetentionRestored;
-        ResetObservation(state, decision);
-        return decision;
-    }
-    if (!decision.gateOpen || decision.resetObservation || capabilityChanged || !newSample) { return decision; }
-
-    const auto& observation = flow.observation;
-    if (state.observationEpoch != observation.epoch) {
-        state.observationEpoch = observation.epoch;
-        state.firstObservationSampleAt.reset();
-        state.observationSampleCount = 0u;
-    }
-    if (sample.sampledAt >= observation.startedAt) {
-        if (!state.firstObservationSampleAt) {
-            state.firstObservationSampleAt = sample.sampledAt;
-            state.firstObservationAvailableBytes = *available;
-        }
-        if (state.observationSampleCount != std::numeric_limits<std::size_t>::max()) {
-            ++state.observationSampleCount;
+        if (grantReady && flow.nextWorkBytes <= m.growthHeadroomBytes) {
+            auto preview = std::min(Scale(m.growthHeadroomBytes, m.gain), std::max(MiB, *m.physicalTotalBytes / 16u));
+            const bool probe = !continuation && state.initialMeasurement && state.gainPhase == 2u;
+            if (probe) { preview = Scale(preview, probeScale); }
+            const auto window = continuation || state.phase == ResourceControlPhase::Recover ? flow.nextWorkBytes :
+                std::min(m.growthHeadroomBytes, std::max(flow.nextWorkBytes, preview));
+            decision.limits.ownedStorageLimitBytes = flow.reservedBytes + window;
+            state.grant = {};
+            state.grant.demandId = flow.demandId;
+            state.grant.baselineReservedBytes = flow.reservedBytes;
+            state.grant.sampledAt = sample.sampledAt;
+            state.grant.grantedAt = now;
+            state.grant.probe = probe;
+            ++m.grantEpoch;
+            if (!continuation && !state.initialMeasurement && state.gainPhase == 0u &&
+                m.calibration != MemoryCalibrationResult::Pending && now - sample.sampledAt <= gainWindow) {
+                m.baselineAvailable = state.recentAvailableAverage;
+                state.measurementBytes = 0u;
+                state.gainPhase = 2u;
+            }
+            decision.reason = continuation ? ResourceDecisionReason::RequiredContinuation : ResourceDecisionReason::RequiredGrowth;
+        } else if (flow.nextWorkBytes > m.growthHeadroomBytes) {
+            decision.reason = state.optionalRetentionPausedByPressure && safeBoundary ?
+                ResourceDecisionReason::RetainedStoragePreventingProgress : ResourceDecisionReason::RuntimeHeadroomLow;
         }
     }
-    const bool batchComplete = observation.required != 0u &&
-        observation.admitted >= observation.required && observation.retiredAt &&
-        sample.sampledAt > *observation.retiredAt;
-    const bool observingBlocks = observation.admitted != 0u || flow.moreIndependentBlocks;
-    const bool cooldownComplete = now >= state.cooldownUntil;
-    if (flow.pendingNecessaryWork && cooldownComplete &&
-        Elapsed(state.highSince, sample.sampledAt, recoveryConfirmation) &&
-        now - state.lastStorageGrowthAt >= storageGrowthInterval &&
-        (!observingBlocks || batchComplete) &&
-        decision.limits.ownedStorageLimitBytes < memoryBound) {
-        constexpr std::uint64_t mib = 1024u * 1024u;
-        const auto delta = std::min({memoryBound - decision.limits.ownedStorageLimitBytes,
-            std::max(mib, state.storageCeilingBytes / 16u),
-            (*available - std::min(*available, marks.high)) / 2u});
-        if (delta != 0u) {
-            decision.limits.ownedStorageLimitBytes += delta;
-            state.lastStorageGrowthAt = now;
-            decision.reason = ResourceDecisionReason::StorageGrowth;
-            ResetObservation(state, decision);
-            return decision;
-        }
-    }
-    if (!batchComplete || !state.firstObservationSampleAt ||
-        sample.sampledAt - *state.firstObservationSampleAt < initialGrowthInterval ||
-        now - observation.startedAt < initialGrowthInterval || state.observationSampleCount < 3u) {
-        return decision;
-    }
-    const auto duration = now - observation.startedAt;
-    const auto interval = state.everConfirmedPressure
-        ? ResourceClock::duration(recoveryGrowthInterval) : ResourceClock::duration(initialGrowthInterval);
-    const bool fallingQuickly = state.firstObservationAvailableBytes > *available &&
-        state.firstObservationAvailableBytes - *available > (marks.high - marks.low) / 4u;
-    const bool mayGrow = flow.moreIndependentBlocks && !flow.singleRecordFlow && !flow.heavyPhaseAdmitted &&
-        state.threaded && cooldownComplete && observation.startedAt >= state.cooldownUntil &&
-        now - state.lastGrowthAt >= interval && !fallingQuickly &&
-        !FractionAtLeast(observation.waits.output, duration, 25u);
-    if (mayGrow) {
-        auto& c = decision.limits.computeLimit;
-        auto& s = decision.limits.slotLimit;
-        if (c < p && FractionAtLeast(observation.waits.compute, duration, 25u)) {
-            const auto step = state.everConfirmedPressure ? 1u :
-                std::min<std::size_t>(4u, std::max<std::size_t>(1u, c / 4u));
-            c += std::min(p - c, static_cast<std::size_t>(step));
-            s = std::min(slotMaximum, std::max(s, c + 1u));
-            decision.reason = ResourceDecisionReason::ComputeGrowth;
-        } else if (s < std::min(slotMaximum, c + q) &&
-                   FractionAtLeast(observation.waits.slots, duration, 25u) &&
-                   (FractionAtLeast(observation.waits.input, duration, 10u) || s == c)) {
-            ++s;
-            decision.reason = ResourceDecisionReason::SlotGrowth;
-        }
-        if (decision.reason == ResourceDecisionReason::ComputeGrowth ||
-            decision.reason == ResourceDecisionReason::SlotGrowth) { state.lastGrowthAt = now; }
-    }
-    ResetObservation(state, decision);
+    expire();
+    if (decision.reason != ResourceDecisionReason::NoChange) { m.reason = decision.reason; }
     return decision;
-}
-
-ResourceWatermarks MakeResourceWatermarks(std::uint64_t totalBytes) noexcept {
-    constexpr std::uint64_t mib = 1024u * 1024u;
-    const auto low = std::min(totalBytes / 4u, std::clamp(totalBytes / 16u, 128u * mib, 4096u * mib));
-    return {low, low + low / 2u, low / 2u};
 }
 
 ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourceParams& params, const ResourceSample& sample) {
     constexpr std::uint64_t mib = 1024u * 1024u;
-    if (params.mode != CodecResourceMode::Fixed && params.mode != CodecResourceMode::Adaptive) {
+    if (params.mode != CodecResourceMode::Fixed && params.mode != CodecResourceMode::Adaptive &&
+        params.mode != CodecResourceMode::Unlimited) {
         throw std::invalid_argument("unknown DataCodec resource mode");
     }
     ResolvedResourceConfiguration result;
+    if (params.threadMode != CodecThreadMode::Fixed && params.threadMode != CodecThreadMode::Adaptive) {
+        throw std::invalid_argument("unknown DataCodec thread mode");
+    }
+    if (params.threadMode == CodecThreadMode::Adaptive) {
+        if (!sample.threaded || !CpuUsageProbe::Supported()) {
+            throw std::invalid_argument("adaptive CPU control is unavailable on this runtime");
+        }
+        if (params.maxComputeThreads || !params.targetCpuIdleRatio ||
+            !std::isfinite(*params.targetCpuIdleRatio) || *params.targetCpuIdleRatio < 0.0 ||
+            *params.targetCpuIdleRatio >= 1.0) {
+            throw std::invalid_argument("adaptive threads require an idle ratio in [0,1) and no fixed thread limit");
+        }
+    } else if (params.targetCpuIdleRatio) {
+        throw std::invalid_argument("fixed threads require an unspecified CPU idle target");
+    }
+    result.threadMode = params.threadMode;
+    result.targetCpuIdleRatio = params.targetCpuIdleRatio.value_or(0.0);
     result.mode = params.mode;
     result.initialSample = sample;
     result.threaded = sample.threaded;
     result.externalSpillAvailable = sample.externalSpillAvailable;
-    const auto allowed = ResourceComputeCapacity(sample, params.mode);
+    const auto allowed = ResourceComputeCapacity(sample, params.mode, params.threadMode);
     result.computeCeiling = params.maxComputeThreads.value_or(allowed);
     if (result.computeCeiling == 0u || result.computeCeiling > allowed) {
         throw std::invalid_argument("compute thread limit exceeds allowed CPU capacity");
     }
     if (!result.threaded && result.computeCeiling != 1u) {
         throw std::invalid_argument("this runtime only supports one compute thread");
+    }
+    if (params.mode != CodecResourceMode::Adaptive && params.targetAvailableMemoryRatio) {
+        throw std::invalid_argument("memory reserve ratio requires Adaptive mode");
+    }
+    if (params.mode == CodecResourceMode::Adaptive) {
+        if (params.ownedStorageLimitBytes) { throw std::invalid_argument("Adaptive memory requires an unspecified byte limit"); }
+        result.targetAvailableMemoryRatio = params.targetAvailableMemoryRatio.value_or(resource_control::defaultReserveRatio);
+        if (!std::isfinite(result.targetAvailableMemoryRatio) || result.targetAvailableMemoryRatio < 0.0 || result.targetAvailableMemoryRatio >= 1.0) {
+            throw std::invalid_argument("memory reserve ratio must be finite and in [0,1)");
+        }
+        if (!ValidPhysicalMemorySample(sample, ResourceClock::now())) {
+            throw std::invalid_argument("memory-observation-unavailable");
+        }
+        result.storageCeilingBytes = Absolute(sample);
+        ResourceControllerState control;
+        InitializeResourceController(control, result, sample.sampledAt);
+        FlowSnapshot flow;
+        flow.limits = {0u, result.computeCeiling, result.threaded ? result.computeCeiling + 1u : 1u};
+        flow.runActive = true;
+        flow.requestId = 1u;
+        const auto decision = Advance(control, sample.sampledAt, sample, flow);
+        result.initialLimits = decision.limits;
+        result.gateOpen = decision.gateOpen;
+        return result;
+    }
+    if (params.mode == CodecResourceMode::Unlimited) {
+        if (params.ownedStorageLimitBytes) {
+            throw std::invalid_argument("Unlimited mode requires an unspecified owned storage limit");
+        }
+        result.storageCeilingBytes.reset();
+        result.initialLimits = {std::nullopt, result.computeCeiling,
+            result.threaded ? result.computeCeiling + 1u : 1u};
+        return result;
     }
     const auto total = sample.physicalTotalBytes ? std::optional<std::uint64_t>(std::min(*sample.physicalTotalBytes,
         sample.hardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max()))) : std::nullopt;
@@ -424,30 +454,20 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
     }
     const auto marks = total ? MakeResourceWatermarks(*total) : ResourceWatermarks{};
     const auto memoryInitial = total && available
-        ? std::min(result.storageCeilingBytes, (*available - std::min(*available, marks.high)) / 2u)
-        : std::min(result.storageCeilingBytes, 64u * mib);
-    if (params.mode == CodecResourceMode::Fixed) {
-        result.initialLimits = {params.ownedStorageLimitBytes.value_or(memoryInitial), result.computeCeiling,
-            result.threaded ? result.computeCeiling + 1u : 1u};
-    } else {
-        const bool pressure = sample.pressure == PressureLevel::Low || sample.pressure == PressureLevel::Critical;
-        result.gateOpen = !pressure && (!available || !total || *available >= marks.low);
-        const bool healthy = result.threaded && total && *total != 0u && available &&
-            *available >= marks.high && !pressure;
-        const auto compute = healthy ? std::min(result.computeCeiling, resource_control::healthyStartupComputeLimit) : 1u;
-        result.initialLimits = {memoryInitial, compute, healthy ? compute + 1u : 1u};
-        if (!result.threaded) { result.gateOpen = true; }
-    }
+        ? std::min(*result.storageCeilingBytes, (*available - std::min(*available, marks.high)) / 2u)
+        : std::min(*result.storageCeilingBytes, 64u * mib);
+    result.initialLimits = {params.ownedStorageLimitBytes.value_or(memoryInitial), result.computeCeiling,
+        result.threaded ? result.computeCeiling + 1u : 1u};
     return result;
 }
 
-std::size_t ResourceComputeCapacity(const ResourceSample& sample, CodecResourceMode mode) noexcept {
+std::size_t ResourceComputeCapacity(const ResourceSample& sample, CodecResourceMode mode, CodecThreadMode threadMode) noexcept {
     if (!sample.threaded) { return 1u; }
     auto allowed = sample.allowedComputeThreads.value_or(1u);
     if (sample.runtimeThreadLimit) {
         // 运行时线程许可先扣除宿主余量、后台 driver 和当前模式的控制线程
         const auto overhead = sample.reservedHostThreads + 1u +
-            (mode == CodecResourceMode::Adaptive ? 1u : 0u);
+            (mode == CodecResourceMode::Adaptive || threadMode == CodecThreadMode::Adaptive ? 1u : 0u);
         const auto workers = *sample.runtimeThreadLimit > overhead ? *sample.runtimeThreadLimit - overhead : 0u;
         allowed = std::min(allowed, workers);
     }

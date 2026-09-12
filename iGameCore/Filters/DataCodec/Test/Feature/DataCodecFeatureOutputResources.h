@@ -68,7 +68,7 @@ inline TestResult RunDataCodecFeatureOutputResources() {
         auto phase = WaitForHeavyPhase(root);
         bytestore::ByteStoreSession stores;
         stores.BindRun(root);
-        auto source = stores.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u, "params_test");
+        auto source = stores.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u, ::datacodec::MemoryDemandKind::RequiredContinuation, "params_test");
         const std::array<std::uint8_t, 8u> expected{1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
         LeafPackage package;
         const bool packaged = phase && source && source->WriteBytesAt(0u, expected) && source->Seal() &&

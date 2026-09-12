@@ -128,7 +128,8 @@ struct TopologyBlockInput {
 
 struct TopologyBlockOutput {
     std::size_t index{0u};
-    topocodec::ConnectivityDecodedBlock decoded;
+    topocodec::PreparedConnectivityDecodedBlock decoded;
+    topocodec::ConnectivityDecodeMemoryLayout memory;
     double computeMs{0.0};
     std::optional<topocodec::TopologyBlockCapacitySamples> capacitySamples;
 };
@@ -220,17 +221,28 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
     phase.reset();
     root.SetWorkType({.path = ResourceWorkPath::ConnectivityDecode,
         .blockElements = numericarray::kSpatialBlockElementCount});
+    topocodec::ConnectivityDecodeMemoryLayout nextMemory;
     completed = RunOrderedBlocks<TopologyBlockInput, TopologyBlockOutput>(root,
         [&] { return cursor < blocks.size(); },
-        [&](TopologyBlockInput& input, const SlotLease& slot) {
+        [&](TopologyBlockInput& input, const SlotLease& slot, DecodeBlockWorkspace& workspace) {
             input.index = cursor++;
             // 顺序字段的外层解压复用原槽位并取得计算额度
             return RunTerminalWork(root, slot, [&](WorkerContext&) {
                 return input.encoded.LoadFrom(stream, MakeConnectivityTopologyEncodedMetadata(blocks[input.index]),
-                    runtime.cache.cacheResources, error);
+                    runtime.cache.cacheResources, workspace, nextMemory, error);
             });
         },
-        [&](const TopologyBlockInput& input, TopologyBlockOutput& output, WorkerContext&) {
+        [&](const TopologyBlockInput& input, TopologyBlockOutput& output, WorkerContext&, DecodeBlockWorkspace& workspace) {
+            const auto& shape = blocks[input.index];
+            output.memory = topocodec::MakeConnectivityDecodeMemoryLayout(shape, static_cast<int>(topo.fixedCellSize), hasTypes);
+            auto& memory = output.memory;
+            output.decoded.connectivity = workspace.View<IndexType>(memory.connectivity);
+            output.decoded.offsets = workspace.View<IndexType>(memory.offsets);
+            output.decoded.cellTypes = workspace.View<IndexType>(memory.types);
+            output.decoded.polynomialOrders = workspace.View<std::uint16_t>(memory.orders);
+            auto scratchBytes = workspace.View<std::uint8_t>(memory.scratch);
+            scratchBytes.resize(scratchBytes.capacity());
+            ArrayWorkspace scratch(scratchBytes.Span());
             output.index = input.index;
             if (runtime.context.recordCapacitySamples) {
                 output.capacitySamples.emplace();
@@ -242,7 +254,7 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
             if (!topocodec::DecodeConnectivityTopologyBlock(input.encoded, points,
                     static_cast<std::size_t>(layout.cellCount), static_cast<std::size_t>(layout.connectivityCount),
                     static_cast<int>(topo.fixedCellSize), hasTypes, output.decoded, &localError, {},
-                    output.capacitySamples ? &*output.capacitySamples : nullptr)) {
+                    output.capacitySamples ? &*output.capacitySamples : nullptr, &scratch)) {
                 root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "topology-block-decode", "DecodeConnectivityTopologyBlock", localError));
                 return false;
@@ -250,7 +262,7 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
             output.computeMs = callback::ElapsedMilliseconds(start);
             return true;
         },
-        [&](TopologyBlockOutput& output) {
+        [&](TopologyBlockOutput& output, DecodeBlockWorkspace& workspace) {
             if (output.index != committed) { return validation::AssignError(error, "topology blocks committed out of order"); }
             const auto& layout = blocks[output.index];
             auto& data = output.decoded;
@@ -264,7 +276,10 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                     [&](auto offset, auto values) { return sink.WriteCellPolynomialOrdersRange(offset, values, error); })) { return false; }
             if (hasOffsets) {
                 const auto first = cellBase == 0u ? 0u : 1u;
-                std::vector<IndexType> adjusted;
+                auto scratchBytes = workspace.View<std::uint8_t>(output.memory.scratch);
+                scratchBytes.resize(scratchBytes.capacity());
+                ArrayWorkspace scratch(scratchBytes.Span());
+                auto adjusted = scratch.Take<IndexType>(std::min<std::size_t>(kIoWindowBytes / sizeof(IndexType), data.offsets.size() - first));
                 adjusted.resize(std::min<std::size_t>(kIoWindowBytes / sizeof(IndexType), data.offsets.size() - first));
                 if (output.capacitySamples) {
                     output.capacitySamples->Observe(topocodec::TopologyBufferSample::AdjustedOffsets, adjusted);
@@ -284,8 +299,8 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                 }
             }
             if (observer && !observer->ObserveConnectivityBlock({output.index, cellBase,
-                    static_cast<int>(topo.fixedCellSize), std::move(data.connectivity),
-                    std::move(data.offsets), std::move(data.cellTypes)}, error)) { return false; }
+                    static_cast<int>(topo.fixedCellSize), workspace.TransferOutput(), data.connectivity.Span(),
+                    data.offsets.Span(), data.cellTypes.Span()}, error)) { return false; }
             if (output.capacitySamples && runtime.context.recordCapacitySamples) {
                 try { runtime.context.recordCapacitySamples(output.capacitySamples->values); }
                 catch (...) { root.RecordDiagnosticExportFailure(); }
@@ -302,7 +317,11 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                 if (!observer->EndConnectivityTopology(error)) { return false; }
             }
             return true;
-        }, singleRecord);
+        }, singleRecord, nullptr, [&] {
+            nextMemory = topocodec::MakeConnectivityDecodeMemoryLayout(blocks[cursor],
+                static_cast<int>(topo.fixedCellSize), hasTypes);
+            return nextMemory;
+        });
     return completed;
 }
 

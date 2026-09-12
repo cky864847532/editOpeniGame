@@ -35,6 +35,7 @@ enum class iGameDataCodecHostMessageId : std::uint8_t {
     OverlappingRegionsBlockCompression,
     SetOutputPath,
     CompressionNoData,
+    CompressionStoragePreflightFailed,
     CreateOutputDirectoryFailed,
     CreateReportDirectoryFailed,
     CompressionFailedWithDetail,

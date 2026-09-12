@@ -160,12 +160,14 @@ inline bool RunReferenceCodecPrecisionCase(
         if (codecId == NumericArrayReferenceCodecId::Wavelet) {
             using Sample = numericarray::NumericBufferSample;
             const auto& lowDelta = encodeSamples.values[static_cast<std::size_t>(Sample::WaveletLowDelta)];
-            const auto& referenceComponent = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletReferenceComponent)];
-            const auto& reconstructed = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletReconstructed)];
+            const auto& decodedLow = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletLowDelta)];
+            const auto& decodedHigh = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletHighDelta)];
             Require(result, lowDelta.capacityBytes.value_or(0u) >= ((tupleCount + 1u) / 2u) * sizeof(double) &&
-                referenceComponent.capacityBytes.value_or(0u) >= tupleCount * sizeof(double) &&
-                reconstructed.capacityBytes.value_or(0u) >= tupleCount * sizeof(double) &&
-                referenceComponent.scopeId != reconstructed.scopeId,
+                decodedLow.capacityBytes.value_or(0u) == ((tupleCount + 1u) / 2u) * sizeof(double) &&
+                decodedHigh.capacityBytes.value_or(0u) == (tupleCount / 2u) * sizeof(double) &&
+                decodedLow.scopeId != decodedHigh.scopeId &&
+                !decodeSamples.values[static_cast<std::size_t>(Sample::WaveletReferenceComponent)].capacityBytes &&
+                !decodeSamples.values[static_cast<std::size_t>(Sample::WaveletReconstructed)].capacityBytes,
                 caseName + ".waveletCapacitySamples", "floating Wavelet arrays must carry independent actual capacity samples alongside precision checks");
         } else {
             using Sample = numericarray::NumericBufferSample;
@@ -302,12 +304,13 @@ inline bool RunIntegerWaveletCase(TestResult& result) {
         &error, &encodeSamples, &decodeSamples);
     using Sample = numericarray::NumericBufferSample;
     const auto& encodedLow = encodeSamples.values[static_cast<std::size_t>(Sample::WaveletLow)];
-    const auto& decodedLow = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletLow)];
+    const auto& decodedHigh = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletHighDelta)];
     const auto& decodedDelta = decodeSamples.values[static_cast<std::size_t>(Sample::WaveletLowDelta)];
     Require(result, encodedLow.capacityBytes.value_or(0u) >= (kTupleCount / 2u) * sizeof(std::uint64_t) &&
-        decodedLow.capacityBytes.value_or(0u) >= (kTupleCount / 2u) * sizeof(std::uint64_t) &&
-        decodedDelta.capacityBytes.value_or(0u) >= (kTupleCount / 2u) * sizeof(std::uint64_t) &&
-        decodedDelta.scopeId != decodedLow.scopeId,
+        decodedHigh.capacityBytes.value_or(0u) == (kTupleCount / 2u) * sizeof(std::uint64_t) &&
+        decodedDelta.capacityBytes.value_or(0u) == (kTupleCount / 2u) * sizeof(std::uint64_t) &&
+        decodedDelta.scopeId != decodedHigh.scopeId &&
+        !decodeSamples.values[static_cast<std::size_t>(Sample::WaveletLow)].capacityBytes,
         "referenceCodec.wavelet.int32.capacity", "integer wavelet samples must reflect uint64 work arrays independently of int32 input");
     return Require(
                result,

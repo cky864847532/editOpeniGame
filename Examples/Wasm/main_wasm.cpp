@@ -18,12 +18,16 @@
 #include "DataCodec/API/Adapter/RunRecordTypes.h"
 #include "IGDC/iGameIGDCWriter.h"
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
+#include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
+#include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
+#include "DataCodec/Platform/Wasm/WasmBrowserFileByteRangeReader.h"
 #include "DataCodec/Storage/Package/PackageBinaryHeader.h"
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -84,6 +88,15 @@ struct WebErrorState {
 
 WebErrorState g_lastError;
 
+// 网页只设置后续请求的启动参数，已创建会话保持自己的资源对象
+std::mutex g_codecStartupMutex;
+::datacodec::CodecResourceParams g_codecStartupResources{.mode = ::datacodec::CodecResourceMode::Unlimited};
+
+::datacodec::CodecResourceParams CopyCodecStartupResources() {
+    std::lock_guard lock(g_codecStartupMutex);
+    return g_codecStartupResources;
+}
+
 struct WebModelMeta {
     IGuint id = 0;
     std::string name;
@@ -133,6 +146,7 @@ struct StagedIgcDecodeTask {
     int reusedModelId{0};
     bool enableReuseCache{true};
     std::optional<bool> enableEncodedInputCache;
+    ::datacodec::CodecResourceParams resources;
 };
 
 std::shared_ptr<StagedIgcDecodeTask> g_stagedIgcDecodeTask;
@@ -1688,6 +1702,7 @@ int StartStagedIgcDecode(
     task->sourceIdentity = sourceIdentity;
     task->enableReuseCache = enableReuseCache;
     task->enableEncodedInputCache = enableEncodedInputCache;
+    task->resources = CopyCodecStartupResources();
     g_stagedFilePath.clear();
     g_stagedExpectedBytes = 0u;
     g_stagedWrittenBytes = 0u;
@@ -1729,7 +1744,8 @@ int StartStagedIgcDecode(
                         : iGame::iGameWasmTopologyOutputMode::PreparedSurface,
                     task->enableEncodedInputCache,
                     progressSink,
-                    task->sourceIdentity);
+                    task->sourceIdentity,
+                    task->resources);
                 auto success = bridgeResult.success;
                 auto timingDetail = std::string("content-id=") +
                     ShortContentIdentity(task->sourceIdentity);
@@ -1922,6 +1938,8 @@ struct API {
     static std::string getBuildInfoJson();
     static std::string getLastErrorJson();
     static void clearLastError();
+    static int configureNextCodecRun(int mode, int computeThreads, const std::string& memoryLimitBytes);
+    static std::string getCodecResourceDefaultsJson();
     static int setSize(int width, int height);
     static int loadVtkFromMem(const val& bytes);
     static int loadVtuFromMem(const val& bytes);
@@ -2207,7 +2225,8 @@ int LoadIgcFromMemory(std::string bytes, const std::string& sourceName, bool rep
         inputOwner,
         std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(inputOwner->data()),
-            inputOwner->size()));
+            inputOwner->size()), true, iGame::iGameWasmTopologyOutputMode::CommitToAdapter,
+        {}, CopyCodecStartupResources());
     auto t1 = std::chrono::steady_clock::now();
 
     if (!bridgeResult.success || bridgeResult.output == nullptr) {
@@ -2267,7 +2286,7 @@ int LoadIgcFromBrowserFileEx(
         enableReuseCache
             ? iGame::iGameWasmTopologyOutputMode::CommitToAdapter
             : iGame::iGameWasmTopologyOutputMode::PreparedSurface,
-        enableEncodedInputCache);
+        enableEncodedInputCache, {}, CopyCodecStartupResources());
     if (!bridgeResult.timingDetail.empty()) {
         DebugLog("INFO", "Direct browser DataCodec timing " + bridgeResult.timingDetail);
     }
@@ -2303,6 +2322,7 @@ int SaveIgcToFileEx(const int modelId, const std::string& filePath) {
     }
     auto writer = iGame::IGDCWriter::New();
     writer->SetEncodeControls(::datacodec::wasm::MakeWasmEncodeConfiguration());
+    writer->SetResourceParams(CopyCodecStartupResources());
     if (!writer->WriteToFile(model->GetDataObject(), filePath)) {
         return FailWithError(0, "SaveIgcToFileEx", "IGDCWriter failed");
     }
@@ -4046,6 +4066,36 @@ void SendMouseEvent(int type, int button, float x, float y, double delta) {
 }
 } // namespace iGameWeb
 
+// 复用首次载入路径，只分析几何和拓扑，按需属性在后续请求中另行申请
+extern "C" EMSCRIPTEN_KEEPALIVE const char* igameAnalyzeIgcBrowserFile(
+    const std::uint32_t fileId, const double fileSize, const int enableReuseCache) {
+    static std::string json;
+    try {
+        if (!fileId || !std::isfinite(fileSize) || fileSize <= 0.0 ||
+            std::floor(fileSize) != fileSize || fileSize > 9007199254740991.0) {
+            throw std::invalid_argument("invalid browser file size or identity");
+        }
+        const auto result = ::datacodec::AnalyzeDecodeStorage({
+            .inputReader = std::make_shared<::datacodec::wasm::WasmBrowserFileByteRangeReader>(
+                fileId, static_cast<std::uint64_t>(fileSize)),
+            .attributeSelection = ::datacodec::AttributeSelectionMode::None,
+            .adapterBackedAttributes = true,
+            .topologyOutputMode = enableReuseCache
+                ? ::datacodec::TopologyDecodeOutputMode::CommitToAdapter
+                : ::datacodec::TopologyDecodeOutputMode::ObserverOnly,
+        });
+        if (!result.success || !result.minimumExecutionLimitBytes) {
+            throw std::runtime_error(result.failure ? ::datacodec::FormatCodecFailure(*result.failure) : "storage analysis unavailable");
+        }
+        json = "{\"success\":true,\"minimumBytes\":\"" + std::to_string(*result.minimumExecutionLimitBytes) + "\"}";
+    } catch (const std::exception& error) {
+        json = "{\"success\":false,\"detail\":\"" + EscapeJsonString(error.what()) + "\"}";
+    } catch (...) {
+        json = "{\"success\":false,\"detail\":\"unexpected storage analysis failure\"}";
+    }
+    return json.c_str();
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE int igameLoadIgcBrowserFile(
     const std::uint32_t browserFileId,
     const double browserFileSize,
@@ -5180,6 +5230,49 @@ void iGameWeb::API::sendMouseEvent(int type, int button, float x, float y, doubl
     }
 }
 
+std::string iGameWeb::API::getCodecResourceDefaultsJson() {
+    const auto sample = ::datacodec::ProbeResources();
+    const auto config = ::datacodec::ResolveResourceConfiguration(
+        {.mode = ::datacodec::CodecResourceMode::Fixed}, sample);
+    return "{\"fixedMemoryBytes\":\"" + std::to_string(*config.initialLimits.ownedStorageLimitBytes) +
+        "\",\"maximumMemoryBytes\":\"" + std::to_string(sample.hardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max())) +
+        "\",\"maximumComputeThreads\":" + std::to_string(config.computeCeiling) + "}";
+}
+
+int iGameWeb::API::configureNextCodecRun(
+    const int mode, const int computeThreads, const std::string& memoryLimitBytes) {
+    try {
+        if ((mode != static_cast<int>(::datacodec::CodecResourceMode::Fixed) &&
+             mode != static_cast<int>(::datacodec::CodecResourceMode::Unlimited)) || computeThreads < 0) {
+            return FailWithError(0, "configureNextCodecRun", "invalid resource mode or compute thread count");
+        }
+        ::datacodec::CodecResourceParams resources;
+        resources.mode = static_cast<::datacodec::CodecResourceMode>(mode);
+        if (computeThreads != 0) { resources.maxComputeThreads = static_cast<std::size_t>(computeThreads); }
+        if (!memoryLimitBytes.empty()) {
+            std::uint64_t bytes = 0u;
+            const auto parsed = std::from_chars(memoryLimitBytes.data(),
+                memoryLimitBytes.data() + memoryLimitBytes.size(), bytes);
+            if (parsed.ec != std::errc{} || parsed.ptr != memoryLimitBytes.data() + memoryLimitBytes.size()) {
+                return FailWithError(0, "configureNextCodecRun", "memory limit must be an unsigned byte count");
+            }
+            resources.ownedStorageLimitBytes = bytes;
+        }
+        (void)::datacodec::ResolveResourceConfiguration(resources, ::datacodec::ProbeResources());
+        {
+            std::lock_guard lock(g_codecStartupMutex);
+            g_codecStartupResources = resources;
+        }
+        DebugLog("INFO", std::string("DataCodec next request mode=") + ::datacodec::CodecResourceModeName(resources.mode) +
+            " memory=" + (resources.mode == ::datacodec::CodecResourceMode::Unlimited ? "Unlimited" :
+                resources.ownedStorageLimitBytes ? std::to_string(*resources.ownedStorageLimitBytes) : "default"));
+        ClearLastError();
+        return 1;
+    } catch (const std::exception& error) {
+        return FailWithError(0, "configureNextCodecRun", error.what());
+    }
+}
+
 EMSCRIPTEN_BINDINGS(iGameWeb_bindings) {
     class_<iGameWeb::API>("iGameWeb")
             .class_function("init", &iGameWeb::API::init)
@@ -5190,6 +5283,8 @@ EMSCRIPTEN_BINDINGS(iGameWeb_bindings) {
             .class_function("getBuildInfoJson", &iGameWeb::API::getBuildInfoJson)
             .class_function("getLastErrorJson", &iGameWeb::API::getLastErrorJson)
             .class_function("clearLastError", &iGameWeb::API::clearLastError)
+            .class_function("configureNextCodecRun", &iGameWeb::API::configureNextCodecRun)
+            .class_function("getCodecResourceDefaultsJson", &iGameWeb::API::getCodecResourceDefaultsJson)
             .class_function("setSize", &iGameWeb::API::setSize)
             .class_function("loadVtkFromMem", &iGameWeb::API::loadVtkFromMem)
             .class_function("loadVtuFromMem", &iGameWeb::API::loadVtuFromMem)

@@ -35,7 +35,7 @@ public:
     }
     [[nodiscard]] virtual bool DecodeBlock(
         const NumericArrayReferenceCodecDecodeInput& input,
-        std::vector<std::uint8_t>& decodedBlockBytes,
+        MutableArray<std::uint8_t> decodedBlockBytes,
         std::string* error = nullptr) const = 0;
 };
 

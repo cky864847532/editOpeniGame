@@ -17,6 +17,8 @@
 #include "DataCodec/Workflow/Decode/Stages/ParamsDecodeStage.h"
 #include "DataCodec/Workflow/Decode/Stages/TopoDecodeStage.h"
 #include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
+#include "DataCodec/Log/Telemetry/TelemetryCpuControl.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryControl.h"
 
 #include <cstddef>
 #include <algorithm>
@@ -270,6 +272,8 @@ private:
         DecodeContext& context,
         const DecodeLeafWorkspace&) noexcept {
         RecordRootCapacityAudit(context.runRecords, context.resources);
+        RecordCpuControlSummary(context);
+        RecordMemoryControlSummary(context);
         if (context.adapter != nullptr) {
             context.runRecords.TryExport([&] {
                 RecordBufferCapacitySamples(context.runRecords, context.adapter->CapacitySamples());

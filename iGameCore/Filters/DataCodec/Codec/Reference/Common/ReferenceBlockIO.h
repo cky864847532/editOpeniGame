@@ -452,12 +452,14 @@ inline bool EncodeNumericArrayReferenceValueBytes(
     std::vector<NumericArrayComponentLayoutParams>* componentLayouts = nullptr,
     std::string* error = nullptr,
     numericarray::NumericArrayCompressorState* compressorState = nullptr,
-    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
+    ArrayWorkspace* workspace = nullptr) {
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
     params.capacitySamples = capacitySamples;
+    params.workspace = workspace;
     return numericarray::ResolveEncodedNumericArrayBlockBytes(
         params,
         defaultCompressor,
@@ -473,15 +475,17 @@ inline bool EncodeNumericArrayReferenceValueBytes(
 inline bool DecodeNumericArrayReferenceValueBytes(
     const NumericArrayStorageParams& meta,
     const ParsedNumericArrayBlock& block,
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     std::string* error = nullptr,
     numericarray::NumericArrayCompressorState* compressorState = nullptr,
-    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr) {
+    numericarray::NumericArrayBlockCapacitySamples* capacitySamples = nullptr,
+    ArrayWorkspace* workspace = nullptr) {
     numericarray::NumericArrayBlockParams params;
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, params, error)) {
         return false;
     }
     params.capacitySamples = capacitySamples;
+    params.workspace = workspace;
     return numericarray::ResolveDecodedNumericArrayBlockBytes(
         params,
         block.backgroundCompressor,

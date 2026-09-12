@@ -32,7 +32,7 @@ bool MemoryByteRangeOutput::PrepareExactSize(std::uint64_t size, std::string* er
         m_failed = true;
         return validation::AssignError(error, "memory output must be prepared before its first write");
     }
-    if (!m_store->PrepareCapacity(size, m_run, error, coexist) ||
+    if (!m_store->PrepareCapacity(size, m_run, MemoryDemandKind::RequiredContinuation, error, coexist) ||
         !m_store->Resize(size, error) || !ZeroRange(0u, size, error)) {
         m_failed = true;
         return false;
@@ -55,7 +55,7 @@ bool MemoryByteRangeOutput::WriteAt(std::uint64_t offset, std::span<const std::u
         return validation::AssignError(error, "memory output write exceeds its prepared layout");
     }
     const auto previousSize = m_store->ByteSizeHint();
-    if ((required > previousSize && (!m_store->PrepareCapacity(required, m_run, error) ||
+    if ((required > previousSize && (!m_store->PrepareCapacity(required, m_run, MemoryDemandKind::RequiredContinuation, error) ||
                                     !m_store->Resize(required, error))) ||
         (offset > previousSize && !ZeroRange(previousSize, offset - previousSize, error)) ||
         !m_store->WriteAt(offset, bytes, error)) {
@@ -71,7 +71,7 @@ bool MemoryByteRangeOutput::Finalize(std::uint64_t size, std::string* error) {
         return validation::AssignError(error, "memory output cannot finalize an invalid layout or failed write");
     }
     const auto previousSize = m_store->ByteSizeHint();
-    if (!m_store->PrepareCapacity(size, m_run, error) || !m_store->Resize(size, error) ||
+    if (!m_store->PrepareCapacity(size, m_run, MemoryDemandKind::RequiredContinuation, error) || !m_store->Resize(size, error) ||
         (size > previousSize && !ZeroRange(previousSize, size - previousSize, error)) ||
         !m_store->Seal(error)) {
         m_failed = true;

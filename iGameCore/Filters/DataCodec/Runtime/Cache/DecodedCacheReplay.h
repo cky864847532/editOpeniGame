@@ -3,6 +3,7 @@
 
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
+#include "DataCodec/Runtime/Execution/DecodeStageMemory.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <algorithm>
@@ -66,13 +67,15 @@ inline bool ReplayTypedDecodedCache(
         }
         return true;
     }
+    FixedByteBacking scratchBuffer;
+    if (!PrepareDecodeStageMemory(runtime.Run(), std::min(valuesPerWindow, elementCount) * valuesPerElement * sizeof(TValue),
+            scratchBuffer, error)) { return false; }
     std::size_t cursor = 0u;
     while (cursor < elementCount) {
         if (runtime.Run().Stopped()) { return false; }
         const auto currentCount = std::min(valuesPerWindow, elementCount - cursor);
         const auto byteCount = currentCount * valuesPerElement * sizeof(TValue);
-        auto scratchBuffer = runtime.ScratchBytePool().Acquire(byteCount);
-        auto bytes = scratchBuffer.Span();
+        auto bytes = scratchBuffer.Span().first(byteCount);
         if (!cache.Read(
                 static_cast<std::uint64_t>(cursor) * valuesPerElement * sizeof(TValue),
                 bytes,

@@ -67,7 +67,7 @@ inline bool CreateAttributeReferenceArray(
     std::size_t bytes = 0u;
     if (!validation::CheckedMulSizeT(count, sizeof(T), bytes, label, error)) { return false; }
     owner = std::static_pointer_cast<bytestore::MemoryStore>(
-        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, bytes, label, error));
+        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, bytes, ::datacodec::MemoryDemandKind::RequiredContinuation, label, error));
     if (!owner) { return false; }
     const auto storage = owner->WritableBytes();
     if (storage.size() != bytes || (bytes != 0u &&
@@ -119,6 +119,19 @@ struct AttributeReferenceSampleGroup {
     std::vector<std::size_t> fieldIndices;
 };
 
+inline bool CalculateAttributeReferenceFieldSampleBytes(
+    const AttrStorageParams& meta, const std::size_t sampleCount,
+    std::size_t& sampleBytes, std::string* error = nullptr) {
+    std::size_t valueSize = 0u, tupleBytes = 0u;
+    if (!TryParamSizeToSizeT(NumericArrayValueSize(meta), valueSize)) {
+        return validation::AssignError(error, "attribute reference sample value size exceeds this platform size limit");
+    }
+    return validation::CheckedMulSizeT(static_cast<std::size_t>(std::max(meta.dimension, 0)),
+        valueSize, tupleBytes, "attribute reference sample tuple bytes", error) &&
+        validation::CheckedMulSizeT(sampleCount, tupleBytes, sampleBytes,
+            "attribute reference sample bytes", error);
+}
+
 inline bool PrepareAttributeReferenceFieldSample(
     const AttrStorageParams& meta, const std::size_t sampleCount, bytestore::ByteStoreSession& session,
     AttributeReferenceFieldSample& sample, std::string* error) {
@@ -128,11 +141,8 @@ inline bool PrepareAttributeReferenceFieldSample(
     }
     sample.componentCount = static_cast<std::size_t>(std::max(meta.dimension, 0));
     sample.tupleCount = sampleCount;
-    std::size_t tupleBytes = 0u, sampleBytes = 0u;
-    if (!validation::CheckedMulSizeT(sample.componentCount, sample.valueSize, tupleBytes,
-            "attribute reference sample tuple bytes", error) ||
-        !validation::CheckedMulSizeT(sampleCount, tupleBytes, sampleBytes,
-            "attribute reference sample bytes", error)) { return false; }
+    std::size_t sampleBytes = 0u;
+    if (!CalculateAttributeReferenceFieldSampleBytes(meta, sampleCount, sampleBytes, error)) { return false; }
     return CreateAttributeReferenceArray(session, sampleBytes, "attribute_reference_sample",
         sample.owner, sample.bytes, error);
 }

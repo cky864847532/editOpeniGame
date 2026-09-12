@@ -24,6 +24,8 @@
 
 namespace datacodec::test {
 
+TestResult RunDataCodecCpuControlTests();
+
 [[nodiscard]] inline TestResult RunDataCodecSelfTest() noexcept {
     auto result = RunDataCodecFeatureAdapterRoundTrip();
     const auto appendResult = [&](const TestResult& addition) {

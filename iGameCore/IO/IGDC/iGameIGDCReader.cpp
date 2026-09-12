@@ -257,6 +257,37 @@ IGDCReader::Pointer IGDCReader::New() {
     return new IGDCReader;
 }
 
+::datacodec::DecodeStorageAnalysisResult IGDCReader::AnalyzeFileStorage(
+    const std::filesystem::path& path, bool loadAllAttributes, std::stop_token stop) {
+    using namespace ::datacodec;
+    try {
+        DecodeStorageAnalysisRequest request{
+            .inputReader = std::make_shared<iGameFileByteRangeReader>(path),
+            .attributeSelection = loadAllAttributes ? AttributeSelectionMode::AllAvailable : AttributeSelectionMode::None,
+            .adapterBackedAttributes = true,
+            .stopToken = stop,
+        };
+        PackageInspection inspection;
+        std::string error;
+        if (!InspectPackage(*request.inputReader, inspection, &error, stop)) { throw std::runtime_error(error); }
+        if (inspection.format == PackageBinaryFormat::FramePackage) {
+            IGDCFrameSequence sequence;
+            if (!ResolveIGDCFrameSequence(path, sequence, &error)) { throw std::runtime_error(error); }
+            request.frameIndex = sequence.entryFrameIndex;
+            for (const auto& source : sequence.decodeSources) {
+                if (source.frameIndex != sequence.entryFrameIndex) { request.referenceReaders.push_back(source.frameReader); }
+            }
+        }
+        return AnalyzeDecodeStorage(request);
+    } catch (const std::exception& error) {
+        DecodeStorageAnalysisResult result;
+        result.cancelled = stop.stop_requested();
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+            "decode.storage-analysis", "IGDCReader", error.what());
+        return result;
+    }
+}
+
 IGDCReader::IGDCReader() : m_state(std::make_unique<State>()) {
     SetDecodeOptions(DataCodecIOSettings::GetDefaultDecodeOptions());
     SetResourceParams(DataCodecIOSettings::GetDefaultDecodeResources());

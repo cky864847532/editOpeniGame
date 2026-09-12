@@ -30,7 +30,7 @@ inline TestResult RunDataCodecFeatureInputCancellation() {
         !FramePackageIO::ReadMetadata(*metadata, frame, nullptr, stop.get_token()) && calls == 1u,
         "input.cancel-metadata", "stopped metadata reads must not invoke the shared source");
 
-    DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 1u, 1u}, 64u, 1u, false, true});
+    DataCodecExecutionResources run(ResolvedResourceConfiguration{{kIoWindowBytes, 1u, 1u}, kIoWindowBytes, 1u, false, true});
     CacheResources runtime;
     runtime.BindRun(run);
     class Source final : public bytestore::IByteSource {

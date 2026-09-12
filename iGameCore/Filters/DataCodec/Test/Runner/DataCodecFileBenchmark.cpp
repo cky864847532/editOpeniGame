@@ -1,5 +1,10 @@
 #include <CGNS/iGameCGNSReader.h>
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
+#include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
+#include "DataCodec/Workflow/Session/CodecRunEntry.h"
+#include "DataCodec/Workflow/Session/DecodeSession.h"
+#include "DataCodec/Filter/Adapter/iGameDecodeAdapter.h"
+#include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
 #include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
@@ -99,6 +104,77 @@ Shape Describe(iGame::DataObject::Pointer object, const char* phase) {
 
 int main(int argc, char** argv) {
     try {
+        if ((argc == 3 || argc == 4 || argc == 5) && std::string_view(argv[1]) == "--storage-bound") {
+            std::int64_t deltaMiB = 0;
+            if (argc >= 4) {
+                const std::string_view value(argv[3]);
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), deltaMiB);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                    deltaMiB < -1048576 || deltaMiB > 1048576) { return 2; }
+            }
+            std::size_t workers = 1u;
+            if (argc == 5) {
+                const std::string_view value(argv[4]);
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), workers);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || workers == 0u || workers > 32u) { return 2; }
+            }
+            auto reader = std::make_shared<iGame::iGameFileByteRangeReader>(argv[2]);
+            const auto start = Clock::now();
+            const auto analysis = datacodec::AnalyzeDecodeStorage({.inputReader = reader, .adapterBackedAttributes = true});
+            if (!analysis.success) {
+                std::cerr << (analysis.failure ? datacodec::FormatCodecFailure(*analysis.failure) : "analysis cancelled") << '\n';
+                return 5;
+            }
+            const auto floor = *analysis.minimumExecutionLimitBytes;
+            const auto signedLimit = static_cast<std::int64_t>(floor) + deltaMiB * 1024 * 1024;
+            if (signedLimit < 0) { return 2; }
+            const auto limit = static_cast<std::uint64_t>(signedLimit);
+            std::cout << "STORAGE_ANALYSIS bytes=" << floor << " seconds=" << Seconds(start)
+                << " stage=" << analysis.peakStage << " frame=" << analysis.peakFrameIndex
+                << " leaf=" << analysis.peakLeafPath << " leaves=" << analysis.inspectedLeafCount << std::endl;
+            std::cout << "COUNT_SCAN milliseconds=" << analysis.polyhedronCountScanMilliseconds << std::endl;
+            for (std::size_t i = 0; i < analysis.peakBytesByKind.size(); ++i) {
+                std::cout << "STORAGE_PART kind=" << i << " bytes=" << analysis.peakBytesByKind[i] << std::endl;
+            }
+            datacodec::DataCodecExecutionResources root(datacodec::ResolvedResourceConfiguration{
+                {limit, workers, workers == 1u ? 1u : workers + 1u}, limit, workers, workers != 1u, true, false});
+            datacodec::CodecRunScope scope(root);
+            datacodec::DecodeSession session;
+            iGame::iGameDecodeAdapter adapter;
+            iGame::iGameFramePackageDecodeAssembly assembly;
+            Memory("before_bounded_decode");
+            const auto decodeStart = Clock::now();
+            const auto decoded = datacodec::DecodePackageInRun({.inputReader = reader,
+                .leafAdapter = &adapter, .frameAssembly = &assembly,
+                .runRecordSink = std::make_shared<Records>()}, root, &session);
+            const auto decodeSeconds = Seconds(decodeStart);
+            const auto storage = root.StorageCapacity()->Snapshot();
+            datacodec::ResourceDebugSnapshot flow;
+            const auto snapshotDeadline = Clock::now() + std::chrono::seconds(2);
+            while (!root.TryCopyResourceDebugSnapshot(flow)) {
+                if (Clock::now() >= snapshotDeadline) {
+                    std::cerr << "resource snapshot unavailable after bounded decode\n";
+                    return 6;
+                }
+                std::this_thread::yield();
+            }
+            const auto scratch = root.Scratch().SnapshotStats();
+            std::cout << "ADMISSION compute_limit=" << workers << " peak_slots=" << flow.peakAdmittedBlocks
+                << " peak_compute=" << flow.peakActiveComputeUnits << " byte_wait_seconds="
+                << std::chrono::duration<double>(flow.byteWaitDuration).count()
+                << " reuse=" << scratch.reusedBlockCount << " allocations="
+                << root.StorageCapacity()->AllocatedStorage().allocationCount << std::endl;
+            std::cout << "STORAGE_RESULT success=" << decoded.success << " limit=" << limit
+                << " planned=" << floor << " observed_peak=" << storage.peakReservedBytes
+                << " reserved=" << storage.reservedBytes << " seconds=" << decodeSeconds << std::endl;
+            Memory("after_bounded_decode");
+            if (!decoded.success) {
+                if (decoded.failure) { std::cerr << datacodec::FormatCodecFailure(*decoded.failure) << '\n'; }
+                return 5;
+            }
+            Describe(decoded.decodedFramePackage ? assembly.Output() : adapter.TakeDataObject(), "bounded_decoded");
+            return storage.peakReservedBytes <= limit ? 0 : 6;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "--decode") {
             std::cout << std::fixed << std::setprecision(3);
             std::cout << "CONFIG decode_only=true mode=Adaptive threads=automatic storage=automatic all_attributes=true" << std::endl;

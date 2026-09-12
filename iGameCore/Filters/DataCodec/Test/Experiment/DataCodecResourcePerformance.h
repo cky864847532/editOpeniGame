@@ -17,6 +17,8 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <condition_variable>
+#include <thread>
 
 namespace datacodec::test {
 namespace resource_experiment {
@@ -24,8 +26,13 @@ namespace resource_experiment {
 // 只保留单个根作用域峰值的最大值，不将不同根或取样对象相加
 class CapacitySink final : public IRunRecordSink {
 public:
-    RunRecordMask Interests() const noexcept override { return RunRecordBit(RunRecordKind::ResourceUsage); }
+    RunRecordMask Interests() const noexcept override { return RunRecordKind::ResourceUsage | RunRecordKind::Message; }
     void Submit(const RunRecord& record) override {
+        if (const auto* message = std::get_if<RunMessageRecord>(&record); message && message->message.origin == "MemoryControl") {
+            std::lock_guard lock(m_mutex);
+            m_memory.push_back(message->message.text);
+            return;
+        }
         const auto* item = std::get_if<RunResourceUsageRecord>(&record);
         if (!item || item->stage.resource.capacityCoverage != TelemetryCapacityCoverage::OwnedStorageArrays) { return; }
         const auto& usage = item->stage.resource;
@@ -37,9 +44,51 @@ public:
         std::lock_guard lock(m_mutex);
         return m_peak;
     }
+    std::vector<std::string> MemorySummaries() const {
+        std::lock_guard lock(m_mutex);
+        return m_memory;
+    }
 private:
     mutable std::mutex m_mutex;
     std::optional<std::uint64_t> m_peak;
+    std::vector<std::string> m_memory;
+};
+
+// 实验侧记录物理余量时间序列，不向调度器反馈采样结果
+class PhysicalTimeline final {
+public:
+    PhysicalTimeline() {
+        m_samples.reserve(4096u);
+        m_samples.push_back(ProbeResources());
+        m_thread = std::jthread([this](std::stop_token stop) {
+            std::unique_lock lock(m_mutex);
+            while (!stop.stop_requested()) {
+                m_wake.wait_for(lock, stop, std::chrono::milliseconds(250), [] { return false; });
+                if (stop.stop_requested()) { break; }
+                if (m_samples.size() < m_samples.capacity()) { m_samples.push_back(ProbeResources()); }
+            }
+        });
+    }
+    void Finish(TestResult& result) {
+        m_thread.request_stop();
+        m_thread.join();
+        for (const auto& sample : m_samples) {
+            std::ostringstream row;
+            row << "resource_physical_sample,ms=" <<
+                std::chrono::duration<double, std::milli>(sample.sampledAt - m_samples.front().sampledAt).count()
+                << ",total=";
+            if (sample.physicalTotalBytes) { row << *sample.physicalTotalBytes; }
+            row << ",available=";
+            if (sample.availableBytes) { row << *sample.availableBytes; }
+            row << ",pressure=" << static_cast<unsigned>(sample.pressure);
+            result.AddDiagnostic(row.str());
+        }
+    }
+private:
+    std::vector<ResourceSample> m_samples;
+    std::mutex m_mutex;
+    std::condition_variable_any m_wake;
+    std::jthread m_thread;
 };
 
 inline TestDataset MakeDataset(std::size_t tuples, std::string_view profile = "points") {
@@ -167,6 +216,7 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
     }
     const auto environment = ProbeResources();
     const auto data = MakeDataset(tuples, profile);
+    PhysicalTimeline physicalTimeline;
     std::vector<AttributeTarget> targets;
     for (std::size_t i = 0u; i < data.pointFields.size(); ++i) { targets.push_back({.attrIndex = i}); }
     struct Configuration { const char* name; CodecResourceParams params; };
@@ -174,7 +224,7 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
         Configuration{"fixed_low", {CodecResourceMode::Fixed, 1u, storageBytes}},
         Configuration{"fixed_mid", {CodecResourceMode::Fixed, std::max<std::size_t>(1u, maxThreads / 2u), storageBytes}},
         Configuration{"fixed_high", {CodecResourceMode::Fixed, maxThreads, storageBytes}},
-        Configuration{"adaptive", {CodecResourceMode::Adaptive, maxThreads, storageBytes}},
+        Configuration{"adaptive", {CodecResourceMode::Adaptive, maxThreads}},
     };
     std::array<std::vector<double>, 4u> successfulTimes;
     std::array<std::size_t, 4u> failures{};
@@ -236,7 +286,9 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
             const auto* failure = encoded.failure ? &*encoded.failure : (decoded.failure ? &*decoded.failure : nullptr);
             std::ostringstream row;
             row << "resource_csv," << config.name << ',' << iteration << ',' << (iteration == 0u) << ',' << tuples
-                << ',' << *config.params.maxComputeThreads << ',' << storageBytes << ',' << success << ','
+                << ',' << *config.params.maxComputeThreads << ',';
+            Number(row, config.params.ownedStorageLimitBytes);
+            row << ',' << success << ','
                 << encoded.encodedByteCount << ',' << encodeMs << ',' << decodeMs << ',' << encodeMs + decodeMs << ',';
             Number(row, encodeSink ? encodeSink->Peak() : std::nullopt);
             row << ',';
@@ -249,6 +301,14 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
             Number(row, rssDecoded);
             row << ',' << (success ? "none" : failure ? failure->reason.data() : "roundtrip-mismatch");
             result.AddDiagnostic(row.str());
+            for (const auto& sink : {encodeSink, decodeSink}) {
+                if (sink) {
+                    for (const auto& memory : sink->MemorySummaries()) {
+                        result.AddDiagnostic(std::string("resource_memory,") + config.name + ",iteration=" +
+                            std::to_string(iteration) + ',' + memory);
+                    }
+                }
+            }
             if (!success) {
                 if (iteration != 0u) { ++failures[index]; }
                 result.AddFailure(std::string("resourcePerformance.") + config.name,
@@ -270,6 +330,7 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
         }
         result.AddDiagnostic(summary.str());
     }
+    physicalTimeline.Finish(result);
     return result;
 }
 
@@ -320,7 +381,7 @@ inline TestResult RunDataCodecResourceOverhead() {
         for (std::size_t i = 0u; i <= repetitions; ++i) {
             const auto begin = ResourceClock::now();
             auto run = std::make_unique<DataCodecExecutionResources>(CodecResourceParams{
-                mode, 1u, 16u * 1024u * 1024u});
+                mode, 1u, mode == CodecResourceMode::Fixed ? std::optional<std::uint64_t>(16u * 1024u * 1024u) : std::nullopt});
             const auto constructed = ResourceClock::now();
             const bool began = run->BeginRun();
             const auto started = ResourceClock::now();

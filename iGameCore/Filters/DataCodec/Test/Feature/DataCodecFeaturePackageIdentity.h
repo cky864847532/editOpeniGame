@@ -65,7 +65,7 @@ inline void RunMultiLeafOwnerCase(TestResult& result) {
         bool prepared = true;
         std::size_t appendCalls = 0u;
         for (std::size_t i = 0u; prepared && i < sizes.size(); ++i) {
-            auto source = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, sizes[i], "multi_leaf_payload", &error);
+            auto source = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, sizes[i], ::datacodec::MemoryDemandKind::RequiredContinuation, "multi_leaf_payload", &error);
             const std::vector<std::uint8_t> input(sizes[i], static_cast<std::uint8_t>(i + 11u));
             prepared = source && source->WriteAt(0u, input, &error) && source->Seal(&error);
             if (!prepared) { break; }

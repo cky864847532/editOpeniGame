@@ -15,7 +15,7 @@ inline TestResult RunDataCodecFeatureNumericExecution() {
     const auto checkType = [&]<typename Value>(const bool direct) {
         constexpr auto count = 2u * numericarray::kSpatialBlockElementCount + 3u;
         constexpr std::size_t components = 3u;
-        constexpr std::uint64_t limit = 32u * 1024u * 1024u;
+        static constexpr std::uint64_t limit = 32u * 1024u * 1024u;
         std::vector<Value> values(static_cast<std::size_t>(count) * components);
         for (std::size_t i = 0u; i < values.size(); ++i) {
             values[i] = static_cast<Value>(std::sin(static_cast<double>(i) * 0.017) + (i % components));

@@ -2,6 +2,7 @@
 #define DATACODEC_RUNTIME_CACHE_DECODECACHE_DECODEDATTRIBUTECACHESET_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 
@@ -189,8 +190,7 @@ public:
             return validation::AssignError(error, "decoded attribute tuple size is invalid");
         }
         std::uint64_t totalBytes = 0u;
-        if (!validation::CheckedMulU64(localElementCount, tupleBytes, totalBytes,
-                "decoded attribute bytes", error)) {
+        if (!CalculateDecodedNumericStorageBytes(meta, totalBytes, error)) {
             return false;
         }
         if (field.bytes == nullptr) {
@@ -198,7 +198,7 @@ public:
                 return validation::AssignError(error, "decoded attribute cache has no byte store session");
             }
             field.bytes = m_byteStoreSession->CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-                totalBytes, "decoded_attribute_" + std::to_string(attrIndex), error);
+                totalBytes, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_attribute_" + std::to_string(attrIndex), error);
             if (field.bytes == nullptr) {
                 return false;
             }

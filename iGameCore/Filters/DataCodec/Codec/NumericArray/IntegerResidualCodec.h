@@ -205,7 +205,7 @@ inline bool DecodeIntegerResidualLiteralRunVarint(
     const std::span<const std::uint8_t> bytes,
     const std::size_t expectedCount,
     const std::size_t valueSize,
-    std::vector<std::uint64_t>& residuals,
+    MutableArray<std::uint64_t> residuals,
     std::string* error = nullptr) {
     residuals.clear();
     residuals.reserve(expectedCount);
@@ -300,7 +300,7 @@ inline bool DecodeIntegerDeltaLiteralRunVarintComponentBytes(
     const NumericArrayBlockParams& params,
     const std::uint32_t elementCount,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedComponent,
+    MutableArray<std::uint8_t> decodedComponent,
     std::string* error = nullptr) {
     decodedComponent.clear();
     if (!IsIntegerNumericArrayDataType(params.dataType)) {
@@ -311,7 +311,8 @@ inline bool DecodeIntegerDeltaLiteralRunVarintComponentBytes(
         return false;
     }
 
-    std::vector<std::uint64_t> residuals;
+    ArrayWorkspace::Scope residualScope(params.workspace);
+    WorkingArray<std::uint64_t> residuals(params.workspace, elementCount);
     if (!DecodeIntegerResidualLiteralRunVarint(
             bytes,
             elementCount,

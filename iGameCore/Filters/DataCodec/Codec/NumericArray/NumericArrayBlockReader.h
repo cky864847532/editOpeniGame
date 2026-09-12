@@ -5,6 +5,7 @@
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockDecode.h"
 #include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
+#include "DataCodec/Codec/NumericArray/NumericDecodeMemoryPlan.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
@@ -26,7 +27,8 @@ struct NumericArrayBlockPayload {
     std::vector<NumericArrayRegionLayerLayoutParams> regionLayers;
     std::vector<double> alpha;
     std::vector<double> beta;
-    ScratchByteBuffer bytes;
+    FixedScratchBuffer bytes;
+    NumericDecodeMemoryLayout memory;
 };
 
 inline ParsedNumericArrayBlock MakeParsedBlockView(const NumericArrayBlockPayload& input) {
@@ -48,7 +50,8 @@ inline bool ReadNumericArrayBlockPayload(
     const std::size_t componentCount,
     const NumericArrayBlockLayoutParams& layout,
     const CacheResources& runtime,
-    NumericArrayBlockPayload& block,
+    NumericArrayBlockPayload& block, const NumericDecodeMemoryLayout& memory,
+    DecodeBlockWorkspace& workspace,
     std::string* error = nullptr) {
     block = {};
     if (!MakeNumericArrayBlockHeader(layout, block.header, error)) {
@@ -67,7 +70,8 @@ inline bool ReadNumericArrayBlockPayload(
         block.beta = layout.beta;
     }
 
-    block.bytes = runtime.ScratchBytePool().Acquire(block.header.encodedByteLength);
+    block.memory = memory;
+    block.bytes = FixedScratchBuffer(workspace.View<std::uint8_t>(memory.input));
     auto& bytes = block.bytes.Bytes();
     for (std::size_t offset = 0u; offset < bytes.size();) {
         if (runtime.Run().Stopped()) { return validation::AssignError(error, "numeric block read cancelled"); }
@@ -132,9 +136,10 @@ struct NumericDecodeCursor {
         }
         return key;
     }
-    bool ReadNext(NumericArrayBlockPayload& block, std::string* error) {
+    bool ReadNext(NumericArrayBlockPayload& block, const NumericDecodeMemoryLayout& memory,
+        DecodeBlockWorkspace& workspace, std::string* error) {
         if (!HasMore()) { return validation::AssignError(error, "numeric decode cursor is exhausted"); }
-        if (!ReadNumericArrayBlockPayload(stream, params.componentCount, layouts[nextBlock], resources, block, error)) {
+        if (!ReadNumericArrayBlockPayload(stream, params.componentCount, layouts[nextBlock], resources, block, memory, workspace, error)) {
             return false;
         }
         ++nextBlock;
@@ -145,7 +150,7 @@ struct NumericDecodeCursor {
 inline bool ResolveDecodedNumericArrayBlockBytes(
     const numericarray::NumericArrayBlockParams& params,
     const NumericArrayBlockPayload& block,
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!numericarray::ValidateNumericArrayBlockParams(params, error)) {

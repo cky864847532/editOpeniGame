@@ -84,6 +84,11 @@ struct RegionRun {
     }
 };
 
+inline bool CalculateNumericRegionStorageBytes(
+    const std::size_t count, std::size_t& bytes, std::string* error = nullptr) {
+    return validation::CheckedMulSizeT(count, sizeof(RegionRun), bytes, "field region runs", error);
+}
+
 inline NumericArrayRegionPrecision MakeNumericArrayRegionPrecision(
     CompressorConfig compressor) {
     NumericArrayRegionPrecision precision;

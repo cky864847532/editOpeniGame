@@ -3,6 +3,7 @@
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedIndexCache.h"
+#include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
@@ -144,21 +145,9 @@ struct DecodedTopologyCache {
         bytestore::ByteStoreSession& byteStoreSession,
         std::string* error = nullptr) {
         Release();
-        std::size_t offsetCount = 0u;
-        std::size_t connectivityBytes = 0u;
-        std::size_t offsetBytes = 0u;
-        std::size_t cellTypeBytes = 0u;
-        std::size_t polynomialOrderBytes = 0u;
-        if ((offsetsPresent && !validation::CheckedAddSizeT(cells, 1u, offsetCount,
-                "decoded topology offset count", error)) ||
-            !validation::CheckedMulSizeT(connectivityValues, sizeof(IndexType), connectivityBytes,
-                "decoded topology connectivity bytes", error) ||
-            !validation::CheckedMulSizeT(offsetCount, sizeof(IndexType), offsetBytes,
-                "decoded topology offset bytes", error) ||
-            (cellTypesPresent && !validation::CheckedMulSizeT(cells, sizeof(IndexType), cellTypeBytes,
-                "decoded topology cell type bytes", error)) ||
-            (cellPolynomialOrdersPresent && !validation::CheckedMulSizeT(cells, sizeof(std::uint16_t), polynomialOrderBytes,
-                "decoded topology polynomial order bytes", error))) {
+        DecodedConnectivityStorageSize size;
+        if (!CalculateDecodedConnectivityStorageSize(cells, connectivityValues, offsetsPresent,
+                cellTypesPresent, cellPolynomialOrdersPresent, size, error)) {
             return false;
         }
         // 完整目标准备成功后发布，任一失败自动释放本次已取得的 owner
@@ -170,21 +159,21 @@ struct DecodedTopologyCache {
         prepared.hasCellTypes = cellTypesPresent;
         prepared.hasCellPolynomialOrders = cellPolynomialOrdersPresent;
         prepared.connectivity = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-            connectivityBytes, "decoded_topology_connectivity", error);
+            size.connectivity, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_topology_connectivity", error);
         if (prepared.connectivity == nullptr) {
             return false;
         }
         bytestore::KnownStorageOwners coexist;
         coexist.Add(prepared.connectivity.get());
         prepared.offsets = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-            offsetBytes, "decoded_topology_offsets", error, coexist.Entries());
+            size.offsets, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_topology_offsets", error, coexist.Entries());
         if (prepared.offsets == nullptr) {
             return false;
         }
         coexist.Add(prepared.offsets.get());
         if (cellTypesPresent) {
             prepared.cellTypes = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-                cellTypeBytes, "decoded_topology_cell_types", error, coexist.Entries());
+                size.cellTypes, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_topology_cell_types", error, coexist.Entries());
             if (prepared.cellTypes == nullptr) {
                 return false;
             }
@@ -192,7 +181,7 @@ struct DecodedTopologyCache {
         }
         if (cellPolynomialOrdersPresent) {
             prepared.cellPolynomialOrders = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-                polynomialOrderBytes, "decoded_topology_cell_polynomial_orders", error, coexist.Entries());
+                size.polynomialOrders, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_topology_cell_polynomial_orders", error, coexist.Entries());
             if (prepared.cellPolynomialOrders == nullptr) {
                 return false;
             }

@@ -392,7 +392,7 @@ inline bool EncodePolyhedronTopologyToTransferCache(
     if (!phase) { return false; }
     bool needsTable = false;
     auto visited = std::dynamic_pointer_cast<bytestore::MemoryStore>(
-        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, faces,
+        session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, faces, ::datacodec::MemoryDemandKind::RequiredContinuation,
             "polyhedron_visited_faces", error));
     if (!visited) { return false; }
     if (!RunTerminalWork(root, *phase, [&](WorkerContext&) {
@@ -410,7 +410,7 @@ inline bool EncodePolyhedronTopologyToTransferCache(
             return validation::AssignError(error, "polyhedron remap point domain does not match the adapter");
         }
         tableOwner = std::dynamic_pointer_cast<bytestore::MemoryStore>(
-            session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, checked, "polyhedron_local_index", error));
+            session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, checked, ::datacodec::MemoryDemandKind::RequiredContinuation, "polyhedron_local_index", error));
         if (!tableOwner) { return false; }
         table = {reinterpret_cast<IndexType*>(tableOwner->WritableBytes().data()), count};
         if (!RunTerminalWork(root, *phase, [&](WorkerContext&) {

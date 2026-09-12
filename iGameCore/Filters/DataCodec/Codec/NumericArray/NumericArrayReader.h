@@ -152,6 +152,17 @@ struct NumericArrayReader {
         return false;
     }
 
+    [[nodiscard]] bool ReadPreparedElements(std::uint64_t offset, std::uint64_t count,
+        std::span<std::uint8_t> output, std::string* error) const {
+        std::size_t bytes = 0u;
+        if ((source.orderProvider && !source.orderProvider->IsIdentity()) ||
+            (source.order && !source.order->empty())) {
+            return validation::AssignError(error, "prepared decode reference must have identity ordering");
+        }
+        return PrepareElementRead(offset, count, bytes, error) &&
+            ReadElementsInto(offset, count, output, error, nullptr);
+    }
+
 private:
     [[nodiscard]] bool PrepareElementRead(
         const std::uint64_t elementOffset,

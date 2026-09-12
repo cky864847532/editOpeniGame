@@ -207,6 +207,8 @@ namespace iGame::datacodec_test {
 }
 
 [[nodiscard]] inline bool TestSynchronousPreparedSurfaceObserver() {
+    const ::datacodec::IndexType vertices[]{0u, 1u, 2u, 3u};
+    const ::datacodec::IndexType cellTypes[]{IG_TETRA};
     iGamePreparedSurfaceDecodeAdapter observer;
     const ::datacodec::ConnectivityTopologyDecodeInfo info{
         .blockCount = 1u, .pointCount = 4u, .cellCount = 1u, .fixedCellSize = 4, .hasCellTypes = true};
@@ -214,7 +216,7 @@ namespace iGame::datacodec_test {
     if (!observer.BeginConnectivityTopology(info, &error)) { return false; }
     ::datacodec::DecodedConnectivityTopologyBlock block{
         .blockIndex = 0u, .cellOffset = 0u, .fixedCellSize = 4,
-        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {IG_TETRA}};
+        .connectivity = vertices, .cellTypes = cellTypes};
     if (!observer.ObserveConnectivityBlock(std::move(block), &error) ||
         !observer.EndConnectivityTopology(&error)) { return false; }
     auto source = UnstructuredMesh::New();
@@ -236,19 +238,19 @@ namespace iGame::datacodec_test {
     iGamePreparedSurfaceDecodeAdapter failed;
     if (!failed.BeginConnectivityTopology(info, &error)) { return false; }
     ::datacodec::DecodedConnectivityTopologyBlock invalid{
-        .fixedCellSize = 4, .connectivity = {0u}, .cellTypes = {IG_TETRA}};
+        .fixedCellSize = 4, .connectivity = std::span(vertices).first(1u), .cellTypes = cellTypes};
     if (failed.ObserveConnectivityBlock(std::move(invalid), &error) ||
         failed.EndConnectivityTopology(&error) || failed.AttachPreparedSurface(source, &error)) { return false; }
     if (!failed.BeginConnectivityTopology(info, &error)) { return false; }
     ::datacodec::DecodedConnectivityTopologyBlock outOfOrder{
         .blockIndex = 1u, .cellOffset = 0u, .fixedCellSize = 4,
-        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {IG_TETRA}};
+        .connectivity = vertices, .cellTypes = cellTypes};
     if (failed.ObserveConnectivityBlock(std::move(outOfOrder), &error) ||
         failed.EndConnectivityTopology(&error)) { return false; }
     if (!failed.BeginConnectivityTopology(info, &error)) { return false; }
     ::datacodec::DecodedConnectivityTopologyBlock restarted{
         .blockIndex = 0u, .cellOffset = 0u, .fixedCellSize = 4,
-        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {IG_TETRA}};
+        .connectivity = vertices, .cellTypes = cellTypes};
     return failed.ObserveConnectivityBlock(std::move(restarted), &error) &&
         failed.EndConnectivityTopology(&error) && failed.AttachPreparedSurface(source, &error) &&
         !failed.AttachPreparedSurface(source, &error);

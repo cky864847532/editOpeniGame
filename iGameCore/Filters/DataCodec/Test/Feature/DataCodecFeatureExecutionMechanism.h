@@ -52,7 +52,7 @@ inline TestResult RunDataCodecFeatureExecutionMechanism() {
     const ResolvedResourceConfiguration fixed{{64u, 2u, 4u}, 128u, 4u, true, true};
     {
         auto config = ResolveResourceConfiguration(
-            {.mode = CodecResourceMode::Adaptive, .maxComputeThreads = 1u, .ownedStorageLimitBytes = 64u},
+            {.mode = CodecResourceMode::Adaptive, .maxComputeThreads = 1u},
             ProbeResources());
         DataCodecExecutionResources run(config);
         run.BeginRun();
@@ -207,7 +207,7 @@ inline TestResult RunDataCodecFeatureExecutionMechanism() {
         const auto epoch = run.EventEpoch();
         Require(result, run.UpdateLimits({0u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck) &&
             run.EventEpoch() == epoch, "execution.unchanged-target", "identical targets must not generate events");
-        Require(result, !run.UpdateLimits({8u, 3u, 2u}, true, ResourceDecisionReason::MechanismCheck) &&
+        Require(result, !run.UpdateLimits({8u, 5u, 2u}, true, ResourceDecisionReason::MechanismCheck) &&
             CopyExecutionSnapshot(run, state) && state.limits.ownedStorageLimitBytes == 0u &&
             state.limits.computeLimit == 1u && state.closing,
             "execution.invalid-target", "invalid updates must retain every previous target and record failure");

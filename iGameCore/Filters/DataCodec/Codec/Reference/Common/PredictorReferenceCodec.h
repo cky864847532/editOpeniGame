@@ -176,7 +176,7 @@ inline NumericArrayReferenceEncodeResult EncodePreparedPredictorReferenceBlockTy
 template<typename TValue>
 inline bool DecodePredictorReferenceBlockTyped(
     const NumericArrayReferenceCodecDecodeInput& input,
-    std::vector<std::uint8_t>& decodedBlockBytes,
+    MutableArray<std::uint8_t> decodedBlockBytes,
     std::string* error = nullptr) {
     const auto componentCount = static_cast<std::size_t>(std::max(input.meta.dimension, 0));
     if (componentCount == 0u) {
@@ -270,10 +270,10 @@ public:
 
     [[nodiscard]] bool DecodeBlock(
         const NumericArrayReferenceCodecDecodeInput& input,
-        std::vector<std::uint8_t>& decodedBlockBytes,
+        MutableArray<std::uint8_t> decodedBlockBytes,
         std::string* error = nullptr) const override {
         if (!DecodeNumericArrayReferenceValueBytes(input.meta, input.block, decodedBlockBytes,
-                error, input.compressorState, input.capacitySamples)) {
+                error, input.compressorState, input.capacitySamples, input.workspace)) {
             return false;
         }
         if (input.meta.dataType == DataType::Float32 && NumericArrayValueSize(input.meta) == sizeof(float)) {

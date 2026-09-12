@@ -4,6 +4,7 @@
 
 #include <QSettings>
 #include <limits>
+#include <cmath>
 
 namespace {
 
@@ -28,27 +29,54 @@ QSettings CreateSettings() {
     ::datacodec::CodecResourceParams resources;
     const auto mode = storage.value(QStringLiteral("ResourceMode"),
         static_cast<int>(::datacodec::CodecResourceMode::Adaptive)).toInt();
-    resources.mode = mode == static_cast<int>(::datacodec::CodecResourceMode::Fixed)
-        ? ::datacodec::CodecResourceMode::Fixed : ::datacodec::CodecResourceMode::Adaptive;
+    switch (mode) {
+    case static_cast<int>(::datacodec::CodecResourceMode::Fixed):
+        resources.mode = ::datacodec::CodecResourceMode::Fixed; break;
+    case static_cast<int>(::datacodec::CodecResourceMode::Unlimited):
+        resources.mode = ::datacodec::CodecResourceMode::Unlimited; break;
+    default: resources.mode = ::datacodec::CodecResourceMode::Adaptive; break;
+    }
     bool valid = false;
+    if (storage.value(QStringLiteral("ThreadMode")).toInt() == static_cast<int>(::datacodec::CodecThreadMode::Adaptive)) {
+        resources.threadMode = ::datacodec::CodecThreadMode::Adaptive;
+        const auto idle = storage.value(QStringLiteral("TargetCpuIdleRatio"), 0.2).toDouble(&valid);
+        resources.targetCpuIdleRatio = valid && std::isfinite(idle) && idle >= 0.0 && idle < 1.0 ? idle : 0.2;
+    }
     const auto threads = storage.value(QStringLiteral("MaxComputeThreads")).toULongLong(&valid);
-    if (valid && threads > 0u && threads <= std::numeric_limits<std::size_t>::max()) {
+    if (resources.threadMode == ::datacodec::CodecThreadMode::Fixed && valid && threads > 0u && threads <= std::numeric_limits<std::size_t>::max()) {
         resources.maxComputeThreads = static_cast<std::size_t>(threads);
     }
     const auto bytes = storage.value(QStringLiteral("OwnedStorageLimitBytes")).toULongLong(&valid);
-    if (valid) { resources.ownedStorageLimitBytes = bytes; }
+    if (valid && resources.mode == ::datacodec::CodecResourceMode::Fixed) {
+        resources.ownedStorageLimitBytes = bytes;
+    }
+    if (resources.mode == ::datacodec::CodecResourceMode::Adaptive) {
+        const bool migrated = storage.value(QStringLiteral("ResourceSettingsVersion"), 0).toInt() >= 2;
+        const auto ratio = migrated ? storage.value(QStringLiteral("TargetAvailableMemoryRatio"), 0.20).toDouble(&valid) : 0.20;
+        resources.targetAvailableMemoryRatio = (!migrated || (valid && std::isfinite(ratio) && ratio >= 0.0 && ratio < 1.0)) ? ratio : 0.20;
+    }
+    // 旧 Adaptive 字节额度直接删除，迁移版本与有效参数一起保存
+    SaveResources(storage, resources);
     return resources;
 }
 
 void igQtDataCodecDecodeSettingsStore::SaveResources(
     QSettings& storage, const ::datacodec::CodecResourceParams& resources) {
     storage.setValue(QStringLiteral("ResourceMode"), static_cast<int>(resources.mode));
-    if (resources.maxComputeThreads) {
+    storage.setValue(QStringLiteral("ResourceSettingsVersion"), 2);
+    storage.setValue(QStringLiteral("ThreadMode"), static_cast<int>(resources.threadMode));
+    if (resources.threadMode == ::datacodec::CodecThreadMode::Adaptive && resources.targetCpuIdleRatio) {
+        storage.setValue(QStringLiteral("TargetCpuIdleRatio"), *resources.targetCpuIdleRatio);
+    } else { storage.remove(QStringLiteral("TargetCpuIdleRatio")); }
+    if (resources.threadMode == ::datacodec::CodecThreadMode::Fixed && resources.maxComputeThreads) {
         storage.setValue(QStringLiteral("MaxComputeThreads"), static_cast<qulonglong>(*resources.maxComputeThreads));
     } else { storage.remove(QStringLiteral("MaxComputeThreads")); }
-    if (resources.ownedStorageLimitBytes) {
+    if (resources.mode == ::datacodec::CodecResourceMode::Fixed && resources.ownedStorageLimitBytes) {
         storage.setValue(QStringLiteral("OwnedStorageLimitBytes"), static_cast<qulonglong>(*resources.ownedStorageLimitBytes));
     } else { storage.remove(QStringLiteral("OwnedStorageLimitBytes")); }
+    if (resources.mode == ::datacodec::CodecResourceMode::Adaptive) {
+        storage.setValue(QStringLiteral("TargetAvailableMemoryRatio"), resources.targetAvailableMemoryRatio.value_or(0.20));
+    } else { storage.remove(QStringLiteral("TargetAvailableMemoryRatio")); }
 }
 
 igQtDataCodecDecodeSettings igQtDataCodecDecodeSettingsStore::Load() {

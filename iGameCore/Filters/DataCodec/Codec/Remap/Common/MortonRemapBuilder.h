@@ -134,6 +134,16 @@ inline constexpr std::size_t ResolveLeafBudgetElements() noexcept {
     return std::max<std::size_t>(1u, kMortonLeafBytes / (sizeof(IndexType) * 2u + sizeof(std::uint16_t)));
 }
 
+inline constexpr std::size_t MortonHighSliceRecords() noexcept {
+    return (kMortonHighBucketBufferBytes + kMortonRunRecordBytes - 1u) / kMortonRunRecordBytes;
+}
+
+inline constexpr std::size_t MortonHighSlabLowerBound(const std::size_t elementCount) noexcept {
+    // 分桶路径中 sum(min(桶元素数, 切片容量)) 至少为 min(总元素数, 切片容量)
+    return elementCount > ResolveLeafBudgetElements()
+        ? std::min(elementCount, MortonHighSliceRecords()) * kMortonRunRecordBytes : 0u;
+}
+
 class RemapScratchRun final {
 public:
     RemapScratchRun() = default;
@@ -223,7 +233,7 @@ public:
             return {};
         }
         return RemapScratchRun(m_session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-            bytes, std::string(label), error, coexist));
+            bytes, ::datacodec::MemoryDemandKind::RequiredContinuation, std::string(label), error, coexist));
     }
 
 private:
@@ -274,8 +284,7 @@ inline bool WriteHighBucketRun(
     if (highCounts.size() != kMortonBucketCount16 || highOffsets.size() != kMortonBucketCount16) {
         return validation::AssignError(error, "Morton high tables have an invalid size");
     }
-    constexpr auto recordsPerSlice =
-        (kMortonHighBucketBufferBytes + kMortonRunRecordBytes - 1u) / kMortonRunRecordBytes;
+    constexpr auto recordsPerSlice = MortonHighSliceRecords();
     std::vector<std::size_t> sliceOffsets(kMortonBucketCount16 + 1u, 0u);
     std::vector<std::size_t> usedBytes(kMortonBucketCount16, 0u);
     std::size_t totalRecords = 0u;
@@ -300,7 +309,7 @@ inline bool WriteHighBucketRun(
     bytestore::KnownStorageOwners coexist;
     coexist.Add(keyCacheSource);
     auto slab = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous,
-        sliceOffsets.back(), "morton_high_slab", error, coexist.Entries());
+        sliceOffsets.back(), ::datacodec::MemoryDemandKind::RequiredContinuation, "morton_high_slab", error, coexist.Entries());
     if (!slab) { return false; }
     std::optional<MortonCapacitySamples> samples;
     if (options.recordCapacitySamples) {

@@ -34,6 +34,10 @@
 #include <IQComponents/igQtProgressBarWidget.h>
 #include <IQCore/igQtDataCodecDecodeSettings.h>
 #include <IQWidgets/igQtDataCodecResourceControls.h>
+#include <IGDC/iGameIGDCReader.h>
+#include <DataCodec/Platform/ResourceProbe.h>
+#include <DataCodec/Filter/Output/iGameDataCodecOutputSinks.h>
+#include <QLineEdit>
 #include <IQCore/igQtFileLoader.h>
 #include <IQCore/igQtOpenGLWidgetManager.h>
 #include <IQWidgets/ColorManager/igQtColorManagerWidget.h>
@@ -2008,8 +2012,8 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
             dialog->setMaximizeEnabled(false);
             dialog->setOpaqueShell(true);
             dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-            dialog->setMinimumSize(420, 350);
-            dialog->resize(460, 380);
+            dialog->setMinimumSize(460, 440);
+            dialog->resize(520, 500);
 
             auto* panel = new QWidget(dialog->contentHost());
             panel->setObjectName(QStringLiteral("DataCodecDecodeSettingsPanel"));
@@ -2080,6 +2084,17 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
             layout->setHorizontalSpacing(12);
             layout->setVerticalSpacing(10);
             resourceControls = new igQtDataCodecResourceControls(panel);
+            auto* fileRow = new QWidget(panel);
+            auto* fileLayout = new QHBoxLayout(fileRow);
+            fileLayout->setContentsMargins(0, 0, 0, 0);
+            auto* checkPath = new QLineEdit(fileRow);
+            checkPath->setObjectName(QStringLiteral("DataCodecDecodeCheckPath"));
+            checkPath->setReadOnly(true);
+            checkPath->setPlaceholderText(QStringLiteral("选择待解压 IGC 以检查容量"));
+            auto* chooseCheckFile = new QPushButton(QStringLiteral("选择文件…"), fileRow);
+            fileLayout->addWidget(checkPath, 1);
+            fileLayout->addWidget(chooseCheckFile);
+            layout->addRow(QStringLiteral("容量检查文件"), fileRow);
 
             onDemandAttributes = new QCheckBox(
                 QStringLiteral("按需解压属性场"),
@@ -2101,6 +2116,51 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
             layout->addRow(QString(), onDemandAttributes);
             layout->addRow(QString(), decodedResultCache);
             layout->addRow(QString(), outputDecodeLogFile);
+            // 提示统一放在设置窗口下方，文件选择只用于检查，不启动读取模型
+            resourceControls->layout()->removeWidget(resourceControls->StorageStatusLabel());
+            layout->addRow(resourceControls->StorageStatusLabel());
+            resourceControls->SetStorageAnalyzer([checkPath] {
+                const auto path = checkPath->text();
+                const bool allAttributes = !onDemandAttributes->isChecked();
+                const bool required = !::datacodec::ProbeResources().externalSpillAvailable;
+                return [path, allAttributes, required](std::stop_token stop) {
+                    if (path.isEmpty()) { return igQtDataCodecResourceControls::StorageCheck{
+                        .detail = QStringLiteral("尚未检查容量：请选择待解压 IGC 文件；当前设置也可保存供后续文件使用")}; }
+                    const auto result = iGame::IGDCReader::AnalyzeFileStorage(
+                        std::filesystem::u8path(path.toUtf8().toStdString()), allAttributes, stop);
+                    return igQtDataCodecResourceControls::StorageCheck{
+                        .minimumBytes = result.success ? result.minimumExecutionLimitBytes : std::nullopt,
+                        .required = required,
+                        // 只取同一峰值中的必需 RAM 工作区，作为允许文件存储路径的保守下界
+                        .requiredMinimumBytes = result.success ? std::optional<std::uint64_t>(
+                            result.peakBytesByKind[static_cast<std::size_t>(::datacodec::DecodeStorageKind::StageWork)] +
+                            result.peakBytesByKind[static_cast<std::size_t>(::datacodec::DecodeStorageKind::BlockWork)]) : std::nullopt,
+                        .detail = result.success
+                            ? ((allAttributes ? QStringLiteral("范围：所选文件及依赖帧的完整属性解码，关闭可选缓存")
+                                              : QStringLiteral("范围：所选文件及依赖帧的首次载入；后续按需属性另行申请容量")) +
+                               QStringLiteral("\n必要下界只计确定并存的内存工作区，达到下界仍需在执行时检查其他申请"))
+                            : QStringLiteral("容量检查未完成：%1").arg(result.failure
+                                ? QString::fromStdString(::datacodec::FormatCodecFailure(*result.failure)) : QStringLiteral("未取得分析结果"))};
+                };
+            });
+            resourceControls->OnStorageStatus([](const QString& text, bool warning) {
+                if (text.isEmpty()) { return; }
+                iGame::iGameSpdlogDataCodecConsoleSink sink;
+                sink.SubmitConsoleStatus(::datacodec::DataCodecStatusRecord{
+                    .severity = warning ? ::datacodec::DataCodecStatusSeverity::Warning : ::datacodec::DataCodecStatusSeverity::Info,
+                    .language = ::datacodec::DataCodecLanguage::SimplifiedChinese,
+                    .text = text.toUtf8().toStdString(),
+                });
+            });
+            connect(chooseCheckFile, &QPushButton::clicked, panel, [checkPath] {
+                const auto path = QFileDialog::getOpenFileName(dialog, QStringLiteral("选择容量检查文件"),
+                    checkPath->text(), QStringLiteral("压缩文件 (*.igc)"));
+                if (path.isEmpty()) { return; }
+                checkPath->setText(path);
+                checkPath->setToolTip(path);
+                resourceControls->CheckStorage();
+            });
+            connect(onDemandAttributes, &QCheckBox::toggled, panel, [](bool) { resourceControls->CheckStorage(); });
 
             auto* buttons = new QDialogButtonBox(
                 QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
@@ -2112,6 +2172,7 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
             layout->addRow(buttons);
 
             connect(buttons, &QDialogButtonBox::accepted, dialog, []() {
+                if (resourceControls->StorageRejected()) { return; }
                 igQtDataCodecDecodeSettingsStore::Save({
                     .resources = resourceControls->Params(),
                     .decodeAttributesOnDemand = onDemandAttributes->isChecked(),
@@ -2130,6 +2191,7 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
         onDemandAttributes->setChecked(settings.decodeAttributesOnDemand);
         decodedResultCache->setChecked(settings.enableDecodedResultCache);
         outputDecodeLogFile->setChecked(settings.outputDecodeLogFile);
+        resourceControls->CheckStorage();
         showSynchronizedToolWindow(dialog);
     });
 

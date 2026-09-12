@@ -2,6 +2,7 @@
 #define DATACODEC_TEST_COMMON_REFERENCECODECTESTHARNESS_H
 
 #include "DataCodec/Codec/Reference/ReferenceCodec.h"
+#include "DataCodec/Codec/NumericArray/NumericDecodeMemoryPlan.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -126,16 +127,32 @@ inline bool EncodeDecodeReferenceTestBlock(
     if (!BuildParsedNumericArrayReferenceBlock(encoded, parsed, error)) {
         return false;
     }
-    return codec->DecodeBlock(
+    auto blockLayout = MakeNumericArrayBlockLayoutParams(parsed.header, parsed.alpha, parsed.beta);
+    blockLayout.componentLayouts = parsed.componentLayouts;
+    const auto plan = numericarray::MakeNumericDecodeMemoryLayout(meta, blockLayout, &meta, false);
+    resource::ResidentByteBudget capacity(plan.TotalBytes());
+    ScratchByteBufferPool decodePool;
+    DecodeBlockWorkspace memory(decodePool, plan);
+    auto lease = capacity.TryReserve(memory.TakeReusable());
+    if (!lease) { return validation::AssignError(error, "reference test layout reservation failed"); }
+    memory.Allocate(capacity, std::move(*lease));
+    auto scratch = memory.View<std::uint8_t>(plan.scratch);
+    scratch.resize(scratch.capacity());
+    ArrayWorkspace arena(scratch.Span());
+    auto output = memory.View<std::uint8_t>(plan.raw);
+    const auto success = codec->DecodeBlock(
         NumericArrayReferenceCodecDecodeInput{
             .meta = meta,
             .block = parsed,
             .referenceBytes = NumericValueBytes(reference),
             .referenceElementOffset = 0u,
             .capacitySamples = decodeSamples,
+            .workspace = &arena,
         },
-        decodedBytes,
+        output,
         error);
+    if (success) { decodedBytes.assign(output.begin(), output.end()); }
+    return success;
 }
 
 } // namespace datacodec::test

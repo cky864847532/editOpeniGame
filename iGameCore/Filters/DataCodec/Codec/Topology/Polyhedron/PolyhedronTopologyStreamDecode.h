@@ -6,6 +6,9 @@
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Runtime/Execution/DecodeStageMemory.h"
+#include "DataCodec/Codec/Topology/Polyhedron/PolyhedronDecodeMemoryPlan.h"
+#include "DataCodec/Storage/ByteIO/ArrayWorkspace.h"
 #include "DataCodec/Codec/SubCodec/SegmentedBitpackCodec.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamFormat.h"
 #include "DataCodec/Common/DataCodecTypes.h"
@@ -44,8 +47,9 @@ class PolyhedronTopologyStreamByteReader final {
 public:
     PolyhedronTopologyStreamByteReader(
         TStream& stream,
-        const PolyhedronTopologyStreamSchedule& schedule, const CacheResources& runtime)
-        : m_stream(stream), m_schedule(schedule), m_runtime(runtime) {
+        const PolyhedronTopologyStreamSchedule& schedule, const CacheResources& runtime, ArrayWorkspace* workspace = nullptr)
+        : m_stream(stream), m_schedule(schedule), m_runtime(runtime),
+          m_buffer(workspace, static_cast<std::size_t>(std::min<std::uint64_t>(schedule.streamByteSize, kIoWindowBytes))) {
         m_buffer.resize(static_cast<std::size_t>(std::min<std::uint64_t>(schedule.streamByteSize, kIoWindowBytes)));
     }
 
@@ -97,7 +101,7 @@ private:
     TStream& m_stream;
     const PolyhedronTopologyStreamSchedule& m_schedule;
     const CacheResources& m_runtime;
-    std::vector<std::uint8_t> m_buffer;
+    WorkingArray<std::uint8_t> m_buffer;
     std::size_t m_bufferCursor{0u}, m_bufferSize{0u};
     std::uint64_t m_streamByteCursor{0u};
 };
@@ -130,7 +134,8 @@ inline bool DecodeVarintScheduleToIndexCache(
     DecodedIndexCache& output,
     const CacheResources& runtime,
     std::string* error = nullptr,
-    PolyhedronCapacitySamples* capacitySamples = nullptr) {
+    PolyhedronCapacitySamples* capacitySamples = nullptr, ArrayWorkspace* workspace = nullptr) {
+    ArrayWorkspace::Scope memoryScope(workspace);
     if (schedule.codec != PolyhedronTopologyStreamCodec::Varint) {
         return validation::AssignError(error, "stateful polyhedron id stream requires varint codec");
     }
@@ -139,15 +144,15 @@ inline bool DecodeVarintScheduleToIndexCache(
             error,
             "stateful polyhedron id stream element count is too large for this platform");
     }
-    PolyhedronTopologyStreamByteReader<TStream> streamReader(stream, schedule, runtime);
+    PolyhedronTopologyStreamByteReader<TStream> streamReader(stream, schedule, runtime, workspace);
     if (!streamReader.ValidateCurrentFormat(error)) {
         return false;
     }
     if (output.Count() != schedule.elementCount || output.WrittenCount() != 0u) {
         return validation::AssignError(error, "polyhedron varint target must be prepared before terminal work");
     }
-    const auto kIndexWriteBatch = runtime.ValuesPerWindow<IndexType>();
-    std::vector<IndexType> buffer;
+    const auto kIndexWriteBatch = std::min<std::size_t>(runtime.ValuesPerWindow<IndexType>(), schedule.elementCount);
+    WorkingArray<IndexType> buffer(workspace, kIndexWriteBatch);
     buffer.reserve(kIndexWriteBatch);
     if (capacitySamples != nullptr) {
         streamReader.ObserveCapacity(*capacitySamples);
@@ -252,7 +257,8 @@ inline bool ValidateGlobalPolyhedronCountStores(
     const DecodedIndexCache& faceVertexCountStore,
     const CacheResources& runtime,
     std::string* error = nullptr,
-    PolyhedronCapacitySamples* capacitySamples = nullptr) {
+    PolyhedronCapacitySamples* capacitySamples = nullptr, ArrayWorkspace* workspace = nullptr) {
+    ArrayWorkspace::Scope memoryScope(workspace);
     if (header.cellCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
         header.faceCount > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         return validation::AssignError(
@@ -268,8 +274,8 @@ inline bool ValidateGlobalPolyhedronCountStores(
     }
 
     const auto kCountReadBatch = runtime.ValuesPerWindow<IndexType>(2u);
-    std::vector<IndexType> uniqueVertexCounts;
-    std::vector<IndexType> cellFaceCounts;
+    WorkingArray<IndexType> uniqueVertexCounts(workspace, std::min<std::size_t>(kCountReadBatch, header.cellCount));
+    WorkingArray<IndexType> cellFaceCounts(workspace, std::min<std::size_t>(kCountReadBatch, header.cellCount));
     std::uint64_t derivedFaceCount = 0u;
     std::uint64_t derivedUniqueIdCount = 0u;
     const auto cellCount = static_cast<std::size_t>(header.cellCount);
@@ -321,7 +327,7 @@ inline bool ValidateGlobalPolyhedronCountStores(
             "stateful polyhedron cell count streams do not match topology totals");
     }
 
-    std::vector<IndexType> faceVertexCounts;
+    WorkingArray<IndexType> faceVertexCounts(workspace, std::min<std::size_t>(kCountReadBatch, header.faceCount));
     std::uint64_t derivedLocalFaceIdCount = 0u;
     const auto faceCount = static_cast<std::size_t>(header.faceCount);
     for (std::size_t cursor = 0u; cursor < faceCount;) {
@@ -370,13 +376,14 @@ inline bool DecodeLocalFaceIdsToCache(
     DecodedIndexCache& localIdStore,
     const CacheResources& runtime,
     std::string* error = nullptr,
-    PolyhedronCapacitySamples* capacitySamples = nullptr) {
+    PolyhedronCapacitySamples* capacitySamples = nullptr, ArrayWorkspace* workspace = nullptr) {
+    ArrayWorkspace::Scope memoryScope(workspace);
     if (localIdStore.Count() != header.localFaceVertexIdCount || localIdStore.WrittenCount() != 0u) {
         return validation::AssignError(error, "polyhedron local-id target must be prepared before terminal work");
     }
 
-    const auto kLocalIdWriteBatch = runtime.ValuesPerWindow<IndexType>();
-    std::vector<IndexType> output;
+    const auto kLocalIdWriteBatch = std::min<std::size_t>(runtime.ValuesPerWindow<IndexType>(), header.localFaceVertexIdCount);
+    WorkingArray<IndexType> output(workspace, kLocalIdWriteBatch);
     output.reserve(kLocalIdWriteBatch);
     if (capacitySamples != nullptr) {
         capacitySamples->Observe(PolyhedronBufferSample::IndexWriteWindow, output);
@@ -572,19 +579,22 @@ inline bool DecodePolyhedronTopologyStreamsToCache(
     const auto sample = [&](const std::size_t index) -> PolyhedronCapacitySamples* {
         return samples ? &(*samples)[index] : nullptr;
     };
+    FixedByteBacking stageMemory;
+    if (!PrepareDecodeStageMemory(root, PolyhedronSequentialWorkBytes(topo), stageMemory, error)) { return false; }
     if (!RunTerminalWork(root, *phase, [&](WorkerContext&) {
-        if (!DecodeVarintScheduleToIndexCache(stream, uniqueCountsSchedule, polyhedron.uniqueVertexCounts, runtime, error, sample(0)) ||
-            !DecodeVarintScheduleToIndexCache(stream, cellFaceCountsSchedule, polyhedron.cellFaceCounts, runtime, error, sample(1)) ||
-            !DecodeVarintScheduleToIndexCache(stream, faceVertexCountsSchedule, polyhedron.faceVertexCounts, runtime, error, sample(2)) ||
-            !DecodeVarintScheduleToIndexCache(stream, uniqueIdsSchedule, polyhedron.cellUniqueVertexIds, runtime, error, sample(3)) ||
+        ArrayWorkspace workspace(stageMemory.Span());
+        if (!DecodeVarintScheduleToIndexCache(stream, uniqueCountsSchedule, polyhedron.uniqueVertexCounts, runtime, error, sample(0), &workspace) ||
+            !DecodeVarintScheduleToIndexCache(stream, cellFaceCountsSchedule, polyhedron.cellFaceCounts, runtime, error, sample(1), &workspace) ||
+            !DecodeVarintScheduleToIndexCache(stream, faceVertexCountsSchedule, polyhedron.faceVertexCounts, runtime, error, sample(2), &workspace) ||
+            !DecodeVarintScheduleToIndexCache(stream, uniqueIdsSchedule, polyhedron.cellUniqueVertexIds, runtime, error, sample(3), &workspace) ||
             !ValidateGlobalPolyhedronCountStores(streamHeader, polyhedron.uniqueVertexCounts,
-                polyhedron.cellFaceCounts, polyhedron.faceVertexCounts, runtime, error, sample(4))) { return false; }
-        PolyhedronTopologyStreamByteReader<TStream> localStreamReader(stream, localIdsSchedule, runtime);
+                polyhedron.cellFaceCounts, polyhedron.faceVertexCounts, runtime, error, sample(4), &workspace)) { return false; }
+        PolyhedronTopologyStreamByteReader<TStream> localStreamReader(stream, localIdsSchedule, runtime, &workspace);
         if (!localStreamReader.ValidateCurrentFormat(error)) { return false; }
         if (samples) { localStreamReader.ObserveCapacity(*sample(5)); }
         LocalFaceIdBitReader<decltype(localStreamReader)> localIdReader(localStreamReader);
         return DecodeLocalFaceIdsToCache(streamHeader, polyhedron.uniqueVertexCounts, polyhedron.cellFaceCounts,
-            polyhedron.faceVertexCounts, localIdReader, polyhedron.localFaceVertexIds, runtime, error, sample(5));
+            polyhedron.faceVertexCounts, localIdReader, polyhedron.localFaceVertexIds, runtime, error, sample(5), &workspace);
     })) { return false; }
     if (samples && recordCapacitySamples) {
         for (const auto& entry : *samples) {

@@ -8,8 +8,12 @@
 namespace datacodec::test {
 
 inline DecodedConnectivityTopologyBlock MakeTopologyObserverTestBlock(std::size_t index) {
+    auto owner = std::make_unique<std::uint8_t[]>(5u * sizeof(IndexType));
+    auto* values = reinterpret_cast<IndexType*>(owner.get());
+    for (std::size_t i = 0u; i < 4u; ++i) { values[i] = static_cast<IndexType>(i); }
+    values[4] = 10u;
     return {.blockIndex = index, .cellOffset = index, .fixedCellSize = 4,
-        .connectivity = {0u, 1u, 2u, 3u}, .cellTypes = {10u}};
+        .owner = std::move(owner), .connectivity = {values, 4u}, .cellTypes = {values + 4u, 1u}};
 }
 
 inline TestResult RunDataCodecFeatureTopologyObserver() {

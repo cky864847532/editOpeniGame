@@ -398,22 +398,22 @@ namespace datacodec::test {
         DataCodecExecutionResources root(ResolvedResourceConfiguration{{8u, 1u, 1u}, 32u, 1u, false, true, true});
         bytestore::ByteStoreSession sized;
         sized.BindStorage(root.StorageCapacity(), root.ExternalSpillAvailable());
-        auto memory = sized.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u);
+        auto memory = sized.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u, ::datacodec::MemoryDemandKind::RequiredContinuation);
         Require(result, memory && dynamic_cast<bytestore::MemoryStore*>(memory.get()) != nullptr &&
             memory->ByteSizeHint() == 8u && memory->ResidentSizeHint() == 8u &&
             root.StorageCapacity()->Snapshot().reservedBytes == 8u && memory->WriteAt(0u, input),
             "sized.exact-admission", "known-length memory must reserve exactly once before the first write");
-        auto file = sized.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u);
+        auto file = sized.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u, ::datacodec::MemoryDemandKind::RequiredContinuation);
         Require(result, file && dynamic_cast<bytestore::FileBackedStreamStore*>(file.get()) != nullptr &&
             file->ByteSizeHint() == 8u && file->ResidentSizeHint() == 0u && file->WriteAt(0u, input) && file->Seal(),
             "sized.ranged-file", "denied memory admission may choose a file before allocation and writing");
-        Require(result, !sized.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 1u) &&
+        Require(result, !sized.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 1u, ::datacodec::MemoryDemandKind::RequiredContinuation) &&
             root.StorageCapacity()->Snapshot().reservedBytes == 8u,
             "sized.contiguous-required", "necessary contiguous storage must never select a file");
         Require(result, root.UpdateLimits({0u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck) &&
             memory && memory->WriteAt(0u, input) && memory->Seal(),
             "sized.granted-downsize", "an already granted exact store must finish after the limit decreases");
-        auto empty = sized.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 0u);
+        auto empty = sized.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 0u, ::datacodec::MemoryDemandKind::RequiredContinuation);
         Require(result, empty && empty->ResidentSizeHint() == 0u && empty->ByteSizeHint() == 0u,
             "sized.empty", "an empty store must need no positive capacity even when U exceeds M");
         Require(result, root.UpdateLimits({32u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck),
@@ -426,7 +426,7 @@ namespace datacodec::test {
         {
             RejectAllocationsScope reject;
             try {
-                failedCreation = !sized.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u);
+                failedCreation = !sized.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 8u, ::datacodec::MemoryDemandKind::RequiredContinuation);
             } catch (const std::bad_alloc&) {
                 failedCreation = true;
             }
@@ -438,7 +438,7 @@ namespace datacodec::test {
             "sized.creation-rollback", "failed owner creation must release its lease without choosing a file");
         bytestore::ByteStoreSession noSpill;
         noSpill.BindStorage(std::make_shared<resource::ResidentByteBudget>(0u), false);
-        Require(result, !noSpill.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 1u) &&
+        Require(result, !noSpill.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, 1u, ::datacodec::MemoryDemandKind::RequiredContinuation) &&
             noSpill.SnapshotStats().storeCount == 0u,
             "sized.no-spill", "no-spill runtime must reject necessary sized memory when admission is denied");
         memory.reset();

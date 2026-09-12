@@ -5,6 +5,7 @@
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Runtime/Execution/DecodeStageMemory.h"
 #include "DataCodec/Storage/ByteIO/ScratchByteBuffer.h"
 #include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 #include "DataCodec/Codec/SubCodec/ZstdCodec.h"
@@ -55,7 +56,7 @@ public:
         std::shared_ptr<bytestore::IByteSource> source,
         const std::uint64_t rawSize,
         const CacheResources& runtime,
-        std::string* error = nullptr) {
+        std::string* error = nullptr, bool controlled = true) {
         Release();
         if (source == nullptr) {
             validation::AssignError(error, "zstd decode segment reader received a null byte source");
@@ -77,7 +78,6 @@ public:
         m_source = std::move(source);
         m_sourceByteSize = static_cast<std::size_t>(sourceByteSize);
         m_rawSize = rawSize;
-        m_scratchBytePool = &runtime.ScratchBytePool();
         m_stop = runtime.Run().StopToken();
         m_rawMode = false;
         if (m_rawSize == 0u && sourceByteSize == 0u) {
@@ -85,7 +85,7 @@ public:
             return true;
         }
 
-        if (!m_zstdDecoder.Initialize(error)) {
+        if (!PrepareWindows(runtime, controlled, error) || !m_zstdDecoder.Initialize(error)) {
             Release();
             return false;
         }
@@ -96,7 +96,7 @@ public:
         std::shared_ptr<bytestore::IByteSource> source,
         const std::uint64_t rawSize,
         const CacheResources& runtime,
-        std::string* error = nullptr) {
+        std::string* error = nullptr, bool controlled = true) {
         Release();
         if (source == nullptr) {
             validation::AssignError(error, "raw decode segment reader received a null byte source");
@@ -118,9 +118,9 @@ public:
         m_source = std::move(source);
         m_sourceByteSize = static_cast<std::size_t>(sourceByteSize);
         m_rawSize = rawSize;
-        m_scratchBytePool = &runtime.ScratchBytePool();
         m_stop = runtime.Run().StopToken();
         m_rawMode = true;
+        if (!PrepareWindows(runtime, controlled, error)) { Release(); return false; }
         if (m_rawSize == 0u) {
             m_finished = true;
         }
@@ -155,12 +155,10 @@ public:
                 return false;
             }
 
-            if (m_scratchBytePool == nullptr) {
+            if (m_source == nullptr) {
                 validation::AssignError(error, "zstd decode window resources are missing");
                 return false;
             }
-            m_outputScratchBuffer.Release();
-            m_outputScratchBuffer = m_scratchBytePool->Acquire(kIoWindowBytes);
             auto outputBuffer = m_outputScratchBuffer.Span();
 
             std::size_t consumedBytes = 0u;
@@ -225,6 +223,23 @@ public:
     }
 
 private:
+    bool PrepareWindows(const CacheResources& runtime, bool controlled, std::string* error) {
+        const auto bytes = DecodeFieldWindowBytes(m_sourceByteSize, m_rawSize, !m_rawMode);
+        const auto input = m_rawMode ? 0u : std::min<std::size_t>(m_sourceByteSize, kIoWindowBytes);
+        std::span<std::uint8_t> memory;
+        if (controlled) {
+            if (!PrepareDecodeStageMemory(runtime.Run(), bytes, m_backing, error)) { return false; }
+            memory = m_backing.Span();
+        } else {
+            // Params 属于明确豁免的有界元数据
+            m_metadataWindow.resize(bytes);
+            memory = m_metadataWindow;
+        }
+        m_inputScratchBuffer = FixedScratchBuffer(FixedArrayView<std::uint8_t>(memory.first(input)));
+        m_outputScratchBuffer = FixedScratchBuffer(FixedArrayView<std::uint8_t>(memory.subspan(input)));
+        return true;
+    }
+
     bool ValidateZstdFrameConsumed(std::string* error) const {
         // field 内只接受一个完整 ZSTD frame，拒绝 frame 后的尾随字节
         if (m_inputCursor != m_inputLimit || m_inputOffset < m_sourceByteSize) {
@@ -241,7 +256,7 @@ private:
         if (m_finished) {
             return true;
         }
-        if (m_scratchBytePool == nullptr) {
+        if (m_source == nullptr) {
             validation::AssignError(error, "raw decode window resources are missing");
             return false;
         }
@@ -254,8 +269,7 @@ private:
             return true;
         }
 
-        m_outputScratchBuffer.Release();
-        m_outputScratchBuffer = m_scratchBytePool->Acquire(currentBytes);
+        m_outputScratchBuffer.Bytes().resize(currentBytes);
         auto outputBuffer = m_outputScratchBuffer.Span();
         if (!m_source->ReadCancellable(m_outputOffset, outputBuffer, m_stop, error)) {
             return false;
@@ -288,12 +302,11 @@ private:
             return true;
         }
 
-        if (m_scratchBytePool == nullptr) {
+        if (m_source == nullptr) {
             validation::AssignError(error, "zstd decode window resources are missing");
             return false;
         }
-        m_inputScratchBuffer.Release();
-        m_inputScratchBuffer = m_scratchBytePool->Acquire(currentBytes);
+        m_inputScratchBuffer.Bytes().resize(currentBytes);
         auto inputBuffer = m_inputScratchBuffer.Span();
         if (!m_source->ReadCancellable(
                 static_cast<std::uint64_t>(m_inputOffset),
@@ -324,7 +337,8 @@ private:
         m_finished = false;
         m_inputScratchBuffer.Release();
         m_outputScratchBuffer.Release();
-        m_scratchBytePool = nullptr;
+        m_backing = {};
+        std::vector<std::uint8_t>().swap(m_metadataWindow);
         m_stop = {};
         m_rawMode = false;
     }
@@ -347,7 +361,8 @@ private:
         };
         m_outputOffset = other.m_outputOffset;
         m_finished = other.m_finished;
-        m_scratchBytePool = other.m_scratchBytePool;
+        m_backing = std::move(other.m_backing);
+        m_metadataWindow = std::move(other.m_metadataWindow);
         m_rawMode = other.m_rawMode;
         other.m_source.reset();
         other.m_sourceByteSize = 0u;
@@ -358,15 +373,15 @@ private:
         other.m_currentInputSegment = {};
         other.m_outputOffset = 0u;
         other.m_finished = false;
-        other.m_scratchBytePool = nullptr;
         other.m_rawMode = false;
     }
 
     std::shared_ptr<bytestore::IByteSource> m_source;
     codec::ZstdStreamingDecoder m_zstdDecoder;
-    ScratchByteBuffer m_inputScratchBuffer;
-    ScratchByteBuffer m_outputScratchBuffer;
-    ScratchByteBufferPool* m_scratchBytePool{nullptr};
+    FixedByteBacking m_backing;
+    std::vector<std::uint8_t> m_metadataWindow;
+    FixedScratchBuffer m_inputScratchBuffer;
+    FixedScratchBuffer m_outputScratchBuffer;
     std::size_t m_sourceByteSize{0u};
     std::uint64_t m_rawSize{0u};
     std::size_t m_inputOffset{0};
@@ -389,10 +404,10 @@ inline bool OpenLeafPackageFieldDecodeStream(
         return false;
     }
     if (field.compressionType == EncodedFieldCompressionType::ZSTD) {
-        return reader.Open(field.source, field.rawSize, runtime, error);
+        return reader.Open(field.source, field.rawSize, runtime, error, field.type != FieldType::Params);
     }
     if (field.compressionType == EncodedFieldCompressionType::None) {
-        return reader.OpenRaw(field.source, field.rawSize, runtime, error);
+        return reader.OpenRaw(field.source, field.rawSize, runtime, error, field.type != FieldType::Params);
     }
     validation::AssignError(error, "leaf package field uses an unsupported compression type");
     return false;
@@ -418,12 +433,12 @@ inline bool PrepareLeafPackageFieldPayload(
     if (field.compressionType != EncodedFieldCompressionType::ZSTD) {
         return validation::AssignError(error, "field payload compression type is unsupported");
     }
-    auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, field.rawSize,
+    auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, field.rawSize, ::datacodec::MemoryDemandKind::RequiredContinuation,
         "prepared_field_payload", error);
     if (!store) { return false; }
+    FieldDecodeStreamReader reader;
+    if (!OpenLeafPackageFieldDecodeStream(field, runtime, reader, error)) { return false; }
     const bool success = RunTerminalWork(root, *phase, [&](WorkerContext& worker) {
-        FieldDecodeStreamReader reader;
-        if (!OpenLeafPackageFieldDecodeStream(field, runtime, reader, error)) { return false; }
         std::uint64_t copied = 0u;
         for (;;) {
             if (worker.StopToken().stop_requested()) { return false; }
@@ -494,16 +509,14 @@ public:
     }
 
     bool Skip(const std::uint64_t byteCount, std::string* error = nullptr) {
-        constexpr std::size_t kSkipBufferBytes = 64u * 1024u;
-        std::vector<std::uint8_t> scratch(kSkipBufferBytes);
         std::uint64_t skipped = 0u;
         while (skipped < byteCount) {
-            const auto currentBytes = static_cast<std::size_t>(
-                std::min<std::uint64_t>(byteCount - skipped, scratch.size()));
-            if (!ReadBytes(scratch.data(), currentBytes, error)) {
-                return false;
-            }
-            skipped += currentBytes;
+            if (!EnsureSegment(error)) { return false; }
+            if (m_available.empty()) { return validation::AssignError(error, "unexpected end while skipping field"); }
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(byteCount - skipped, m_available.size()));
+            m_available = m_available.subspan(count);
+            skipped += count;
+            m_position += count;
         }
         return true;
     }

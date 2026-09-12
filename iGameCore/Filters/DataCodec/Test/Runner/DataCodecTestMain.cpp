@@ -367,7 +367,16 @@ int WriteBrowserFixture(const std::filesystem::path& outputPath) {
 
 }
 
+namespace datacodec::test { int RunDataCodecStorageAnalysisTests(); }
+namespace datacodec::test { int RunDataCodecEncodeStorageAnalysisTests(); }
+
 int main(const int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--encode-storage-analysis") {
+        return datacodec::test::RunDataCodecEncodeStorageAnalysisTests();
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--storage-analysis") {
+        return datacodec::test::RunDataCodecStorageAnalysisTests();
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--resource-coverage") {
         datacodec::test::testCheckObserver = ObserveTestCheck;
         const auto result = datacodec::test::RunDataCodecSelfTest();
@@ -450,6 +459,11 @@ int main(const int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--execution-mechanism") {
         const auto result = datacodec::test::RunDataCodecFeatureExecutionMechanism();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--cpu-control") {
+        const auto result = datacodec::test::RunDataCodecCpuControlTests();
         PrintResult(result);
         return result.passed ? 0 : 1;
     }

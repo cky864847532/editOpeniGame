@@ -323,7 +323,7 @@ inline bool TestFixedWindowFieldDecode() {
     const auto input = MakeWindowTestBytes();
     DataCodecExecutionResources root(CodecResourceParams{
         .mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u,
-        .ownedStorageLimitBytes = 0u});
+        .ownedStorageLimitBytes = 4u * kIoWindowBytes});
     CacheResources resources;
     resources.BindRun(root);
     std::string error;
@@ -403,14 +403,16 @@ inline bool TestAttributePayloadSizedStorage() {
         return false;
     }
     for (const bool externalSpill : {false, true}) {
-        const auto limit = externalSpill ? 0u : static_cast<std::uint64_t>(input.size());
+        const auto residentBytes = externalSpill ? 0u : static_cast<std::uint64_t>(input.size());
+        const auto limit = residentBytes + DecodeFieldWindowBytes(encoded.size(), input.size(), true);
         DataCodecExecutionResources root(ResolvedResourceConfiguration{
-            {limit, 1u, 1u}, static_cast<std::uint64_t>(input.size()), 1u, false, true, externalSpill});
+            {limit, 1u, 1u}, limit, 1u, false, true, externalSpill});
         CodecRunScope request(root);
         DecodeLeafWorkspace workspace;
         RunBinding binding(workspace, root);
         auto source = std::make_shared<WindowCheckedSource>(encoded);
         LeafPackageField field;
+        field.type = FieldType::Geometry;
         field.source = source;
         field.rawSize = input.size();
         field.compressionType = EncodedFieldCompressionType::ZSTD;
@@ -419,7 +421,7 @@ inline bool TestAttributePayloadSizedStorage() {
         const auto prepared = decodefield::PrepareLeafPackageFieldPayload(field, workspace.CacheResourcesRef(),
             workspace.ByteStoreSessionRef(), owner, &error);
         Require(result, prepared && owner && owner->ByteSizeHint() == input.size() &&
-            root.StorageCapacity()->Snapshot().reservedBytes == limit &&
+            root.StorageCapacity()->Snapshot().reservedBytes == residentBytes &&
             source->maxReadBytes <= kIoWindowBytes,
             "payload.sized-owner", "full attribute payload must use the root sized store and bounded source reads");
         if (!prepared || !owner) { continue; }

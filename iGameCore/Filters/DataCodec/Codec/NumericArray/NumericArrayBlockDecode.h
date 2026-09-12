@@ -21,7 +21,7 @@ inline bool DecodeIntegerDeltaRunVarintComponentBytes(
     const NumericArrayBlockParams& params,
     const std::uint32_t elementCount,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedComponent,
+    MutableArray<std::uint8_t> decodedComponent,
     std::string* error = nullptr) {
     decodedComponent.clear();
     if (!IsIntegerNumericArrayDataType(params.dataType)) {
@@ -82,7 +82,7 @@ inline bool DecodeNumericArrayComponentBytes(
     const std::uint32_t componentIndex,
     const NumericArrayBytesCodec bytesCodec,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedComponent,
+    MutableArray<std::uint8_t> decodedComponent,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedComponent.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
@@ -147,7 +147,7 @@ inline bool DecodeNumericArrayComponentBundle(
     const std::uint32_t elementCount,
     const std::span<const NumericArrayComponentLayoutParams> componentLayouts,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
@@ -176,7 +176,9 @@ inline bool DecodeNumericArrayComponentBundle(
     }
 
     std::vector<bool> seen(componentCount, false);
-    std::vector<std::uint8_t> decodedComponent;
+    ArrayWorkspace::Scope componentScope(params.workspace);
+    WorkingArray<std::uint8_t> decodedComponent(params.workspace,
+        DecodeBlockMemoryPlan::Multiply(elementCount, params.valueSize));
     for (const auto& componentLayout : componentLayouts) {
         const auto componentIndex = componentLayout.componentIndex;
         const auto encodedByteLength = componentLayout.encodedByteLength;
@@ -236,7 +238,7 @@ inline bool ResolveDecodedNumericArrayBlockBytes(
     const NumericArrayBytesCodec bytesCodec,
     const std::span<const NumericArrayComponentLayoutParams> componentLayouts,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
@@ -260,7 +262,7 @@ inline bool ResolveDecodedNumericArrayBlockBytes(
 
 template<typename TValue>
 inline void AddResidualBytesInPlace(
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     const std::span<const std::uint8_t> residualBytes,
     const std::size_t componentCount,
     const std::size_t valueSize,
@@ -329,7 +331,7 @@ inline bool ResolveDecodedLayeredResidualNumericArrayBlockBytes(
     const std::span<const NumericArrayComponentLayoutParams> backgroundComponentLayouts,
     const std::span<const NumericArrayRegionLayerLayoutParams> regionLayers,
     const std::span<const std::uint8_t> bytes,
-    std::vector<std::uint8_t>& decodedBytes,
+    MutableArray<std::uint8_t> decodedBytes,
     std::string* error = nullptr, numericarray::NumericArrayCompressorState* compressorState = nullptr) {
     decodedBytes.clear();
     if (!ValidateNumericArrayBlockParams(params, error)) {
@@ -385,7 +387,9 @@ inline bool ResolveDecodedLayeredResidualNumericArrayBlockBytes(
         }
         auto residualParams = params;
         residualParams.regionControl = nullptr;
-        std::vector<std::uint8_t> residualBytes;
+        ArrayWorkspace::Scope layerScope(params.workspace);
+        WorkingArray<std::uint8_t> residualBytes(params.workspace,
+            DecodeBlockMemoryPlan::Multiply(static_cast<std::size_t>(layer.refinedElementCount), tupleBytes));
         if (!ResolveDecodedNumericArrayBlockBytes(
                 residualParams,
                 layer.refineCompressor,

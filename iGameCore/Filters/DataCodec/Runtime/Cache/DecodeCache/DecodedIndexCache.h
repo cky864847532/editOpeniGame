@@ -59,7 +59,7 @@ public:
             return false;
         }
         m_bytes = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
-            byteCount, label, error, coexist, site);
+            byteCount, ::datacodec::MemoryDemandKind::RequiredContinuation, label, error, coexist, site);
         if (m_bytes == nullptr) {
             return false;
         }

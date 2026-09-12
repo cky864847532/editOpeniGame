@@ -5,6 +5,8 @@
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockWireFormat.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
+#include "DataCodec/Storage/ByteIO/ArrayWorkspace.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +23,7 @@ struct NumericArrayBlockParams : public NumericArrayLayout {
     const NumericArrayRegionControlParams* regionControl{nullptr};
     const std::vector<RegionRun>* regionRuns{nullptr};
     NumericArrayBlockCapacitySamples* capacitySamples{nullptr};
+    ArrayWorkspace* workspace{nullptr};
 };
 
 inline NumericArrayBlockParams MakeNumericArrayBlockParams(const NumericArrayLayout& layout) {

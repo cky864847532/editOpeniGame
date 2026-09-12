@@ -1,6 +1,7 @@
 #include "iGameIGDCWriter.h"
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "DataCodec/Runtime/Record/RunRecordSubmit.h"
+#include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 
 #include "DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h"
@@ -305,6 +306,70 @@ bool IGDCWriter::GenerateBuffers()
 ::datacodec::EncodePackageKind IGDCWriter::ResolveEncodePackageKind(const DataObject::Pointer& rootObject) const
 {
     return ResolveDataCodecEncodePackageKind(rootObject);
+}
+
+::datacodec::EncodeStorageAnalysisResult IGDCWriter::AnalyzeStorage(const DataObject::Pointer& data) const
+{
+    using namespace ::datacodec;
+    try {
+        const auto frames = data != nullptr ? data->PeekTimeFrames() : nullptr;
+        if (frames != nullptr && frames->GetTimeNum() > 1u) {
+            // 时序源按需载入，GUI 预检不触发帧读取，各实际叶在执行前再次预检
+            EncodeStorageAnalysisResult result;
+            result.success = true;
+            result.provenLowerBoundBytes = 0u;
+            result.unresolved = {EncodeStorageUnknown::UnloadedTemporalFrames};
+            return result;
+        }
+        const auto kind = ResolveEncodePackageKind(data);
+        std::unique_ptr<iGameEncodeAdapter> leaf;
+        std::unique_ptr<iGameBlockTreeAdapter> tree;
+        EncodeRequest request;
+        if (kind == EncodePackageKind::LeafPackage && CanCreateiGameEncodeAdapter(data)) {
+            leaf = std::make_unique<iGameEncodeAdapter>(data);
+            request.input = EncodeInput::LeafAdapter(leaf.get());
+        } else if (kind == EncodePackageKind::FramePackage && data != nullptr) {
+            tree = std::make_unique<iGameBlockTreeAdapter>(data);
+            request.input = EncodeInput::BlockTreeAdapter(tree.get());
+        }
+        request.output.packageKind = kind;
+        request.attributeSelection = m_hasAttributeTargets ? AttributeSelectionMode::Explicit : AttributeSelectionMode::AllAvailable;
+        request.attributeTargets = m_hasAttributeTargets ? m_attributeTargets : std::vector<AttributeTarget>{};
+        request.configuration = {
+            .controlParams = m_hasCodecParams ? m_CodecParams : MakeDefaultEncodeControlParams(),
+            .pipelineControl = m_pipelineControl,
+            .source = m_configurationSource,
+            .language = m_language,
+        };
+        return AnalyzeEncodeStorage(request);
+    } catch (const std::exception& exception) {
+        EncodeStorageAnalysisResult result;
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+            "encode.storage-analysis", "IGDCWriter", exception.what());
+        return result;
+    } catch (...) {
+        EncodeStorageAnalysisResult result;
+        result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+            "encode.storage-analysis", "IGDCWriter", "unknown encode storage analysis exception");
+        return result;
+    }
+}
+
+std::optional<::datacodec::CodecFailureRecord> IGDCWriter::CheckStorageBeforeEncode(
+    const DataObject::Pointer& data) const
+{
+    using namespace ::datacodec;
+    if (m_resources.mode != CodecResourceMode::Fixed) { return std::nullopt; }
+    try {
+        const auto configuration = ResolveResourceConfiguration(m_resources, ProbeResources());
+        return CheckEncodeStorageLowerBound(AnalyzeStorage(data), configuration.initialLimits.ownedStorageLimitBytes);
+    } catch (const std::exception& exception) {
+        return MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+            "encode.storage-preflight", "IGDCWriter", exception.what());
+    } catch (...) {
+        return MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+            "encode.storage-preflight", "IGDCWriter", "unknown encode storage preflight exception");
+    }
 }
 
 bool IGDCWriter::EncodeToFile(const ::datacodec::EncodePackageKind packageKind)

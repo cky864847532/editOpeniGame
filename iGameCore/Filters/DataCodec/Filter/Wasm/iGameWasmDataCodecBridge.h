@@ -29,7 +29,7 @@ struct iGameWasmDataCodecDecodeRequest {
     std::optional<bool> enableEncodedInputCache;
     iGameWasmTopologyOutputMode topologyOutputMode{
         iGameWasmTopologyOutputMode::CommitToAdapter};
-    ::datacodec::CodecResourceParams resources;
+    ::datacodec::CodecResourceParams resources{.mode = ::datacodec::CodecResourceMode::Unlimited};
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink;
 };
 
@@ -74,7 +74,8 @@ struct iGameWasmDataCodecDecodeResult {
         iGameWasmTopologyOutputMode::CommitToAdapter,
     std::optional<bool> enableEncodedInputCache = {},
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
-    ::datacodec::DecodeSourceIdentity sourceIdentity = {});
+    ::datacodec::DecodeSourceIdentity sourceIdentity = {},
+    ::datacodec::CodecResourceParams resources = {.mode = ::datacodec::CodecResourceMode::Unlimited});
 
 [[nodiscard]] iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecMemory(
     std::shared_ptr<const void> inputOwner,
@@ -82,7 +83,8 @@ struct iGameWasmDataCodecDecodeResult {
     bool enableReuseCache = true,
     iGameWasmTopologyOutputMode topologyOutputMode =
         iGameWasmTopologyOutputMode::CommitToAdapter,
-    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {});
+    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
+    ::datacodec::CodecResourceParams resources = {.mode = ::datacodec::CodecResourceMode::Unlimited});
 
 [[nodiscard]] iGameWasmDataCodecDecodeResult DecodeiGameWasmBrowserFile(
     std::uint32_t browserFileId,
@@ -91,7 +93,8 @@ struct iGameWasmDataCodecDecodeResult {
     iGameWasmTopologyOutputMode topologyOutputMode =
         iGameWasmTopologyOutputMode::CommitToAdapter,
     std::optional<bool> enableEncodedInputCache = {},
-    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {});
+    std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
+    ::datacodec::CodecResourceParams resources = {.mode = ::datacodec::CodecResourceMode::Unlimited});
 
 IGAME_NAMESPACE_END
 

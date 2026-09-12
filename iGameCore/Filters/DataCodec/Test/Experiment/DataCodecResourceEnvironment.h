@@ -58,7 +58,7 @@ inline TestResult RunDataCodecResourceEnvironment() {
         return result;
     }
     const auto threads = std::min<std::size_t>(4u, ResourceComputeCapacity(environment, CodecResourceMode::Adaptive));
-    DataCodecExecutionResources run(CodecResourceParams{CodecResourceMode::Adaptive, threads, 128u * mib});
+    DataCodecExecutionResources run(CodecResourceParams{CodecResourceMode::Adaptive, threads});
     if (!run.BeginRun()) {
         result.AddFailure("resourceEnvironment.begin", "cannot begin the constrained request");
         return result;
@@ -74,13 +74,18 @@ inline TestResult RunDataCodecResourceEnvironment() {
         bool gate{};
         bool retentionPaused{};
         bool hostLoad{};
+        std::optional<std::uint64_t> total;
+        std::optional<std::uint64_t> available;
+        std::uint64_t reserve{};
+        std::uint64_t reserved{};
+        double gain{};
     };
     std::vector<Sample> samples;
     samples.reserve(600u);
     std::atomic_uint observerFailure{0u};
     std::atomic_bool loadReleased{false};
     const auto began = ResourceClock::now();
-    const auto finishAt = began + std::chrono::seconds(22);
+    const auto finishAt = began + std::chrono::seconds(5);
     std::jthread observer([&](std::stop_token stop) {
         struct HostAllocation {
             void* address{};
@@ -125,7 +130,8 @@ inline TestResult RunDataCodecResourceEnvironment() {
                     state.resourceSample.processRemainingBytes.value_or(0u), state.limits,
                     state.controlPhase, state.admittedBlocks, state.activeComputeUnits,
                     state.pressurePending, state.gateOpen, state.optionalRetentionPausedByPressure,
-                    host.address != nullptr});
+                    host.address != nullptr, state.memory.physicalTotalBytes, state.memory.availableBytes,
+                    state.memory.reserveBytes, state.storage.reservedBytes, state.memory.gain});
             }
             if (now - began >= std::chrono::seconds(26)) {
                 observerFailure = 3u;
@@ -149,20 +155,18 @@ inline TestResult RunDataCodecResourceEnvironment() {
     observer.request_stop();
     observer.join();
     const bool ended = run.EndRun();
-    bool pending = false, hold = false, resumed = false, retentionRestored = false;
-    std::size_t initialCompute = 0u, reducedCompute = threads;
+    bool constrained = false, observedLoad = false;
+    bool cpuUnchanged = true, physicalTargetPreserved = true;
+    std::optional<std::uint64_t> initialAllowance;
     for (std::size_t i = 0u; i < samples.size(); ++i) {
         const auto& sample = samples[i];
-        if (i == 0u) { initialCompute = sample.limits.computeLimit; }
-        pending |= sample.pending;
-        if (sample.phase == ResourceControlPhase::Hold) {
-            hold |= sample.admitted == 0u && sample.computing == 0u && !sample.gate;
-            reducedCompute = std::min(reducedCompute, sample.limits.computeLimit);
-        }
-        if (hold && !sample.hostLoad && sample.phase == ResourceControlPhase::Normal && sample.gate) {
-            resumed = true;
-            retentionRestored |= !sample.retentionPaused;
-        }
+        if (i == 0u) { initialAllowance = sample.limits.ownedStorageLimitBytes; }
+        observedLoad |= sample.hostLoad;
+        cpuUnchanged &= sample.limits.computeLimit == threads;
+        physicalTargetPreserved &= sample.total && sample.reserve == MakeReserveWatermarks(*sample.total, 0.20).low;
+        constrained |= sample.hostLoad && initialAllowance && sample.limits.ownedStorageLimitBytes &&
+            *sample.limits.ownedStorageLimitBytes < *initialAllowance &&
+            *sample.limits.ownedStorageLimitBytes <= sample.reserved + sample.remaining;
         const bool changed = i == 0u || sample.phase != samples[i - 1u].phase ||
             sample.pending != samples[i - 1u].pending || sample.gate != samples[i - 1u].gate ||
             sample.retentionPaused != samples[i - 1u].retentionPaused ||
@@ -170,21 +174,23 @@ inline TestResult RunDataCodecResourceEnvironment() {
         if (!changed) { continue; }
         std::ostringstream row;
         row << "resource_environment_trace,ms=" << sample.milliseconds << ",remaining=" << sample.remaining
-            << ",M=" << sample.limits.ownedStorageLimitBytes << ",C=" << sample.limits.computeLimit
+            << ",M=" << (sample.limits.ownedStorageLimitBytes
+                ? std::to_string(*sample.limits.ownedStorageLimitBytes) : "Unlimited") << ",C=" << sample.limits.computeLimit
             << ",S=" << sample.limits.slotLimit << ",phase=" << static_cast<unsigned>(sample.phase)
             << ",admitted=" << sample.admitted << ",computing=" << sample.computing
             << ",pending=" << sample.pending << ",gate=" << sample.gate
             << ",retention_paused=" << sample.retentionPaused << ",host_load=" << sample.hostLoad;
+        row << ",physical_total=" << sample.total.value_or(0u) << ",physical_available=" << sample.available.value_or(0u)
+            << ",reserve=" << sample.reserve << ",reserved=" << sample.reserved << ",Km=" << sample.gain;
         result.AddDiagnostic(row.str());
     }
     if (!success || !ended || observerFailure != 0u || read == 0u || read != committed) {
         result.AddFailure("resourceEnvironment.completion", "constrained workload failed to complete in order");
     }
-    if (!pending || !hold || !resumed || !retentionRestored || !loadReleased ||
-        (initialCompute > 1u && reducedCompute >= initialCompute)) {
-        result.AddFailure("resourceEnvironment.response", "real process pressure did not drain, shrink and recover");
+    if (!constrained || !observedLoad || !loadReleased || !cpuUnchanged || !physicalTargetPreserved) {
+        result.AddFailure("resourceEnvironment.response", "Job headroom must revoke unused allowance while retaining physical reserve and CPU settings");
     }
-    result.AddDiagnostic("resource_environment_scope,Windows_Job_process_limit,host_allocation_at_most_512_MiB,mechanism_only,no_global_pressure_notification_claim");
+    result.AddDiagnostic("resource_environment_scope,Windows_Job_process_limit,host_allocation_at_most_512_MiB,unused_allowance_revocation,physical_denominator_and_CPU_independence,no_global_pressure_notification_claim");
 #else
     result.AddFailure("resourceEnvironment.platform", "this explicit experiment requires Windows Job objects");
 #endif

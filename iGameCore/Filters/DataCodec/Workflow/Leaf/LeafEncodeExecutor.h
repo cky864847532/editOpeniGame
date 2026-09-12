@@ -9,6 +9,7 @@
 #include "DataCodec/Storage/LeafPackage/EncodedLeafFieldBundle.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Workflow/Encode/EncodePipeline.h"
+#include "DataCodec/Workflow/Encode/EncodeStoragePlan.h"
 #include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
 #include "DataCodec/Runtime/Record/RunRecordTimestamp.h"
 
@@ -114,6 +115,16 @@ public:
                     pipelineBindingError,
                     result);
                 return result;
+            }
+            if (const auto fixedLimit = context.resources.FixedStorageLimitBytes()) {
+                const auto analysis = encodestorage::AnalyzeLeaf(*context.adapter, *controlParams,
+                    request.pipelineControl, context.attributeTargets, context.frameIndex, context.path,
+                    request.includeTopology, context.attributeTemporalRole, context.resources.StopToken());
+                if (auto failure = CheckEncodeStorageLowerBound(analysis, fixedLimit)) {
+                    context.RecordFailure(*failure);
+                    result.failure = std::move(failure);
+                    return result;
+                }
             }
             const auto contextInitResult = context.Initialize(request.runRecordSink);
             if (!contextInitResult) {

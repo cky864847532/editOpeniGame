@@ -332,7 +332,7 @@ inline std::shared_ptr<IWritableRemapProvider> MakeStoreBackedWritableRemapProvi
     if (!validation::CheckedMulSizeT(size, sizeof(IndexType), bytes, "remap provider bytes", error)) {
         return nullptr;
     }
-    auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, bytes, label, error, coexist);
+    auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Ranged, bytes, ::datacodec::MemoryDemandKind::RequiredContinuation, label, error, coexist);
     if (store == nullptr) {
         return nullptr;
     }

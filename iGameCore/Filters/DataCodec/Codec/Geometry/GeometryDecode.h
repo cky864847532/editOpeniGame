@@ -9,6 +9,7 @@
 #include "DataCodec/Codec/Reference/DecodedReference.h"
 #include "DataCodec/Codec/Reference/NumericArrayReferenceBytes.h"
 #include "DataCodec/Codec/Reference/ReferenceCodec.h"
+#include "DataCodec/Codec/Reference/PreparedDecodeReference.h"
 #include "DataCodec/Common/DataCodecError.h"
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
@@ -58,15 +59,15 @@ inline GeometryDecodeResult MakeGeometryDecodeFailure(
 
 template<typename TValue>
 inline bool ConvertGeometryPointValues(
-    const std::span<const std::uint8_t> raw, ScratchByteBufferPool& scratch,
-    ScratchByteBuffer& converted, std::string* error) {
+    const std::span<const std::uint8_t> raw,
+    FixedScratchBuffer& converted, std::string* error) {
     if (raw.size() % sizeof(TValue) != 0u) {
         return validation::AssignError(error, "geometry source has an incomplete numeric value");
     }
     const auto count = raw.size() / sizeof(TValue);
     std::size_t bytes = 0u;
     if (!validation::CheckedMulSizeT(count, sizeof(float), bytes, "converted geometry values", error)) { return false; }
-    converted = scratch.Acquire(bytes);
+    converted.Bytes().resize(bytes);
     const auto* source = reinterpret_cast<const TValue*>(raw.data());
     auto* target = reinterpret_cast<float*>(converted.Bytes().data());
     for (std::size_t i = 0u; i < count; ++i) { target[i] = static_cast<float>(source[i]); }
@@ -75,107 +76,45 @@ inline bool ConvertGeometryPointValues(
 
 inline bool ConvertGeometryPointBlock(
     const DataType type, const std::span<const std::uint8_t> raw,
-    ScratchByteBufferPool& scratch, ScratchByteBuffer& converted, std::string* error) {
+    FixedScratchBuffer& converted, std::string* error) {
     switch (type) {
         case DataType::Float32: return true;
-        case DataType::Float64: return ConvertGeometryPointValues<double>(raw, scratch, converted, error);
-        case DataType::Int8: return ConvertGeometryPointValues<std::int8_t>(raw, scratch, converted, error);
-        case DataType::UInt8: return ConvertGeometryPointValues<std::uint8_t>(raw, scratch, converted, error);
-        case DataType::Int16: return ConvertGeometryPointValues<std::int16_t>(raw, scratch, converted, error);
-        case DataType::UInt16: return ConvertGeometryPointValues<std::uint16_t>(raw, scratch, converted, error);
-        case DataType::Int32: return ConvertGeometryPointValues<std::int32_t>(raw, scratch, converted, error);
-        case DataType::UInt32: return ConvertGeometryPointValues<std::uint32_t>(raw, scratch, converted, error);
-        case DataType::Int64: return ConvertGeometryPointValues<std::int64_t>(raw, scratch, converted, error);
-        case DataType::UInt64: return ConvertGeometryPointValues<std::uint64_t>(raw, scratch, converted, error);
+        case DataType::Float64: return ConvertGeometryPointValues<double>(raw, converted, error);
+        case DataType::Int8: return ConvertGeometryPointValues<std::int8_t>(raw, converted, error);
+        case DataType::UInt8: return ConvertGeometryPointValues<std::uint8_t>(raw, converted, error);
+        case DataType::Int16: return ConvertGeometryPointValues<std::int16_t>(raw, converted, error);
+        case DataType::UInt16: return ConvertGeometryPointValues<std::uint16_t>(raw, converted, error);
+        case DataType::Int32: return ConvertGeometryPointValues<std::int32_t>(raw, converted, error);
+        case DataType::UInt32: return ConvertGeometryPointValues<std::uint32_t>(raw, converted, error);
+        case DataType::Int64: return ConvertGeometryPointValues<std::int64_t>(raw, converted, error);
+        case DataType::UInt64: return ConvertGeometryPointValues<std::uint64_t>(raw, converted, error);
         default: return validation::AssignError(error, "geometry value type is unsupported");
     }
 }
 
-inline bool ResolveGeometryReferenceBytesForBlock(
-    const GeometryStorageParams& meta,
-    const DecodedGeometryReference* keyFrameReference,
-    const ParsedNumericArrayBlock& block,
-    ScratchByteBufferPool& scratchBytePool,
-    ScratchByteBuffer& referenceBytes,
-    std::string* error = nullptr) {
-    if (block.header.referenceKind != NumericArrayReferenceKind::TemporalKeyFrame) {
-        return validation::AssignError(error, "geometry reference block requires temporal key-frame reference");
-    }
-    if (keyFrameReference == nullptr ||
-        keyFrameReference->store == nullptr ||
-        !keyFrameReference->store->IsComplete()) {
-        return validation::AssignError(error, "geometry key frame reference store is not ready");
-    }
-
-    GeometryStorageParams referenceMeta;
-    numericarray::NumericArraySource referenceSource;
-    if (!BuildGeometryReferenceCacheNumericArraySource(
-            keyFrameReference->store,
-            meta,
-            referenceMeta,
-            referenceSource,
-            error)) {
-        return false;
-    }
-    numericarray::NumericArrayReader referenceReader;
-    if (!numericarray::BuildNumericArrayReader(referenceSource, referenceReader, error)) {
-        return false;
-    }
-    std::size_t localElementOffset = 0u;
-    std::size_t localElementCount = 0u;
-    if (!validation::CheckedCastSizeT(
-            block.header.elementOffset,
-            localElementOffset,
-            "geometry reference block element offset",
-            error) ||
-        !validation::CheckedCastSizeT(
-            block.header.elementCount,
-            localElementCount,
-            "geometry reference block element count",
-            error)) {
-        return false;
-    }
-    if (block.header.codecId == NumericArrayReferenceCodecId::Predictor) {
-        return numericarrayreference::BuildNumericArrayPredictorReferenceBlockBytes(
-            referenceReader,
-            referenceMeta,
-            meta,
-            scratchBytePool,
-            localElementOffset,
-            localElementCount,
-            block.header.predictorOffset,
-            referenceBytes,
-            error);
-    }
-    return numericarrayreference::BuildNumericArrayReferenceRangeBytes(
-        referenceReader,
-        referenceMeta,
-        meta,
-        scratchBytePool,
-        localElementOffset,
-        localElementCount,
-        referenceBytes,
-        error);
-}
-
 struct GeometryDecodedBlock {
     NumericArrayBlockHeader header;
-    ScratchByteBuffer raw;
-    ScratchByteBuffer converted;
+    FixedScratchBuffer raw;
+    FixedScratchBuffer converted;
     std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
 };
 
 inline bool ComputeGeometryDecodedBlock(
     const GeometryDecodeRuntime& runtime, const numericarray::NumericArrayBlockParams& sourceParams,
     const numericarray::NumericArrayBlockPayload& input, GeometryDecodedBlock& output,
-    WorkerContext& worker, std::string* error) {
+    WorkerContext& worker, DecodeBlockWorkspace& workspace, std::string* error) {
+    auto scratchBytes = workspace.View<std::uint8_t>(input.memory.scratch);
+    scratchBytes.resize(scratchBytes.capacity());
+    ArrayWorkspace scratch(scratchBytes.Span());
     auto params = sourceParams;
+    params.workspace = &scratch;
     params.capacitySamples = output.capacitySamples ? &*output.capacitySamples : nullptr;
     if (params.capacitySamples != nullptr) {
         params.capacitySamples->Observe(numericarray::NumericBufferSample::EncodedInput, input.bytes.Bytes());
     }
     output.header = input.header;
-    output.raw = worker.Scratch().Acquire(0u);
+    output.raw = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.raw));
+    output.converted = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.converted));
     auto& decoded = output.raw.Bytes();
     if (input.header.codecId == NumericArrayReferenceCodecId::NonReference) {
         if (input.header.referenceKind != NumericArrayReferenceKind::None ||
@@ -186,9 +125,18 @@ inline bool ComputeGeometryDecodedBlock(
             return validation::AssignError(error, "ordinary geometry field contains a reference block");
         }
         const auto block = numericarray::MakeParsedBlockView(input);
-        ScratchByteBuffer reference;
-        if (!ResolveGeometryReferenceBytesForBlock(runtime.data.meta, runtime.data.keyFrameReference,
-                block, worker.Scratch(), reference, error)) { return false; }
+        if (!runtime.data.keyFrameReference || !runtime.data.keyFrameReference->store) {
+            return validation::AssignError(error, "geometry reference is unavailable");
+        }
+        GeometryStorageParams referenceMeta;
+        numericarray::NumericArraySource source;
+        numericarray::NumericArrayReader reader;
+        auto reference = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.reference));
+        if (!BuildGeometryReferenceCacheNumericArraySource(runtime.data.keyFrameReference->store,
+                runtime.data.meta, referenceMeta, source, error) ||
+            !numericarray::BuildNumericArrayReader(source, reader, error) ||
+            !PrepareDecodeReference(reader, referenceMeta, runtime.data.meta, input.header,
+                reference.Bytes(), scratch, error)) { return false; }
         if (params.capacitySamples != nullptr) {
             params.capacitySamples->Observe(numericarray::NumericBufferSample::ReferencePrimary, reference.Bytes());
         }
@@ -198,14 +146,14 @@ inline bool ComputeGeometryDecodedBlock(
                 .meta = runtime.data.meta, .block = block, .referenceBytes = reference.Span(),
                 .referenceElementOffset = 0u,
                 .compressorState = &worker.NumericCompressor(),
-                .capacitySamples = params.capacitySamples}, decoded, error)) { return false; }
+                .capacitySamples = params.capacitySamples, .workspace = &scratch}, decoded, error)) { return false; }
     }
     std::size_t expected = 0u;
     if (!numericarray::ResolveNumericArrayBlockRawByteCount(params, input.header.elementCount, expected, error) ||
         decoded.size() != expected) {
         return validation::AssignError(error, "geometry decoded block does not match its logical shape");
     }
-    if (!ConvertGeometryPointBlock(params.dataType, output.raw.Span(), worker.Scratch(), output.converted, error)) {
+    if (!ConvertGeometryPointBlock(params.dataType, output.raw.Span(), output.converted, error)) {
         return false;
     }
     if (params.capacitySamples != nullptr) {
@@ -290,16 +238,17 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
     }
     ParamSize committedElements = 0u;
     phase.reset();
+    numericarray::NumericDecodeMemoryLayout nextMemory;
     const bool success = RunOrderedBlocks<numericarray::NumericArrayBlockPayload, detail::GeometryDecodedBlock>(
         root, [&] { return cursor.HasMore(); },
-        [&](numericarray::NumericArrayBlockPayload& input, const SlotLease& slot) {
+        [&](numericarray::NumericArrayBlockPayload& input, const SlotLease& slot, DecodeBlockWorkspace& workspace) {
             // driver 串行推进唯一字段流，外层解压使用同一槽位的计算额度
-            return RunTerminalWork(root, slot, [&](WorkerContext&) { return cursor.ReadNext(input, &error); });
+            return RunTerminalWork(root, slot, [&](WorkerContext&) { return cursor.ReadNext(input, nextMemory, workspace, &error); });
         },
-        [&](const numericarray::NumericArrayBlockPayload& input, detail::GeometryDecodedBlock& output, WorkerContext& worker) {
+        [&](const numericarray::NumericArrayBlockPayload& input, detail::GeometryDecodedBlock& output, WorkerContext& worker, DecodeBlockWorkspace& workspace) {
             std::string localError;
             if (runtime.recordCapacitySamples) { output.capacitySamples.emplace(); }
-            if (!detail::ComputeGeometryDecodedBlock(runtime, params, input, output, worker, &localError)) {
+            if (!detail::ComputeGeometryDecodedBlock(runtime, params, input, output, worker, workspace, &localError)) {
                 root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "geometry-block-decode", "ComputeGeometryDecodedBlock", localError));
                 return false;
@@ -336,7 +285,13 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
                 catch (...) { root.RecordDiagnosticExportFailure(); }
             }
             return committedElements != params.elementCount || finish();
-        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::GeometryDecode); });
+        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::GeometryDecode); }, [&] {
+            const auto* referenceMeta = runtime.data.keyFrameReference && runtime.data.keyFrameReference->store
+                ? &runtime.data.keyFrameReference->store->StorageParams() : nullptr;
+            nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, meta.blockLayouts[cursor.nextBlock],
+                referenceMeta, true);
+            return nextMemory;
+        });
     if (!success) {
         geometry.Release();
         if (referenceCache != nullptr) { referenceCache->Reset(); }

@@ -249,11 +249,11 @@ inline NumericArrayRegionControlParams MakeRegionPrecisionTestControl(
             auto sharedOwner = field.owner;
             field = {};
             auto denied = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous,
-                sizeof(RegionRun), "region_capacity_denied", &error);
+                sizeof(RegionRun), ::datacodec::MemoryDemandKind::RequiredContinuation, "region_capacity_denied", &error);
             Require(result, !denied, "regionPrecision.sharedCapacity", "shared owner must keep the full run capacity");
             sharedOwner.reset();
             auto reused = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous,
-                bytes, "region_capacity_reused", &error);
+                bytes, ::datacodec::MemoryDemandKind::RequiredContinuation, "region_capacity_reused", &error);
             Require(result, reused != nullptr, "regionPrecision.lastOwner", "last owner release must return run capacity");
         }
     }

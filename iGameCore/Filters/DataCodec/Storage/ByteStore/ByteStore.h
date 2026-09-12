@@ -248,7 +248,7 @@ public:
         return true;
     }
 
-    bool PrepareCapacity(const std::uint64_t requiredBytes, DataCodecExecutionResources& run,
+    bool PrepareCapacity(const std::uint64_t requiredBytes, DataCodecExecutionResources& run, MemoryDemandKind kind,
                          std::string* error = nullptr,
                          std::span<const resource::StorageOwnerDescription> coexist = {}) {
         std::size_t required = 0u;
@@ -259,7 +259,7 @@ public:
         }
         // 只有 driver 能同步解除可选缓存引用，终端 worker 继续单次即时预约
         if (run.IsDriverThread()) { run.ReclaimOptionalStorage(required); }
-        return ReserveCapacity(required, error, &run, coexist);
+        return ReserveCapacity(required, error, &run, coexist, kind);
     }
 
 private:
@@ -286,7 +286,8 @@ private:
 
     bool ReserveCapacity(const std::size_t requiredBytes, std::string* error,
                          DataCodecExecutionResources* run = nullptr,
-                         std::span<const resource::StorageOwnerDescription> coexist = {}) {
+                         std::span<const resource::StorageOwnerDescription> coexist = {},
+                         MemoryDemandKind kind = MemoryDemandKind::Block) {
         if (requiredBytes <= m_capacity) {
             return true;
         }
@@ -307,10 +308,13 @@ private:
             owners[ownerCount++] = owner;
         }
         resource::CapacityRejection rejection;
-        auto lease = m_residentBudget->TryReserveGrowth(requiredBytes, targetCapacity, &rejection,
-            m_owner, std::span(owners).first(ownerCount));
+        const bool driver = run != nullptr && run->IsDriverThread();
+        auto lease = driver ? run->WaitForStorage(requiredBytes, kind, m_owner,
+            std::span(owners).first(ownerCount), targetCapacity) :
+            m_residentBudget->TryReserveGrowth(requiredBytes, targetCapacity, &rejection,
+                m_owner, std::span(owners).first(ownerCount));
         if (!lease) {
-            if (run != nullptr) { run->RecordCapacityRejection(rejection, true); }
+            if (run != nullptr && !run->Stopped()) { run->RecordCapacityRejection(rejection, true); }
             return validation::AssignError(error, "memory store capacity admission was rejected");
         }
         targetCapacity = static_cast<std::size_t>(lease->Bytes());
@@ -324,6 +328,7 @@ private:
         m_bytes = std::move(expanded);
         m_capacityLease = std::move(*lease);
         m_capacity = targetCapacity;
+        if (driver) { run->CompleteMemoryPreparation(); }
         return true;
     }
 
@@ -346,7 +351,8 @@ inline bool AppendableByteStoreWriter::Write(std::span<const std::uint8_t> bytes
     if (auto* memory = dynamic_cast<MemoryStore*>(m_store.get())) {
         std::uint64_t required = 0u;
         if (!validation::CheckedAddU64(memory->ByteSizeHint(), bytes.size(), required,
-                "appendable store size", error) || !memory->PrepareCapacity(required, m_run, error)) { return false; }
+                "appendable store size", error) || !memory->PrepareCapacity(required, m_run,
+                    MemoryDemandKind::RequiredContinuation, error)) { return false; }
     }
     return m_store->AppendBytes(bytes, error);
 }
@@ -642,7 +648,7 @@ struct ByteStoreSessionStats {
     std::uint64_t managedFileBytes{0u};
     std::uint64_t reservedBytes{0u};
     std::uint64_t peakReservedBytes{0u};
-    std::uint64_t capacityLimitBytes{0u};
+    std::optional<std::uint64_t> capacityLimitBytes{0u};
     std::size_t storeCount{0u};
 };
 
@@ -749,6 +755,7 @@ public:
     [[nodiscard]] std::shared_ptr<IByteStore> CreateSizedStore(
         const ByteStorePurpose purpose,
         const std::uint64_t byteSize,
+        const MemoryDemandKind demandKind = MemoryDemandKind::Block,
         const std::string& label = "store",
         std::string* error = nullptr,
         std::span<const resource::StorageOwnerDescription> coexist = {},
@@ -780,12 +787,18 @@ public:
         const auto owner = capacity->NewOwner(purpose == ByteStorePurpose::Contiguous
             ? resource::StorageOwnerPurpose::Contiguous : resource::StorageOwnerPurpose::Ranged, label, site);
         resource::CapacityRejection rejection;
-        auto lease = capacity->TryReserve(byteSize, &rejection, owner, coexist);
-        if (lease) {
-            return CreateReservedMemoryStore(std::move(*lease), error);
-        }
         const bool fatal = purpose == ByteStorePurpose::Contiguous || !externalSpillAvailable;
-        if (run != nullptr) { run->RecordCapacityRejection(rejection, fatal); }
+        const bool driver = run != nullptr && run->IsDriverThread();
+        auto lease = driver ? (fatal ? run->WaitForStorage(byteSize, demandKind, owner, coexist) :
+            run->TryAcquireStorage(byteSize, demandKind, &rejection, owner, coexist)) :
+            capacity->TryReserve(byteSize, &rejection, owner, coexist);
+        if (lease) {
+            auto store = CreateReservedMemoryStore(std::move(*lease), error);
+            if (driver && store) { run->CompleteMemoryPreparation(); }
+            return store;
+        }
+        if (driver) { run->ClearByteWait(); }
+        if (run != nullptr && !run->Stopped()) { run->RecordCapacityRejection(rejection, fatal); }
         if (fatal) {
             validation::AssignError(error, "sized memory store capacity admission was rejected");
             return nullptr;

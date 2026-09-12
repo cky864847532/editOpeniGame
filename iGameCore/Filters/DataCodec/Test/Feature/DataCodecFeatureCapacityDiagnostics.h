@@ -8,6 +8,7 @@
 #include "DataCodec/Storage/ByteStore/SegmentedBinaryObject.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
 #include <latch>
+#include <thread>
 
 namespace datacodec::test {
 
@@ -15,11 +16,66 @@ inline TestResult RunDataCodecFeatureCapacityDiagnostics() {
     TestResult result;
     static_assert(std::is_trivially_copyable_v<ResourceDebugSnapshot>);
     {
+        DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 1u, 1u}, 64u, 1u, false, true});
+        CodecRunScope scope(run);
+        bytestore::ByteStoreSession session;
+        session.BindRun(run);
+        run.UpdateLimits({64u, 1u, 1u}, false, ResourceDecisionReason::MechanismCheck);
+        resource::CapacityRejection rejection;
+        auto early = run.TryAcquireStorage(8u, MemoryDemandKind::RequiredContinuation, &rejection);
+        Require(result, !early && run.StorageCapacity()->Snapshot().reservedBytes == 0u && !run.Stopped(),
+            "admission.closed-storage", "a closed memory gate must reject a driver reservation even with sufficient byte allowance");
+        std::jthread reopen([&] {
+            const auto deadline = ResourceClock::now() + std::chrono::seconds(2);
+            ResourceDebugSnapshot snapshot;
+            while (ResourceClock::now() < deadline) {
+                if (run.TryCopyResourceDebugSnapshot(snapshot) && snapshot.waiting == ResourceWaitReason::ByteCapacity) {
+                    run.UpdateLimits({64u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck);
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            run.RequestStop();
+        });
+        auto store = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 8u,
+            MemoryDemandKind::RequiredContinuation, "gated-stage");
+        reopen.join();
+        Require(result, store && run.StorageCapacity()->Snapshot().reservedBytes == 8u && !run.Stopped(),
+            "admission.driver-resume", "a necessary driver allocation must resume after the memory gate reopens");
+        auto memory = std::dynamic_pointer_cast<bytestore::MemoryStore>(store);
+        if (memory) {
+            const auto bytesBefore = run.StorageCapacity()->Snapshot().reservedBytes;
+            Require(result, memory->PrepareCapacity(16u, run, MemoryDemandKind::RequiredContinuation) &&
+                run.StorageCapacity()->Snapshot().peakReservedBytes >= bytesBefore + 16u,
+                "admission.growth-coexistence", "growth must reserve the complete new array while the old array is live");
+        }
+    }
+    {
+        DataCodecExecutionResources run(ResolvedResourceConfiguration{{64u, 1u, 1u}, 64u, 1u, false, true});
+        CodecRunScope scope(run);
+        run.UpdateLimits({64u, 1u, 1u}, false, ResourceDecisionReason::MechanismCheck);
+        std::jthread cancel([&] {
+            const auto deadline = ResourceClock::now() + std::chrono::seconds(2);
+            ResourceDebugSnapshot snapshot;
+            while (ResourceClock::now() < deadline) {
+                if (run.TryCopyResourceDebugSnapshot(snapshot) && snapshot.byteWaiting) { break; }
+                std::this_thread::yield();
+            }
+            run.RequestStop();
+        });
+        const auto begin = ResourceClock::now();
+        auto lease = run.WaitForStorage(8u, MemoryDemandKind::RequiredContinuation);
+        cancel.join();
+        Require(result, !lease && run.Stopped() && ResourceClock::now() - begin < std::chrono::seconds(3) &&
+            run.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "admission.cancel-wait", "cancellation must wake a necessary allocation wait and preserve capacity ownership");
+    }
+    {
         DataCodecExecutionResources run({{12u, 1u, 1u}, 12u, 1u, false, true, false});
         CodecRunScope scope(run);
         bytestore::ByteStoreSession session;
         session.BindRun(run);
-        auto input = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 8u, "materialize_input");
+        auto input = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 8u, ::datacodec::MemoryDemandKind::RequiredContinuation, "materialize_input");
         bytestore::SegmentedBinaryObject source;
         Require(result, input && input->Seal() && source.AddSegment(input),
             "diagnostics.materialize-setup", "the required source allocation must be ready");
@@ -96,7 +152,7 @@ inline TestResult RunDataCodecFeatureCapacityDiagnostics() {
         Require(result, run.BeginRun(), "diagnostics.begin", "the request must begin");
         bytestore::ByteStoreSession session;
         session.BindRun(run);
-        auto owner = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 8u, "payload");
+        auto owner = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous, 8u, ::datacodec::MemoryDemandKind::RequiredContinuation, "payload");
         auto memory = std::dynamic_pointer_cast<bytestore::MemoryStore>(owner);
         Require(result, memory != nullptr, "diagnostics.memory", "the exact owner must be available");
         if (memory) {
@@ -107,7 +163,7 @@ inline TestResult RunDataCodecFeatureCapacityDiagnostics() {
             ResourceDebugSnapshot snapshot;
             {
                 RejectAllocationsScope reject;
-                rejected = !memory->PrepareCapacity(13u, run);
+                rejected = !memory->PrepareCapacity(13u, run, MemoryDemandKind::RequiredContinuation);
                 rejected &= run.TryCopyResourceDebugSnapshot(snapshot);
             }
             Require(result, rejected && rejectedAllocationCount == 0u && snapshot.capacityRejection &&

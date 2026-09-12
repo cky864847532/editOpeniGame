@@ -83,8 +83,15 @@ void WriteProcessDetailValueJson(
 
 void WriteProcessDetailsJson(
         ProcessReportJsonWriter& writer,
-        const std::vector<DataCodecProcessDetail>& details) {
+        const std::vector<DataCodecProcessDetail>& details,
+        const bool unlimited = false) {
     writer.StartObject();
+    if (unlimited) {
+        writer.Key("ownedStorageLimitBytes");
+        writer.Null();
+        writer.Key("storageCeilingBytes");
+        writer.Null();
+    }
     for (const auto& detail: details) {
         WriteJsonKey(writer, detail.name);
         WriteProcessDetailValueJson(writer, detail.value);
@@ -102,7 +109,8 @@ void WriteReportConfigurationJson(
     WriteJsonString(writer, configuration.runtimeProfile);
     for (const auto& section : configuration.sections) {
         WriteJsonKey(writer, section.name);
-        WriteProcessDetailsJson(writer, section.values);
+        WriteProcessDetailsJson(writer, section.values,
+            section.name == "resourceLimits" && configuration.resourceMode == "Unlimited");
     }
     writer.EndObject();
 }
@@ -136,7 +144,14 @@ void WriteReportConfigurationJson(
 
 [[nodiscard]] std::vector<DataCodecProcessDetail> MakeResourceLimitDetails(const CodecResourceParams& resources) {
     std::vector<DataCodecProcessDetail> values;
-    if (resources.ownedStorageLimitBytes) {
+    values.emplace_back("threadMode", std::string(CodecThreadModeName(resources.threadMode)));
+    if (resources.threadMode == CodecThreadMode::Adaptive && resources.targetCpuIdleRatio) {
+        values.emplace_back("targetCpuIdleRatio", *resources.targetCpuIdleRatio);
+    }
+    if (resources.mode == CodecResourceMode::Adaptive) {
+        values.emplace_back("targetAvailableMemoryRatio", resources.targetAvailableMemoryRatio.value_or(0.20));
+    }
+    if (resources.mode == CodecResourceMode::Fixed && resources.ownedStorageLimitBytes) {
         values.emplace_back("ownedStorageLimitBytes", *resources.ownedStorageLimitBytes);
     }
     if (resources.maxComputeThreads) {
@@ -236,7 +251,7 @@ DataCodecReportConfiguration MakeDataCodecEncodeReportConfiguration(
     const auto& control = configuration.controlParams;
 
     return DataCodecReportConfiguration{
-        .resourceMode = resources.mode == CodecResourceMode::Fixed ? "Fixed" : "Adaptive",
+        .resourceMode = CodecResourceModeName(resources.mode),
         .runtimeProfile = DataCodecRuntimeProfileName(
             configuration.source.runtimeProfile),
         .sections = {
@@ -298,7 +313,7 @@ DataCodecReportConfiguration MakeDataCodecDecodeReportConfiguration(
     const auto& control = configuration.controlParams;
 
     return DataCodecReportConfiguration{
-        .resourceMode = resources.mode == CodecResourceMode::Fixed ? "Fixed" : "Adaptive",
+        .resourceMode = CodecResourceModeName(resources.mode),
         .runtimeProfile = DataCodecRuntimeProfileName(
             configuration.source.runtimeProfile),
         .sections = {

@@ -75,6 +75,7 @@ target_link_options(iGameWeb PRIVATE
     "SHELL:-s USE_GLFW=3"
     "SHELL:-s FULL_ES2=1"
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+    "SHELL:-s ABORTING_MALLOC=0"
     "SHELL:-lembind"
     ${IGAME_WASM_MEMORY_LINK_OPTIONS}
     "SHELL:-s FORCE_FILESYSTEM=1"
@@ -99,6 +100,7 @@ endif ()
 set(IGAME_WASM_HTML_ASSETS
     index.html
     cache.js
+    codec_resources.js
     serve_wasm.py
 )
 

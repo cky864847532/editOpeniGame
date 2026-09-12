@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "DataCodec/Workflow/Decode/DecodeStoragePlan.h"
 
 namespace datacodec {
 
@@ -45,6 +46,63 @@ public:
         std::shared_ptr<const FrameIdentityMap> frameIdentities) {
         m_referenceCache = resources.Caches().ReferenceCache();
         m_frameIdentities = std::move(frameIdentities);
+    }
+
+    // 由串行 driver 在无在途任务时分析补充请求，容量快照独立于占用审计
+    [[nodiscard]] DecodeStorageAnalysisResult AnalyzeAttributeStorage(
+        const DecodeStorageAnalysisRequest& request, DataCodecExecutionResources& resources) const {
+        ResourceDebugSnapshot snapshot;
+        if (!resources.TryCopyResourceDebugSnapshot(snapshot) || snapshot.admittedBlocks != 0u ||
+            snapshot.activeComputeUnits != 0u) {
+            DecodeStorageAnalysisResult result;
+            result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure, "decode-storage-analysis",
+                "DecodeSession", "attribute storage analysis requires a drained request");
+            return result;
+        }
+        storageplan::ExistingState existing;
+        const auto idle = resources.Scratch().RetainedFixedBytes();
+        existing.reservedBytes = snapshot.storage.reservedBytes - std::min(snapshot.storage.reservedBytes, idle);
+        existing.supplementAttributesOnly = true;
+        auto append = [&](std::uint32_t frameIndex, const BlockPath& path, const LeafPackage* package,
+                          const DecodedAttributeCacheSet* attributes, bool geometryReady, bool topologyReady) {
+            for (const auto& leaf : existing.leaves) {
+                if (leaf.frameIndex == frameIndex && leaf.package.path == path) { return; }
+            }
+            storageplan::ExistingLeaf leaf;
+            leaf.frameIndex = frameIndex;
+            if (package) { leaf.package = *package; }
+            leaf.package.path = path;
+            leaf.geometryReferenceReady = geometryReady;
+            leaf.topologyReady = topologyReady;
+            if (attributes && attributes->IsInitialized()) {
+                for (std::size_t i = 0u; i < attributes->FieldCount(); ++i) {
+                    leaf.completeAttributes.push_back(attributes->Complete(i));
+                    leaf.adapterBackedAttributes.push_back(attributes->AdapterBacked(i));
+                }
+            }
+            existing.leaves.push_back(std::move(leaf));
+        };
+        for (const auto& [key, state] : m_leafStates) {
+            const auto& workspace = *state->workspace;
+            append(state->frameIndex, state->leafPackage.path, &state->leafPackage, &workspace.attributes,
+                state->geometryReferenceCache && state->geometryReferenceCache->IsComplete(),
+                workspace.topology && workspace.topology->complete);
+        }
+        // reference 的属性、拓扑和 workspace 可以共享 owner，全部由根预约基线计一次
+        if (m_frameIdentities) {
+            for (const auto& [frameIndex, identity] : *m_frameIdentities) {
+                const auto cached = FindReferenceFrame(frameIndex);
+                // 按需补充允许 reference 中仅有部分属性完成，逐字段记录当前状态
+                if (!cached) { continue; }
+                for (const auto& [path, leaf] : cached->leaves) {
+                    const auto* package = leaf.attribute ? &leaf.attribute->reference.leafPackage :
+                        leaf.geometry ? &leaf.geometry->reference.leafPackage : nullptr;
+                    append(frameIndex, path, package, leaf.attribute ? leaf.attribute->store.get() : nullptr,
+                        leaf.geometry && leaf.geometry->store && leaf.geometry->store->IsComplete(), !leaf.topology.empty());
+                }
+            }
+        }
+        return storageplan::Analyze(request, existing);
     }
 
     bool BeginFramePackage(

@@ -28,6 +28,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -248,8 +249,16 @@ inline bool TestNativePolyhedronResourceBoundary() {
         const bool success = polyhedron::EncodePolyhedronTopologyToTransferCache(input, encoded, &error);
         ResourceDebugSnapshot snapshot;
         if (limit < 24u) {
+            // 快照接口允许锁竞争时返回空，完成后的拒绝状态在有界重试中读取
+            bool captured = false;
+            const auto snapshotDeadline = ResourceClock::now() + std::chrono::seconds(2);
+            do {
+                captured = root.TryCopyResourceDebugSnapshot(snapshot);
+                if (captured) { break; }
+                std::this_thread::yield();
+            } while (ResourceClock::now() < snapshotDeadline);
             Require(result, !success && blockSamples == 0u && !encoded.transferCache &&
-                root.TryCopyResourceDebugSnapshot(snapshot) && snapshot.capacityRejection &&
+                captured && snapshot.capacityRejection &&
                 snapshot.capacityRejection->requestedBytes == (limit == 8u ? 9u : 3u * sizeof(IndexType)) &&
                 snapshot.capacityRejection->reservedBytes == 0u && snapshot.storage.reservedBytes == 0u &&
                 !snapshot.heavyPhaseAdmitted && !scope.Finish(false),

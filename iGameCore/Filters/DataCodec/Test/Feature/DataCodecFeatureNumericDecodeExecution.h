@@ -13,7 +13,7 @@ namespace datacodec::test {
 
 inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
     TestResult result;
-    constexpr std::uint64_t limit = 32u * 1024u * 1024u;
+    static constexpr std::uint64_t limit = 32u * 1024u * 1024u;
     for (const bool legacy : {false, true}) {
         const auto blockSize = numericarray::kSpatialBlockElementCount + (legacy ? 3u : 0u);
         const std::size_t count = 2u * blockSize + 7u;

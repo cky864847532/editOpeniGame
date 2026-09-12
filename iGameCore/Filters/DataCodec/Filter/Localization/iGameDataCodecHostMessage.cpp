@@ -52,6 +52,8 @@ std::string_view EnglishMessage(const iGameDataCodecHostMessageId id) noexcept {
             return "Set the output path first";
         case iGameDataCodecHostMessageId::CompressionNoData:
             return "Compression failed: no data is loaded";
+        case iGameDataCodecHostMessageId::CompressionStoragePreflightFailed:
+            return "Cannot start compression: memory preflight failed. {detail}";
         case iGameDataCodecHostMessageId::CreateOutputDirectoryFailed:
             return "Compression failed: cannot create output directory {path}";
         case iGameDataCodecHostMessageId::CreateReportDirectoryFailed:
@@ -179,6 +181,8 @@ std::string_view SimplifiedChineseMessage(
             return "请先设置输出路径";
         case iGameDataCodecHostMessageId::CompressionNoData:
             return "压缩失败：未载入数据";
+        case iGameDataCodecHostMessageId::CompressionStoragePreflightFailed:
+            return "无法开始压缩：内存预检未通过。{detail}";
         case iGameDataCodecHostMessageId::CreateOutputDirectoryFailed:
             return "压缩失败：无法创建输出目录 {path}";
         case iGameDataCodecHostMessageId::CreateReportDirectoryFailed:

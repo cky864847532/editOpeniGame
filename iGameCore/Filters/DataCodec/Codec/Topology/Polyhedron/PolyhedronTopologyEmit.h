@@ -5,6 +5,8 @@
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedIndexCache.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Runtime/Execution/DecodeStageMemory.h"
+#include "DataCodec/Codec/Topology/Polyhedron/PolyhedronDecodeMemoryPlan.h"
 #include "DataCodec/Codec/NumericArray/SpatialBlockLayout.h"
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyStreamFormat.h"
 #include "DataCodec/Common/Views/TopologyViews.h"
@@ -21,11 +23,11 @@
 #include <vector>
 namespace datacodec::polyhedron {
 struct PolyhedronCellBatchScratch {
-    std::vector<IndexType> cellVertexOffsets;
-    std::vector<IndexType> cellFaceOffsets;
-    std::vector<IndexType> faceVertexOffsets;
-    std::vector<IndexType> cellUniqueVertexIds;
-    std::vector<IndexType> localFaceVertexIds;
+    FixedArrayView<IndexType> cellVertexOffsets;
+    FixedArrayView<IndexType> cellFaceOffsets;
+    FixedArrayView<IndexType> faceVertexOffsets;
+    FixedArrayView<IndexType> cellUniqueVertexIds;
+    FixedArrayView<IndexType> localFaceVertexIds;
 };
 
 inline bool ReadPolyhedronBatchRange(
@@ -41,7 +43,7 @@ inline bool ReadPolyhedronBatchRange(
     return true;
 }
 
-inline bool AppendPolyhedronOffset(std::vector<IndexType>& offsets,
+inline bool AppendPolyhedronOffset(FixedArrayView<IndexType>& offsets,
     const IndexType count, std::string* error) {
     if (count < 0 || count > std::numeric_limits<IndexType>::max() - offsets.back()) {
         return validation::AssignError(error, "polyhedron batch offset exceeds index capacity");
@@ -49,10 +51,6 @@ inline bool AppendPolyhedronOffset(std::vector<IndexType>& offsets,
     offsets.push_back(offsets.back() + count);
     return true;
 }
-
-struct PolyhedronBatchRange {
-    std::size_t firstCell{0u}, cellCount{0u}, firstFace{0u}, firstUnique{0u}, firstLocal{0u};
-};
 
 struct PolyhedronBatchOutput {
     PolyhedronBatchRange range;
@@ -64,10 +62,18 @@ inline bool BuildPolyhedronCellBatch(
     DataCodecExecutionResources& root, const PolyhedronBatchRange& range,
     const DecodedIndexCache& uniqueCounts, const DecodedIndexCache& cellFaces,
     const DecodedIndexCache& faceVertices, const DecodedIndexCache& uniqueIds,
-    const DecodedIndexCache& localIds, PolyhedronBatchOutput& output, std::string* error) {
+    const DecodedIndexCache& localIds, PolyhedronBatchOutput& output, DecodeBlockWorkspace& workspace, std::string* error) {
     output.range = range;
     auto& scratch = output.scratch;
-    std::vector<IndexType> counts(range.cellCount), faces(range.cellCount);
+    const auto memory = MakePolyhedronBatchMemoryLayout(range);
+    scratch.cellVertexOffsets = workspace.View<IndexType>(memory.output[0]);
+    scratch.cellFaceOffsets = workspace.View<IndexType>(memory.output[1]);
+    scratch.faceVertexOffsets = workspace.View<IndexType>(memory.output[2]);
+    scratch.cellUniqueVertexIds = workspace.View<IndexType>(memory.output[3]);
+    scratch.localFaceVertexIds = workspace.View<IndexType>(memory.output[4]);
+    auto counts = workspace.View<IndexType>(memory.counts);
+    auto faces = workspace.View<IndexType>(memory.faces);
+    counts.resize(range.cellCount); faces.resize(range.cellCount);
     if (!ReadPolyhedronBatchRange(uniqueCounts, root, range.firstCell, counts, error) ||
         !ReadPolyhedronBatchRange(cellFaces, root, range.firstCell, faces, error)) { return false; }
     scratch.cellVertexOffsets.reserve(range.cellCount + 1u);
@@ -90,7 +96,8 @@ inline bool BuildPolyhedronCellBatch(
     scratch.faceVertexOffsets.reserve(offsetCount);
     scratch.faceVertexOffsets.push_back(0u);
     // 固定窗口扫描当前批次面计数，逐步建立实际偏移
-    std::vector<IndexType> faceWindow(std::min<std::size_t>(faceCount, kIoWindowBytes / sizeof(IndexType)));
+    auto faceWindow = workspace.View<IndexType>(memory.faceWindow);
+    faceWindow.resize(faceWindow.capacity());
     for (std::size_t cursor = 0u; cursor < faceCount;) {
         if (root.Stopped()) { return false; }
         const auto count = std::min(faceWindow.size(), faceCount - cursor);
@@ -102,6 +109,9 @@ inline bool BuildPolyhedronCellBatch(
         cursor += count;
     }
     const auto localCount = static_cast<std::size_t>(scratch.faceVertexOffsets.back());
+    if (faceCount != range.faceCount || uniqueCount != range.uniqueCount || localCount != range.localCount) {
+        return validation::AssignError(error, "polyhedron batch differs from admitted shape");
+    }
     if (range.firstLocal > localIds.Count() || localCount > localIds.Count() - range.firstLocal ||
         !validation::CheckedMulSizeT(uniqueCount, sizeof(IndexType), bytes, "polyhedron unique id bytes", error) ||
         !validation::CheckedMulSizeT(localCount, sizeof(IndexType), bytes, "polyhedron local id bytes", error)) {
@@ -171,23 +181,28 @@ inline bool EmitPolyhedronCacheToAdapter(
         ended = true;
         return adapter.EndPolyhedronTopology(error);
     }
-    PolyhedronBatchRange cursor;
+    PolyhedronBatchRange cursor, nextRange;
+    TopoStorageParams shape;
+    shape.cellCount = header.cellCount;
+    shape.polyhedronFaceVertexCount = header.faceCount;
+    FixedByteBacking descriptionMemory;
+    if (!PrepareDecodeStageMemory(root, PolyhedronDescriptionWindowBytes(shape), descriptionMemory, error)) { return false; }
+    auto descriptionWindow = std::span<IndexType>(reinterpret_cast<IndexType*>(descriptionMemory.Span().data()),
+        descriptionMemory.size / sizeof(IndexType));
     phase.reset();
     root.SetWorkType({.path = ResourceWorkPath::PolyhedronEmit,
         .blockElements = numericarray::kSpatialBlockElementCount});
     return RunOrderedBlocks<PolyhedronBatchRange, PolyhedronBatchOutput>(root,
         [&] { return cursor.firstCell < header.cellCount; },
         [&](PolyhedronBatchRange& input) {
-            input = cursor;
-            input.cellCount = static_cast<std::size_t>(std::min<std::uint64_t>(
-                numericarray::kSpatialBlockElementCount, header.cellCount - cursor.firstCell));
+            input = nextRange;
             return true;
         },
-        [&](const PolyhedronBatchRange& input, PolyhedronBatchOutput& output, WorkerContext&) {
+        [&](const PolyhedronBatchRange& input, PolyhedronBatchOutput& output, WorkerContext&, DecodeBlockWorkspace& workspace) {
             std::string localError;
             if (recordCapacitySamples) { output.capacitySamples.emplace(); }
             if (!BuildPolyhedronCellBatch(root, input, uniqueCounts, cellFaces, faceVertices,
-                    uniqueIds, localIds, output, &localError)) {
+                    uniqueIds, localIds, output, workspace, &localError)) {
                 root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "polyhedron-batch-build", "BuildPolyhedronCellBatch", localError));
                 return false;
@@ -224,7 +239,22 @@ inline bool EmitPolyhedronCacheToAdapter(
             }
             ended = true;
             return adapter.EndPolyhedronTopology(error);
-        }, true);
+        }, true, nullptr, [&] {
+            nextRange = cursor;
+            const auto reader = [&](const DecodedIndexCache& source) {
+                return [&](std::size_t first, std::span<IndexType> values, std::string* detail) {
+                    return ReadPolyhedronBatchRange(source, root, first, values, detail);
+                };
+            };
+            if (!DescribePolyhedronBatch(nextRange, header.cellCount, reader(uniqueCounts), reader(cellFaces),
+                    reader(faceVertices), descriptionWindow, error) ||
+                nextRange.firstFace > header.faceCount || nextRange.faceCount > header.faceCount - nextRange.firstFace ||
+                nextRange.firstUnique > header.uniqueVertexIdCount || nextRange.uniqueCount > header.uniqueVertexIdCount - nextRange.firstUnique ||
+                nextRange.firstLocal > header.localFaceVertexIdCount || nextRange.localCount > header.localFaceVertexIdCount - nextRange.firstLocal) {
+                throw std::invalid_argument("polyhedron batch description exceeds complete stores");
+            }
+            return MakePolyhedronBatchMemoryLayout(nextRange);
+        });
 }
 
 

@@ -117,11 +117,11 @@ inline bool PrepareNumericEncodeRegions(
     }
     const auto count = params.regionRuns->size();
     std::size_t byteSize = 0u;
-    if (!validation::CheckedMulSizeT(count, sizeof(RegionRun), byteSize, "field region runs", error)) {
+    if (!CalculateNumericRegionStorageBytes(count, byteSize, error)) {
         return false;
     }
     auto owner = std::static_pointer_cast<bytestore::MemoryStore>(session.CreateSizedStore(
-        bytestore::ByteStorePurpose::Contiguous, byteSize, "numeric_region_runs", error));
+        bytestore::ByteStorePurpose::Contiguous, byteSize, ::datacodec::MemoryDemandKind::RequiredContinuation, "numeric_region_runs", error));
     if (!owner) { return false; }
     const auto bytes = owner->WritableBytes();
     if (bytes.size() != byteSize || reinterpret_cast<std::uintptr_t>(bytes.data()) % alignof(RegionRun) != 0u) {

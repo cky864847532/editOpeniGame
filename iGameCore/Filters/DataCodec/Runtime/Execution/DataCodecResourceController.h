@@ -13,24 +13,26 @@ struct ResourceWatermarks {
 };
 
 namespace resource_control {
-inline constexpr std::size_t healthyStartupComputeLimit = 8u;
 inline constexpr auto sampleInterval = std::chrono::milliseconds(250);
 inline constexpr auto maximumSampleAge = std::chrono::seconds(1);
 inline constexpr auto pendingConfirmation = std::chrono::milliseconds(500);
-inline constexpr auto pendingMaximum = std::chrono::seconds(2);
 inline constexpr auto recoveryConfirmation = std::chrono::seconds(2);
-inline constexpr auto initialCooldown = std::chrono::seconds(10);
-inline constexpr auto maximumCooldown = std::chrono::seconds(60);
-inline constexpr auto repeatPressureWindow = std::chrono::seconds(60);
+inline constexpr auto recoveryCooldown = std::chrono::seconds(2);
 inline constexpr auto holdTimeout = std::chrono::seconds(30);
 inline constexpr auto initialGrowthInterval = std::chrono::milliseconds(500);
-inline constexpr auto recoveryGrowthInterval = std::chrono::seconds(5);
-inline constexpr auto storageGrowthInterval = std::chrono::seconds(5);
+inline constexpr double defaultReserveRatio = 0.20;
+inline constexpr double nominalGain = 0.5;
+inline constexpr double responseAlpha = 0.5;
+inline constexpr double minimumGain = 0.025;
+inline constexpr double maximumGain = 1.0;
+inline constexpr double probeScale = 0.75;
+inline constexpr auto gainWindow = std::chrono::milliseconds(250);
+inline constexpr auto calibrationDeadline = std::chrono::seconds(1);
 }
 
 struct FlowWaitDurations {
     ResourceClock::duration compute{};
-    ResourceClock::duration slots{};
+    ResourceClock::duration slotCapacity{};
     ResourceClock::duration input{};
     ResourceClock::duration output{};
 };
@@ -60,42 +62,55 @@ struct FlowSnapshot {
     std::uint64_t requestId{0u};
     ResourceWorkType workType;
     ObservationBatch observation;
+    std::uint64_t nextWorkBytes{0u};
+    bool byteWaiting{false};
+    ResourceClock::time_point byteWaitStarted{};
+    ResourceClock::duration byteWaitDuration{};
+    std::uint64_t reservedBytes{0u};
+    std::size_t queuedTasks{0u};
+    std::uint64_t demandId{0u};
+    MemoryDemandKind demandKind{MemoryDemandKind::Block};
+};
+
+struct MemoryGrant {
+    std::uint64_t demandId{0u};
+    std::uint64_t baselineReservedBytes{0u};
+    ResourceClock::time_point sampledAt{};
+    ResourceClock::time_point grantedAt{};
+    std::optional<ResourceClock::time_point> completedAt;
+    std::optional<std::uint64_t> sequence;
+    std::uint64_t flowId{0u};
+    bool used{false};
+    bool probe{false};
 };
 
 struct ResourceControllerState {
     ResourceControlPhase phase{ResourceControlPhase::Normal};
-    std::uint64_t storageCeilingBytes{0u};
-    std::size_t computeCeiling{1u};
-    std::size_t currentComputeCeiling{1u};
-    std::optional<std::uint64_t> currentHardLimitBytes;
-    bool threaded{true};
+    MemoryControlSnapshot memory;
+    MemoryGrant grant;
+    std::size_t normalSlotLimit{1u};
     bool initialized{false};
     bool signalValid{false};
-    bool signalRecoveryPending{false};
     bool pressurePending{false};
     bool pressureConfirmed{false};
     bool severePressure{false};
-    bool nativePressureActive{false};
-    bool everConfirmedPressure{false};
     bool optionalRetentionPausedByPressure{false};
-    std::optional<ResourceClock::time_point> pendingSince;
     std::optional<ResourceClock::time_point> lowSince;
-    std::optional<ResourceClock::time_point> pendingClearSince;
     std::optional<ResourceClock::time_point> highSince;
-    std::optional<ResourceClock::time_point> holdSince;
-    std::optional<ResourceClock::time_point> lastPressureAt;
-    std::optional<ResourceClock::time_point> lastRecoveryAt;
     std::optional<ResourceClock::time_point> lastSampleAt;
+    std::optional<std::uint64_t> previousAvailableBytes;
+    std::uint64_t growthAvailableBytes{0u};
+    double recentAvailableAverage{0.0};
     ResourceClock::time_point cooldownUntil{};
-    ResourceClock::time_point lastGrowthAt{};
-    ResourceClock::time_point lastStorageGrowthAt{};
-    ResourceClock::duration cooldown{resource_control::initialCooldown};
+    std::optional<ResourceClock::time_point> recoveryStartedAt;
+    std::optional<ResourceClock::time_point> progressAt;
     std::uint64_t requestId{0u};
-    ResourceWorkType workType;
-    std::uint64_t observationEpoch{0u};
-    std::optional<ResourceClock::time_point> firstObservationSampleAt;
-    std::uint64_t firstObservationAvailableBytes{0u};
-    std::size_t observationSampleCount{0u};
+    unsigned gainPhase{0u};
+    bool initialMeasurement{false};
+    ResourceClock::time_point gainWindowStarted{};
+    double availableSum{0.0};
+    std::size_t availableSamples{0u};
+    std::uint64_t measurementBytes{0u};
 };
 
 struct ControlDecision {
@@ -106,6 +121,7 @@ struct ControlDecision {
     bool trimOptionalRetention{false};
     bool failForSustainedPressure{false};
     bool resetObservation{false};
+    bool failForCapacityBound{false};
 };
 
 void InitializeResourceController(ResourceControllerState&,
@@ -115,7 +131,14 @@ ControlDecision Advance(ResourceControllerState&, ResourceClock::time_point,
                         const ResourceSample&, const FlowSnapshot&) noexcept;
 
 ResourceWatermarks MakeResourceWatermarks(std::uint64_t totalBytes) noexcept;
-std::size_t ResourceComputeCapacity(const ResourceSample&, CodecResourceMode) noexcept;
+ResourceWatermarks MakeReserveWatermarks(std::uint64_t, double) noexcept;
+bool ValidPhysicalMemorySample(const ResourceSample&, ResourceClock::time_point) noexcept;
+void NoteMemoryReservation(ResourceControllerState&, std::uint64_t bytes, std::uint64_t demandId,
+    ResourceClock::time_point) noexcept;
+void FinishMemoryMeasurement(ResourceControllerState&, ResourceClock::time_point,
+    ResourceDecisionReason) noexcept;
+std::size_t ResourceComputeCapacity(const ResourceSample&, CodecResourceMode,
+    CodecThreadMode = CodecThreadMode::Fixed) noexcept;
 ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourceParams&, const ResourceSample&);
 
 }

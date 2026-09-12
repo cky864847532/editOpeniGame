@@ -772,6 +772,7 @@ void igQtDataCodecCompressionWidget::SetModel(iGame::Model::Pointer model) {
     resetRegionState();
     refreshFeatureState();
     appendPredictionEncodingRecommendation();
+    if (m_resourceControls) { m_resourceControls->CheckStorage(); }
 }
 
 bool igQtDataCodecCompressionWidget::eventFilter(QObject* watched, QEvent* event) {
@@ -821,6 +822,7 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     auto* pathRow = new QHBoxLayout;
     pathRow->setSpacing(6);
     m_outputPathEdit = new QLineEdit(panel);
+    m_outputPathEdit->setObjectName(QStringLiteral("DataCodecEncodeOutputPath"));
     m_outputPathEdit->setReadOnly(true);
     m_outputPathEdit->setFocusPolicy(Qt::StrongFocus);
     m_outputPathEdit->installEventFilter(this);
@@ -918,6 +920,33 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     m_zstdLevelSpin->setValue(performanceSettings.zstdLevel);
     m_gopFrameCountSpin->setValue(performanceSettings.gopFrameCount);
     m_resourceControls->OnChanged([this] { persistPerformanceSettings(); });
+    m_resourceControls->SetStorageAnalyzer([this]() -> igQtDataCodecResourceControls::StorageAnalysis {
+        const auto data = m_model ? m_model->GetDataObject() : nullptr;
+        if (!data || !hasSelectedFields()) {
+            return [](std::stop_token) { return igQtDataCodecResourceControls::StorageCheck{
+                .detail = QStringLiteral("选择待压缩数据和属性场后检查容量")}; };
+        }
+        auto writer = iGame::IGDCWriter::New();
+        writer->SetAttributeTargets(selectedAttributeTargets());
+        auto definition = ::datacodec::MakeEncodeConfigurationParams(selectedEncodeOptions());
+        definition.language = m_dataCodecLanguage;
+        applyCompressionControlToDataCodec(definition.controlParams);
+        writer->SetEncodeControls(definition);
+        return [writer, data](std::stop_token stop) {
+            if (stop.stop_requested()) { return igQtDataCodecResourceControls::StorageCheck{}; }
+            const auto result = writer->AnalyzeStorage(data);
+            return igQtDataCodecResourceControls::StorageCheck{
+                .minimumBytes = result.success ? result.provenLowerBoundBytes : std::nullopt,
+                .detail = result.success
+                    ? QStringLiteral("此值为已证明的必要下界；未载入的时序帧和依赖数据内容的占用仍需执行时检查")
+                    : QStringLiteral("容量检查未完成：%1").arg(result.failure
+                        ? QString::fromStdString(::datacodec::FormatCodecFailure(*result.failure)) : QStringLiteral("未取得分析结果"))};
+        };
+    });
+    m_resourceControls->OnStorageStatus([this](const QString& text, bool warning) {
+        if (!text.isEmpty()) { publishStatus(text, warning ? ::datacodec::DataCodecStatusSeverity::Warning
+            : ::datacodec::DataCodecStatusSeverity::Info); }
+    });
     connect(m_compressionEnhancementCheck, &QCheckBox::toggled, this,
         [this](const bool checked) {
             persistPerformanceSettings();
@@ -1194,6 +1223,7 @@ QWidget* igQtDataCodecCompressionWidget::createStatusPanel() {
     title->setObjectName(QStringLiteral("DataCodecSectionTitle"));
     m_emitPerformanceCheck = new QCheckBox(QStringLiteral("生成性能报告"), panel);
     m_startEncodeButton = new QPushButton(QStringLiteral("开始压缩"), panel);
+    m_startEncodeButton->setProperty("dataCodecAction", QStringLiteral("startEncode"));
     m_startEncodeButton->setObjectName(QStringLiteral("DataCodecDarkButton"));
     header->addWidget(title);
     header->addStretch();
@@ -1886,6 +1916,7 @@ void igQtDataCodecCompressionWidget::refreshSelectedRegion() {
 }
 
 void igQtDataCodecCompressionWidget::refreshFeatureState() {
+    if (m_resourceControls) { m_resourceControls->InvalidateStorageCheck(); }
     auto* fieldState = currentFieldState();
     if (fieldState != nullptr) {
         ensureFeatureStates(*fieldState);
@@ -2116,7 +2147,18 @@ void igQtDataCodecCompressionWidget::refreshPerformanceControls() {
     return m_resourceControls ? m_resourceControls->Params() : ::datacodec::CodecResourceParams{};
 }
 
+::datacodec::DataCodecEncodeOptions igQtDataCodecCompressionWidget::selectedEncodeOptions() const {
+    ::datacodec::DataCodecEncodeOptions options;
+    options.enableCompressionEnhancement = m_compressionEnhancementCheck && m_compressionEnhancementCheck->isChecked();
+    if (m_zstdLevelSpin) { options.packageZstdLevel = m_zstdLevelSpin->value(); }
+    if (hasMultiFrameData() && m_gopFrameCountSpin) {
+        options.temporalKeyFrameInterval = static_cast<std::uint32_t>(m_gopFrameCountSpin->value());
+    }
+    return options;
+}
+
 void igQtDataCodecCompressionWidget::persistPerformanceSettings() const {
+    if (m_resourceControls) { m_resourceControls->InvalidateStorageCheck(); }
     const int zstdLevel = m_zstdLevelSpin != nullptr ? m_zstdLevelSpin->value() : 3;
     const int gopFrameCount = m_gopFrameCountSpin != nullptr
         ? m_gopFrameCountSpin->value()
@@ -2243,15 +2285,6 @@ void igQtDataCodecCompressionWidget::startEncode() {
     }
 
     const QFileInfo outputInfo(outputPath);
-    if (!QDir().mkpath(outputInfo.absolutePath())) {
-        publishStatus(
-            dataCodecHostLogText(
-                m_dataCodecLanguage,
-                iGame::iGameDataCodecHostMessageId::CreateOutputDirectoryFailed,
-                {{"path", toUtf8StdString(outputInfo.absolutePath())}}),
-            ::datacodec::DataCodecStatusSeverity::Error);
-        return;
-    }
     const bool outputPerformance = !multiFrame && m_emitPerformanceCheck != nullptr &&
         m_emitPerformanceCheck->isChecked();
     iGame::iGameDataCodecTelemetryCapture telemetryCapture;
@@ -2263,18 +2296,8 @@ void igQtDataCodecCompressionWidget::startEncode() {
             m_dataCodecLanguage,
             iGame::iGameDataCodecHostMessageId::CompressionRatioCalculationNote);
     }); }
-    ::datacodec::DataCodecEncodeOptions options;
+    const auto options = selectedEncodeOptions();
     const auto resources = selectedResources();
-    options.enableCompressionEnhancement =
-        m_compressionEnhancementCheck != nullptr &&
-        m_compressionEnhancementCheck->isChecked();
-    if (m_zstdLevelSpin != nullptr) {
-        options.packageZstdLevel = m_zstdLevelSpin->value();
-    }
-    if (multiFrame && m_gopFrameCountSpin != nullptr) {
-        options.temporalKeyFrameInterval = static_cast<std::uint32_t>(
-            m_gopFrameCountSpin->value());
-    }
 
     auto writer = iGame::IGDCWriter::New();
     writer->SetAttributeTargets(selectedAttributeTargets());
@@ -2290,6 +2313,20 @@ void igQtDataCodecCompressionWidget::startEncode() {
     }); }
     writer->SetEncodeControls(definition);
     writer->SetResourceParams(resources);
+    if (const auto failure = writer->CheckStorageBeforeEncode(dataObject)) {
+        publishStatus(dataCodecHostLogText(m_dataCodecLanguage,
+            iGame::iGameDataCodecHostMessageId::CompressionStoragePreflightFailed,
+            {{"detail", ::datacodec::FormatCodecFailure(*failure)}}),
+            ::datacodec::DataCodecStatusSeverity::Error);
+        return;
+    }
+    if (!QDir().mkpath(outputInfo.absolutePath())) {
+        publishStatus(dataCodecHostLogText(m_dataCodecLanguage,
+            iGame::iGameDataCodecHostMessageId::CreateOutputDirectoryFailed,
+            {{"path", toUtf8StdString(outputInfo.absolutePath())}}),
+            ::datacodec::DataCodecStatusSeverity::Error);
+        return;
+    }
     QString reportDirectory;
     std::shared_ptr<iGame::iGameDataCodecReportFileSink> reportSink;
     std::string reportFileTimestamp;

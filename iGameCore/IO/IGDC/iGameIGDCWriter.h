@@ -2,6 +2,7 @@
 #define iGameIGDCWriter_h
 
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
+#include "DataCodec/API/Entry/EncodeStorageAnalysis.h"
 #include "DataCodec/Filter/Localization/iGameDataCodecHostMessage.h"
 #include "iGameFileWriter.h"
 
@@ -20,6 +21,11 @@ public:
 
     bool Execute() override;
     bool GenerateBuffers() override;
+
+    // 复用写入时的属性选择和参数，未载入的时序帧只记录未知项
+    [[nodiscard]] ::datacodec::EncodeStorageAnalysisResult AnalyzeStorage(const DataObject::Pointer& data) const;
+    [[nodiscard]] std::optional<::datacodec::CodecFailureRecord> CheckStorageBeforeEncode(
+        const DataObject::Pointer& data) const;
 
     void SetEncodeControls(const ::datacodec::DataCodecEncodeConfigurationParams& definition) {
         m_hasCodecParams = true;
