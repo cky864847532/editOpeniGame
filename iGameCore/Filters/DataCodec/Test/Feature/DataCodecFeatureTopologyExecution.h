@@ -442,6 +442,7 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                     "topology.format-roundtrip", "ordered four-stream blocks must decode exact variable connectivity and remapped indices");
                 Require(result, scope.Finish(success), "topology.flow-finish", "the complete topology flow must finish cleanly");
                 if (success) {
+                    for (const bool concurrentObserver : {false, true})
                     for (const bool rejectObserver : {false, true}) {
                         DataCodecExecutionResources decodeRoot(ResolvedResourceConfiguration{{limit, compute, slots},
                             limit, threaded ? 2u : 1u, threaded, true, externalSpill});
@@ -473,25 +474,34 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                         public:
                             DataCodecExecutionResources* root{};
                             std::thread::id driver{std::this_thread::get_id()};
-                            bool reject{false}, valid{true};
+                            bool reject{false}, valid{true}, concurrent{false};
+                            std::mutex mutex;
                             std::size_t blocks{0u}, ended{0u};
-                            bool BeginConnectivityTopology(const ConnectivityTopologyDecodeInfo&, std::string*) override {
+                            bool SupportsConcurrentBlocks() const noexcept override { return concurrent; }
+                            bool BeginConnectivityTopology(const ConnectivityTopologyDecodeInfo& info, std::string*) override {
                                 ResourceDebugSnapshot snapshot;
-                                valid &= CopyExecutionSnapshot(*root, snapshot) && snapshot.heavyPhaseAdmitted;
+                                valid &= CopyExecutionSnapshot(*root, snapshot) && snapshot.heavyPhaseAdmitted &&
+                                    info.workerCapacity == root->WorkerCapacity();
                                 return true;
                             }
                             bool ObserveConnectivityBlock(DecodedConnectivityTopologyBlock block, std::string*) override {
+                                std::lock_guard lock(mutex);
                                 ResourceDebugSnapshot snapshot;
                                 valid &= CopyExecutionSnapshot(*root, snapshot) && snapshot.admittedBlocks > 0u &&
-                                    driver == std::this_thread::get_id() && block.blockIndex == blocks++ &&
+                                    (concurrent ? snapshot.activeComputeUnits > 0u && !block.owner &&
+                                        block.workerIndex < root->WorkerCapacity() &&
+                                        (!root->Threaded() || driver != std::this_thread::get_id()) :
+                                        driver == std::this_thread::get_id() && block.blockIndex == blocks) &&
                                     block.offsets.front() == 0u && block.offsets.back() == block.connectivity.size();
-                                return !reject || blocks != 2u;
+                                ++blocks;
+                                return !reject || block.blockIndex != 1u;
                             }
                             bool EndConnectivityTopology(std::string*) override { ++ended; return true; }
                         };
                         auto observer = std::make_shared<Observer>();
                         observer->root = &decodeRoot;
                         observer->reject = rejectObserver;
+                        observer->concurrent = concurrentObserver;
                         TopologyDecodeRuntime decodeRuntime{.data = {storage},
                             .cache = {runtime, decodeSession, decoded}, .context = {.topologyBlockObserver = observer}};
                         std::size_t capacityBlocks = 0u;
@@ -512,9 +522,9 @@ inline TestResult RunDataCodecFeatureTopologyExecution() {
                         };
                         const auto status = DecodeTopologyFieldToCache(decodeRuntime, stream);
                         Require(result, status.success != rejectObserver && stream.valid && observer->valid &&
-                            capacityValid && capacityBlocks == (rejectObserver ? 1u : 9u) &&
+                            capacityValid && (rejectObserver ? (concurrentObserver ? capacityBlocks < 9u : capacityBlocks == 1u) : capacityBlocks == 9u) &&
                             observer->ended == 1u && (rejectObserver ? !decoded.complete : decoded.complete),
-                            "topology.decode-flow", "topology decode must commit in order and finish the synchronous observer once");
+                            "topology.decode-flow", "topology decode must bound observer work, commit in order and finish the observer once");
                         decodeScope.Finish(status.success);
                         decoded.Release();
                         ResourceDebugSnapshot snapshot;

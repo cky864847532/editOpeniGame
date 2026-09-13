@@ -30,7 +30,7 @@ function(igame_datacodec_reject_includes root_path forbidden_pattern rule_name)
     endforeach ()
 endfunction()
 
-function(igame_check_datacodec_dependencies datacodec_root)
+function(datacodec_check_dependencies datacodec_root)
     igame_datacodec_reject_includes(
         "${datacodec_root}/Common"
         "DataCodec/(Workflow|Filter|Platform)/|(^|[/<\"])iGame[^/]*\\.h"
@@ -44,7 +44,11 @@ function(igame_check_datacodec_dependencies datacodec_root)
         "(^|[/<\"])iGame[^/]*\\.h|ModelSurface/|Rendering/|WebGL|GLES"
         "Platform/Wasm must not depend on iGame or rendering types")
 
-    foreach (generic_module IN ITEMS Common API Codec Log Runtime Storage Validation Workflow)
+    foreach (generic_module IN ITEMS Common API Codec Localization Log Runtime Storage Validation Workflow)
+        igame_datacodec_reject_includes(
+            "${datacodec_root}/${generic_module}"
+            "DataCodec/Filter/|Examples/|(^|[/<\"])iGame[^/]*\\.h|(^|[/<\"])igQt[^/]*\\.h|(^|[/<\"])Q[A-Z][A-Za-z]+|Qt(Core|Gui|Widgets|OpenGL)/|ModelSurface/|Rendering/"
+            "core modules must not depend on host adapters, Qt or rendering")
         igame_datacodec_reject_includes(
             "${datacodec_root}/${generic_module}"
             "DataCodec/Filter/Wasm/|emscripten/|WebGL|GLES"
@@ -54,6 +58,11 @@ function(igame_check_datacodec_dependencies datacodec_root)
             "DataCodec/Test/"
             "production DataCodec modules must not depend on Test")
     endforeach ()
+
+    igame_datacodec_reject_includes(
+        "${datacodec_root}/Platform"
+        "DataCodec/Filter/|Examples/|(^|[/<\"])iGame[^/]*\\.h|(^|[/<\"])igQt[^/]*\\.h|(^|[/<\"])Q[A-Z][A-Za-z]+|Qt(Core|Gui|Widgets|OpenGL)/|ModelSurface/|Rendering/|DataCodec/Test/"
+        "platform modules must not depend on host adapters or tests")
 
     igame_datacodec_reject_includes(
         "${datacodec_root}/Filter"

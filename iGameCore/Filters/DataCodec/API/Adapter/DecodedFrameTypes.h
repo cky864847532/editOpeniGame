@@ -2,13 +2,21 @@
 #define DATACODEC_API_ADAPTER_DECODEDFRAMETYPES_H
 
 #include "DataCodec/API/Adapter/CacheAccessResult.h"
-#include "DataCodec/Runtime/Cache/DecodeCacheIdentity.h"
+#include "DataCodec/API/Params/CodecStorageParams.h"
+#include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
 
 #include <cstdint>
 #include <memory>
 #include <vector>
 
 namespace datacodec {
+
+struct DecodeAttributeDescriptor {
+    AttributeTarget target;
+    AttrStorageParams metadata;
+    bool decoded{false};
+    bool committed{false};
+};
 
 class IDecodedFramePayload {
 public:

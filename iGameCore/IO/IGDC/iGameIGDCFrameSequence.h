@@ -4,7 +4,7 @@
 #include "DataCodec/Workflow/FrameSequence/FrameDecodeSource.h"
 #include "DataCodec/Storage/FramePackage/FramePackageIO.h"
 #include "DataCodec/Storage/FramePackage/FramePackageSeries.h"
-#include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
+#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -62,7 +62,7 @@ inline bool ResolveIGDCFrameSelection(const std::vector<std::filesystem::path>& 
     sequence.framePaths.reserve(discovered.frames.size());
     sequence.decodeSources.reserve(discovered.frames.size());
     for (const auto& frame: discovered.frames) {
-        auto reader = std::make_shared<iGameFileByteRangeReader>(frame.framePackagePath);
+        auto reader = std::make_shared<::datacodec::FileByteRangeReader>(frame.framePackagePath);
         auto metadata = std::make_shared<::datacodec::FramePackage>();
         if (!::datacodec::FramePackageIO::ReadMetadata(*reader, *metadata, error)) {
             sequence = {};

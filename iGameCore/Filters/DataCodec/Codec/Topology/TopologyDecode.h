@@ -48,6 +48,7 @@ struct TopologyDecodeCache {
     const CacheResources& cacheResources;
     bytestore::ByteStoreSession& byteStoreSession;
     DecodedTopologyCache& topology;
+    IDecodeAdapter* destination{nullptr};
 };
 
 struct TopologyDecodeContext {
@@ -195,9 +196,11 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
         bool& completed;
         ~OutputGuard() { if (!completed) { cache.Release(); } }
     } outputGuard{cache, completed};
-    topology::CacheTopologyDecodeSink sink(cache, runtime.cache.byteStoreSession);
-    if (!sink.BeginConnectivityTopology(cells, indices, hasOffsets, hasTypes, hasOrders, error)) { return false; }
+    topology::CacheTopologyDecodeSink sink(cache, runtime.cache.byteStoreSession, runtime.cache.destination);
+    if (!sink.BeginConnectivityTopology(cells, indices, hasOffsets, hasTypes, hasOrders, error) ||
+        !root.SynchronizeMemoryAfterPreparation()) { return false; }
     auto observer = runtime.context.topologyBlockObserver;
+    const bool concurrentObserver = observer && observer->SupportsConcurrentBlocks();
     bool observerStarted = false, observerEnded = false;
     struct ObserverGuard {
         std::shared_ptr<IDecodeTopologyBlockObserver>& observer;
@@ -214,7 +217,7 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
     if (observer) {
         observerStarted = true;
         if (!observer->BeginConnectivityTopology({blocks.size(), points, cells,
-                static_cast<int>(topo.fixedCellSize), hasOffsets, hasTypes}, error)) { return false; }
+                static_cast<int>(topo.fixedCellSize), hasOffsets, hasTypes, root.WorkerCapacity()}, error)) { return false; }
     }
     std::size_t cursor = 0u, committed = 0u;
     const auto begin = stream.Position();
@@ -232,7 +235,7 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                     runtime.cache.cacheResources, workspace, nextMemory, error);
             });
         },
-        [&](const TopologyBlockInput& input, TopologyBlockOutput& output, WorkerContext&, DecodeBlockWorkspace& workspace) {
+        [&](const TopologyBlockInput& input, TopologyBlockOutput& output, WorkerContext& worker, DecodeBlockWorkspace& workspace) {
             const auto& shape = blocks[input.index];
             output.memory = topocodec::MakeConnectivityDecodeMemoryLayout(shape, static_cast<int>(topo.fixedCellSize), hasTypes);
             auto& memory = output.memory;
@@ -260,6 +263,19 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                 return false;
             }
             output.computeMs = callback::ElapsedMilliseconds(start);
+            // 表面处理复用当前块的计算额度与槽位，完成后才发布可提交结果
+            if (concurrentObserver && !observer->ObserveConnectivityBlock({
+                    .blockIndex = output.index,
+                    .cellOffset = static_cast<std::size_t>(layout.cellOffset),
+                    .fixedCellSize = static_cast<int>(topo.fixedCellSize),
+                    .connectivity = output.decoded.connectivity.Span(),
+                    .offsets = output.decoded.offsets.Span(),
+                    .cellTypes = output.decoded.cellTypes.Span(),
+                    .workerIndex = worker.Index()}, &localError)) {
+                root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+                    "topology-block-observer", "ObserveConnectivityBlock", localError));
+                return false;
+            }
             return true;
         },
         [&](TopologyBlockOutput& output, DecodeBlockWorkspace& workspace) {
@@ -298,7 +314,7 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                     offset += count;
                 }
             }
-            if (observer && !observer->ObserveConnectivityBlock({output.index, cellBase,
+            if (observer && !concurrentObserver && !observer->ObserveConnectivityBlock({output.index, cellBase,
                     static_cast<int>(topo.fixedCellSize), workspace.TransferOutput(), data.connectivity.Span(),
                     data.offsets.Span(), data.cellTypes.Span()}, error)) { return false; }
             if (output.capacitySamples && runtime.context.recordCapacitySamples) {

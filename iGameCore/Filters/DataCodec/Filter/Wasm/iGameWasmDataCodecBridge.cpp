@@ -1,6 +1,6 @@
 #include "DataCodec/Filter/Wasm/iGameWasmDataCodecBridge.h"
 
-#include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
+#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
 #include "DataCodec/Runtime/Record/RunRecordSubmit.h"
 #include "DataCodec/Filter/Wasm/iGameWasmDataCodecTiming.h"
@@ -83,7 +83,7 @@ bool ResolveiGameWasmDataCodecFileSourceIdentity(
             error,
             "DataCodec WASM file path is empty");
     }
-    iGameFileByteRangeReader reader{std::filesystem::path(filePath)};
+    ::datacodec::FileByteRangeReader reader{std::filesystem::path(filePath)};
     return ResolveiGameWasmPackageSourceIdentity(reader, sourceIdentity, error);
 }
 
@@ -196,7 +196,10 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodec(
         result.timingDetail = BuildiGameWasmTopologyTimingDetail(recordSinks.SnapshotCompletedTelemetrySessions());
     });
     if (result.output == nullptr) {
-        if (result.decodeResult.messages.empty()) {
+        const auto readError = browserReader ? browserReader->LastReadError() : std::string{};
+        if (!readError.empty()) {
+            SetWasmDecodeError(result, runRecordSink.get(), readError);
+        } else if (result.decodeResult.messages.empty()) {
             SetWasmDecodeError(
                 result,
                 runRecordSink.get(),
@@ -293,7 +296,7 @@ iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecFile(
         return result;
     }
     return DecodeiGameWasmDataCodec(iGameWasmDataCodecDecodeRequest{
-        .inputReader = std::make_shared<iGameFileByteRangeReader>(
+        .inputReader = std::make_shared<::datacodec::FileByteRangeReader>(
             std::filesystem::path(filePath)),
         .sourceIdentity = std::move(sourceIdentity),
         .enableReuseCache = enableReuseCache,

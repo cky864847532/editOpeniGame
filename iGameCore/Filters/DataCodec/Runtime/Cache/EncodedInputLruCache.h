@@ -1,7 +1,7 @@
 #ifndef DATACODEC_RUNTIME_CACHE_ENCODEDINPUTLRUCACHE_H
 #define DATACODEC_RUNTIME_CACHE_ENCODEDINPUTLRUCACHE_H
 
-#include "DataCodec/Runtime/Cache/EncodedInputTypes.h"
+#include "DataCodec/API/Adapter/EncodedInputTypes.h"
 #include "DataCodec/Runtime/Cache/LruCacheIndex.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 

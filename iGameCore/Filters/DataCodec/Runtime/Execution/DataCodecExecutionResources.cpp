@@ -18,6 +18,21 @@
 namespace datacodec {
 namespace {
 
+template<class Predicate>
+bool WaitWithPlatformEvents(std::unique_lock<std::mutex>& lock, Predicate&& ready,
+    ResourceClock::time_point deadline = ResourceClock::time_point::max()) {
+    if (ResourceWaitRequiresEventLoop()) {
+        // 等待 worker 时释放资源锁并让出事件循环，使代理的 File 异步读取能够完成
+        while (!ready() && ResourceClock::now() < deadline) {
+            lock.unlock();
+            YieldResourceWaitToEventLoop();
+            lock.lock();
+        }
+        return true;
+    }
+    return false;
+}
+
 CodecFailureRecord ExecutionFailure(std::string_view reason, std::string_view message) noexcept {
     return MakeCodecFailureRecord(CodecErrorCode::PipelineFailure, reason,
                                   "DataCodecExecutionResources", message);
@@ -91,6 +106,18 @@ struct ExecutionState {
         debug.byteWaiting = false;
         debug.nextWorkBytes = 0u;
     }
+    void RequestMemorySampleLocked(ResourceClock::time_point boundary) noexcept {
+        if (configuration.mode != CodecResourceMode::Adaptive) { return; }
+        memorySampleAfter = boundary;
+        memoryControlRequested = true;
+        controllerChanged.notify_all();
+    }
+    void MemoryPreparationCompletedLocked(ResourceClock::time_point now) noexcept {
+        controller.memory.lastPreparationAt = now;
+        controller.progressAt = now;
+        if (controller.grant.used && !controller.grant.sequence) { controller.grant.completedAt = now; }
+        RequestMemorySampleLocked(now);
+    }
     void ReservedLocked(std::uint64_t bytes, std::optional<std::uint64_t> sequence = {}) noexcept {
         const auto now = ResourceClock::now();
         if (controller.grant.demandId == debug.memoryDemandId && !controller.grant.used) {
@@ -98,7 +125,11 @@ struct ExecutionState {
             controller.grant.flowId = debug.flowId;
         }
         NoteMemoryReservation(controller, bytes, debug.memoryDemandId, now);
-        if (controller.phase == ResourceControlPhase::Normal) { controller.memory.waitSince.reset(); }
+        if (controller.phase == ResourceControlPhase::Recover) {
+            debug.gateOpen = false;
+            memoryControlRequested = true;
+            controllerChanged.notify_all();
+        }
         ClearDemandLocked();
     }
     void ResetCpuLocked(ResourceClock::time_point now) noexcept {
@@ -184,8 +215,7 @@ struct ExecutionState {
             // 发布额度时调用方已持有容量锁，事件只接收同一事务取得的确定值
             event.reservedBytes = reservedBytes;
             event.grantEpoch = controller.memory.grantEpoch;
-            event.memoryGain = controller.memory.gain;
-            event.memoryCalibration = controller.memory.calibration;
+            event.memoryPreviewRatio = controller.memory.previewRatio;
             event.memoryPhase = controller.phase;
         }
         debug.nextEvent = (debug.nextEvent + 1u) % debug.events.size();
@@ -202,8 +232,6 @@ struct ExecutionState {
     }
 
     bool FailLocked(const CodecFailureRecord& failure, bool close = false) noexcept {
-        FinishMemoryMeasurement(controller, ResourceClock::now(),
-            failure.cancelled ? ResourceDecisionReason::RequestCancelled : ResourceDecisionReason::RequestEnded);
         const bool first = !debug.failure.has_value();
         if (first) { debug.failure = failure; }
         else { ++debug.secondaryFailures; }
@@ -265,7 +293,14 @@ struct ExecutionState {
             return;
         }
         admission.active = false;
-        controller.progressAt = ResourceClock::now();
+        if (admission.committed || admission.completion == BlockCompletion::Succeeded) {
+            controller.progressAt = ResourceClock::now();
+            controller.memory.waitSince.reset();
+            // 单块退休立即观测，避免把周期采样间隔变成逐块节流
+            if (controller.phase != ResourceControlPhase::Normal) {
+                RequestMemorySampleLocked(*controller.progressAt);
+            }
+        }
         if (controller.grant.used && controller.grant.flowId == debug.flowId &&
             controller.grant.sequence == admission.sequence && index + 1u < admissions.size()) {
             controller.grant.completedAt = controller.progressAt;
@@ -323,6 +358,7 @@ struct ExecutionState {
     bool moreIndependentBlocks{false};
     bool pendingHeavyPhase{false};
     bool memoryControlRequested{false};
+    std::optional<ResourceClock::time_point> memorySampleAfter;
     ResourceWorkType workType;
     bool waitCompute{false};
     bool waitSlots{false};
@@ -504,7 +540,6 @@ bool DataCodecExecutionResources::EndRun() noexcept {
             state.debug.admittedBlocks != 0u || state.runningTasks != 0u ||
             state.debug.queuedTasks != 0u || state.debug.heavyPhaseAdmitted;
         if (!failed) {
-            FinishMemoryMeasurement(state.controller, ResourceClock::now(), ResourceDecisionReason::RequestEnded);
             state.debug.runActive = false;
             state.debug.waiting = ResourceWaitReason::None;
             state.moreIndependentBlocks = false;
@@ -648,8 +683,8 @@ bool DataCodecExecutionResources::CheckNecessaryCapacity(std::uint64_t bytes,
             (kind == MemoryDemandKind::Block && state.debug.admittedBlocks != 0u);
         if (bytes <= ceiling && canProgress) { return true; }
         fatal = bytes > ceiling || (state.configuration.mode == CodecResourceMode::Fixed && !capacity.CanReserve(bytes)) ||
-            capacity.reservedBytes > ceiling || bytes > ceiling - capacity.reservedBytes ||
-            (state.controller.memory.waitSince && ResourceClock::now() - *state.controller.memory.waitSince >= resource_control::holdTimeout);
+            capacity.reservedBytes > ceiling || bytes > ceiling - capacity.reservedBytes;
+        // 压力等待超时由控制器统一裁决，保留准确的终止原因
         rejection.requestedBytes = bytes;
         rejection.reservedBytes = capacity.reservedBytes;
         rejection.limitBytes = capacity.limitBytes;
@@ -670,7 +705,6 @@ void DataCodecExecutionResources::ClearByteWait() noexcept {
         state.controller.grant.completedAt = ResourceClock::now();
     }
     state.ClearDemandLocked();
-    if (state.controller.phase == ResourceControlPhase::Normal) { state.controller.memory.waitSince.reset(); }
 }
 
 std::optional<resource::ResidentByteBudget::Lease> DataCodecExecutionResources::TryAcquireStorage(
@@ -732,13 +766,27 @@ void DataCodecExecutionResources::CompleteMemoryPreparation() noexcept {
     auto& state = *m_impl->state;
     std::lock_guard lock(state.mutex);
     const auto now = ResourceClock::now();
-    state.controller.memory.lastPreparationAt = now;
-    state.controller.progressAt = now;
-    if (state.controller.grant.used && !state.controller.grant.sequence) {
-        state.controller.grant.completedAt = now;
-    }
+    state.MemoryPreparationCompletedLocked(now);
     state.Event(ResourceEventKind::Complete);
     state.changed.notify_all();
+}
+
+bool DataCodecExecutionResources::SynchronizeMemoryAfterPreparation() {
+    auto& state = *m_impl->state;
+    std::unique_lock lock(state.mutex);
+    if (state.configuration.mode != CodecResourceMode::Adaptive) { return !state.debug.runStopped; }
+    if (!state.debug.runActive || state.driver != std::this_thread::get_id() || state.IsWorkerLocked()) {
+        throw std::logic_error("memory preparation synchronization requires the active driver");
+    }
+    const auto boundary = ResourceClock::now();
+    const auto request = state.debug.requestId;
+    state.MemoryPreparationCompletedLocked(boundary);
+    const auto observed = [&] {
+        return state.debug.closing || state.debug.runStopped || !state.debug.runActive ||
+            state.debug.requestId != request || state.debug.resourceSample.sampledAt > boundary;
+    };
+    if (!WaitWithPlatformEvents(lock, observed)) { state.changed.wait(lock, observed); }
+    return state.debug.runActive && !state.debug.runStopped && !state.debug.closing && state.debug.requestId == request;
 }
 
 std::optional<HeavyPhaseLease> DataCodecExecutionResources::TryAcquireHeavyPhase() {
@@ -995,8 +1043,6 @@ std::optional<CodecFailureRecord> DataCodecExecutionResources::ApplyControlLocke
     ResourceClock::time_point now, const ResourceSample& sample) noexcept {
     auto& state = *m_impl->state;
     state.debug.resourceSample = sample;
-    const auto previousCalibration = state.controller.memory.calibration;
-    const auto previousGainUpdates = state.controller.memory.gainUpdates;
     const auto previousPhase = state.controller.phase;
     const auto flow = state.FlowLocked(now);
     const auto decision = Advance(state.controller, now, sample, flow);
@@ -1010,8 +1056,7 @@ std::optional<CodecFailureRecord> DataCodecExecutionResources::ApplyControlLocke
     auto failure = PublishLimitsLocked(decision.limits, decision.gateOpen, decision.reason,
         decision.optionalRetentionPausedByPressure, decision.trimOptionalRetention, decision.resetObservation);
     if (failure) { return failure; }
-    if (previousCalibration != state.controller.memory.calibration ||
-        previousGainUpdates != state.controller.memory.gainUpdates || previousPhase != state.controller.phase) {
+    if (previousPhase != state.controller.phase) {
         state.Event(ResourceEventKind::MemoryControl, 0u, decision.reason, {}, flow.reservedBytes);
     }
     if (decision.failForCapacityBound) {
@@ -1065,9 +1110,10 @@ void DataCodecExecutionResources::ControlMain() noexcept {
         const bool sampleCpu = state.AutomaticCpu() && (resetCpu || now >= nextCpuAt);
         const bool pressureNotified = m_impl->pressureSignal.exchange(false, std::memory_order_acq_rel);
         const bool demandNotified = std::exchange(state.memoryControlRequested, false);
-        const bool memoryDue = memoryAdaptive && (now >= nextSampleAt || pressureNotified);
-        if ((memoryAdaptive && (now >= nextSampleAt || pressureNotified)) || sampleCpu) {
-            const bool sampleMemory = memoryAdaptive && (now >= nextSampleAt || pressureNotified);
+        const bool preparationSample = state.memorySampleAfter && sample.sampledAt <= *state.memorySampleAfter;
+        const bool memoryDue = memoryAdaptive && (now >= nextSampleAt || pressureNotified || preparationSample);
+        if (memoryDue || sampleCpu) {
+            const bool sampleMemory = memoryDue;
             lock.unlock();
             if (sampleMemory) {
                 try { sample = ProbeResources(); }
@@ -1087,6 +1133,7 @@ void DataCodecExecutionResources::ControlMain() noexcept {
             if (state.debug.closing) { return; }
             if (!state.debug.runActive || state.debug.runStopped || state.debug.requestId != requestId) { continue; }
         }
+        if (state.memorySampleAfter && sample.sampledAt > *state.memorySampleAfter) { state.memorySampleAfter.reset(); }
         const auto before = state.debug.eventEpoch;
         auto failure = memoryAdaptive && (memoryDue || demandNotified || state.debug.controlPhase != ResourceControlPhase::Normal)
             ? ApplyControlLocked(now, sample) : std::optional<CodecFailureRecord>{};
@@ -1174,7 +1221,6 @@ void DataCodecExecutionResources::CancelAndWaitRun() noexcept {
             state.FailLocked(ExecutionFailure("invalid-drain-driver", "only the active driver may drain the request"), true);
         }
         state.debug.runStopped = true;
-        FinishMemoryMeasurement(state.controller, ResourceClock::now(), ResourceDecisionReason::RequestCancelled);
         m_impl->scratch.SetRetainedCount(0u);
         state.Event(ResourceEventKind::Stop);
         stop = state.stopSource;
@@ -1206,7 +1252,8 @@ void DataCodecExecutionResources::CancelAndWaitRun() noexcept {
     }
     SetWaitReason(ResourceWaitReason::RunDrain);
     std::unique_lock lock(state.mutex);
-    state.changed.wait(lock, [&] { return state.runningTasks == 0u; });
+    const auto drained = [&] { return state.runningTasks == 0u; };
+    if (!WaitWithPlatformEvents(lock, drained)) { state.changed.wait(lock, drained); }
     lock.unlock();
     SetWaitReason(ResourceWaitReason::None);
 }
@@ -1264,6 +1311,9 @@ void DataCodecExecutionResources::WaitForChange(std::uint64_t observedEpoch, std
     const auto changed = [&] {
         return state.debug.eventEpoch != observedEpoch || state.debug.runStopped || state.debug.closing || stop.stop_requested();
     };
+    const auto deadline = state.debug.byteWaiting
+        ? ResourceClock::now() + resource_control::sampleInterval : ResourceClock::time_point::max();
+    if (WaitWithPlatformEvents(lock, changed, deadline)) { return; }
     if (state.debug.byteWaiting) { state.changed.wait_for(lock, resource_control::sampleInterval, changed); }
     else { state.changed.wait(lock, changed); }
 }
@@ -1340,11 +1390,6 @@ bool DataCodecExecutionResources::TryCopyResourceDebugSnapshot(ResourceDebugSnap
     output.cpuPermitCredit = state.cpuBudget.Credit();
     output.memory = state.controller.memory;
     output.capturedAt = ResourceClock::now();
-    if (output.memory.calibration == MemoryCalibrationResult::Measuring) {
-        output.memory.calibrationElapsed = output.capturedAt - output.memory.calibrationStarted;
-    }
-    output.memory.measuredReservationBytes = state.controller.gainPhase >= 2u
-        ? state.controller.measurementBytes : output.memory.measuredReservationBytes;
     output.allocatedStorage = state.capacity->m_state->allocated;
     output.allocatedStorage.capturedAt = output.capturedAt;
     output.workType = state.workType;
@@ -1445,6 +1490,10 @@ void DataCodecExecutionResources::ReclaimOptionalStorage(const std::uint64_t req
 std::size_t DataCodecExecutionResources::Concurrency() const noexcept {
     std::lock_guard lock(m_impl->state->mutex);
     return std::max<std::size_t>(1u, m_impl->state->EffectiveComputeLocked());
+}
+std::size_t DataCodecExecutionResources::WorkerCapacity() const noexcept {
+    const auto& configuration = m_impl->state->configuration;
+    return configuration.threaded ? configuration.computeCeiling : 1u;
 }
 bool DataCodecExecutionResources::Threaded() const noexcept { return m_impl->state->configuration.threaded; }
 bool DataCodecExecutionResources::IsDriverThread() const noexcept {

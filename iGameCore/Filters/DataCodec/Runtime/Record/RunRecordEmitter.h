@@ -151,6 +151,10 @@ public:
     } catch (...) { ReportExportFailure(); }
 
     void AddMessage(TelemetryMessageRecord message) try {
+        // 原始诊断继承请求语言，已本地化的消息保留自身语言
+        if (message.messageId == DataCodecMessageId::None) {
+            message.language = m_run.language;
+        }
         message.order = m_messageOrder.fetch_add(1u, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(m_messageMutex);

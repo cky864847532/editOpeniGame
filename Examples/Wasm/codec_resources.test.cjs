@@ -1,101 +1,82 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createCodecResourceControls } = require('./codec_resources.js');
+const { createCodecResourceControls, createCodecHostMessages } = require('./codec_resources.js');
 
-function fixture(analyze = async () => ({ success: true, minimumBytes: '1048577' })) {
-    const elements = Object.fromEntries(['codecResourceMode', 'codecMemoryMiB', 'codecMemoryRow',
-        'codecComputeThreads', 'btnDecodeIgc'].map(id => [id, {
-            value: '', style: {}, attributes: {},
-            setAttribute(key, value) { this.attributes[key] = value; },
-        }]));
-    elements.codecResourceMode.value = '0';
-    elements.codecComputeThreads.value = '0';
-    const messages = [];
+function fixture(maximumComputeThreads = 16, configureFailure = null) {
+    const decode = { disabled: false };
     const configurations = [];
+    const statuses = [];
+    let busy = false;
     const controls = createCodecResourceControls({
-        document: { getElementById: id => elements[id] },
-        defaults: { fixedMemoryBytes: '1048576', maximumComputeThreads: 6, maximumMemoryBytes: '17179869184' },
-        log: message => messages.push(message),
-        configure: value => configurations.push(value), analyze, isBusy: () => false,
+        document: { getElementById(id) { assert.equal(id, 'btnDecodeIgc'); return decode; } },
+        defaults: { maximumComputeThreads },
+        configure: value => { if (configureFailure) { throw configureFailure; } configurations.push(value); },
+        messages: { submit: (...args) => statuses.push(args) },
+        isBusy: () => busy,
     });
-    return { controls, elements, messages, configurations };
+    return { controls, decode, configurations, statuses, setBusy(value) { busy = value; } };
 }
 
-test('default capacity, exact rounding, correction and unlimited', async () => {
-    const { controls, elements, messages, configurations } = fixture();
-    assert.equal(await controls.check(false), true);
-    assert.match(messages.at(-1), /尚未检查/);
-    controls.selectFile({ name: 'sample.igc' });
-    assert.equal(await controls.check(false), false);
-    assert.equal(elements.codecMemoryMiB.attributes['aria-invalid'], 'true');
-    assert.match(messages.at(-1), /至少设置 2 MiB（1048577 字节）/);
-    assert.equal(elements.btnDecodeIgc.disabled, true);
-    elements.codecMemoryMiB.value = '2';
-    controls.invalidate();
-    assert.equal(await controls.check(false), true);
-    assert.equal(elements.codecMemoryMiB.style.color, '');
-    controls.apply();
-    assert.deepEqual(configurations.at(-1), { mode: 0, threads: 0, bytes: '2097152' });
-    elements.codecResourceMode.value = '2';
-    elements.codecMemoryMiB.value = 'bad';
-    assert.equal(await controls.check(false), true);
-    controls.apply();
-    assert.deepEqual(configurations.at(-1), { mode: 2, threads: 0, bytes: '' });
-    assert.equal(elements.codecMemoryRow.hidden, true);
-});
-
-test('zero, uint64 overflow and the runtime thread ceiling', async () => {
-    const { controls, elements, messages } = fixture();
-    controls.selectFile({});
-    for (const value of ['-1', '1.5', '17592186044416', '16385']) {
-        elements.codecMemoryMiB.value = value;
-        assert.equal(await controls.check(false), false);
-        assert.equal(elements.codecMemoryMiB.attributes['aria-invalid'], 'true');
+test('always use unlimited memory and the complete device thread capacity', () => {
+    for (const threads of [1, 6, 16, 32]) {
+        const { controls, configurations } = fixture(threads);
+        controls.apply();
+        assert.deepEqual(configurations, [{ mode: 2, threads, bytes: '' }]);
     }
-    elements.codecMemoryMiB.value = '0';
-    assert.equal(await controls.check(false), false);
-    assert.match(messages.at(-1), /上限不足/);
-    elements.codecComputeThreads.value = '7';
-    assert.equal(await controls.check(false), false);
-    assert.match(messages.at(-1), /0 至 6/);
 });
 
-test('file and topology mode invalidate the analysis cache', async () => {
-    let calls = 0;
-    const { controls, elements } = fixture(async () => { ++calls; return { success: true, minimumBytes: '1' }; });
-    elements.codecMemoryMiB.value = '1';
-    controls.selectFile({});
-    await controls.check(false);
-    await controls.check(false);
-    assert.equal(calls, 1);
-    await controls.check(true);
-    controls.selectFile({});
-    await controls.check(true);
-    assert.equal(calls, 3);
+test('file selection and busy state control the decode button without resource inputs', () => {
+    const { controls, decode, setBusy } = fixture();
+    assert.equal(decode.disabled, true);
+    assert.equal(controls.selectedFile(), null);
+    const file = { name: 'sample.igc' };
+    controls.selectFile(file);
+    assert.equal(controls.selectedFile(), file);
+    assert.equal(decode.disabled, false);
+    setBusy(true);
+    controls.refresh();
+    assert.equal(decode.disabled, true);
+    setBusy(false);
+    controls.refresh();
+    assert.equal(decode.disabled, false);
+    controls.selectFile(null);
+    assert.equal(decode.disabled, true);
 });
 
-test('late analysis cannot reject unlimited mode or a corrected limit', async () => {
-    let release;
-    const { controls, elements } = fixture(() => new Promise(resolve => { release = resolve; }));
-    controls.selectFile({});
-    const pending = controls.check(false);
-    elements.codecResourceMode.value = '2';
-    controls.invalidate();
-    await controls.check(false);
-    release({ success: true, minimumBytes: '999999999' });
-    await pending;
-    assert.equal(elements.codecMemoryMiB.attributes['aria-invalid'], 'false');
-    assert.equal(elements.btnDecodeIgc.disabled, false);
+test('invalid device thread capacity reports an error', () => {
+    for (const count of [undefined, 0, -1, 1.5, NaN]) {
+        const statuses = [];
+        assert.throws(() => createCodecResourceControls({
+            document: { getElementById: () => ({}) },
+            defaults: { maximumComputeThreads: count },
+            configure() {},
+            isBusy: () => false,
+            messages: { submit: (...args) => statuses.push(args) },
+        }), /invalid device compute thread capacity/);
+        assert.deepEqual(statuses, [['DeviceComputeThreadsUnavailable', {}, 'error']]);
+    }
 });
 
-test('analysis failure provides no invented minimum and can be retried', async () => {
-    let success = false;
-    const { controls, elements, messages } = fixture(async () => success
-        ? { success: true, minimumBytes: '0' } : { success: false, detail: 'missing reference' });
-    controls.selectFile({});
-    assert.equal(await controls.check(false), false);
-    assert.match(messages.at(-1), /missing reference/);
-    assert.equal(elements.codecMemoryMiB.attributes['aria-invalid'], 'false');
-    success = true;
-    assert.equal(await controls.check(false), true);
+test('configuration rejection uses the host message and preserves the original failure', () => {
+    const failure = new Error('invalid memory limit');
+    const { controls, statuses, configurations } = fixture(16, failure);
+    assert.throws(() => controls.apply(), error => error === failure);
+    assert.deepEqual(statuses, [['ResourceConfigurationFailed', {}, 'error', 'invalid memory limit']]);
+    assert.deepEqual(configurations, []);
+});
+
+test('host messages preserve language, severity and diagnostic detail with one-pass interpolation', () => {
+    for (const language of ['en', 'zh-CN']) {
+        const statuses = [];
+        const messages = createCodecHostMessages({ language, templates: {
+            sample: language === 'en' ? 'Threads: {threads}; {name}' : '线程：{threads}；{name}',
+        } }, status => statuses.push(status));
+        const status = messages.submit('sample', { threads: 16, name: '{threads}' }, 'warning', 'offset=42');
+        assert.equal(status.text, language === 'en' ? 'Threads: 16; {threads}' : '线程：16；{threads}');
+        assert.equal(status.language, language);
+        assert.equal(status.severity, 'warning');
+        assert.equal(status.messageId, 'sample');
+        assert.equal(status.technicalDetail, 'offset=42');
+        assert.deepEqual(statuses, [status]);
+    }
 });

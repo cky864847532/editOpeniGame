@@ -19,15 +19,7 @@ inline constexpr auto pendingConfirmation = std::chrono::milliseconds(500);
 inline constexpr auto recoveryConfirmation = std::chrono::seconds(2);
 inline constexpr auto recoveryCooldown = std::chrono::seconds(2);
 inline constexpr auto holdTimeout = std::chrono::seconds(30);
-inline constexpr auto initialGrowthInterval = std::chrono::milliseconds(500);
 inline constexpr double defaultReserveRatio = 0.20;
-inline constexpr double nominalGain = 0.5;
-inline constexpr double responseAlpha = 0.5;
-inline constexpr double minimumGain = 0.025;
-inline constexpr double maximumGain = 1.0;
-inline constexpr double probeScale = 0.75;
-inline constexpr auto gainWindow = std::chrono::milliseconds(250);
-inline constexpr auto calibrationDeadline = std::chrono::seconds(1);
 }
 
 struct FlowWaitDurations {
@@ -81,7 +73,6 @@ struct MemoryGrant {
     std::optional<std::uint64_t> sequence;
     std::uint64_t flowId{0u};
     bool used{false};
-    bool probe{false};
 };
 
 struct ResourceControllerState {
@@ -98,19 +89,10 @@ struct ResourceControllerState {
     std::optional<ResourceClock::time_point> lowSince;
     std::optional<ResourceClock::time_point> highSince;
     std::optional<ResourceClock::time_point> lastSampleAt;
-    std::optional<std::uint64_t> previousAvailableBytes;
-    std::uint64_t growthAvailableBytes{0u};
-    double recentAvailableAverage{0.0};
     ResourceClock::time_point cooldownUntil{};
     std::optional<ResourceClock::time_point> recoveryStartedAt;
     std::optional<ResourceClock::time_point> progressAt;
     std::uint64_t requestId{0u};
-    unsigned gainPhase{0u};
-    bool initialMeasurement{false};
-    ResourceClock::time_point gainWindowStarted{};
-    double availableSum{0.0};
-    std::size_t availableSamples{0u};
-    std::uint64_t measurementBytes{0u};
 };
 
 struct ControlDecision {
@@ -135,8 +117,6 @@ ResourceWatermarks MakeReserveWatermarks(std::uint64_t, double) noexcept;
 bool ValidPhysicalMemorySample(const ResourceSample&, ResourceClock::time_point) noexcept;
 void NoteMemoryReservation(ResourceControllerState&, std::uint64_t bytes, std::uint64_t demandId,
     ResourceClock::time_point) noexcept;
-void FinishMemoryMeasurement(ResourceControllerState&, ResourceClock::time_point,
-    ResourceDecisionReason) noexcept;
 std::size_t ResourceComputeCapacity(const ResourceSample&, CodecResourceMode,
     CodecThreadMode = CodecThreadMode::Fixed) noexcept;
 ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourceParams&, const ResourceSample&);

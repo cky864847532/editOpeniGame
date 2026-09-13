@@ -2,6 +2,7 @@
 #define DATACODEC_WORKFLOW_DECODE_STAGES_ATTRDECODESTAGE_H
 
 #include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryControl.h"
 
 #include "DataCodec/Codec/Attributes/AttributeDecode.h"
 #include "DataCodec/Codec/Attributes/AttributeReferenceDecode.h"
@@ -165,6 +166,7 @@ inline bool PrepareDirectAttributeDecodeStores(
             error)) {
         return false;
     }
+    RecordSchedulerInvestigation(context, workspace, "attributes.prepare.begin");
     for (const auto attrIndex : attrIndices) {
         if (attrIndex >= workspace.StorageParams().attrParams.size()) {
             return validation::AssignError(error, "attribute decode store index is out of range");
@@ -185,7 +187,8 @@ inline bool PrepareDirectAttributeDecodeStores(
             return false;
         }
     }
-    return true;
+    RecordSchedulerInvestigation(context, workspace, "attributes.prepare.end");
+    return workspace.CacheResourcesRef().Run().SynchronizeMemoryAfterPreparation();
 }
 
 class AttrDecodeStage final : public DecodeStage {
@@ -200,6 +203,7 @@ public:
 
     // 把属性 domain 按 block 解入 decoded attribute cache
     void Execute(DecodeContext& context, DecodeLeafWorkspace& workspace) override {
+        RecordSchedulerInvestigation(context, workspace, "attributes.begin");
         const auto targetAttrIndices = ResolveAttributeDecodeIndices(
             context.attributeTargets,
             context.frameIndex,
@@ -277,12 +281,13 @@ public:
 
         decodeimpl::detail::AttributeDecodeTimingCallback attributeTimingCallback;
         if (collectTiming) {
-            attributeTimingCallback = [&context](const decodeimpl::detail::AttributeDecodeTimingDetail& detail) {
+            attributeTimingCallback = [&context, &workspace](const decodeimpl::detail::AttributeDecodeTimingDetail& detail) {
                 context.runRecords.RecordStageTiming(
                     "AttrDecodeStage[" + std::to_string(detail.attrIndex) + "]",
                     detail.elapsedMs,
                     TelemetryStageCategory::General,
                     FormatAttributeDecodeTimingScope(detail));
+                RecordSchedulerInvestigation(context, workspace, "attribute.done." + std::to_string(detail.attrIndex));
             };
         }
 
@@ -304,6 +309,7 @@ public:
         };
         const auto decoded = decodeimpl::detail::DecodeAttributePayloadRangesToCache(
             decodeRuntime, *payloadOwner, targetAttrIndices, referenceDecoder, &decodeError);
+        RecordSchedulerInvestigation(context, workspace, decoded ? "attributes.end" : "attributes.failed");
         if (!decoded) {
             FailDecodeStage(
                 context,

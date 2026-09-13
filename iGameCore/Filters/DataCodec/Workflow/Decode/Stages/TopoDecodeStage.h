@@ -163,6 +163,7 @@ public:
                 .cacheResources = workspace.CacheResourcesRef(),
                 .byteStoreSession = workspace.ByteStoreSessionRef(),
                 .topology = workspace.MutableTopology(),
+                .destination = context.topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly ? nullptr : context.adapter,
             },
             .context = TopologyDecodeContext{
                 .timingCallback = std::move(topologyTiming),

@@ -19,6 +19,8 @@ public:
     iGamePreparedSurfaceDecodeAdapter(const iGamePreparedSurfaceDecodeAdapter&) = delete;
     iGamePreparedSurfaceDecodeAdapter& operator=(const iGamePreparedSurfaceDecodeAdapter&) = delete;
 
+    bool SupportsConcurrentBlocks() const noexcept override { return true; }
+
     bool BeginConnectivityTopology(
         const ::datacodec::ConnectivityTopologyDecodeInfo& info,
         std::string* error = nullptr) override;

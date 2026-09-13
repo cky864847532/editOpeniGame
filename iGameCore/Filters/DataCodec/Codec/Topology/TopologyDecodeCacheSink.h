@@ -16,9 +16,10 @@ class CacheTopologyDecodeSink final : public topocodec::IConnectivityTopologyDec
 public:
     CacheTopologyDecodeSink(
         DecodedTopologyCache& topology,
-        bytestore::ByteStoreSession& byteStoreSession)
+        bytestore::ByteStoreSession& byteStoreSession,
+        IDecodeAdapter* destination = nullptr)
         : m_topology(topology),
-          m_byteStoreSession(byteStoreSession) {}
+          m_byteStoreSession(byteStoreSession), m_destination(destination) {}
 
     bool BeginConnectivityTopology(
         const std::size_t cellCount,
@@ -34,7 +35,7 @@ public:
             hasCellTypes,
             hasCellPolynomialOrders,
             m_byteStoreSession,
-            error);
+            error, m_destination);
     }
 
     bool WriteConnectivityRange(
@@ -96,6 +97,7 @@ public:
 private:
     DecodedTopologyCache& m_topology;
     bytestore::ByteStoreSession& m_byteStoreSession;
+    IDecodeAdapter* m_destination;
 };
 
 } // namespace datacodec::topology

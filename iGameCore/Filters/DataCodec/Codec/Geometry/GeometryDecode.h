@@ -37,6 +37,7 @@ struct GeometryDecodeCache {
     bytestore::ByteStoreSession& byteStoreSession;
     DecodedGeometryCache& geometry;
     DecodedGeometryReferenceCache* referenceCache{nullptr};
+    IDecodeAdapter* destination{nullptr};
 };
 
 struct GeometryDecodeRuntime {
@@ -205,12 +206,15 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
     auto phase = WaitForHeavyPhase(root);
     if (!phase) { return detail::MakeGeometryDecodeFailure(CodecErrorCode::PipelineFailure, "geometry preparation was stopped"); }
     // 完整目标在块流前取得容量，两个真实数组分别持有 owner
-    if (!geometry.Initialize(params.elementCount, params.componentCount, runtime.cache.byteStoreSession, &error) ||
+    if (!geometry.Initialize(params.elementCount, params.componentCount, runtime.cache.byteStoreSession, &error, runtime.cache.destination) ||
         (referenceCache != nullptr &&
             !referenceCache->BeginGeometry(meta, runtime.cache.byteStoreSession, &error))) {
         geometry.Release();
         if (referenceCache != nullptr) { referenceCache->Reset(); }
         return detail::MakeGeometryDecodeFailure(CodecErrorCode::DecodeFailure, std::move(error));
+    }
+    if (!root.SynchronizeMemoryAfterPreparation()) {
+        return detail::MakeGeometryDecodeFailure(CodecErrorCode::PipelineFailure, "geometry preparation was cancelled");
     }
     const auto finish = [&] {
         if (stream.Position() != end) {

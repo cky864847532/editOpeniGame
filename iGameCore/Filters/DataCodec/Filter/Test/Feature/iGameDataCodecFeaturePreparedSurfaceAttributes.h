@@ -5,6 +5,7 @@
 #include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
 #include "DataCodec/Filter/Adapter/iGameDecodeAdapter.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
+#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 
 #include "iGameAttributeSet.h"
 #include "iGameCellArray.h"
@@ -256,9 +257,59 @@ namespace iGame::datacodec_test {
         !failed.AttachPreparedSurface(source, &error);
 }
 
+[[nodiscard]] inline bool TestPreparedSurfaceOnCodecWorkers() {
+    // 两个四面体共用一个面，逆序投递后应消去公共面并保留六个外表面
+    const ::datacodec::IndexType vertices[2][4]{{0u, 1u, 2u, 3u}, {0u, 2u, 1u, 4u}};
+    const ::datacodec::IndexType cellTypes[]{IG_TETRA};
+    for (const std::size_t workers : {1u, 2u}) {
+        ::datacodec::DataCodecExecutionResources run(::datacodec::ResolvedResourceConfiguration{
+            {4096u, workers, workers + 1u}, 4096u, workers, true, true});
+        ::datacodec::CodecRunScope scope(run);
+        iGamePreparedSurfaceDecodeAdapter observer;
+        std::string error;
+        if (!scope || !observer.SupportsConcurrentBlocks() ||
+            !observer.BeginConnectivityTopology({.blockCount = 2u, .pointCount = 5u,
+                .cellCount = 2u, .fixedCellSize = 4, .hasCellTypes = true,
+                .workerCapacity = run.WorkerCapacity()}, &error)) { return false; }
+        std::size_t next = 0u;
+        const bool success = ::datacodec::RunOrderedBlocks<std::size_t, std::size_t>(run,
+            [&] { return next < 2u; },
+            [&](std::size_t& index) { index = 1u - next++; return true; },
+            [&](const std::size_t index, std::size_t&, ::datacodec::WorkerContext& worker) {
+                ::datacodec::ResourceDebugSnapshot snapshot;
+                if (!run.TryCopyResourceDebugSnapshot(snapshot) || snapshot.admittedBlocks == 0u ||
+                    snapshot.activeComputeUnits == 0u || snapshot.activeComputeUnits > workers) { return false; }
+                std::string localError;
+                return observer.ObserveConnectivityBlock({.blockIndex = index, .cellOffset = index,
+                    .fixedCellSize = 4, .connectivity = vertices[index], .cellTypes = cellTypes,
+                    .workerIndex = worker.Index()}, &localError);
+            }, [](std::size_t&) { return true; });
+        if (!observer.EndConnectivityTopology(&error) || !scope.Finish(success)) { return false; }
+        auto source = UnstructuredMesh::New();
+        auto points = Points::New();
+        points->AddPoint(0.0f, 0.0f, 0.0f);
+        points->AddPoint(1.0f, 0.0f, 0.0f);
+        points->AddPoint(0.0f, 1.0f, 0.0f);
+        points->AddPoint(0.0f, 0.0f, 1.0f);
+        points->AddPoint(0.0f, 0.0f, -1.0f);
+        source->SetPoints(points);
+        if (!observer.AttachPreparedSurface(source, &error) ||
+            observer.Summary().find("surface-faces=6") == std::string::npos ||
+            observer.Summary().find("surface-points=5") == std::string::npos) { return false; }
+        ::datacodec::ResourceDebugSnapshot snapshot;
+        if (!run.TryCopyResourceDebugSnapshot(snapshot) || snapshot.admittedBlocks != 0u ||
+            snapshot.activeComputeUnits != 0u) { return false; }
+    }
+    return true;
+}
+
 [[nodiscard]] inline int RunDataCodecFeaturePreparedSurfaceAttributes() {
     if (!TestSynchronousPreparedSurfaceObserver()) {
         std::cerr << "synchronous prepared surface observer contract failed\n";
+        return 1;
+    }
+    if (!TestPreparedSurfaceOnCodecWorkers()) {
+        std::cerr << "prepared surface codec-worker execution failed\n";
         return 1;
     }
     if (!TestRobustRangeCollapseRecovery()) { return 1; }

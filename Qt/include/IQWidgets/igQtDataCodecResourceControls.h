@@ -1,6 +1,7 @@
 #pragma once
 
 #include <DataCodec/API/Params/CodecResourceParams.h>
+#include <DataCodec/Filter/Localization/iGameDataCodecHostMessage.h>
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
@@ -24,7 +25,8 @@ public:
         // 只有已证明必需的额度才阻止启动，文件存储路径的全内存门槛仅作建议
         bool required{true};
         std::optional<std::uint64_t> requiredMinimumBytes;
-        QString detail;
+        iGame::iGameDataCodecHostMessageId messageId{iGame::iGameDataCodecHostMessageId::StorageCheckUnavailable};
+        QString technicalDetail;
     };
     using StorageAnalysis = std::function<StorageCheck(std::stop_token)>;
     using StorageAnalysisFactory = std::function<StorageAnalysis()>;
@@ -43,7 +45,8 @@ public:
         m_reserve->setRange(0.0, 99.9);
         m_reserve->setDecimals(1);
         m_reserve->setSuffix(QStringLiteral(" %"));
-        m_reserve->setToolTip(QStringLiteral("期望系统保留的可用物理内存比例，默认 20%；系统观测包含其他程序，允许短时偏离目标"));
+        m_reserve->setToolTip(QStringLiteral("期望系统保留的可用物理内存比例，默认 20%\n右侧容量 = 物理内存总量 × 当前比例；表示系统可用内存保留目标\n系统观测包含其他程序，允许短时偏离目标"));
+        InitializeMemoryReserveHint();
         m_threadMode = new QComboBox(this);
         m_threadMode->setObjectName(QStringLiteral("DataCodecThreadMode"));
         m_threadMode->addItem(QStringLiteral("固定线程上限"), static_cast<int>(::datacodec::CodecThreadMode::Fixed));
@@ -127,15 +130,21 @@ public:
 
     void OnChanged(std::function<void()> callback) { m_changed = std::move(callback); }
     void SetStorageAnalyzer(StorageAnalysisFactory factory) { m_analyzer = std::move(factory); }
-    void OnStorageStatus(std::function<void(const QString&, bool)> callback) { m_statusChanged = std::move(callback); }
+    void OnStorageStatus(std::function<void(const ::datacodec::DataCodecStatusRecord&)> callback) { m_statusChanged = std::move(callback); }
+    void SetLanguage(::datacodec::DataCodecLanguage language);
+    [[nodiscard]] ::datacodec::DataCodecLanguage Language() const noexcept { return m_language; }
     void CheckStorage();
     void InvalidateStorageCheck();
     [[nodiscard]] bool StorageRejected() const noexcept { return m_storageRejected; }
     [[nodiscard]] QLabel* StorageStatusLabel() const noexcept { return m_storageStatus; }
 
 private:
+    void InitializeMemoryReserveHint();
+    void UpdateMemoryReserveHint(std::optional<std::uint64_t> physicalTotalBytes);
+    void LayoutMemoryReserveHint();
+    bool eventFilter(QObject* watched, QEvent* event) override;
     void UpdateThreadRange();
-    void PublishStorageStatus(const QString& text, bool rejected = false, bool warning = false);
+    void PublishStorageStatus(const ::datacodec::DataCodecStatusRecord& status, bool rejected = false);
     void RefreshMode() {
         const bool adaptive = m_threadMode->currentData().toInt() == static_cast<int>(::datacodec::CodecThreadMode::Adaptive);
         m_threads->setEnabled(!adaptive);
@@ -162,10 +171,13 @@ private:
     QSpinBox* m_threads{nullptr};
     QDoubleSpinBox* m_memory{nullptr};
     QDoubleSpinBox* m_reserve{nullptr};
+    QLabel* m_reserveCapacity{nullptr};
     QFormLayout* m_layout{nullptr};
     QLabel* m_storageStatus{nullptr};
     StorageAnalysisFactory m_analyzer;
-    std::function<void(const QString&, bool)> m_statusChanged;
+    std::function<void(const ::datacodec::DataCodecStatusRecord&)> m_statusChanged;
+    ::datacodec::DataCodecLanguage m_language{::datacodec::DataCodecLanguage::SimplifiedChinese};
+    ::datacodec::DataCodecStatusSeverity m_storageSeverity{::datacodec::DataCodecStatusSeverity::Info};
     std::stop_source m_checkStop;
     std::uint64_t m_checkGeneration{0u};
     bool m_checkRunning{false};

@@ -1,6 +1,8 @@
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeaturePlaybackSession.h"
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeaturePreparedSurfaceAttributes.h"
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureRemap.h"
+#include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureLocalization.h"
+#include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureNativeDecodeStorage.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h"
 #include "DataCodec/Filter/Output/iGameDataCodecOutputSinks.h"
 #include "DataCodec/Log/Report/DataCodecProcessReportJson.h"
@@ -452,6 +454,9 @@ int main(const int argc, char** argv) {
         PrintResult(result);
         return result.passed ? 0 : 1;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--prepared-surface") {
+        return iGame::datacodec_test::RunDataCodecFeaturePreparedSurfaceAttributes();
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--morton-resources") {
         const auto result = datacodec::test::RunDataCodecFeatureMortonResources();
         PrintResult(result);
@@ -470,6 +475,11 @@ int main(const int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--task-coordinator") {
         return datacodec::test::RunDataCodecFeatureDecodeTaskCoordinator();
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--native-decode-storage") {
+        const auto result = datacodec::test::RunDataCodecFeatureNativeDecodeStorage();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--storage-ownership") {
         const auto result = datacodec::test::RunDataCodecFeatureStorageOwnership();
         PrintResult(result);
@@ -479,6 +489,12 @@ int main(const int argc, char** argv) {
         const auto result = datacodec::test::RunDataCodecFeatureFailure();
         PrintResult(result);
         return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--localization") {
+        const auto result = datacodec::test::RunDataCodecFeatureLocalization();
+        PrintResult(result);
+        const auto hostResult = iGame::datacodec_test::RunDataCodecFeatureHostLocalization();
+        return result.passed && hostResult == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string(argv[1]) == "--report-contract") {
         const auto result = datacodec::test::RunDataCodecSelfTest();

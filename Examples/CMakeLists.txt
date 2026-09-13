@@ -88,6 +88,7 @@ if (IGAME_DATACODEC_VTK_EXAMPLE)
     add_executable(testDataCodecVtkUnstructuredRoundTrip "${CMAKE_CURRENT_SOURCE_DIR}/Filter/Codec/TestDataCodecVtkUnstructuredRoundTrip.cpp")
     target_link_libraries(testDataCodecVtkUnstructuredRoundTrip PRIVATE
             dataCodecVtkAdapter
+            iGameCore
             VTK::IOLegacy
             VTK::IOXML
             VTK::RenderingCore

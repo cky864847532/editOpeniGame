@@ -1,7 +1,7 @@
 #include <DataCodec/API/Entry/DataCodecEncodeEntry.h>
 #include <DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h>
 #include <DataCodec/Filter/Adapter/iGameEncodeAdapter.h>
-#include <DataCodec/Filter/Adapter/iGameFileByteRangeIO.h>
+#include <DataCodec/Storage/ByteIO/FileByteRangeIO.h>
 #include <iGameFileIO.h>
 
 #include <filesystem>
@@ -76,7 +76,7 @@ int main(const int argc, char** argv) {
     });
 
     // ByteRangeOutput和执行资源分别接入文件系统与iGame线程池
-    iGame::iGameFileByteRangeOutput output(encodedFile);
+    ::datacodec::FileByteRangeOutput output(encodedFile);
     auto result = ::datacodec::Encode({
         .input = std::move(encodeInput),
         .output = ::datacodec::EncodeOutput::ByteRange(output, packageKind),

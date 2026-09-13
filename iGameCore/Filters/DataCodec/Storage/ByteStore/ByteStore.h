@@ -4,6 +4,7 @@
 #include "DataCodec/Storage/ByteIO/Window/WindowRuntimeParams.h"
 
 #include "DataCodec/Storage/ByteIO/ByteSource.h"
+#include "DataCodec/Storage/ByteStore/ByteStoreInterface.h"
 #include "DataCodec/Storage/ByteIO/ByteBudget.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
@@ -33,27 +34,6 @@ inline std::uint64_t NextByteStoreSessionId() noexcept {
     static std::atomic<std::uint64_t> nextId{0u};
     return nextId.fetch_add(1u, std::memory_order_relaxed) + 1u;
 }
-
-class IAppendableByteStore : public IByteSource {
-public:
-    virtual bool AppendBytes(std::span<const std::uint8_t> bytes, std::string* error = nullptr) = 0;
-    virtual bool Seal(std::string* error = nullptr) = 0;
-
-    bool AppendBytes(std::vector<std::uint8_t> bytes, std::string* error = nullptr) {
-        const auto ok = AppendBytes(std::span<const std::uint8_t>(bytes.data(), bytes.size()), error);
-        std::vector<std::uint8_t>().swap(bytes);
-        return ok;
-    }
-};
-
-class IRandomAccessByteStore : public IAppendableByteStore {
-public:
-    virtual bool ResizeBytes(std::uint64_t byteSize, std::string* error = nullptr) = 0;
-    virtual bool WriteBytesAt(
-        std::uint64_t offset,
-        std::span<const std::uint8_t> bytes,
-        std::string* error = nullptr) = 0;
-};
 
 class AppendableByteStoreWriter final : public IByteWriter {
 public:

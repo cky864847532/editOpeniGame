@@ -2,6 +2,7 @@
 #define DATACODEC_WORKFLOW_SESSION_DECODESESSION_H
 
 #include "DataCodec/API/Adapter/IFramePackageDecodeAssembly.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
 #include "DataCodec/Workflow/Leaf/LeafDecodeExecutor.h"
 #include "DataCodec/Workflow/Session/DataCodecReferenceState.h"
@@ -21,13 +22,6 @@
 #include "DataCodec/Workflow/Decode/DecodeStoragePlan.h"
 
 namespace datacodec {
-
-struct DecodeAttributeDescriptor {
-    AttributeTarget target;
-    AttrStorageParams metadata;
-    bool decoded{false};
-    bool committed{false};
-};
 
 class DecodeSession {
 public:

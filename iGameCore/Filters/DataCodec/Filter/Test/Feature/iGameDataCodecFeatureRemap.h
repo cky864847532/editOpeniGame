@@ -869,9 +869,9 @@ inline bool TestNativeResourceExemptions() {
         std::vector<std::uint8_t> bytes(2u * kIoWindowBytes + 13u);
         for (std::size_t i = 0u; i < bytes.size(); ++i) { bytes[i] = static_cast<std::uint8_t>(i % 251u); }
         std::string error;
-        iGameFileByteRangeOutput output(file);
+        ::datacodec::FileByteRangeOutput output(file);
         const bool written = output.WriteAt(0u, bytes, &error) && output.Finalize(bytes.size(), &error);
-        auto reader = std::make_shared<iGameFileByteRangeReader>(file);
+        auto reader = std::make_shared<::datacodec::FileByteRangeReader>(file);
         std::weak_ptr<IByteRangeReader> weak = reader;
         auto range = std::make_shared<SubrangeByteRangeReader>(reader, kIoWindowBytes - 3u, kIoWindowBytes + 7u);
         auto slot = root.TryAcquireSlot();

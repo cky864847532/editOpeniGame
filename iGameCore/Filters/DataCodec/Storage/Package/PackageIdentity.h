@@ -1,7 +1,7 @@
 #ifndef DATACODEC_STORAGE_PACKAGE_PACKAGEIDENTITY_H
 #define DATACODEC_STORAGE_PACKAGE_PACKAGEIDENTITY_H
 
-#include "DataCodec/Runtime/Cache/DecodeCacheIdentity.h"
+#include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
 
 #include <algorithm>
 #include <bit>

@@ -2,6 +2,7 @@
 #define DATACODEC_RUNTIME_CACHE_DECODECACHE_DECODEDTOPOLOGYCACHE_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/API/Adapter/IDecodeAdapter.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedIndexCache.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
 #include "DataCodec/Common/DataCodecTypes.h"
@@ -135,6 +136,7 @@ struct DecodedTopologyCache {
     std::shared_ptr<bytestore::IRandomAccessByteStore> cellPolynomialOrders;
     DecodedPolyhedronCache polyhedron;
     bool complete{false};
+    std::weak_ptr<const void> nativeOutputIdentity;
 
     bool InitializeConnectivity(
         const std::size_t cells,
@@ -143,7 +145,8 @@ struct DecodedTopologyCache {
         const bool cellTypesPresent,
         const bool cellPolynomialOrdersPresent,
         bytestore::ByteStoreSession& byteStoreSession,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        IDecodeAdapter* destination = nullptr) {
         Release();
         DecodedConnectivityStorageSize size;
         if (!CalculateDecodedConnectivityStorageSize(cells, connectivityValues, offsetsPresent,
@@ -158,6 +161,22 @@ struct DecodedTopologyCache {
         prepared.hasOffsets = offsetsPresent;
         prepared.hasCellTypes = cellTypesPresent;
         prepared.hasCellPolynomialOrders = cellPolynomialOrdersPresent;
+        if (destination && destination->SupportsConnectivityDecodeStores(cellPolynomialOrdersPresent)) {
+            NativeConnectivityDecodeStores stores;
+            if (!destination->CreateConnectivityDecodeStores(cells, connectivityValues, offsetsPresent,
+                    cellTypesPresent, stores, error)) { return false; }
+            prepared.nativeOutputIdentity = destination->DecodeStorageIdentity();
+            if (prepared.nativeOutputIdentity.expired() || !stores.connectivity || !stores.offsets ||
+                stores.connectivity->ByteSizeHint() != size.connectivity || stores.offsets->ByteSizeHint() != size.offsets ||
+                (cellTypesPresent && (!stores.cellTypes || stores.cellTypes->ByteSizeHint() != size.cellTypes))) {
+                return validation::AssignError(error, "native topology stores do not match output shape");
+            }
+            prepared.connectivity = std::move(stores.connectivity);
+            prepared.offsets = std::move(stores.offsets);
+            prepared.cellTypes = std::move(stores.cellTypes);
+            *this = std::move(prepared);
+            return true;
+        }
         prepared.connectivity = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
             size.connectivity, ::datacodec::MemoryDemandKind::RequiredContinuation, "decoded_topology_connectivity", error);
         if (prepared.connectivity == nullptr) {
@@ -235,6 +254,7 @@ struct DecodedTopologyCache {
         cellTypes.reset();
         cellPolynomialOrders.reset();
         polyhedron.Release();
+        nativeOutputIdentity.reset();
         kind = Kind::None;
         structuredAxisSize = {0, 0, 0};
         cellCount = 0u;
@@ -259,6 +279,7 @@ private:
         cellTypes = std::move(other.cellTypes);
         cellPolynomialOrders = std::move(other.cellPolynomialOrders);
         polyhedron = std::move(other.polyhedron);
+        nativeOutputIdentity = std::move(other.nativeOutputIdentity);
         complete = other.complete;
         other.kind = Kind::None;
         other.structuredAxisSize = {0, 0, 0};

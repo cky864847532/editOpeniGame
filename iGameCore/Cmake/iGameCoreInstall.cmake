@@ -1,5 +1,5 @@
 if (CORE_MODULE_INSTALL AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    install(TARGETS ${MODULE_NAME}
+    install(TARGETS ${MODULE_NAME} DataCodecCore
             EXPORT ${MODULE_NAME}Targets
             ARCHIVE DESTINATION lib
             LIBRARY DESTINATION lib
@@ -338,7 +338,7 @@ if (CORE_MODULE_INSTALL AND CMAKE_BUILD_TYPE STREQUAL "Release")
 
     set(IGAME_SDK_INTERNAL_LIBRARY_NAMES)
     foreach (_IGAME_SDK_LIBRARY_TARGET IN ITEMS
-            libpressio std_compat libzstd_static)
+            DataCodecCore libpressio std_compat libzstd_static)
         if (TARGET ${_IGAME_SDK_LIBRARY_TARGET})
             igame_get_target_output_name(${_IGAME_SDK_LIBRARY_TARGET}
                     _IGAME_SDK_LIBRARY_OUTPUT_NAME)
@@ -358,10 +358,7 @@ if (CORE_MODULE_INSTALL AND CMAKE_BUILD_TYPE STREQUAL "Release")
         endif ()
     endif ()
 
-    set(IGAME_SDK_REQUIRES_THREADS OFF)
-    if (ZSTD_MULTITHREAD_SUPPORT AND UNIX)
-        set(IGAME_SDK_REQUIRES_THREADS ON)
-    endif ()
+    set(IGAME_SDK_REQUIRES_THREADS ON)
 
     # 生成和安装 ${MODULE_NAME}Config.cmake 文件
     configure_file(Cmake/iGameCoreConfig.cmake.in

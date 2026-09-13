@@ -2,6 +2,7 @@
 #define DATACODEC_RUNTIME_CACHE_DECODECACHE_DECODEDGEOMETRYCACHE_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/API/Adapter/IDecodeAdapter.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
@@ -37,22 +38,29 @@ struct DecodedGeometryCache {
     std::size_t dimension{0u};
     std::shared_ptr<bytestore::IRandomAccessByteStore> bytes;
     bool complete{false};
+    std::weak_ptr<const void> nativeOutputIdentity;
 
     bool Initialize(
         const std::size_t count,
         const std::size_t pointDimension,
         bytestore::ByteStoreSession& byteStoreSession,
-        std::string* error = nullptr) {
+        std::string* error = nullptr,
+        IDecodeAdapter* destination = nullptr) {
         Release();
         std::uint64_t byteCount = 0u;
         if (!CalculateGeometryCacheBytes(count, pointDimension, byteCount, error)) {
             return false;
         }
-        bytes = byteStoreSession.CreateSizedStore(
-            bytestore::ByteStorePurpose::Ranged,
-            byteCount, ::datacodec::MemoryDemandKind::RequiredContinuation,
-            "decoded_geometry",
-            error);
+        if (destination && destination->SupportsGeometryDecodeStore()) {
+            bytes = destination->CreateGeometryDecodeStore(count, pointDimension, error);
+            nativeOutputIdentity = destination->DecodeStorageIdentity();
+            if (nativeOutputIdentity.expired() || !bytes || bytes->ByteSizeHint() != byteCount) {
+                return validation::AssignError(error, "native geometry store does not match output shape");
+            }
+        } else {
+            bytes = byteStoreSession.CreateSizedStore(bytestore::ByteStorePurpose::Ranged,
+                byteCount, MemoryDemandKind::RequiredContinuation, "decoded_geometry", error);
+        }
         if (bytes == nullptr) {
             return false;
         }
@@ -63,6 +71,7 @@ struct DecodedGeometryCache {
 
     void Release() noexcept {
         bytes.reset();
+        nativeOutputIdentity.reset();
         pointCount = 0u;
         dimension = 0u;
         complete = false;
@@ -73,6 +82,7 @@ private:
         pointCount = other.pointCount;
         dimension = other.dimension;
         bytes = std::move(other.bytes);
+        nativeOutputIdentity = std::move(other.nativeOutputIdentity);
         complete = other.complete;
         other.pointCount = 0u;
         other.dimension = 0u;

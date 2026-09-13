@@ -172,7 +172,7 @@ int resolveToolbarIconSizeForWidget(const QWidget* widget) {
     return resolveToolbarIconSize(availableWidth, dpiScale);
 }
 
-constexpr int kDataCodecCompressionDialogBaseWidth = 1034;
+constexpr int kDataCodecCompressionDialogBaseWidth = 1254;
 constexpr int kDataCodecCompressionDialogBaseHeight = 880;
 constexpr int kDataCodecCompressionContentBaseHeight = 840;
 
@@ -2012,8 +2012,8 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
             dialog->setMaximizeEnabled(false);
             dialog->setOpaqueShell(true);
             dialog->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-            dialog->setMinimumSize(460, 440);
-            dialog->resize(520, 500);
+            dialog->setMinimumSize(480, 0);
+            dialog->resize(520, 320);
 
             auto* panel = new QWidget(dialog->contentHost());
             panel->setObjectName(QStringLiteral("DataCodecDecodeSettingsPanel"));
@@ -2029,7 +2029,7 @@ QLabel, QCheckBox {
     color: #d4d4d4;
     font-size: 12px;
 }
-QComboBox, QSpinBox, QDoubleSpinBox {
+QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit#DataCodecDecodeCheckPath {
     min-height: 28px;
     max-height: 28px;
     background: #1e1e1e;
@@ -2039,7 +2039,7 @@ QComboBox, QSpinBox, QDoubleSpinBox {
     padding: 0 8px;
     font-size: 12px;
 }
-QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit#DataCodecDecodeCheckPath:focus {
     border-color: #26a29c;
 }
 QComboBox::drop-down {
@@ -2082,19 +2082,26 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
             auto* layout = new QFormLayout(panel);
             layout->setContentsMargins(16, 12, 16, 12);
             layout->setHorizontalSpacing(12);
-            layout->setVerticalSpacing(10);
+            layout->setVerticalSpacing(12);
+            layout->setFormAlignment(Qt::AlignTop);
             resourceControls = new igQtDataCodecResourceControls(panel);
+            auto* resourceForm = qobject_cast<QFormLayout*>(resourceControls->layout());
+            resourceForm->setHorizontalSpacing(12);
+            resourceForm->setVerticalSpacing(8);
             auto* fileRow = new QWidget(panel);
             auto* fileLayout = new QHBoxLayout(fileRow);
             fileLayout->setContentsMargins(0, 0, 0, 0);
+            fileLayout->setSpacing(6);
             auto* checkPath = new QLineEdit(fileRow);
             checkPath->setObjectName(QStringLiteral("DataCodecDecodeCheckPath"));
             checkPath->setReadOnly(true);
-            checkPath->setPlaceholderText(QStringLiteral("选择待解压 IGC 以检查容量"));
+            checkPath->setPlaceholderText(QStringLiteral("选择 IGC 文件"));
+            checkPath->setToolTip(QStringLiteral("选择待解压 IGC 文件进行容量检查"));
+            checkPath->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
             auto* chooseCheckFile = new QPushButton(QStringLiteral("选择文件…"), fileRow);
             fileLayout->addWidget(checkPath, 1);
             fileLayout->addWidget(chooseCheckFile);
-            layout->addRow(QStringLiteral("容量检查文件"), fileRow);
+            resourceForm->insertRow(0, QStringLiteral("容量检查文件"), fileRow);
 
             onDemandAttributes = new QCheckBox(
                 QStringLiteral("按需解压属性场"),
@@ -2113,19 +2120,43 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
                 QStringLiteral("在 IGC 文件所在目录创建解码日志目录"));
 
             layout->addRow(resourceControls);
-            layout->addRow(QString(), onDemandAttributes);
-            layout->addRow(QString(), decodedResultCache);
-            layout->addRow(QString(), outputDecodeLogFile);
-            // 提示统一放在设置窗口下方，文件选择只用于检查，不启动读取模型
-            resourceControls->layout()->removeWidget(resourceControls->StorageStatusLabel());
-            layout->addRow(resourceControls->StorageStatusLabel());
+            auto* options = new QHBoxLayout;
+            options->setSpacing(12);
+            options->addWidget(onDemandAttributes);
+            options->addWidget(decodedResultCache);
+            options->addWidget(outputDecodeLogFile);
+            options->addStretch();
+            layout->addRow(options);
+            // 状态区按需出现，长文本滚动查看，窗口高度跟随当前可见内容
+            auto* statusLabel = resourceControls->StorageStatusLabel();
+            resourceForm->removeWidget(statusLabel);
+            statusLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+            auto* statusArea = new QScrollArea(panel);
+            statusArea->setFrameShape(QFrame::NoFrame);
+            statusArea->setWidgetResizable(true);
+            statusArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+            statusArea->setWidget(statusLabel);
+            statusArea->hide();
+            layout->addRow(statusArea);
+            const auto fitDialog = [panel, statusArea, statusLabel] {
+                QTimer::singleShot(0, panel, [panel, statusArea, statusLabel] {
+                    panel->layout()->activate();
+                    const int lineHeight = statusLabel->fontMetrics().lineSpacing();
+                    const int textWidth = std::max(1, panel->width() - 32);
+                    const int textHeight = statusLabel->heightForWidth(textWidth);
+                    statusArea->setFixedHeight(std::clamp(textHeight, lineHeight, lineHeight * 4));
+                    dialog->layout()->activate();
+                    dialog->resize(dialog->width(), dialog->minimumSizeHint().height());
+                });
+            };
+            resourceControls->OnChanged(fitDialog);
             resourceControls->SetStorageAnalyzer([checkPath] {
                 const auto path = checkPath->text();
                 const bool allAttributes = !onDemandAttributes->isChecked();
                 const bool required = !::datacodec::ProbeResources().externalSpillAvailable;
                 return [path, allAttributes, required](std::stop_token stop) {
                     if (path.isEmpty()) { return igQtDataCodecResourceControls::StorageCheck{
-                        .detail = QStringLiteral("尚未检查容量：请选择待解压 IGC 文件；当前设置也可保存供后续文件使用")}; }
+                        .messageId = iGame::iGameDataCodecHostMessageId::DecodeStorageSelectFile}; }
                     const auto result = iGame::IGDCReader::AnalyzeFileStorage(
                         std::filesystem::u8path(path.toUtf8().toStdString()), allAttributes, stop);
                     return igQtDataCodecResourceControls::StorageCheck{
@@ -2135,22 +2166,20 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
                         .requiredMinimumBytes = result.success ? std::optional<std::uint64_t>(
                             result.peakBytesByKind[static_cast<std::size_t>(::datacodec::DecodeStorageKind::StageWork)] +
                             result.peakBytesByKind[static_cast<std::size_t>(::datacodec::DecodeStorageKind::BlockWork)]) : std::nullopt,
-                        .detail = result.success
-                            ? ((allAttributes ? QStringLiteral("范围：所选文件及依赖帧的完整属性解码，关闭可选缓存")
-                                              : QStringLiteral("范围：所选文件及依赖帧的首次载入；后续按需属性另行申请容量")) +
-                               QStringLiteral("\n必要下界只计确定并存的内存工作区，达到下界仍需在执行时检查其他申请"))
-                            : QStringLiteral("容量检查未完成：%1").arg(result.failure
-                                ? QString::fromStdString(::datacodec::FormatCodecFailure(*result.failure)) : QStringLiteral("未取得分析结果"))};
+                        .messageId = result.success
+                            ? (allAttributes ? iGame::iGameDataCodecHostMessageId::DecodeStorageAllScope
+                                             : iGame::iGameDataCodecHostMessageId::DecodeStorageInitialScope)
+                            : iGame::iGameDataCodecHostMessageId::StorageCheckFailed,
+                        .technicalDetail = result.failure
+                            ? QString::fromStdString(::datacodec::FormatCodecFailure(*result.failure)) : QString{}};
                 };
             });
-            resourceControls->OnStorageStatus([](const QString& text, bool warning) {
-                if (text.isEmpty()) { return; }
+            resourceControls->OnStorageStatus([statusArea, fitDialog](const ::datacodec::DataCodecStatusRecord& status) {
+                statusArea->setVisible(!status.text.empty());
+                fitDialog();
+                if (status.text.empty()) { return; }
                 iGame::iGameSpdlogDataCodecConsoleSink sink;
-                sink.SubmitConsoleStatus(::datacodec::DataCodecStatusRecord{
-                    .severity = warning ? ::datacodec::DataCodecStatusSeverity::Warning : ::datacodec::DataCodecStatusSeverity::Info,
-                    .language = ::datacodec::DataCodecLanguage::SimplifiedChinese,
-                    .text = text.toUtf8().toStdString(),
-                });
+                sink.SubmitConsoleStatus(status);
             });
             connect(chooseCheckFile, &QPushButton::clicked, panel, [checkPath] {
                 const auto path = QFileDialog::getOpenFileName(dialog, QStringLiteral("选择容量检查文件"),
@@ -2193,6 +2222,8 @@ QPushButton#DataCodecDecodeSettingsPrimaryButton:hover {
         outputDecodeLogFile->setChecked(settings.outputDecodeLogFile);
         resourceControls->CheckStorage();
         showSynchronizedToolWindow(dialog);
+        dialog->layout()->activate();
+        dialog->resize(dialog->width(), dialog->minimumSizeHint().height());
     });
 
     QAction* dataCodecCompressionAction = ui->menu_DataAnalysis->addAction(QStringLiteral("数据压缩"));

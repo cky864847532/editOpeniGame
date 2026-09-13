@@ -726,7 +726,7 @@ igQtDataCodecCompressionWidget::FieldState::FieldState() : features(3) {}
 igQtDataCodecCompressionWidget::igQtDataCodecCompressionWidget(QWidget* parent) : QWidget(parent) {
     setObjectName(QStringLiteral("DataCodecCompressionWidget"));
     setAttribute(Qt::WA_StyledBackground, true);
-    setMinimumSize(940, 840);
+    setMinimumSize(1160, 840);
 
     auto* root = new QVBoxLayout(this);
     root->setContentsMargins(0, 0, 0, 0);
@@ -738,7 +738,7 @@ igQtDataCodecCompressionWidget::igQtDataCodecCompressionWidget(QWidget* parent) 
     bodyLayout->setSpacing(14);
 
     auto* leftColumn = new QWidget(body);
-    leftColumn->setFixedWidth(300);
+    leftColumn->setFixedWidth(520);
     auto* leftLayout = new QVBoxLayout(leftColumn);
     leftLayout->setContentsMargins(0, 0, 0, 0);
     leftLayout->setSpacing(12);
@@ -804,9 +804,10 @@ bool igQtDataCodecCompressionWidget::eventFilter(QObject* watched, QEvent* event
 QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     auto* panel = new QFrame(this);
     panel->setObjectName(QStringLiteral("DataCodecPanel"));
+    panel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
     auto* layout = new QVBoxLayout(panel);
     layout->setContentsMargins(10, 10, 10, 10);
-    layout->setSpacing(10);
+    layout->setSpacing(8);
 
     auto* titleRow = new QHBoxLayout;
     auto* title = new QLabel(QStringLiteral("输出"), panel);
@@ -817,10 +818,10 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
 
     auto* outputLabel = new QLabel(QStringLiteral("输出文件"), panel);
     outputLabel->setObjectName(QStringLiteral("DataCodecLabel"));
-    layout->addWidget(outputLabel);
 
     auto* pathRow = new QHBoxLayout;
     pathRow->setSpacing(6);
+    pathRow->addWidget(outputLabel);
     m_outputPathEdit = new QLineEdit(panel);
     m_outputPathEdit->setObjectName(QStringLiteral("DataCodecEncodeOutputPath"));
     m_outputPathEdit->setReadOnly(true);
@@ -832,13 +833,30 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     pathRow->addWidget(m_outputPathButton, 0);
     layout->addLayout(pathRow);
 
+    auto* settingsRow = new QHBoxLayout;
+    settingsRow->setSpacing(16);
+    auto* resourceColumn = new QVBoxLayout;
+    resourceColumn->setSpacing(8);
+    auto* resourceLabel = new QLabel(QStringLiteral("资源控制"), panel);
+    resourceLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
+    resourceColumn->addWidget(resourceLabel);
     m_resourceControls = new igQtDataCodecResourceControls(panel);
-    layout->addWidget(m_resourceControls);
+    resourceColumn->addWidget(m_resourceControls);
+    resourceColumn->addStretch();
+    settingsRow->addLayout(resourceColumn, 3);
+
+    auto* compressionColumn = new QVBoxLayout;
+    compressionColumn->setSpacing(8);
+    auto* compressionLabel = new QLabel(QStringLiteral("压缩设置"), panel);
+    compressionLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
+    compressionColumn->addWidget(compressionLabel);
+    settingsRow->addLayout(compressionColumn, 2);
+    layout->addLayout(settingsRow);
 
     m_compressionEnhancementCheck = new QCheckBox(QStringLiteral("压缩率增强"), panel);
     m_compressionEnhancementCheck->setToolTip(
         QStringLiteral("启用单元重排与扩展预测搜索以提高压缩率，不改变 ZSTD压缩等级与资源模式"));
-    layout->addWidget(m_compressionEnhancementCheck);
+    compressionColumn->addWidget(m_compressionEnhancementCheck);
 
     auto* zstdRow = new QHBoxLayout;
     auto* zstdLabel = new QLabel(QStringLiteral("ZSTD压缩等级"), panel);
@@ -847,7 +865,7 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     m_zstdLevelSpin->setRange(1, 22);
     zstdRow->addWidget(zstdLabel, 1);
     zstdRow->addWidget(m_zstdLevelSpin, 0);
-    layout->addLayout(zstdRow);
+    compressionColumn->addLayout(zstdRow);
 
     m_gopControlRow = new QWidget(panel);
     auto* gopRow = new QHBoxLayout(m_gopControlRow);
@@ -860,11 +878,11 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
         QStringLiteral("每隔指定数量的帧写入一个关键帧"));
     gopRow->addWidget(gopLabel, 1);
     gopRow->addWidget(m_gopFrameCountSpin, 0);
-    layout->addWidget(m_gopControlRow);
+    compressionColumn->addWidget(m_gopControlRow);
 
     auto* batchLabel = new QLabel(QStringLiteral("批量设置"), panel);
     batchLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
-    layout->addWidget(batchLabel);
+    compressionColumn->addWidget(batchLabel);
 
     m_applyLosslessAllButton = new QPushButton(QStringLiteral("全部无损"), panel);
     m_applyLossyAllButton = new QPushButton(QStringLiteral("全部有损"), panel);
@@ -874,20 +892,27 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     batchModeRow->setSpacing(6);
     batchModeRow->addWidget(m_applyLosslessAllButton);
     batchModeRow->addWidget(m_applyLossyAllButton);
-    layout->addLayout(batchModeRow);
-    layout->addWidget(m_syncDefaultPrecisionButton);
-    layout->addSpacing(2);
+    compressionColumn->addLayout(batchModeRow);
+    compressionColumn->addWidget(m_syncDefaultPrecisionButton);
+    compressionColumn->addSpacing(2);
 
     auto* predictionLabel = new QLabel(QStringLiteral("预测编码"), panel);
     predictionLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
-    layout->addWidget(predictionLabel);
+    compressionColumn->addWidget(predictionLabel);
 
     m_intraAttributePredictionCheck = new QCheckBox(QStringLiteral("帧内数据预测编码"), panel);
     m_temporalAttributePredictionCheck = new QCheckBox(QStringLiteral("帧间数据预测编码"), panel);
     m_intraAttributePredictionCheck->setChecked(true);
     m_temporalAttributePredictionCheck->setChecked(true);
-    layout->addWidget(m_intraAttributePredictionCheck);
-    layout->addWidget(m_temporalAttributePredictionCheck);
+    compressionColumn->addWidget(m_intraAttributePredictionCheck);
+    compressionColumn->addWidget(m_temporalAttributePredictionCheck);
+    compressionColumn->addStretch();
+
+    // 容量提示横跨两列，为完整说明保留换行空间
+    auto* storageStatus = m_resourceControls->StorageStatusLabel();
+    m_resourceControls->layout()->removeWidget(storageStatus);
+    storageStatus->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Minimum);
+    layout->addWidget(storageStatus);
 
     connect(m_outputPathButton, &QPushButton::clicked, this, &igQtDataCodecCompressionWidget::chooseOutputPath);
     connect(m_outputPathEdit, &QLineEdit::textChanged, this, &igQtDataCodecCompressionWidget::refreshFeatureState);
@@ -924,7 +949,7 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
         const auto data = m_model ? m_model->GetDataObject() : nullptr;
         if (!data || !hasSelectedFields()) {
             return [](std::stop_token) { return igQtDataCodecResourceControls::StorageCheck{
-                .detail = QStringLiteral("选择待压缩数据和属性场后检查容量")}; };
+                .messageId = iGame::iGameDataCodecHostMessageId::EncodeStorageSelectInput}; };
         }
         auto writer = iGame::IGDCWriter::New();
         writer->SetAttributeTargets(selectedAttributeTargets());
@@ -937,15 +962,14 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
             const auto result = writer->AnalyzeStorage(data);
             return igQtDataCodecResourceControls::StorageCheck{
                 .minimumBytes = result.success ? result.provenLowerBoundBytes : std::nullopt,
-                .detail = result.success
-                    ? QStringLiteral("此值为已证明的必要下界；未载入的时序帧和依赖数据内容的占用仍需执行时检查")
-                    : QStringLiteral("容量检查未完成：%1").arg(result.failure
-                        ? QString::fromStdString(::datacodec::FormatCodecFailure(*result.failure)) : QStringLiteral("未取得分析结果"))};
+                .messageId = result.success ? iGame::iGameDataCodecHostMessageId::EncodeStorageCheckScope
+                    : iGame::iGameDataCodecHostMessageId::StorageCheckFailed,
+                .technicalDetail = result.failure
+                    ? QString::fromStdString(::datacodec::FormatCodecFailure(*result.failure)) : QString{}};
         };
     });
-    m_resourceControls->OnStorageStatus([this](const QString& text, bool warning) {
-        if (!text.isEmpty()) { publishStatus(text, warning ? ::datacodec::DataCodecStatusSeverity::Warning
-            : ::datacodec::DataCodecStatusSeverity::Info); }
+    m_resourceControls->OnStorageStatus([this](const ::datacodec::DataCodecStatusRecord& status) {
+        if (!status.text.empty()) { publishStatus(status); }
     });
     connect(m_compressionEnhancementCheck, &QCheckBox::toggled, this,
         [this](const bool checked) {
@@ -982,6 +1006,7 @@ QWidget* igQtDataCodecCompressionWidget::createFieldPanel() {
 
     m_fieldList = new QListWidget(panel);
     m_fieldList->setObjectName(QStringLiteral("DataCodecFieldList"));
+    m_fieldList->setMinimumHeight(180);
     m_fieldList->setSelectionMode(QAbstractItemView::SingleSelection);
     m_fieldList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_fieldList->setTextElideMode(Qt::ElideNone);
@@ -2183,12 +2208,21 @@ void igQtDataCodecCompressionWidget::appendLog(
     }
 }
 
+void igQtDataCodecCompressionWidget::SetDataCodecLanguage(const ::datacodec::DataCodecLanguage language) {
+    m_dataCodecLanguage = language;
+    if (m_resourceControls) { m_resourceControls->SetLanguage(language); }
+}
+
+void igQtDataCodecCompressionWidget::publishStatus(const ::datacodec::DataCodecStatusRecord& status) {
+    appendLog(QString::fromStdString(::datacodec::FormatDataCodecStatusText(status)));
+    iGame::iGameSpdlogDataCodecConsoleSink console;
+    console.SubmitConsoleStatus(status);
+}
+
 void igQtDataCodecCompressionWidget::publishStatus(
         const QString& text,
         const ::datacodec::DataCodecStatusSeverity severity) {
-    appendLog(text);
-    iGame::iGameSpdlogDataCodecConsoleSink console;
-    console.SubmitConsoleStatus(::datacodec::DataCodecStatusRecord{
+    publishStatus(::datacodec::DataCodecStatusRecord{
         .severity = severity,
         .language = m_dataCodecLanguage,
         .text = toUtf8StdString(text),
@@ -2415,8 +2449,9 @@ void igQtDataCodecCompressionWidget::startEncode() {
             ::datacodec::RunCollectionKind::MemoryTrace);
         try { telemetryCapture.CaptureRemapOrders(); }
         catch (...) {
-            publishStatus(QStringLiteral("无法准备精度分析所需的重排记录，编码未启动"),
-                ::datacodec::DataCodecStatusSeverity::Error);
+            publishStatus(iGame::iGameDataCodecHostStatus(m_dataCodecLanguage,
+                iGame::iGameDataCodecHostMessageId::PrecisionRemapPreparationFailed, {},
+                ::datacodec::DataCodecStatusSeverity::Error));
             return;
         }
     }
@@ -2848,7 +2883,8 @@ void igQtDataCodecCompressionWidget::startEncode() {
                     {{"path", toUtf8StdString(writtenPaths.back())}}));
             }
             if (writer->DiagnosticsIncomplete() || telemetryCapture.DiagnosticsIncomplete()) {
-                messages.push_back(QStringLiteral("编码输出已生成，部分诊断或报告未能完整导出"));
+                messages.push_back(dataCodecHostLogText(logLanguage,
+                    iGame::iGameDataCodecHostMessageId::EncodeDiagnosticsIncomplete));
             }
             complete(std::move(messages));
         } catch (const std::exception& exception) {

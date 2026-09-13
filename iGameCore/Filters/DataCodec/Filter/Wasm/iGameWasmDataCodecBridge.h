@@ -2,10 +2,10 @@
 #define iGameWasmDataCodecBridge_h
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
-#include "DataCodec/Runtime/Cache/EncodedInputTypes.h"
+#include "DataCodec/API/Adapter/EncodedInputTypes.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
 #include "DataCodec/Filter/Adapter/iGamePreparedSurfaceDecodeAdapter.h"
-#include "DataCodec/Runtime/Cache/DecodedFrameLruCache.h"
+#include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 
 #include <cstdint>
 #include <functional>

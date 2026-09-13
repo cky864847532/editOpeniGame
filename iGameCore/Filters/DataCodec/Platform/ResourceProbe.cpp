@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #elif defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
 #include <emscripten/heap.h>
 #include <emscripten/threading.h>
 #endif
@@ -155,6 +156,20 @@ void ProbeCgroups(ResourceSample& sample) {
 
 }
 
+bool ResourceWaitRequiresEventLoop() noexcept {
+#if defined(__EMSCRIPTEN__)
+    return emscripten_is_main_browser_thread();
+#else
+    return false;
+#endif
+}
+
+void YieldResourceWaitToEventLoop() {
+#if defined(__EMSCRIPTEN__)
+    emscripten_sleep(0);
+#endif
+}
+
 ResourceSample ProbeResources() {
     ResourceSample result;
     const auto hardware = std::thread::hardware_concurrency();
@@ -262,10 +277,13 @@ ResourceSample ProbeResources() {
     result.addressSpaceLimitBytes = result.hardLimitBytes;
     const auto logicalCores = emscripten_num_logical_cores();
     if (logicalCores > 0) { result.allowedComputeThreads = static_cast<std::size_t>(logicalCores); }
-#if defined(DATACODEC_RUNTIME_THREAD_LIMIT)
+#if defined(DATACODEC_RUNTIME_THREAD_LIMIT) && DATACODEC_RUNTIME_THREAD_LIMIT > 0
     result.runtimeThreadLimit = static_cast<std::size_t>(DATACODEC_RUNTIME_THREAD_LIMIT);
-    result.reservedHostThreads = 1u;
+#else
+    // 线程池布局由同一个 WASM 构建契约提供
+    result.runtimeThreadLimit = result.allowedComputeThreads.value_or(1u) + DATACODEC_WASM_POOL_OVERHEAD;
 #endif
+    result.reservedHostThreads = DATACODEC_WASM_HOST_THREADS;
 #if !defined(__EMSCRIPTEN_PTHREADS__)
     result.threaded = false;
     result.allowedComputeThreads = 1u;

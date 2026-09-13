@@ -17,12 +17,32 @@ namespace bytestore {
 class IRandomAccessByteStore;
 }
 
+struct NativeConnectivityDecodeStores {
+    std::shared_ptr<bytestore::IRandomAccessByteStore> connectivity;
+    std::shared_ptr<bytestore::IRandomAccessByteStore> offsets;
+    std::shared_ptr<bytestore::IRandomAccessByteStore> cellTypes;
+};
+
 struct IDecodeAdapter : public ICellTypeMapping {
     virtual ~IDecodeAdapter() = default;
 
     // 创建或切换目标原生网格对象类型
     // 解码流水线会先调用它，再填充几何、拓扑和属性
     virtual bool SetMeshType(MeshType type, std::string* error = nullptr) = 0;
+    // 标识本次输出，跨请求 reference 不能作为当前输出直接发布
+    // 身份在本次组装期间保持稳定，新输出必须使用新身份，共享存储以 shared_ptr 保留 owner
+    [[nodiscard]] virtual std::shared_ptr<const void> DecodeStorageIdentity() const noexcept { return {}; }
+    // 原生存储为可选能力，未声明支持时使用 Begin/WriteRange/End 交付
+    // 声明支持后创建失败即为请求失败，创建者完成对应 Begin 初始化
+    // 返回的 store 必须保持原生数组存活，满足 ByteStoreInterface 的并发写入和 Seal 契约
+    // 核心完成写入后调用 EndPoints/EndTopology/EndAttribute 发布已有数组
+    // Commit 发布对象，Abort 丢弃未提交状态，共享存储在最后一个持有者释放时销毁
+    [[nodiscard]] virtual bool SupportsGeometryDecodeStore() const noexcept { return false; }
+    virtual std::shared_ptr<bytestore::IRandomAccessByteStore> CreateGeometryDecodeStore(
+        std::size_t count, std::size_t dimension, std::string* error) { return {}; }
+    [[nodiscard]] virtual bool SupportsConnectivityDecodeStores(bool polynomialOrders) const noexcept { return false; }
+    virtual bool CreateConnectivityDecodeStores(std::size_t cells, std::size_t values, bool hasOffsets, bool hasTypes,
+        NativeConnectivityDecodeStores& stores, std::string* error) { return false; }
     // 开始按 range 写入点坐标
     virtual bool BeginPoints(std::size_t count, std::size_t dimension, std::string* error = nullptr) = 0;
     // 写入一段点坐标
@@ -137,6 +157,7 @@ struct IDecodeAdapter : public ICellTypeMapping {
         return nullptr;
     }
     // 结束属性写入并挂接到目标对象
+    // 原生属性存储已完成写入时仅发布已有数组，不在此重新创建完整数值缓冲
     virtual bool EndAttribute(std::size_t attrIndex, std::string* error = nullptr) = 0;
     // 仅返回显式接入数组的确定容量取样，未知宿主存储不纳入
     [[nodiscard]] virtual std::span<const BufferCapacitySample> CapacitySamples() const noexcept { return {}; }

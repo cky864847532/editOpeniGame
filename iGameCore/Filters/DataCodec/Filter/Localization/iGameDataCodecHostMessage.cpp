@@ -128,6 +128,46 @@ std::string_view EnglishMessage(const iGameDataCodecHostMessageId id) noexcept {
             return "Decompression time: {milliseconds} ms";
         case iGameDataCodecHostMessageId::WriteDecodeTelemetryFailed:
             return "Failed to write decode telemetry data: {detail}";
+        case iGameDataCodecHostMessageId::StorageCheckUpdating:
+            return "Updating the capacity check…";
+        case iGameDataCodecHostMessageId::StorageCheckRunning:
+            return "Checking memory capacity…";
+        case iGameDataCodecHostMessageId::StorageCheckUnavailable:
+            return "No capacity check result is available yet";
+        case iGameDataCodecHostMessageId::StorageCheckFailed:
+            return "The capacity check did not complete";
+        case iGameDataCodecHostMessageId::StorageLimitInsufficient:
+            return "The memory limit is insufficient: set at least {mib} MiB ({bytes} bytes), or select unlimited memory";
+        case iGameDataCodecHostMessageId::StorageSpillRequired:
+            return "In-memory decoding requires at least {mib} MiB ({bytes} bytes); the current limit requires temporary file storage and allows continuation";
+        case iGameDataCodecHostMessageId::StorageLimitSufficient:
+            return "The current limit meets the known capacity threshold: {mib} MiB ({bytes} bytes)";
+        case iGameDataCodecHostMessageId::EncodeStorageSelectInput:
+            return "Select the input data and attribute fields before checking capacity";
+        case iGameDataCodecHostMessageId::EncodeStorageCheckScope:
+            return "This is a proven necessary lower bound; unloaded time-series frames and content-dependent allocations require runtime checks";
+        case iGameDataCodecHostMessageId::DecodeStorageSelectFile:
+            return "Capacity has not been checked: select an IGC file to decode; these settings can also be saved for subsequent files";
+        case iGameDataCodecHostMessageId::DecodeStorageAllScope:
+            return "Scope: decode all attributes of the selected file and dependency frames, with optional caches disabled\nThe necessary lower bound includes only known concurrent memory workspaces; other allocations require runtime checks";
+        case iGameDataCodecHostMessageId::DecodeStorageInitialScope:
+            return "Scope: initial loading of the selected file and dependency frames; on-demand attributes request capacity separately\nThe necessary lower bound includes only known concurrent memory workspaces; other allocations require runtime checks";
+        case iGameDataCodecHostMessageId::PrecisionRemapPreparationFailed:
+            return "Cannot prepare remap records for precision analysis; encoding has not started";
+        case iGameDataCodecHostMessageId::EncodeDiagnosticsIncomplete:
+            return "Encoded output was generated; some diagnostics or reports could not be fully exported";
+        case iGameDataCodecHostMessageId::ResourceConfigurationFailed:
+            return "Failed to configure DataCodec resources";
+        case iGameDataCodecHostMessageId::DeviceComputeThreadsUnavailable:
+            return "A valid device compute thread count is unavailable";
+        case iGameDataCodecHostMessageId::UnlimitedMemoryFixedThreads:
+            return "Unlimited memory; fixed compute thread count: {threads}";
+        case iGameDataCodecHostMessageId::WaitBeforeDecode:
+            return "Wait for the current task to finish before decoding";
+        case iGameDataCodecHostMessageId::WaitBeforeLoad:
+            return "Wait for the current task to finish before loading a file";
+        case iGameDataCodecHostMessageId::WaitBeforeFileSelection:
+            return "Wait for the current task to finish before selecting another file";
     }
     return {};
 }
@@ -257,6 +297,46 @@ std::string_view SimplifiedChineseMessage(
             return "解压时间：{milliseconds} ms";
         case iGameDataCodecHostMessageId::WriteDecodeTelemetryFailed:
             return "无法写出解码检测数据：{detail}";
+        case iGameDataCodecHostMessageId::StorageCheckUpdating:
+            return "正在更新容量检查…";
+        case iGameDataCodecHostMessageId::StorageCheckRunning:
+            return "正在检查内存容量…";
+        case iGameDataCodecHostMessageId::StorageCheckUnavailable:
+            return "尚未取得可用的容量检查结果";
+        case iGameDataCodecHostMessageId::StorageCheckFailed:
+            return "容量检查未完成";
+        case iGameDataCodecHostMessageId::StorageLimitInsufficient:
+            return "内存上限不足：至少设置 {mib} MiB（{bytes} 字节），或选择内存不设上限";
+        case iGameDataCodecHostMessageId::StorageSpillRequired:
+            return "全内存解码至少需要 {mib} MiB（{bytes} 字节）；当前额度将依赖临时文件存储，可继续操作";
+        case iGameDataCodecHostMessageId::StorageLimitSufficient:
+            return "当前额度未低于已知容量门槛：{mib} MiB（{bytes} 字节）";
+        case iGameDataCodecHostMessageId::EncodeStorageSelectInput:
+            return "选择待压缩数据和属性场后检查容量";
+        case iGameDataCodecHostMessageId::EncodeStorageCheckScope:
+            return "此值为已证明的必要下界；未载入的时序帧和依赖数据内容的占用仍需执行时检查";
+        case iGameDataCodecHostMessageId::DecodeStorageSelectFile:
+            return "尚未检查容量：请选择待解压 IGC 文件；当前设置也可保存供后续文件使用";
+        case iGameDataCodecHostMessageId::DecodeStorageAllScope:
+            return "范围：所选文件及依赖帧的完整属性解码，关闭可选缓存\n必要下界只计确定并存的内存工作区，达到下界仍需在执行时检查其他申请";
+        case iGameDataCodecHostMessageId::DecodeStorageInitialScope:
+            return "范围：所选文件及依赖帧的首次载入；后续按需属性另行申请容量\n必要下界只计确定并存的内存工作区，达到下界仍需在执行时检查其他申请";
+        case iGameDataCodecHostMessageId::PrecisionRemapPreparationFailed:
+            return "无法准备精度分析所需的重排记录，编码未启动";
+        case iGameDataCodecHostMessageId::EncodeDiagnosticsIncomplete:
+            return "编码输出已生成，部分诊断或报告未能完整导出";
+        case iGameDataCodecHostMessageId::ResourceConfigurationFailed:
+            return "DataCodec 资源配置失败";
+        case iGameDataCodecHostMessageId::DeviceComputeThreadsUnavailable:
+            return "未取得有效的设备计算线程数";
+        case iGameDataCodecHostMessageId::UnlimitedMemoryFixedThreads:
+            return "内存不设上限，固定计算线程={threads}";
+        case iGameDataCodecHostMessageId::WaitBeforeDecode:
+            return "请等待当前任务完成后再解压";
+        case iGameDataCodecHostMessageId::WaitBeforeLoad:
+            return "请等待当前任务完成后再载入文件";
+        case iGameDataCodecHostMessageId::WaitBeforeFileSelection:
+            return "请等待当前任务完成后重新选择文件";
     }
     return {};
 }
@@ -279,6 +359,20 @@ std::string iGameDataCodecHostMessage(
         }
     }
     return result;
+}
+
+::datacodec::DataCodecStatusRecord iGameDataCodecHostStatus(
+    const ::datacodec::DataCodecLanguage language,
+    const iGameDataCodecHostMessageId id,
+    const std::initializer_list<iGameDataCodecHostMessageArgument> arguments,
+    const ::datacodec::DataCodecStatusSeverity severity,
+    std::string technicalDetail) {
+    return {
+        .severity = severity,
+        .language = language,
+        .text = iGameDataCodecHostMessage(language, id, arguments),
+        .technicalDetail = std::move(technicalDetail),
+    };
 }
 
 IGAME_NAMESPACE_END

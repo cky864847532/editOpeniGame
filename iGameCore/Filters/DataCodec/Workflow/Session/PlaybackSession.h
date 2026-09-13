@@ -4,7 +4,7 @@
 #include "DataCodec/API/Adapter/IDecodedFrameAssembly.h"
 #include "DataCodec/API/Adapter/IDecodedFrameAttributeAccess.h"
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
-#include "DataCodec/Runtime/Cache/EncodedInputTypes.h"
+#include "DataCodec/API/Adapter/EncodedInputTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"

@@ -2,7 +2,8 @@
 #define iGameDataCodeciGameDecodeAdapter_h
 
 #include "DataCodec/API/Adapter/IDecodeAdapter.h"
-#include "DataCodec/Storage/ByteStore/ByteStore.h"
+#include "DataCodec/Storage/ByteStore/ByteStoreInterface.h"
+#include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
 #include "DataCodec/Filter/Adapter/iGameCellTypeMapping.h"
 #include "DataCodec/Common/Views/TopologyViews.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
@@ -56,10 +57,45 @@ public:
     // 为解码后的 mesh type 创建目标原生网格对象
     bool SetMeshType(MeshType type, std::string* error = nullptr) override {
         ReleaseOutputState();
+        m_decodeStorageIdentity = std::make_shared<unsigned char>(0u);
         m_meshType = type;
         m_output = DataObject::CreateDataObject(ToNativeMeshType(type));
         if (m_output == nullptr) {
             return Fail(error, "failed to create iGame output object");
+        }
+        return true;
+    }
+
+    std::shared_ptr<const void> DecodeStorageIdentity() const noexcept override { return m_decodeStorageIdentity; }
+    bool SupportsGeometryDecodeStore() const noexcept override { return true; }
+    std::shared_ptr<::datacodec::bytestore::IRandomAccessByteStore> CreateGeometryDecodeStore(
+        std::size_t count, std::size_t dimension, std::string* error) override {
+        std::size_t values{}, bytes{};
+        if (!::datacodec::validation::CheckedMulSizeT(count, dimension, values, "native points", error) ||
+            !::datacodec::validation::CheckedMulSizeT(values, sizeof(float), bytes, "native point bytes", error) ||
+            !BeginPoints(count, dimension, error)) { return {}; }
+        return std::make_shared<NativeArrayByteStore>(m_pendingPoints,
+            std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(m_pendingPoints->RawPointer()), bytes));
+    }
+    bool SupportsConnectivityDecodeStores(bool polynomialOrders) const noexcept override { return !polynomialOrders; }
+    bool CreateConnectivityDecodeStores(std::size_t cells, std::size_t values, bool hasOffsets, bool hasTypes,
+        ::datacodec::NativeConnectivityDecodeStores& stores, std::string* error) override {
+        static_assert(sizeof(igIndex) == sizeof(IndexType));
+        ::datacodec::DecodedConnectivityStorageSize sizes;
+        if (!::datacodec::CalculateDecodedConnectivityStorageSize(cells, values, hasOffsets, hasTypes, false, sizes, error) ||
+            !BeginTopology(cells, values, hasOffsets, error)) { return false; }
+        stores.connectivity = std::make_shared<NativeArrayByteStore>(m_pendingConnectivityIds,
+            std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(m_pendingConnectivityIds->RawPointer()), sizes.connectivity));
+        // 固定单元尺寸路径保留零长 offsets 视图，满足缓存读取契约
+        stores.offsets = std::make_shared<NativeArrayByteStore>(m_pendingOffsets,
+            std::span<std::uint8_t>(hasOffsets ? reinterpret_cast<std::uint8_t*>(m_pendingOffsets->RawPointer()) : nullptr,
+                sizes.offsets));
+        if (hasTypes) {
+            m_cellTypes = UnsignedIntArray::New();
+            m_cellTypes->Resize(cells);
+            stores.cellTypes = std::make_shared<NativeArrayByteStore>(m_cellTypes,
+                std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(m_cellTypes->RawPointer()), sizes.cellTypes));
+            m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(m_nativeResidentBytes, sizes.cellTypes);
         }
         return true;
     }
@@ -554,7 +590,7 @@ public:
             !ResolveMutableArrayBytes(m_pendingAttributes[attrIndex], bytes, error)) {
             return nullptr;
         }
-        return std::make_shared<NativeAttributeByteStore>(
+        return std::make_shared<NativeArrayByteStore>(
             m_pendingAttributes[attrIndex],
             bytes);
     }
@@ -620,12 +656,13 @@ public:
     }
 
 private:
-    class NativeAttributeByteStore final : public ::datacodec::bytestore::IRandomAccessByteStore {
+    class NativeArrayByteStore final : public ::datacodec::bytestore::IRandomAccessByteStore {
     public:
-        NativeAttributeByteStore(
-            ArrayObject::Pointer owner,
-            const std::span<std::uint8_t> bytes) noexcept
-            : m_owner(std::move(owner)), m_bytes(bytes) {}
+        template<class TOwner>
+        NativeArrayByteStore(
+            TOwner owner,
+            const std::span<std::uint8_t> bytes)
+            : m_owner(std::make_shared<TOwner>(std::move(owner))), m_bytes(bytes) {}
 
         bool AppendBytes(
             const std::span<const std::uint8_t> bytes,
@@ -716,13 +753,14 @@ private:
         }
 
     private:
-        ArrayObject::Pointer m_owner;
+        std::shared_ptr<void> m_owner;
         std::span<std::uint8_t> m_bytes;
         std::size_t m_appendOffset{0u};
         bool m_released{false};
     };
 
     void ReleaseOutputState() {
+        m_decodeStorageIdentity.reset();
         ResetPartialState();
         m_output = nullptr;
     }
@@ -1138,6 +1176,7 @@ private:
     UnsignedIntArray::Pointer m_cellTypes;
     // 暂存的逐 cell 阶数流
     std::vector<std::uint16_t> m_cellPolynomialOrders;
+    std::shared_ptr<const void> m_decodeStorageIdentity{std::make_shared<unsigned char>(0u)};
     ::datacodec::BufferCapacitySample m_polynomialOrdersCapacity{"adapter.decode.polynomial_orders"};
     // 正在写入的 cell 数
     std::size_t m_pendingCellCount{0u};

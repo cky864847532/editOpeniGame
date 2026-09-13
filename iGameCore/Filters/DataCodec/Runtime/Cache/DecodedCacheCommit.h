@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <string>
@@ -60,6 +61,15 @@ inline bool CommitGeometryCache(
     if (!geometry.complete || geometry.bytes == nullptr) {
         return true;
     }
+    if (const auto identity = geometry.nativeOutputIdentity.lock();
+        identity && identity == adapter.DecodeStorageIdentity()) {
+        if (!runtime.Run().IsDriverThread() || runtime.Run().Stopped()) {
+            return validation::AssignError(error, "native output publication requires an active driver");
+        }
+        if (!adapter.EndPoints(error)) { return false; }
+        geometry.Release();
+        return true;
+    }
     if (!adapter.BeginPoints(geometry.pointCount, geometry.dimension, error)) {
         return false;
     }
@@ -93,6 +103,15 @@ inline bool CommitConnectivityTopologyCache(
         (topology.hasCellTypes && topology.cellTypes == nullptr) ||
         (topology.hasCellPolynomialOrders && topology.cellPolynomialOrders == nullptr)) {
         return validation::AssignError(error, "decoded topology cache is incomplete");
+    }
+    if (const auto identity = topology.nativeOutputIdentity.lock();
+        identity && identity == adapter.DecodeStorageIdentity()) {
+        if (!runtime.Run().IsDriverThread() || runtime.Run().Stopped()) {
+            return validation::AssignError(error, "native output publication requires an active driver");
+        }
+        if (!adapter.EndTopology(error)) { return false; }
+        if (releaseTarget) { releaseTarget->Release(); }
+        return true;
     }
     if (!adapter.BeginTopology(topology.cellCount, topology.connectivityCount, topology.hasOffsets, error)) {
         return false;
@@ -332,8 +351,9 @@ inline bool CommitAttributeCacheFields(
         return validation::AssignError(error, "decoded attribute cache set is not initialized");
     }
     auto& root = runtime.Run();
-    auto phase = WaitForHeavyPhase(root);
-    if (!phase) { return false; }
+    if (!root.IsDriverThread()) {
+        return validation::AssignError(error, "decoded attribute commit requires the driver");
+    }
     for (const auto attrIndex : attrIndices) {
         if (root.Stopped()) { return false; }
         if (attrIndex >= attributes.FieldCount() || !attributes.Complete(attrIndex)) {
@@ -350,9 +370,13 @@ inline bool CommitAttributeCacheFields(
         AttributeCommitField field{attrIndex, meta, std::move(bytes), tupleBytes,
             elementCount, totalBytes, attributes.AdapterBacked(attrIndex)};
         // 每个字段的构造、窗口写入和挂接均在 driver 完成
-        if (!field.adapterBacked &&
-            (!adapter.BeginAttribute(attrIndex, *meta, error) ||
-             !WriteAttributeCommitField(adapter, runtime, field, error))) { return false; }
+        // 已在宿主数组中完成的字段直接挂接，回放字段仍需重型阶段准入
+        std::optional<HeavyPhaseLease> phase;
+        if (!field.adapterBacked) {
+            phase = WaitForHeavyPhase(root);
+            if (!phase || !adapter.BeginAttribute(attrIndex, *meta, error) ||
+                !WriteAttributeCommitField(adapter, runtime, field, error)) { return false; }
+        }
         if (root.Stopped() || !adapter.EndAttribute(attrIndex, error)) { return false; }
     }
     return true;

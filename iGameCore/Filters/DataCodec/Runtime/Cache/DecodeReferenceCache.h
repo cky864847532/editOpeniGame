@@ -2,7 +2,7 @@
 #define DATACODEC_RUNTIME_CACHE_DECODEREFERENCECACHE_H
 
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
-#include "DataCodec/Runtime/Cache/DecodeCacheIdentity.h"
+#include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
 #include "DataCodec/Codec/Reference/DecodedReference.h"
 #include "DataCodec/Runtime/Cache/LruCacheIndex.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"

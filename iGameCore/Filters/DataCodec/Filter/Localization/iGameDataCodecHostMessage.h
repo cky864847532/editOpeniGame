@@ -2,6 +2,7 @@
 #define iGameDataCodeciGameDataCodecHostMessage_h
 
 #include "DataCodec/Localization/DataCodecLanguage.h"
+#include "DataCodec/API/Output/DataCodecOutputSinks.h"
 #include "iGameMacro.h"
 
 #include <cstdint>
@@ -73,6 +74,26 @@ enum class iGameDataCodecHostMessageId : std::uint8_t {
     DecodeStageTiming,
     DecodeTime,
     WriteDecodeTelemetryFailed,
+    StorageCheckUpdating,
+    StorageCheckRunning,
+    StorageCheckUnavailable,
+    StorageCheckFailed,
+    StorageLimitInsufficient,
+    StorageSpillRequired,
+    StorageLimitSufficient,
+    EncodeStorageSelectInput,
+    EncodeStorageCheckScope,
+    DecodeStorageSelectFile,
+    DecodeStorageAllScope,
+    DecodeStorageInitialScope,
+    PrecisionRemapPreparationFailed,
+    EncodeDiagnosticsIncomplete,
+    ResourceConfigurationFailed,
+    DeviceComputeThreadsUnavailable,
+    UnlimitedMemoryFixedThreads,
+    WaitBeforeDecode,
+    WaitBeforeLoad,
+    WaitBeforeFileSelection,
 };
 
 struct iGameDataCodecHostMessageArgument {
@@ -84,6 +105,14 @@ struct iGameDataCodecHostMessageArgument {
     ::datacodec::DataCodecLanguage language,
     iGameDataCodecHostMessageId id,
     std::initializer_list<iGameDataCodecHostMessageArgument> arguments = {});
+
+// 宿主提示保留正文、严重级别和技术详情，展示层负责最终排版
+[[nodiscard]] ::datacodec::DataCodecStatusRecord iGameDataCodecHostStatus(
+    ::datacodec::DataCodecLanguage language,
+    iGameDataCodecHostMessageId id,
+    std::initializer_list<iGameDataCodecHostMessageArgument> arguments = {},
+    ::datacodec::DataCodecStatusSeverity severity = ::datacodec::DataCodecStatusSeverity::Info,
+    std::string technicalDetail = {});
 
 IGAME_NAMESPACE_END
 

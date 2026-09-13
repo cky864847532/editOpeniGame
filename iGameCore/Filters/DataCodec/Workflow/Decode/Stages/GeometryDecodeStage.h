@@ -9,6 +9,7 @@
 #include "DataCodec/Workflow/Decode/Stages/FieldDecodeInput.h"
 #include "DataCodec/Workflow/Common/PipelineStageBase.h"
 #include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
+#include "DataCodec/Log/Telemetry/TelemetryMemoryControl.h"
 
 #include <algorithm>
 #include <string>
@@ -47,6 +48,7 @@ inline void DecodeGeometryField(
 
     decodefield::FieldDecodeStreamReader reader;
     std::string error;
+    RecordSchedulerInvestigation(context, workspace, "geometry.field.open.begin");
     if (!decodefield::OpenLeafPackageFieldDecodeStream(
             *input.field,
             workspace.CacheResourcesRef(),
@@ -60,6 +62,7 @@ inline void DecodeGeometryField(
             "failed to open geometry field: " + error);
         return;
     }
+    RecordSchedulerInvestigation(context, workspace, "geometry.field.open.end");
     decodefield::FieldDecodeByteStream stream(reader);
 
     GeometryDecodeResult result;
@@ -73,6 +76,7 @@ inline void DecodeGeometryField(
             .byteStoreSession = workspace.ByteStoreSessionRef(),
             .geometry = workspace.geometry,
             .referenceCache = context.currentGeometryReferenceCache,
+            .destination = context.adapter,
         },
         .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
     };

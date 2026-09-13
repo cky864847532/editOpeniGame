@@ -22,6 +22,9 @@ struct DecodeStorageAnalysisRequest {
     std::vector<AttributeTarget> attributeTargets;
     // 必须与实际 adapter 的 SupportsAttributeDecodeStore 能力一致
     bool adapterBackedAttributes{false};
+    // 与实际宿主直写能力一致，多项式阶数拓扑仍使用受控缓存
+    bool adapterBackedGeometry{false};
+    bool adapterBackedConnectivity{false};
     TopologyDecodeOutputMode topologyOutputMode{TopologyDecodeOutputMode::CommitToAdapter};
     std::stop_token stopToken;
 };

@@ -196,6 +196,10 @@ if (OpenMP_CXX_FOUND)
     )
 endif ()
 
+if(WIN32)
+    list(APPEND IGAMEVIS_CORE_LIB_TARGETS pdh psapi)
+endif()
+
 #----------------------------------------------
 # Find ThirdParty lib and Core Components Lib
 #----------------------------------------------

@@ -122,10 +122,7 @@ public:
     explicit igQtDataCodecCompressionWidget(QWidget* parent = nullptr);
 
     void SetModel(iGame::Model::Pointer model);
-    void SetDataCodecLanguage(
-        const ::datacodec::DataCodecLanguage language) noexcept {
-        m_dataCodecLanguage = language;
-    }
+    void SetDataCodecLanguage(::datacodec::DataCodecLanguage language);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -244,6 +241,7 @@ private:
     bool hasMultiFrameData() const;
     void appendPredictionEncodingRecommendation();
     void appendLog(const QString& text);
+    void publishStatus(const ::datacodec::DataCodecStatusRecord& status);
     void publishStatus(
         const QString& text,
         ::datacodec::DataCodecStatusSeverity severity =

@@ -2,7 +2,7 @@
 #define iGameWasmDecodedModelRegistry_h
 
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
-#include "DataCodec/Runtime/Cache/DecodeCacheIdentity.h"
+#include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
 
 #include <cstdint>
 #include <map>

@@ -1,9 +1,21 @@
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
 
 #include <algorithm>
+#include <limits>
 #include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 
 namespace datacodec::wasm {
+
+WasmResourceDefaults GetWasmResourceDefaults() {
+    const auto sample = ProbeResources();
+    const auto config = ResolveResourceConfiguration({.mode = CodecResourceMode::Fixed}, sample);
+    return {*config.initialLimits.ownedStorageLimitBytes,
+        sample.hardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max()), config.computeCeiling};
+}
+
+void ValidateWasmResourceParams(const CodecResourceParams& resources) {
+    (void)ResolveResourceConfiguration(resources, ProbeResources());
+}
 
 WasmRuntimeCapabilities DetectWasmRuntimeCapabilities() noexcept {
     WasmRuntimeCapabilities capabilities;

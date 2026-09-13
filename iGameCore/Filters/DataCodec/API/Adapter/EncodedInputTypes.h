@@ -1,8 +1,8 @@
-#ifndef DATACODEC_RUNTIME_CACHE_ENCODEDINPUTTYPES_H
-#define DATACODEC_RUNTIME_CACHE_ENCODEDINPUTTYPES_H
+#ifndef DATACODEC_API_ADAPTER_ENCODEDINPUTTYPES_H
+#define DATACODEC_API_ADAPTER_ENCODEDINPUTTYPES_H
 
 #include "DataCodec/API/Adapter/CacheAccessResult.h"
-#include "DataCodec/Runtime/Cache/DecodeCacheIdentity.h"
+#include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
 
 #include <cstdint>
 #include <memory>

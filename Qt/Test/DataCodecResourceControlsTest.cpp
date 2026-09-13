@@ -104,10 +104,13 @@ int main(int argc, char** argv) {
     const auto savedControlParams = controls.Params();
     controls.SetParams({datacodec::CodecResourceMode::Fixed, 1u, 0u});
     bool advisory = false;
+    ::datacodec::DataCodecStatusRecord storageStatus;
+    controls.OnStorageStatus([&](const ::datacodec::DataCodecStatusRecord& status) { storageStatus = status; });
     controls.SetStorageAnalyzer([&] {
         const auto required = !advisory;
         return [required](std::stop_token) { return igQtDataCodecResourceControls::StorageCheck{
-            .minimumBytes = MiB + 1u, .required = required, .detail = QStringLiteral("范围说明")}; };
+            .minimumBytes = MiB + 1u, .required = required,
+            .messageId = iGame::iGameDataCodecHostMessageId::EncodeStorageCheckScope}; };
     });
     controls.show();
     storage->setFocus();
@@ -117,16 +120,22 @@ int main(int argc, char** argv) {
     require(waitUntil([&] { return controls.StorageRejected(); }), "leaving the memory input must run capacity analysis");
     require(storage->property("storageInsufficient").toBool() && controls.StorageStatusLabel()->text().contains("2 MiB"),
         "proven insufficiency must mark input and round the minimum upward");
+    require(storageStatus.severity == datacodec::DataCodecStatusSeverity::Error,
+        "a capacity rejection must reach the output callback as Error");
     storage->setValue(2.0);
     QMetaObject::invokeMethod(storage, "editingFinished");
     require(waitUntil([&] { return controls.StorageStatusLabel()->text().contains(QStringLiteral("未低于")); }) &&
         !controls.StorageRejected() && !storage->property("storageInsufficient").toBool(),
         "correcting the limit must clear the red text");
+    require(storageStatus.severity == datacodec::DataCodecStatusSeverity::Info,
+        "a sufficient capacity check must reach the output callback as Info");
     advisory = true;
     storage->setValue(0.0);
     controls.CheckStorage();
     require(waitUntil([&] { return controls.StorageStatusLabel()->text().contains(QStringLiteral("临时文件")); }) &&
         !controls.StorageRejected(), "spill-capable decode advice must not claim proven failure");
+    require(storageStatus.severity == datacodec::DataCodecStatusSeverity::Warning,
+        "an advisory spill check must reach the output callback as Warning");
     controls.SetStorageAnalyzer([] {
         return [](std::stop_token) { return igQtDataCodecResourceControls::StorageCheck{
             .minimumBytes = 2u * MiB, .required = false, .requiredMinimumBytes = 32u}; };
@@ -139,6 +148,20 @@ int main(int argc, char** argv) {
     controls.CheckStorage();
     require(waitUntil([&] { return controls.StorageStatusLabel()->text().contains(QStringLiteral("临时文件")); }) &&
         !controls.StorageRejected(), "capacity above mandatory work may use file storage below the all-memory threshold");
+    controls.SetLanguage(datacodec::DataCodecLanguage::English);
+    require(waitUntil([&] { return storageStatus.text.find("temporary file storage") != std::string::npos; }) &&
+        storageStatus.language == datacodec::DataCodecLanguage::English,
+        "changing language must replace an existing capacity check with English wording");
+    controls.SetStorageAnalyzer([] {
+        return [](std::stop_token) -> igQtDataCodecResourceControls::StorageCheck {
+            throw std::runtime_error("reader failed at offset 42");
+        };
+    });
+    controls.CheckStorage();
+    require(waitUntil([&] { return storageStatus.technicalDetail == "reader failed at offset 42"; }) &&
+        storageStatus.text == "The capacity check did not complete" &&
+        storageStatus.severity == datacodec::DataCodecStatusSeverity::Warning && !controls.StorageRejected(),
+        "analysis exceptions must retain localized text and a separate technical detail without claiming insufficient capacity");
     controls.CheckStorage();
     modes->setCurrentIndex(modes->findData(static_cast<int>(datacodec::CodecResourceMode::Unlimited)));
     QApplication::processEvents();

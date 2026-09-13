@@ -32,8 +32,8 @@ endif ()
 
 set(IGAME_RENDER_BACKEND "DesktopGL" CACHE STRING "Rendering backend: DesktopGL or GLES2")
 set_property(CACHE IGAME_RENDER_BACKEND PROPERTY STRINGS DesktopGL GLES2)
-set(IGAME_WASM_PTHREAD_POOL_SIZE "16" CACHE STRING "Precreated pthread count for Wasm")
-set(IGAME_WASM_DATACODEC_MAX_WORKERS "6" CACHE STRING "Maximum workers in one DataCodec thread pool for Wasm")
+set(IGAME_WASM_PTHREAD_POOL_SIZE "0" CACHE STRING "Precreated pthread count for Wasm; 0 uses device concurrency plus two host/driver threads")
+set(IGAME_WASM_DATACODEC_MAX_WORKERS "0" CACHE STRING "Maximum workers in one DataCodec thread pool for Wasm; 0 uses device concurrency")
 set(IGAME_WASM_MEMORY_PROFILE "memory-4g" CACHE STRING "Wasm memory profile: memory-4g or memory-16g")
 set_property(CACHE IGAME_WASM_MEMORY_PROFILE PROPERTY STRINGS memory-4g memory-16g)
 
@@ -89,23 +89,9 @@ add_compile_options(
         "$<$<AND:$<CXX_COMPILER_ID:MSVC>,$<COMPILE_LANGUAGE:CXX>>:/utf-8>"
 )
 if (EMSCRIPTEN)
-    if (NOT IGAME_WASM_PTHREAD_POOL_SIZE MATCHES "^[1-9][0-9]*$")
-        message(FATAL_ERROR "IGAME_WASM_PTHREAD_POOL_SIZE must be a positive integer")
-    endif ()
-    if (NOT IGAME_WASM_DATACODEC_MAX_WORKERS MATCHES "^[1-9][0-9]*$")
-        message(FATAL_ERROR "IGAME_WASM_DATACODEC_MAX_WORKERS must be a positive integer")
-    endif ()
-    add_compile_options(
-            "$<$<COMPILE_LANGUAGE:C>:-pthread>"
-            "$<$<COMPILE_LANGUAGE:CXX>:-pthread>"
-            "$<$<COMPILE_LANGUAGE:CXX>:-fexceptions>"
-    )
-    if (IGAME_WASM_MEMORY_PROFILE STREQUAL "memory-16g")
-        add_compile_options(-sMEMORY64=1)
-    elseif (NOT IGAME_WASM_MEMORY_PROFILE STREQUAL "memory-4g")
-        message(FATAL_ERROR "Unknown IGAME_WASM_MEMORY_PROFILE: ${IGAME_WASM_MEMORY_PROFILE}")
-    endif ()
-    add_link_options(-pthread -fexceptions)
+    include(iGameCore/Filters/DataCodec/Cmake/DataCodecWasm.cmake)
+    datacodec_initialize_wasm("${IGAME_WASM_MEMORY_PROFILE}"
+        "${IGAME_WASM_PTHREAD_POOL_SIZE}" "${IGAME_WASM_DATACODEC_MAX_WORKERS}")
 endif ()
 add_definitions(/D_USE_MATH_DEFINES)
 set(CMAKE_CXX_STANDARD 20)
@@ -145,14 +131,11 @@ endif ()
 
 add_subdirectory(ThirdParty)
 
+# 编解码核心拥有独立编译边界，宿主桥接仍在 iGameCore 内
+add_subdirectory(iGameCore/Filters/DataCodec)
+
 # 导入核心库
 add_subdirectory(iGameCore)
-if (EMSCRIPTEN)
-    target_compile_definitions(iGameCore PUBLIC
-            DATACODEC_MAX_PARALLEL_WORKERS=${IGAME_WASM_DATACODEC_MAX_WORKERS}
-            DATACODEC_RUNTIME_THREAD_LIMIT=${IGAME_WASM_PTHREAD_POOL_SIZE}
-    )
-endif ()
 
 # 导入Qt模块
 if (ENABLE_QT_MODULE)

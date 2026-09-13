@@ -17,6 +17,8 @@ struct ConnectivityTopologyDecodeInfo {
     int fixedCellSize{0};
     bool hasOffsets{false};
     bool hasCellTypes{false};
+    // 稳定的 worker 索引范围，运行期实际并发可以在此范围内变化
+    std::size_t workerCapacity{1u};
 };
 
 struct DecodedConnectivityTopologyBlock {
@@ -27,17 +29,22 @@ struct DecodedConnectivityTopologyBlock {
     std::span<const IndexType> connectivity;
     std::span<const IndexType> offsets;
     std::span<const IndexType> cellTypes;
+    std::size_t workerIndex{0u};
 };
 
 class IDecodeTopologyBlockObserver {
 public:
     virtual ~IDecodeTopologyBlockObserver() = default;
 
+    // 并发观察者在块计算额度内消费借用视图，调用返回前必须完成消费
+    // 同一 worker 不重入，块间允许乱序，Begin 和 End 由 driver 在任务收束边界调用
+    virtual bool SupportsConcurrentBlocks() const noexcept { return false; }
+
     virtual bool BeginConnectivityTopology(
         const ConnectivityTopologyDecodeInfo& info,
         std::string* error = nullptr) = 0;
-    // 同步消费当前块，按值移出的数组归调用方所有
-    // 调用方自行创建的后台队列不属于 DataCodec 的在途资源范围
+    // 默认由 driver 顺序消费并移交 owner，并发模式借用当前槽位存储且 owner 为空
+    // 当前槽位保持到消费完成，并发观察者不得保存视图或创建后台子任务
     virtual bool ObserveConnectivityBlock(
         DecodedConnectivityTopologyBlock block,
         std::string* error = nullptr) = 0;

@@ -126,24 +126,6 @@
             <h2>iGameVis Version.Web</h2>
             <div class="build-marker">Build marker: 2026-06-13_V1</div>
             <div class="row">
-                <label for="codecResourceMode">DataCodec 内存模式</label>
-                <select id="codecResourceMode">
-                    <option value="0">固定上限</option>
-                    <option value="2" selected>内存不设上限</option>
-                </select>
-                <span id="codecMemoryRow" hidden>
-                    <label for="codecMemoryMiB">内存上限 MiB</label>
-                    <input id="codecMemoryMiB" type="text" inputmode="numeric" disabled style="width: 140px;" />
-                </span>
-                <label for="codecThreadMode">线程模式</label>
-                <select id="codecThreadMode" disabled title="浏览器无法采样系统 CPU 空闲率，当前提供固定线程上限">
-                    <option value="0">固定线程上限</option>
-                </select>
-                <label for="codecComputeThreads">计算线程上限</label>
-                <input id="codecComputeThreads" type="number" min="0" max="2147483647" step="1" value="0" title="0 表示设备默认" style="width: 80px;" />
-                <span>对新请求生效，已有模型的按需解码沿用原配置</span>
-            </div>
-            <div class="row">
                 <input id="vtkFile" type="file" accept=".vtk,.vtu,.vtp,.igc,.zip" />
                 <button id="btnDecodeIgc" type="button" disabled>解压所选 IGC</button>
                 <button id="btnLoadFromServer" type="button">Load From Server</button>
@@ -358,6 +340,7 @@
     </div>
 
     <script src="codec_resources.js?build=@IGAME_WASM_BUILD_ID@-@IGAME_WASM_MEMORY_PROFILE@"></script>
+    <script src="datacodec_browser_files.js?build=@IGAME_WASM_BUILD_ID@-@IGAME_WASM_MEMORY_PROFILE@"></script>
     <script>
         const log = (msg) => {
             const logElement = document.getElementById('log');
@@ -1023,6 +1006,19 @@
             log('pthread unavailable: serve this page with COOP=same-origin and COEP=require-corp');
         }
 
+        const browserFileStats = new Map();
+        const browserFiles = createDataCodecBrowserFiles({
+            onRead(fileId, offset, byteCount) {
+                const previous = browserFileStats.get(fileId) || {
+                    requests: 0, bytes: 0, firstOffset: offset, lastOffset: offset,
+                };
+                previous.requests += 1;
+                previous.bytes += byteCount;
+                previous.lastOffset = offset;
+                browserFileStats.set(fileId, previous);
+            },
+            onRelease(fileId) { browserFileStats.delete(fileId); },
+        });
         Module = {
             canvas: document.getElementById('canvas'),
             print(text) {
@@ -1038,22 +1034,7 @@
             printErr(text) {
                 console.error(String(text));
             },
-            igameBrowserFiles: new Map(),
-            igameBrowserFileStats: new Map(),
-            igameNextBrowserFileId: 1,
-            igameBrowserFileLastError: '',
-            igameBrowserFileReadObserver(fileId, offset, byteCount) {
-                const previous = this.igameBrowserFileStats.get(fileId) || {
-                    requests: 0,
-                    bytes: 0,
-                    firstOffset: offset,
-                    lastOffset: offset,
-                };
-                previous.requests += 1;
-                previous.bytes += byteCount;
-                previous.lastOffset = offset;
-                this.igameBrowserFileStats.set(fileId, previous);
-            },
+            dataCodecBrowserFiles: browserFiles,
             onAbort(what) {
                 log(`wasm abort: ${what}`);
             },
@@ -1063,45 +1044,22 @@
                     log('init exception: Module.iGameWeb is unavailable');
                     return;
                 }
+                const codecDefaults = JSON.parse(api.getCodecResourceDefaultsJson());
+                const codecMessages = createCodecHostMessages(JSON.parse(api.getCodecHostMessagesJson()), status => {
+                    const separator = status.language === 'en' ? ': ' : '：';
+                    log(`[DataCodec/${status.severity}] ${status.text}${status.technicalDetail ? separator + status.technicalDetail : ''}`);
+                });
                 const codecResources = createCodecResourceControls({
-                    document, log,
-                    defaults: JSON.parse(api.getCodecResourceDefaultsJson()),
+                    document,
+                    defaults: codecDefaults,
+                    messages: codecMessages,
                     isBusy: () => wasmAsyncCallActive,
                     configure: ({ mode, threads, bytes }) => {
                         if (!api.configureNextCodecRun(mode, threads, bytes)) { throw new Error(api.getLastErrorJson()); }
                     },
-                    analyze: async (file, reuseCache) => {
-                        const fileId = Module.igameNextBrowserFileId++;
-                        Module.igameBrowserFiles.set(fileId, file);
-                        wasmAsyncCallActive = true;
-                        try {
-                            return JSON.parse(await Module.ccall('igameAnalyzeIgcBrowserFile', 'string',
-                                ['number', 'number', 'number'], [fileId, file.size, reuseCache ? 1 : 0], { async: true }));
-                        } finally {
-                            Module.igameBrowserFiles.delete(fileId);
-                            Module.igameBrowserFileStats.delete(fileId);
-                            wasmAsyncCallActive = false;
-                        }
-                    },
                 });
-                const codecReuseCache = () => {
-                    const file = codecResources.selectedFile();
-                    if (file && !singleFrameBenchmarkMode && file.size > stagedIgcThresholdBytes) {
-                        return dataCodecCacheExperiment.decodedFrameCache;
-                    }
-                    return dataCodecCacheExperimentEnabled
-                        ? dataCodecCacheExperiment.decodedFrameCache : !singleFrameBenchmarkMode;
-                };
+                codecMessages.submit('UnlimitedMemoryFixedThreads', { threads: codecDefaults.maximumComputeThreads });
                 const applyCodecStartupResources = () => codecResources.apply();
-                for (const id of ['codecMemoryMiB', 'codecComputeThreads']) {
-                    const input = document.getElementById(id);
-                    input.addEventListener('input', () => codecResources.invalidate());
-                    input.addEventListener('blur', () => codecResources.check(codecReuseCache()));
-                }
-                document.getElementById('codecResourceMode').addEventListener('change', () => {
-                    codecResources.invalidate();
-                    codecResources.check(codecReuseCache());
-                });
 
                 try {
                     const buildInfo = JSON.parse(api.getBuildInfoJson());
@@ -2398,7 +2356,7 @@
                     file,
                     sourceName,
                     enableReuseCache = !singleFrameBenchmarkMode) => {
-                    if (wasmAsyncCallActive) { log('请等待当前任务完成后再解压'); return false; }
+                    if (wasmAsyncCallActive) { codecMessages.submit('WaitBeforeDecode', {}, 'warning'); return false; }
                     if (typeof Module.ccall !== 'function') {
                         log('[Browser file] async ccall is unavailable');
                         return false;
@@ -2408,14 +2366,10 @@
                         return false;
                     }
 
-                    const reuseForCheck = dataCodecCacheExperimentEnabled
-                        ? dataCodecCacheExperiment.decodedFrameCache : enableReuseCache;
                     if (codecResources.selectedFile() !== file) { codecResources.selectFile(file); }
-                    if (!await codecResources.check(reuseForCheck)) { return false; }
 
-                    const fileId = Module.igameNextBrowserFileId++;
-                    Module.igameBrowserFiles.set(fileId, file);
-                    Module.igameBrowserFileStats.set(fileId, {
+                    const fileId = browserFiles.register(file);
+                    browserFileStats.set(fileId, {
                         requests: 0,
                         bytes: 0,
                         firstOffset: 0,
@@ -2445,11 +2399,10 @@
                             ],
                             { async: true });
                         const elapsed = performance.now() - loadStart;
-                        const stats = Module.igameBrowserFileStats.get(fileId);
+                        const stats = browserFileStats.get(fileId);
                         if (!modelId) {
-                            Module.igameBrowserFiles.delete(fileId);
-                            Module.igameBrowserFileStats.delete(fileId);
-                            log(`[Browser file] load failed elapsed=${elapsed.toFixed(2)} ms hostError=${Module.igameBrowserFileLastError} lastError=${api.getLastErrorJson()}`);
+                            browserFiles.release(fileId);
+                            log(`[Browser file] load failed elapsed=${elapsed.toFixed(2)} ms hostError=${browserFiles.lastError()} lastError=${api.getLastErrorJson()}`);
                             return false;
                         }
                         log(`[Browser file] loaded modelId=${modelId} elapsed=${elapsed.toFixed(2)} ms requests=${stats ? stats.requests : 0} bytes=${stats ? stats.bytes : 0}`);
@@ -2464,9 +2417,8 @@
                         startRenderLoop();
                         return true;
                     } catch (err) {
-                        Module.igameBrowserFiles.delete(fileId);
-                        Module.igameBrowserFileStats.delete(fileId);
-                        log(`[Browser file] exception error=${errorText(err)} hostError=${Module.igameBrowserFileLastError}`);
+                        browserFiles.release(fileId);
+                        log(`[Browser file] exception error=${errorText(err)} hostError=${browserFiles.lastError()}`);
                         return false;
                     } finally {
                         wasmAsyncCallActive = false;
@@ -2477,7 +2429,7 @@
                     const summarizeReads = () => {
                         let requests = 0;
                         let bytes = 0;
-                        for (const stats of Module.igameBrowserFileStats.values()) {
+                        for (const stats of browserFileStats.values()) {
                             requests += stats.requests;
                             bytes += stats.bytes;
                         }
@@ -2506,10 +2458,9 @@
                 };
 
                 const loadLargeStagedFile = async (file, sourceName, modelKind) => {
-                    if (wasmAsyncCallActive) { log('请等待当前任务完成后再载入文件'); return false; }
+                    if (wasmAsyncCallActive) { codecMessages.submit('WaitBeforeLoad', {}, 'warning'); return false; }
                     if (modelKind === 'igc') {
                         if (codecResources.selectedFile() !== file) { codecResources.selectFile(file); }
-                        if (!await codecResources.check(dataCodecCacheExperiment.decodedFrameCache)) { return false; }
                     }
                     const totalLoadStartedAt = performance.now();
                     const safeName = String(sourceName || `local.${modelKind}`).replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -2758,22 +2709,20 @@
                         if (singleFrameBenchmarkMode || file.size <= stagedIgcThresholdBytes) {
                             await loadIgcBrowserFile(file, file.name, !singleFrameBenchmarkMode);
                         } else { await loadLargeStagedFile(file, file.name, 'igc'); }
-                    } catch (error) { log(`IGC 解压失败：${errorText(error)}`); }
+                    } catch (error) { codecMessages.submit('DecodeFailed', {}, 'error', errorText(error)); }
                     finally { codecResources.refresh(); }
                 });
 
                 document.getElementById('vtkFile').addEventListener('change', async (e) => {
                     const file = e.target.files && e.target.files[0];
                     if (!file) return;
-                    if (wasmAsyncCallActive) { log('请等待当前任务完成后重新选择文件'); return; }
+                    if (wasmAsyncCallActive) { codecMessages.submit('WaitBeforeFileSelection', {}, 'warning'); return; }
 
                     const sourceName = file.name || 'Local model';
 
                     const normalizedSourceName = sourceName.toLowerCase();
                     if (normalizedSourceName.endsWith('.igc')) {
                         codecResources.selectFile(file);
-                        await codecResources.check(singleFrameBenchmarkMode || file.size <= stagedIgcThresholdBytes
-                            ? codecReuseCache() : dataCodecCacheExperiment.decodedFrameCache);
                         return;
                     }
                     codecResources.selectFile(null);

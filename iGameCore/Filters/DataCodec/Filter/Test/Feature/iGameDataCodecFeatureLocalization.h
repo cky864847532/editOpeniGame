@@ -53,6 +53,29 @@ namespace iGame::datacodec_test {
         "hostLocalization.compressionRatioCalculationNote",
         "compression ratio calculation note should provide equivalent Chinese and English wording");
 
+    const auto rejected = iGameDataCodecHostStatus(::datacodec::DataCodecLanguage::English,
+        iGameDataCodecHostMessageId::StorageLimitInsufficient,
+        {{"mib", "2"}, {"bytes", "1048577"}}, ::datacodec::DataCodecStatusSeverity::Error);
+    ::datacodec::test::Require(result,
+        rejected.text.find("2 MiB (1048577 bytes)") != std::string::npos &&
+        rejected.severity == ::datacodec::DataCodecStatusSeverity::Error,
+        "hostLocalization.capacity-rejection", "capacity messages must substitute byte counts and preserve severity");
+    const auto failed = iGameDataCodecHostStatus(::datacodec::DataCodecLanguage::English,
+        iGameDataCodecHostMessageId::StorageCheckFailed, {},
+        ::datacodec::DataCodecStatusSeverity::Warning, "I/O error at offset 42");
+    ::datacodec::test::Require(result, failed.text == "The capacity check did not complete" &&
+        failed.technicalDetail == "I/O error at offset 42" &&
+        failed.language == ::datacodec::DataCodecLanguage::English,
+        "hostLocalization.technical-detail", "host status must separate localized business text from diagnostic details");
+    for (unsigned id = static_cast<unsigned>(iGameDataCodecHostMessageId::StorageCheckUpdating);
+         id <= static_cast<unsigned>(iGameDataCodecHostMessageId::WaitBeforeFileSelection); ++id) {
+        const auto message = static_cast<iGameDataCodecHostMessageId>(id);
+        const auto en = iGameDataCodecHostMessage(::datacodec::DataCodecLanguage::English, message);
+        const auto zh = iGameDataCodecHostMessage(::datacodec::DataCodecLanguage::SimplifiedChinese, message);
+        ::datacodec::test::Require(result, !en.empty() && !zh.empty() && en != zh,
+            "hostLocalization.new-message-coverage", "each new host message must have Chinese and English templates");
+    }
+
     for (const auto& failure : result.failures) {
         std::cerr << failure.check << ": " << failure.message << '\n';
     }

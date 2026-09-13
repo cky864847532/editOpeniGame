@@ -2,7 +2,7 @@
 
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "IGDC/iGameDataCodecIOSettings.h"
-#include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
+#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -45,7 +45,7 @@ bool IGDCAttributeDataSource::Open(const std::string& filePath, std::string* err
     const auto definition = ::datacodec::MakeDecodeConfigurationParams(
         DataCodecIOSettings::GetDefaultDecodeOptions());
     auto result = m_session.Open({
-        .inputReader = std::make_shared<iGameFileByteRangeReader>(
+        .inputReader = std::make_shared<::datacodec::FileByteRangeReader>(
             std::filesystem::path(filePath)),
         .controlParams = &definition.controlParams,
         .executionOptions = &definition.execution,

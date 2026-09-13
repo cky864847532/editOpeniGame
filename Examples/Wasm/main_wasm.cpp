@@ -15,10 +15,10 @@
 #include "DataCodec/Filter/Wasm/iGameWasmDataCodecBridge.h"
 #include "DataCodec/Filter/Wasm/iGameWasmDecodedModelRegistry.h"
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
+#include "DataCodec/Filter/Localization/iGameDataCodecHostMessage.h"
 #include "DataCodec/API/Adapter/RunRecordTypes.h"
 #include "IGDC/iGameIGDCWriter.h"
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
-#include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 #include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
 #include "DataCodec/Platform/Wasm/WasmBrowserFileByteRangeReader.h"
 #include "DataCodec/Storage/Package/PackageBinaryHeader.h"
@@ -1940,6 +1940,7 @@ struct API {
     static void clearLastError();
     static int configureNextCodecRun(int mode, int computeThreads, const std::string& memoryLimitBytes);
     static std::string getCodecResourceDefaultsJson();
+    static std::string getCodecHostMessagesJson();
     static int setSize(int width, int height);
     static int loadVtkFromMem(const val& bytes);
     static int loadVtuFromMem(const val& bytes);
@@ -5231,12 +5232,35 @@ void iGameWeb::API::sendMouseEvent(int type, int button, float x, float y, doubl
 }
 
 std::string iGameWeb::API::getCodecResourceDefaultsJson() {
-    const auto sample = ::datacodec::ProbeResources();
-    const auto config = ::datacodec::ResolveResourceConfiguration(
-        {.mode = ::datacodec::CodecResourceMode::Fixed}, sample);
-    return "{\"fixedMemoryBytes\":\"" + std::to_string(*config.initialLimits.ownedStorageLimitBytes) +
-        "\",\"maximumMemoryBytes\":\"" + std::to_string(sample.hardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max())) +
-        "\",\"maximumComputeThreads\":" + std::to_string(config.computeCeiling) + "}";
+    const auto defaults = ::datacodec::wasm::GetWasmResourceDefaults();
+    return "{\"fixedMemoryBytes\":\"" + std::to_string(defaults.fixedMemoryBytes) +
+        "\",\"maximumMemoryBytes\":\"" + std::to_string(defaults.maximumMemoryBytes) +
+        "\",\"maximumComputeThreads\":" + std::to_string(defaults.maximumComputeThreads) + "}";
+}
+
+std::string iGameWeb::API::getCodecHostMessagesJson() {
+    // 页面与编解码请求使用同一语言，宿主文案只由 C++ 目录提供
+    const auto language = ::datacodec::wasm::MakeWasmDecodeConfiguration(false).language;
+    using Message = iGame::iGameDataCodecHostMessageId;
+    const std::pair<const char*, Message> messages[]{
+        {"ResourceConfigurationFailed", Message::ResourceConfigurationFailed},
+        {"DeviceComputeThreadsUnavailable", Message::DeviceComputeThreadsUnavailable},
+        {"UnlimitedMemoryFixedThreads", Message::UnlimitedMemoryFixedThreads},
+        {"WaitBeforeDecode", Message::WaitBeforeDecode},
+        {"WaitBeforeLoad", Message::WaitBeforeLoad},
+        {"WaitBeforeFileSelection", Message::WaitBeforeFileSelection},
+        {"DecodeFailed", Message::DecodeFailed},
+    };
+    std::string json = "{\"language\":\"" + std::string(::datacodec::DataCodecLanguageName(language)) +
+        "\",\"templates\":{";
+    bool first = true;
+    for (const auto& [name, id] : messages) {
+        if (!first) { json += ','; }
+        first = false;
+        json += "\"" + std::string(name) + "\":\"" +
+            EscapeJsonString(iGame::iGameDataCodecHostMessage(language, id)) + "\"";
+    }
+    return json + "}}";
 }
 
 int iGameWeb::API::configureNextCodecRun(
@@ -5248,6 +5272,7 @@ int iGameWeb::API::configureNextCodecRun(
         }
         ::datacodec::CodecResourceParams resources;
         resources.mode = static_cast<::datacodec::CodecResourceMode>(mode);
+        resources.threadMode = ::datacodec::CodecThreadMode::Fixed;
         if (computeThreads != 0) { resources.maxComputeThreads = static_cast<std::size_t>(computeThreads); }
         if (!memoryLimitBytes.empty()) {
             std::uint64_t bytes = 0u;
@@ -5258,7 +5283,7 @@ int iGameWeb::API::configureNextCodecRun(
             }
             resources.ownedStorageLimitBytes = bytes;
         }
-        (void)::datacodec::ResolveResourceConfiguration(resources, ::datacodec::ProbeResources());
+        ::datacodec::wasm::ValidateWasmResourceParams(resources);
         {
             std::lock_guard lock(g_codecStartupMutex);
             g_codecStartupResources = resources;
@@ -5285,6 +5310,7 @@ EMSCRIPTEN_BINDINGS(iGameWeb_bindings) {
             .class_function("clearLastError", &iGameWeb::API::clearLastError)
             .class_function("configureNextCodecRun", &iGameWeb::API::configureNextCodecRun)
             .class_function("getCodecResourceDefaultsJson", &iGameWeb::API::getCodecResourceDefaultsJson)
+            .class_function("getCodecHostMessagesJson", &iGameWeb::API::getCodecHostMessagesJson)
             .class_function("setSize", &iGameWeb::API::setSize)
             .class_function("loadVtkFromMem", &iGameWeb::API::loadVtkFromMem)
             .class_function("loadVtuFromMem", &iGameWeb::API::loadVtuFromMem)

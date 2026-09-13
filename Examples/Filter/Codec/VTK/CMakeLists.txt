@@ -24,7 +24,7 @@ target_include_directories(dataCodecVtkAdapter PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 target_link_libraries(dataCodecVtkAdapter PUBLIC
-        iGameCore
+        DataCodecCore
         VTK::CommonCore
         VTK::CommonDataModel
         VTK::IOLegacy

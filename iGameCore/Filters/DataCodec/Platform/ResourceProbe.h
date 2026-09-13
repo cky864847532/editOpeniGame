@@ -37,6 +37,10 @@ struct ResourceSample {
 
 ResourceSample ProbeResources();
 
+// 事件循环线程等待后台任务时需要让出宿主执行权
+bool ResourceWaitRequiresEventLoop() noexcept;
+void YieldResourceWaitToEventLoop();
+
 // 原生通知只唤醒控制线程，平台句柄与回调收束由此对象独占
 class ResourcePressureMonitor final {
 public:

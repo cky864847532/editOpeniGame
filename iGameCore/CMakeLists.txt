@@ -16,10 +16,10 @@ endif ()
 #--------------------------------------------------------------------
 # Core Module's main Cmake
 #--------------------------------------------------------------------
-include(Cmake/CheckDataCodecDependencies.cmake)
-igame_check_datacodec_dependencies(${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec)
-
 file(GLOB_RECURSE IGAME_CORE_FILE CONFIGURE_DEPENDS ./*.h ./*.cpp)
+# 核心由 DataCodecCore 编译，宿主目标只保留 Filter 桥接
+list(FILTER IGAME_CORE_FILE EXCLUDE REGEX
+        "Filters/DataCodec/(API|Common|Codec|Localization|Log|Platform|Runtime|Storage|Validation|Workflow|Test)/")
 set(IGAME_DATACODEC_TEST_RUNNER_SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecTestMain.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/Filters/DataCodec/Test/Runner/DataCodecStorageAnalysisTests.cpp"
@@ -43,9 +43,7 @@ if (UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
     endif ()
 endif ()
 
-if (WIN32)
-    target_link_libraries(${MODULE_NAME} PRIVATE pdh)
-endif ()
+target_link_libraries(${MODULE_NAME} PUBLIC DataCodecCore)
 
 # add rendering core
 add_subdirectory(Rendering)

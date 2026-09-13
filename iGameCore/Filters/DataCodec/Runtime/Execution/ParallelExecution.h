@@ -19,6 +19,18 @@ namespace datacodec {
 
 namespace numericarray { class NumericArrayCompressorState; }
 
+// 临时块响应调查入口，仅由测试 driver 绑定，空指针时不采集
+struct BlockResponseInvestigation {
+    void* context{};
+    void (*callback)(void*, DataCodecExecutionResources&, const char*,
+                 const DecodeBlockMemoryPlan&, std::uint64_t) noexcept{};
+    void Record(DataCodecExecutionResources& run, const char* point,
+                const DecodeBlockWorkspace* workspace, std::uint64_t missing = 0u) const noexcept {
+        if (callback && workspace) { callback(context, run, point, workspace->Plan(), missing); }
+    }
+};
+inline thread_local BlockResponseInvestigation blockResponseInvestigation;
+
 class WorkerContext final {
 public:
     WorkerContext(ScratchByteBufferPool& scratch, std::size_t index) noexcept;
@@ -69,6 +81,7 @@ struct BlockRecord {
     std::optional<Input> input;
     std::optional<Output> output;
     std::shared_ptr<TerminalWork> work;
+    std::uint64_t investigationMissing{};
 
     void Retire() noexcept {
         work.reset();
@@ -99,6 +112,7 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                       Compute&& compute, Commit&& commit, const bool singleRecord = false,
                       DescribeWork&& describeWork = nullptr, DescribeMemory&& describeMemory = nullptr) noexcept {
     try {
+        const auto investigation = blockResponseInvestigation;
         std::deque<std::shared_ptr<BlockRecord<Input, Output>>> records;
         std::optional<ResourceWorkType> activeWorkType;
         std::optional<ResourceWorkType> nextWorkType;
@@ -125,6 +139,7 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
             if (!records.empty() &&
                 run.Completion(*records.front()->work) == BlockCompletion::Succeeded) {
                 auto& record = *records.front();
+                investigation.Record(run, "commit.begin", record.workspace.get(), record.investigationMissing);
                 // 最后一块的 End/Seal 由提交函数完成，完成后才归还槽位
                 run.SetWaitReason(ResourceWaitReason::OutputIO, &record.slot);
                 const bool committed = [&] {
@@ -137,7 +152,12 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                         "block-commit-failed", "RunOrderedBlocks", "block commit failed"));
                     return false;
                 }
+                investigation.Record(run, "commit.end", record.workspace.get(), record.investigationMissing);
+                const auto retiredPlan = investigation.callback && record.workspace ?
+                    record.workspace->Plan() : DecodeBlockMemoryPlan{};
+                const auto retiredMissing = record.investigationMissing;
                 record.Retire();
+                if (investigation.callback) { investigation.callback(investigation.context, run, "retired", retiredPlan, retiredMissing); }
                 run.SetWaitReason(ResourceWaitReason::None);
                 records.pop_front();
                 // 提交可能推进供给游标，下一轮重新读取供给状态
@@ -156,18 +176,22 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                         auto plan = describeMemory();
                         nextWorkspace = std::make_unique<DecodeBlockWorkspace>(run.Scratch(), plan);
                         nextBytes = nextWorkspace->TakeReusable();
+                        investigation.Record(run, "plan", nextWorkspace.get(), nextBytes);
                     }
                     run.ReclaimOptionalStorage(nextBytes);
                     if (!run.CheckNecessaryCapacity(nextBytes)) { return false; }
                 }
                 resource::ResidentByteBudget::Lease reservation;
+                investigation.Record(run, "admission.try", nextWorkspace.get(), nextBytes);
                 if (auto slot = run.TryAcquireSlot(nextBytes, reservation)) {
                     auto record = std::make_shared<BlockRecord<Input, Output>>();
                     record->slot = std::move(*slot);
+                    record->investigationMissing = nextBytes;
                     if (nextWorkspace) {
                         nextWorkspace->Allocate(*run.StorageCapacity(), std::move(reservation));
                         record->workspace = std::move(nextWorkspace);
                     }
+                    investigation.Record(run, "allocated", record->workspace.get(), record->investigationMissing);
                     record->input.emplace();
                     record->output.emplace();
                     run.SetWaitReason(ResourceWaitReason::InputIO, &record->slot);
@@ -181,6 +205,7 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                         }
                     }();
                     run.SetWaitReason(ResourceWaitReason::None);
+                    investigation.Record(run, "read.end", record->workspace.get(), record->investigationMissing);
                     if (!readSucceeded) {
                         run.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
                             "block-read-failed", "RunOrderedBlocks", "block read failed"));
@@ -188,12 +213,15 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
                     }
                     nextWorkType.reset();
                     auto* current = record.get();
-                    record->work = std::make_shared<TerminalWork>([current, &compute](WorkerContext& worker) {
-                        if constexpr (std::is_invocable_r_v<bool, Compute&, Input&, Output&, WorkerContext&, DecodeBlockWorkspace&>) {
-                            return compute(*current->input, *current->output, worker, *current->workspace);
-                        } else {
-                            return compute(*current->input, *current->output, worker);
-                        }
+                    record->work = std::make_shared<TerminalWork>([current, &compute, &run, investigation](WorkerContext& worker) {
+                        investigation.Record(run, "compute.begin", current->workspace.get(), current->investigationMissing);
+                        const bool success = [&] {
+                            if constexpr (std::is_invocable_r_v<bool, Compute&, Input&, Output&, WorkerContext&, DecodeBlockWorkspace&>) {
+                                return compute(*current->input, *current->output, worker, *current->workspace);
+                            } else { return compute(*current->input, *current->output, worker); }
+                        }();
+                        investigation.Record(run, "compute.end", current->workspace.get(), current->investigationMissing);
+                        return success;
                     });
                     // 先将记录放入受 guard 保护的窗口，再发布终端任务
                     records.push_back(std::move(record));

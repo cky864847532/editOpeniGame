@@ -17,7 +17,7 @@
 #include <DataCodec/Filter/Test/Feature/iGameDataCodecFeatureProgress.h>
 #include <DataCodec/Test/Feature/DataCodecFeatureDecodedFrameCache.h>
 #include <DataCodec/Filter/Test/Feature/iGameDataCodecFeatureStreamingFrameCache.h>
-#include <DataCodec/Filter/Adapter/iGameFileByteRangeIO.h>
+#include <DataCodec/Storage/ByteIO/FileByteRangeIO.h>
 #include <IGDC/iGameIGDCFrameSequence.h>
 #include <IGDC/iGameIGDCReader.h>
 #include <IGDC/iGameIGDCWriter.h>
@@ -266,7 +266,7 @@ bool TestSingleLeafFrameSequence() {
     }
     std::string error;
     for (const auto& path: paths) {
-        auto reader = std::make_shared<iGame::iGameFileByteRangeReader>(std::filesystem::path(path));
+        auto reader = std::make_shared<::datacodec::FileByteRangeReader>(std::filesystem::path(path));
         ::datacodec::FramePackage framePackage;
         const auto metadataRead = ::datacodec::FramePackageIO::ReadMetadata(*reader, framePackage, &error);
         if (!metadataRead || framePackage.leaves.size() != 1u) {

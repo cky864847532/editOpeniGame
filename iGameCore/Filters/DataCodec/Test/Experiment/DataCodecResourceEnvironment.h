@@ -131,7 +131,7 @@ inline TestResult RunDataCodecResourceEnvironment() {
                     state.controlPhase, state.admittedBlocks, state.activeComputeUnits,
                     state.pressurePending, state.gateOpen, state.optionalRetentionPausedByPressure,
                     host.address != nullptr, state.memory.physicalTotalBytes, state.memory.availableBytes,
-                    state.memory.reserveBytes, state.storage.reservedBytes, state.memory.gain});
+                    state.memory.reserveBytes, state.storage.reservedBytes, state.memory.previewRatio});
             }
             if (now - began >= std::chrono::seconds(26)) {
                 observerFailure = 3u;
@@ -181,7 +181,7 @@ inline TestResult RunDataCodecResourceEnvironment() {
             << ",pending=" << sample.pending << ",gate=" << sample.gate
             << ",retention_paused=" << sample.retentionPaused << ",host_load=" << sample.hostLoad;
         row << ",physical_total=" << sample.total.value_or(0u) << ",physical_available=" << sample.available.value_or(0u)
-            << ",reserve=" << sample.reserve << ",reserved=" << sample.reserved << ",Km=" << sample.gain;
+            << ",reserve=" << sample.reserve << ",reserved=" << sample.reserved << ",previewRatio=" << sample.gain;
         result.AddDiagnostic(row.str());
     }
     if (!success || !ended || observerFailure != 0u || read == 0u || read != committed) {

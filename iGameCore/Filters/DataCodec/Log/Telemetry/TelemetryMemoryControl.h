@@ -3,8 +3,32 @@
 #include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 #include "DataCodec/API/Adapter/RunRecord.h"
 #include <string>
+#include <cstdlib>
 
 namespace datacodec {
+
+// 临时调度调查插桩，仅由显式环境开关启用，沿用现有消息通道
+template<class Context, class Workspace>
+void RecordSchedulerInvestigation(Context& context, Workspace& workspace, const std::string& point) noexcept {
+    if (std::getenv("IGAME_DATACODEC_SCHEDULER_TRACE") == nullptr ||
+        !context.runRecords.Wants(RunRecordKind::Message)) { return; }
+    context.runRecords.TryExport([&] {
+        const auto capacity = context.resources.StorageCapacity()->Snapshot();
+        const auto resident = [](const auto& store) { return store ? store->ResidentSizeHint() : 0u; };
+        const auto stores = workspace.ByteStoreSessionRef().SnapshotStats();
+        const auto& topo = workspace.topology;
+        context.AddInfo("SchedulerInvestigation", "point=" + point +
+            ";atMs=" + std::to_string(std::chrono::duration<double, std::milli>(ResourceClock::now().time_since_epoch()).count()) +
+            ";reserved=" + std::to_string(capacity.reservedBytes) +
+            ";geometry=" + std::to_string(resident(workspace.geometry.bytes)) +
+            ";connectivity=" + std::to_string(topo ? resident(topo->connectivity) : 0u) +
+            ";offsets=" + std::to_string(topo ? resident(topo->offsets) : 0u) +
+            ";cellTypes=" + std::to_string(topo ? resident(topo->cellTypes) : 0u) +
+            ";topologySharedOwners=" + std::to_string(topo.use_count()) +
+            ";nativeHint=" + std::to_string(context.adapter ? context.adapter->NativeResidentBytesHint() : 0u) +
+            ";storeMemory=" + std::to_string(stores.residentBytes) + ";storeFile=" + std::to_string(stores.managedFileBytes));
+    });
+}
 
 // 许可、预约和系统观测分别输出，未知字段保留 null，复用现有消息通道
 template<class Context>
@@ -60,17 +84,9 @@ void RecordMemoryControlSummary(Context& context) noexcept {
                 ";waitDeadlineMs=" + (m.waitSince ? ms((*m.waitSince + resource_control::holdTimeout).time_since_epoch()) : "null") +
                 ";lastPreparationMs=" + at(m.lastPreparationAt) + ";trimEpoch=" + std::to_string(s.trimEpoch) +
                 ";lastTrimCompletedMs=" + at(lastTrim) +
-                ";memoryGain=" + std::to_string(m.gain) + ";memoryResponse=" + text(m.response) +
-                ";gainSource=" + (m.response ? "Observed" : "Nominal") +
-                ";calibration=" + MemoryCalibrationResultName(m.calibration) +
-                ";calibrationMs=" + ms(m.calibrationElapsed) +
-                ";calibrationStartedMs=" + (m.calibration == MemoryCalibrationResult::Pending ? "null" : ms(m.calibrationStarted.time_since_epoch())) +
-                ";calibrationDeadlineMs=" + (m.calibration == MemoryCalibrationResult::Pending ? "null" :
-                    ms((m.calibrationStarted + resource_control::calibrationDeadline).time_since_epoch())) +
-                ";baselineAvailable=" + text(m.baselineAvailable) + ";responseAvailable=" + text(m.responseAvailable) +
-                ";measuredReservationBytes=" + std::to_string(m.measuredReservationBytes) +
-                ";gainUpdates=" + std::to_string(m.gainUpdates) + ";lastDecision=" + MemoryDecisionReasonName(m.reason) +
-                ";measurementEnd=" + MemoryDecisionReasonName(m.calibrationEndReason);
+                ";previewRatio=" + std::to_string(m.previewRatio) +
+                ";previewHeadroomBytes=" + std::to_string(m.previewHeadroomBytes) +
+                ";lastDecision=" + MemoryDecisionReasonName(m.reason);
         }
         context.AddInfo("MemoryControl", std::move(detail));
     });

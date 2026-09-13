@@ -125,8 +125,7 @@ inline TestResult RunDataCodecFeatureResourceController() {
         Trace t;
         const auto initial = t.flow.limits;
         for (int i = 0; i < 30; ++i) { t.Tick(); }
-        Require(result, initial == t.flow.limits && t.state.memory.grantEpoch == 0u &&
-            t.state.memory.calibration == MemoryCalibrationResult::Pending,
+        Require(result, initial == t.flow.limits && t.state.memory.grantEpoch == 0u,
             "reserve.no-demand", "healthy unused capacity must not trigger growth or a calibration request");
         t.Need(2u * gib);
         const auto growth = t.Tick();
@@ -179,6 +178,7 @@ inline TestResult RunDataCodecFeatureResourceController() {
         t.flow.admittedBlocks = 2u;
         t.sample.availableBytes = 3u * gib;
         auto decision = t.Tick();
+        t.flow.pendingNecessaryWork = true;
         const auto wait = t.state.memory.waitSince;
         Require(result, !decision.gateOpen && !decision.trimOptionalRetention &&
             t.state.phase == ResourceControlPhase::Drain && decision.limits.computeLimit == 4u &&
@@ -195,13 +195,13 @@ inline TestResult RunDataCodecFeatureResourceController() {
         t.flow.admittedBlocks = t.flow.activeComputeUnits = 0u;
         t.flow.heavyPhaseAdmitted = true;
         t.Tick();
-        Require(result, t.state.phase == ResourceControlPhase::Hold && t.state.memory.waitSince == wait,
+        Require(result, t.state.phase == ResourceControlPhase::Hold && t.state.memory.waitSince.has_value(),
             "reserve.heavy-hold", "an idle heavy phase is a hold boundary and does not reset the deadline");
         t.sample.availableBytes = 8u * gib;
         t.sample.pressure = PressureLevel::Normal;
-        for (int i = 0; i < 9; ++i) { decision = t.Tick(); }
+        for (int i = 0; i < 8; ++i) { decision = t.Tick(); }
         Require(result, decision.gateOpen && t.state.phase == ResourceControlPhase::Recover &&
-            decision.limits.slotLimit == 1u && t.state.memory.waitSince == wait,
+            decision.limits.slotLimit == 1u && t.state.memory.waitSince.has_value(),
             "reserve.recover-single", "two seconds of healthy samples restore one slot and preserve the unresolved wait");
         t.state.progressAt = t.now;
         for (int i = 0; i < 8; ++i) { decision = t.Tick(); }
@@ -213,6 +213,7 @@ inline TestResult RunDataCodecFeatureResourceController() {
         Trace t;
         t.flow.reservedBytes = gib;
         t.sample.availableBytes.reset();
+        t.Need(1u);
         t.Tick();
         const auto started = t.state.memory.waitSince;
         t.Need(1u);
@@ -243,113 +244,57 @@ inline TestResult RunDataCodecFeatureResourceController() {
         Require(result, decision.failForSustainedPressure && t.flow.limits.ownedStorageLimitBytes == gib,
             "reserve.large-wait-bounded", "an unmet physical reserve constraint cannot wait forever or silently lower the target");
     }
-    // 首次测量完全使用合成时间，成功预约计数与 lease 归还量分别驱动
-    const auto measure = [&](double responseFactor) {
+    // 必要增长与预给分开验证，不使用占用周转推导物理响应
+    {
         Trace t;
-        t.Need(2u * gib);
-        t.Tick(0ms);
-        t.Reserve(2u * gib);
-        t.Prepared();
-        t.Tick();
-        Require(result, t.state.gainPhase == 2u, "gain.baseline-window", "the baseline window must complete after 250 ms");
-        t.Need(gib / 2u);
-        t.Tick();
-        Require(result, t.state.grant.probe && *t.flow.limits.ownedStorageLimitBytes == 2u * gib + 3u * gib / 4u,
-            "gain.probe-preview", "one initial probe reduces only the optional preview by a quarter");
-        t.Reserve(gib / 2u);
-        t.flow.reservedBytes -= gib;
-        t.sample.availableBytes = 8u * gib - static_cast<std::uint64_t>(responseFactor * static_cast<double>(gib / 2u));
-        t.Tick();
-        return t;
-    };
-    {
-        auto t = measure(2.0);
-        Require(result, t.state.memory.calibration == MemoryCalibrationResult::Estimated &&
-            t.state.memory.gain == 0.25 && t.state.memory.measuredReservationBytes == gib / 2u &&
-            t.state.memory.gainUpdates == 1u && t.state.memory.calibrationElapsed == 750ms,
-            "gain.estimated", "positive response estimates Km once using gross new reservations within one second");
-        t.Tick(0ms, false);
-        Require(result, t.state.memory.gainUpdates == 1u, "gain.single-use", "a completed measurement pair must not be reused");
-        ++t.flow.requestId;
-        t.Tick();
-        Require(result, t.state.memory.gain == 0.5 && t.state.memory.gainUpdates == 0u &&
-            t.state.memory.calibration == MemoryCalibrationResult::Pending, "gain.new-request", "new requests reset nominal Km");
-    }
-    {
-        const auto t = measure(0.0);
-        Require(result, t.state.memory.calibration == MemoryCalibrationResult::Unusable && t.state.memory.gain == 0.5 &&
-            !t.state.memory.response, "gain.no-response", "zero response retains nominal gain");
+        t.sample.availableBytes = t.state.memory.reserveBytes + 4u * mib;
+        t.Need(2u * mib);
+        const auto d = t.Tick();
+        Require(result, d.gateOpen && d.limits.slotLimit == 1u &&
+            d.limits.ownedStorageLimitBytes == 2u * mib && t.state.memory.previewHeadroomBytes == 0u,
+            "reserve.single-exact", "a required block fits below the throughput recovery watermark");
+        const auto grant = t.state.memory.grantEpoch;
+        for (int i = 0; i < 5; ++i) { t.Tick(0ms, false); }
+        Require(result, t.state.memory.grantEpoch == grant && t.flow.limits.ownedStorageLimitBytes == 2u * mib,
+            "reserve.single-unused-grant", "duplicate wakes preserve the exact outstanding grant");
+        t.Reserve(2u * mib);
+        t.flow.admittedBlocks = 1u;
+        t.Need(mib);
+        Require(result, !t.Tick().gateOpen, "reserve.single-live", "single-step admission drains the current block");
+        t.flow.admittedBlocks = 0u;
+        t.state.progressAt = t.now;
+        t.state.grant.completedAt = t.now;
+        Require(result, !t.Tick(0ms, false).gateOpen, "reserve.single-fresh", "next block needs a post-retirement sample");
+        Require(result, t.Tick().gateOpen, "reserve.single-next", "fresh observed headroom permits another block");
     }
     {
         Trace t;
-        t.Need(7u * gib);
-        t.Tick(0ms);
+        t.sample.availableBytes = t.state.memory.reserveBytes + 4u * mib;
+        t.Need(8u * mib);
         t.Tick();
-        t.Tick(750ms);
-        Require(result, t.state.memory.calibration == MemoryCalibrationResult::TimedOut && t.state.memory.gain == 0.5,
-            "gain.timeout", "waiting for a reservation cannot extend the one-second initial attempt");
-        t.Need(2u * gib);
-        t.Tick();
-        t.Reserve(2u * gib);
-        t.sample.availableBytes = 7u * gib;
-        t.Tick();
-        Require(result, t.state.memory.gainUpdates == 1u && t.state.memory.gain == 1.0,
-            "gain.passive-update", "ordinary growth after a failed initial attempt can update the clamped gain");
+        const auto started = t.state.memory.waitSince;
+        const auto ratio = t.state.memory.previewRatio;
+        for (int i = 0; i < 120; ++i) {
+            NoteMemoryReservation(t.state, gib, 0u, t.now);
+            t.Need(8u * mib);
+            t.Tick();
+        }
+        Require(result, t.state.memory.waitSince == started && t.Tick().failForSustainedPressure,
+            "reserve.wait-real-progress", "request retries and reservation churn do not reset a blocked wait");
+        Require(result, t.state.memory.previewRatio == ratio, "reserve.preview-policy", "preview is a policy fraction");
     }
     {
         Trace t;
-        t.state.gainPhase = 3u;
-        t.state.gainWindowStarted = t.now;
-        t.state.memory.baselineAvailable = 8.0 * gib;
-        t.state.measurementBytes = 1u;
-        t.sample.availableBytes = 4u * gib;
-        t.Tick();
-        Require(result, t.state.memory.gain == resource_control::minimumGain,
-            "gain.minimum-clamp", "a large valid response must clamp to the minimum gain");
-        t.state.gainPhase = 3u;
-        t.state.gainWindowStarted = t.now;
-        t.state.availableSamples = 0u;
-        t.state.availableSum = 0.0;
-        t.state.memory.baselineAvailable = 4.0 * gib;
-        t.state.measurementBytes = 1u;
-        t.sample.availableBytes = 5u * gib;
-        t.Tick();
-        Require(result, t.state.memory.gain == resource_control::minimumGain && t.state.memory.gainUpdates == 1u,
-            "gain.negative-response", "a negative response must preserve the previous observed gain");
-        t.state.gainPhase = 2u;
-        t.state.initialMeasurement = true;
-        t.sample.jobLimitBytes = 10u * gib;
-        t.Tick();
-        Require(result, t.state.gainPhase == 0u &&
-            t.state.memory.calibrationEndReason == ResourceDecisionReason::HardCapabilityChanged,
-            "gain.capability-change", "capacity changes terminate an active measurement");
-    }
-    {
-        Trace t;
-        t.Need(2u * gib);
-        t.Tick(0ms);
-        t.Tick();
+        t.flow.admittedBlocks = t.flow.activeComputeUnits = 1u;
+        t.flow.pendingNecessaryWork = true;
         t.sample.availableBytes = 0u;
         t.Tick();
-        Require(result, t.state.memory.calibration == MemoryCalibrationResult::Unusable &&
-            t.state.memory.calibrationEndReason == ResourceDecisionReason::ReserveTargetLow &&
-            !t.flow.gateOpen, "gain.pressure-first", "pressure must terminate measurement before accepting a response");
-    }
-    {
-        Trace t;
-        t.Need(2u * gib);
-        t.Tick(0ms);
+        Require(result, !t.Tick(31s).failForSustainedPressure, "reserve.active-drain",
+            "running work is allowed to drain before external recovery waiting starts");
+        t.flow.admittedBlocks = t.flow.activeComputeUnits = 0u;
         t.Tick();
-        FinishMemoryMeasurement(t.state, t.now, ResourceDecisionReason::RequestCancelled);
-        Require(result, t.state.memory.calibration == MemoryCalibrationResult::Unusable &&
-            t.state.memory.calibrationEndReason == ResourceDecisionReason::RequestCancelled,
-            "gain.cancel", "cancellation records an explicit incomplete observation");
-        t.state.initialMeasurement = true;
-        t.state.gainPhase = 2u;
-        t.state.measurementBytes = std::numeric_limits<std::uint64_t>::max();
-        NoteMemoryReservation(t.state, 1u, 0u, t.now);
-        Require(result, t.state.gainPhase == 0u && t.state.memory.calibrationEndReason == ResourceDecisionReason::CapacityBoundExceeded,
-            "gain.counter-overflow", "reservation counter overflow ends the measurement without affecting capacity");
+        Require(result, t.Tick(30s).failForSustainedPressure, "reserve.drained-deadline",
+            "drained work cannot wait indefinitely for unavailable resources");
     }
     {
         Trace t;

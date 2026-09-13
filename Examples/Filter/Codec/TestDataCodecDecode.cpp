@@ -1,6 +1,6 @@
 #include <DataCodec/API/Entry/DataCodecDecodeEntry.h>
 #include <DataCodec/Filter/Adapter/iGameDecodeAdapter.h>
-#include <DataCodec/Filter/Adapter/iGameFileByteRangeIO.h>
+#include <DataCodec/Storage/ByteIO/FileByteRangeIO.h>
 #include <DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h>
 #include <iGameInteractor.h>
 #include <iGameRenderWindow.h>
@@ -29,7 +29,7 @@ int main(const int argc, char** argv) {
     }
 
     // ByteRangeReader向DataCodec提供文件随机访问能力
-    auto inputReader = std::make_shared<iGame::iGameFileByteRangeReader>(encodedFile);
+    auto inputReader = std::make_shared<::datacodec::FileByteRangeReader>(encodedFile);
     if (inputReader->ByteSize() == 0u) {
         std::cerr << "encoded DataCodec file is empty\n";
         return 1;

@@ -55,8 +55,8 @@ enum class ResourceDecisionReason : std::uint8_t {
     RetentionRestored, PressureTimeout,
     ReserveTargetLow, NativeMemoryPressure, RuntimeHeadroomLow, RequiredGrowth,
     RequiredContinuation, SampleUnavailable, RetainedStoragePreventingProgress,
-    WaitDeadlineExceeded, CapacityBoundExceeded, MemoryGainUpdated,
-    RequestEnded, RequestCancelled, MeasurementUnusable,
+    WaitDeadlineExceeded, CapacityBoundExceeded,
+    RequestEnded, RequestCancelled,
 };
 
 enum class ResourceEventKind : std::uint8_t {
@@ -86,8 +86,6 @@ struct ResourceWaitContext {
 enum class TerminalWorkKind : std::uint8_t { Ordinary, ExclusivePackage };
 enum class ResourceControlPhase : std::uint8_t { Normal, Drain, Hold, Recover };
 enum class MemoryDemandKind : std::uint8_t { Block, RequiredContinuation };
-enum class MemoryCalibrationResult : std::uint8_t { Pending, Measuring, Estimated, Unusable, TimedOut };
-const char* MemoryCalibrationResultName(MemoryCalibrationResult) noexcept;
 const char* MemoryDecisionReasonName(ResourceDecisionReason) noexcept;
 
 struct MemoryControlSnapshot {
@@ -99,18 +97,10 @@ struct MemoryControlSnapshot {
     std::uint64_t recoveryBytes{0u};
     std::uint64_t absoluteCapacityBytes{0u};
     std::uint64_t growthHeadroomBytes{0u};
-    double gain{0.5};
-    std::optional<double> response;
-    MemoryCalibrationResult calibration{MemoryCalibrationResult::Pending};
-    ResourceClock::time_point calibrationStarted{};
-    ResourceClock::duration calibrationElapsed{};
-    std::optional<double> baselineAvailable;
-    std::optional<double> responseAvailable;
-    std::uint64_t measuredReservationBytes{0u};
-    std::uint64_t gainUpdates{0u};
+    double previewRatio{0.5};
+    std::uint64_t previewHeadroomBytes{0u};
     std::uint64_t grantEpoch{0u};
     ResourceDecisionReason reason{ResourceDecisionReason::NoChange};
-    ResourceDecisionReason calibrationEndReason{ResourceDecisionReason::NoChange};
     std::optional<ResourceClock::time_point> waitSince;
     std::optional<ResourceClock::time_point> lastPreparationAt;
 };
@@ -144,8 +134,7 @@ struct ResourceEvent {
     std::size_t computing{0u};
     std::optional<std::uint64_t> reservedBytes;
     std::uint64_t grantEpoch{0u};
-    double memoryGain{0.5};
-    MemoryCalibrationResult memoryCalibration{MemoryCalibrationResult::Pending};
+    double memoryPreviewRatio{0.5};
     ResourceControlPhase memoryPhase{ResourceControlPhase::Normal};
 };
 static_assert(sizeof(ResourceEvent) <= 256u);
@@ -284,6 +273,7 @@ public:
     DataCodecExecutionResources& operator=(const DataCodecExecutionResources&) = delete;
     ~DataCodecExecutionResources();
     std::size_t Concurrency() const noexcept;
+    std::size_t WorkerCapacity() const noexcept;
     bool Threaded() const noexcept;
     bool IsDriverThread() const noexcept;
     bool ExternalSpillAvailable() const noexcept;
@@ -308,6 +298,8 @@ public:
         MemoryDemandKind, resource::StorageOwnerTag = {},
         std::span<const resource::StorageOwnerDescription> = {}, std::uint64_t preferredBytes = 0u);
     void CompleteMemoryPreparation() noexcept;
+    // 大额宿主准备结束后，后续准入必须读取边界之后的系统样本
+    bool SynchronizeMemoryAfterPreparation();
     void ClearByteWait() noexcept;
     std::optional<HeavyPhaseLease> TryAcquireHeavyPhase();
     bool SubmitTerminal(const SlotLease&, const std::shared_ptr<TerminalWork>&) noexcept;

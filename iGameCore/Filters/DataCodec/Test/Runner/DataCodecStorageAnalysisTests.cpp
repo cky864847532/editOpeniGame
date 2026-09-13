@@ -207,7 +207,7 @@ void Sequence(const LeafPackage& leaf, bool host, const LeafPackage* keyLeaf = n
     target.attributeTemporalRole = TemporalFieldRole::PredFrame;
     auto input = FrameReader({leaf}, target);
     const auto estimate = AnalyzeDecodeStorage({.inputReader = input, .referenceReaders = {reference},
-        .adapterBackedAttributes = host});
+        .adapterBackedAttributes = host, .adapterBackedGeometry = host, .adapterBackedConnectivity = host});
     Ensure(estimate.success, estimate.failure ? FormatCodecFailure(*estimate.failure) : "sequence analysis failed");
     const auto limit = *estimate.minimumExecutionLimitBytes;
     DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u}, limit, 1u, false});
@@ -680,7 +680,7 @@ void MultiBatchPolyhedronAdmission() {
         .attributeSelection = AttributeSelectionMode::None});
     Ensure(encoded.success, encoded.failure ? FormatCodecFailure(*encoded.failure) : "polyhedron multi-batch encode");
     auto input = std::make_shared<MemoryByteRangeReader>(std::make_shared<const EncodedBuffer>(std::move(encoded.encodedBytes)));
-    const DecodeStorageAnalysisRequest request{.inputReader = input, .adapterBackedAttributes = true};
+    const DecodeStorageAnalysisRequest request{.inputReader = input, .adapterBackedAttributes = true, .adapterBackedGeometry = true, .adapterBackedConnectivity = true};
     const auto analysis = AnalyzeDecodeStorage(request);
     Ensure(analysis.success && analysis.polyhedronCountScanMilliseconds > 0.0, "polyhedron count scan is reported");
     Run(request, false);
@@ -705,15 +705,15 @@ int RunDataCodecStorageAnalysisTests() try {
                 for (const auto selection : {AttributeSelectionMode::None, AttributeSelectionMode::Explicit,
                                             AttributeSelectionMode::AllAvailable}) {
                     DecodeStorageAnalysisRequest request{.inputReader = input, .attributeSelection = selection,
-                        .adapterBackedAttributes = host};
+                        .adapterBackedAttributes = host, .adapterBackedGeometry = host, .adapterBackedConnectivity = host};
                     if (selection == AttributeSelectionMode::Explicit) { request.attributeTargets = {{0u, {}, 1u}}; }
                     Run(request, false);
                     Run(request, false, true);
                 }
-                Run({.inputReader = FrameReader({leaf, leaf}), .adapterBackedAttributes = host}, true);
-                Run({.inputReader = input, .adapterBackedAttributes = host}, false, false, true);
+                Run({.inputReader = FrameReader({leaf, leaf}), .adapterBackedAttributes = host, .adapterBackedGeometry = host, .adapterBackedConnectivity = host}, true);
+                Run({.inputReader = input, .adapterBackedAttributes = host, .adapterBackedGeometry = host, .adapterBackedConnectivity = host}, false, false, true);
                 if (topology) {
-                    Run({.inputReader = input, .adapterBackedAttributes = host,
+                    Run({.inputReader = input, .adapterBackedAttributes = host, .adapterBackedGeometry = host, .adapterBackedConnectivity = host,
                         .topologyOutputMode = TopologyDecodeOutputMode::ObserverOnly}, false);
                 }
             }
@@ -736,8 +736,8 @@ int RunDataCodecStorageAnalysisTests() try {
             .output = EncodeOutput::Memory(EncodePackageKind::LeafPackage)});
         Ensure(encoded.success, encoded.failure ? FormatCodecFailure(*encoded.failure) : "host fixture encode failed");
         auto reader = std::make_shared<MemoryByteRangeReader>(std::make_shared<const EncodedBuffer>(std::move(encoded.encodedBytes)));
-        Run({.inputReader = reader, .adapterBackedAttributes = true}, false);
-        Run({.inputReader = reader, .adapterBackedAttributes = true}, false, true);
+        Run({.inputReader = reader, .adapterBackedAttributes = true, .adapterBackedGeometry = true, .adapterBackedConnectivity = true}, false);
+        Run({.inputReader = reader, .adapterBackedAttributes = true, .adapterBackedGeometry = true, .adapterBackedConnectivity = true}, false, true);
     }
     const auto missing = AnalyzeDecodeStorage({});
     Ensure(!missing.success && missing.failure && !missing.minimumExecutionLimitBytes, "missing input must fail cleanly");
@@ -750,7 +750,7 @@ int RunDataCodecStorageAnalysisTests() try {
         NumericArrayReferenceKind::IntraArray, 1u);
     for (const bool host : {false, true}) {
         Run({.inputReader = LeafReader(intra), .attributeSelection = AttributeSelectionMode::Explicit,
-            .attributeTargets = {{0u, {}, 1u}}, .adapterBackedAttributes = host}, false);
+            .attributeTargets = {{0u, {}, 1u}}, .adapterBackedAttributes = host, .adapterBackedGeometry = host, .adapterBackedConnectivity = host}, false);
     }
     NumericArrayStorageParams oversized;
     oversized.elementCount = std::numeric_limits<std::uint64_t>::max();

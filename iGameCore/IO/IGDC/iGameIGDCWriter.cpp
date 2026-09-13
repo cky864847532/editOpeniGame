@@ -7,7 +7,7 @@
 #include "DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h"
 #include "DataCodec/Filter/Adapter/iGameEncodeAdapter.h"
 #include "DataCodec/Workflow/FrameSequence/FrameSequenceEncodeExecutor.h"
-#include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
+#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
 #include "iGameIGDCFrameSequence.h"
 #include "iGameStreamingData.h"
 
@@ -216,7 +216,7 @@ public:
             m_outputHint,
             static_cast<std::uint32_t>(frameOrdinal));
         m_attemptedPaths.push_back(path);
-        return std::make_unique<iGameFileByteRangeOutput>(path);
+        return std::make_unique<::datacodec::FileByteRangeOutput>(path);
     }
 
     bool CommitFrame(
@@ -403,7 +403,7 @@ bool IGDCWriter::EncodeToFile(const ::datacodec::EncodePackageKind packageKind)
             m_DataObject != nullptr ? m_DataObject->GetName() : std::string{});
     }
 
-    iGameFileByteRangeOutput outputSink(outputPath);
+    ::datacodec::FileByteRangeOutput outputSink(outputPath);
     auto controlParams = m_hasCodecParams
         ? m_CodecParams
         : ::datacodec::MakeDefaultEncodeControlParams();

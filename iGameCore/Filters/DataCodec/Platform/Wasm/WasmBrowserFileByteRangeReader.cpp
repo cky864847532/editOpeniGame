@@ -2,65 +2,69 @@
 
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
+#include <array>
+#include <limits>
+
 #if defined(__EMSCRIPTEN__)
-#include <emscripten/em_js.h>
+#include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
 #endif
 
 namespace datacodec::wasm {
 
 #if defined(__EMSCRIPTEN__)
-EM_ASYNC_JS(int, datacodec_wasm_read_browser_file_range,
-            (std::uint32_t fileId, std::uint64_t offset, std::uint8_t* output, std::size_t byteCount), {
-    try {
-        const registry = Module.igameBrowserFiles;
-        const file = registry && registry.get(fileId);
-        if (!file) {
-            Module.igameBrowserFileLastError = `browser file ${fileId} is unavailable`;
-            return -1;
-        }
-        const start = Number(offset);
-        const count = Number(byteCount);
-        const destination = Number(output);
-        if (!Number.isSafeInteger(start) || start < 0 ||
-            !Number.isSafeInteger(count) || count < 0 || count > 1048576 ||
-            !Number.isSafeInteger(destination) || destination < 0 ||
-            !Number.isSafeInteger(start + count) || start + count > file.size) {
-            Module.igameBrowserFileLastError =
-                `invalid browser file range offset=${start} bytes=${count} size=${file.size}`;
-            return -2;
-        }
-        let bytes = new Uint8Array(await file.slice(start, start + count).arrayBuffer());
-        if (bytes.byteLength !== count) {
-            Module.igameBrowserFileLastError =
-                `browser file range returned ${bytes.byteLength} bytes, expected ${count}`;
-            return -3;
-        }
-        if (destination > HEAPU8.length || count > HEAPU8.length - destination) {
-            Module.igameBrowserFileLastError = 'browser file destination exceeds linear memory';
-            return -2;
-        }
-        HEAPU8.set(bytes, destination);
-        bytes = null;
-        if (typeof Module.igameBrowserFileReadObserver === 'function') {
-            try { Module.igameBrowserFileReadObserver(fileId, start, count); }
-            catch (error) {
-                Module.igameBrowserFileDiagnosticFailures = (Module.igameBrowserFileDiagnosticFailures || 0) + 1;
-            }
-        }
-        Module.igameBrowserFileLastError = String();
-        return 1;
-    } catch (error) {
-        Module.igameBrowserFileLastError = error && error.message
-            ? error.message
-            : String(error);
-        return -4;
-    }
-});
+namespace {
 
-EM_JS(void, datacodec_wasm_release_browser_file, (std::uint32_t fileId), {
-    if (Module.igameBrowserFiles) Module.igameBrowserFiles.delete(fileId);
-    if (Module.igameBrowserFileStats) Module.igameBrowserFileStats.delete(fileId);
-});
+int ReadBrowserFileRange(std::uint32_t fileId, std::uint64_t offset,
+    std::uint8_t* output, std::size_t byteCount, std::span<char> errorText) {
+    alignas(4) std::int32_t status = 0;
+    // 主线程持有 File 对象，异步读取结束前请求状态和目标缓冲保持存活
+    MAIN_THREAD_ASYNC_EM_ASM({
+        const fileId = Number($0);
+        const start = Number($1);
+        const destination = Number($2);
+        const count = Number($3);
+        const statusIndex = Number($4) / 4;
+        const errorAddress = Number($5);
+        const errorCapacity = Number($6);
+        const finish = (status, detail) => {
+            if (Module.dataCodecBrowserFiles) Module.dataCodecBrowserFiles.recordError(detail);
+            stringToUTF8(detail, errorAddress, errorCapacity);
+            Atomics.store(HEAP32, statusIndex, status);
+            Atomics.notify(HEAP32, statusIndex);
+        };
+        (async () => {
+            try {
+                const registry = Module.dataCodecBrowserFiles;
+                if (!registry) { finish(-1, 'DataCodec browser file bridge is unavailable'); return; }
+                if (!Number.isSafeInteger(destination) || destination < 0) {
+                    finish(-2, 'invalid browser file destination');
+                    return;
+                }
+                let bytes = await registry.read(fileId, start, count);
+                if (destination > HEAPU8.length || count > HEAPU8.length - destination) {
+                    finish(-2, 'browser file destination exceeds linear memory');
+                    return;
+                }
+                HEAPU8.set(bytes, destination);
+                bytes = null;
+                finish(1, String());
+            } catch (error) {
+                finish(-4, error && error.message ? error.message : String(error));
+            }
+        })();
+    }, fileId, offset, output, byteCount, &status, errorText.data(), errorText.size());
+    while (__atomic_load_n(&status, __ATOMIC_ACQUIRE) == 0) {
+        if (emscripten_is_main_browser_thread()) {
+            emscripten_sleep(0);
+        } else {
+            emscripten_futex_wait(&status, 0u, std::numeric_limits<double>::infinity());
+        }
+    }
+    return __atomic_load_n(&status, __ATOMIC_ACQUIRE);
+}
+
+}
 #endif
 
 WasmBrowserFileByteRangeReader::WasmBrowserFileByteRangeReader(
@@ -81,28 +85,43 @@ bool WasmBrowserFileByteRangeReader::ReadAt(
     const std::span<std::uint8_t> output,
     std::string* error) {
     if (m_fileId == 0u || offset > m_byteSize || output.size() > m_byteSize - offset) {
-        return validation::AssignError(error, "browser file read range is invalid");
+        return FailRead("browser file read range is invalid", error);
     }
     if (output.empty()) { return true; }
 #if defined(__EMSCRIPTEN__)
     for (std::size_t consumed = 0u; consumed < output.size();) {
         const auto count = std::min(output.size() - consumed, kIoWindowBytes);
-        const auto status = datacodec_wasm_read_browser_file_range(
-            m_fileId, offset + consumed, output.data() + consumed, count);
+        std::array<char, 512u> detail{};
+        const auto status = ReadBrowserFileRange(
+            m_fileId, offset + consumed, output.data() + consumed, count, detail);
         if (status != 1) {
-            return validation::AssignError(error,
-                "browser file range read failed with status " + std::to_string(status));
+            return FailRead("browser file range read failed: fileId=" + std::to_string(m_fileId) +
+                " offset=" + std::to_string(offset + consumed) + " bytes=" + std::to_string(count) +
+                " status=" + std::to_string(status) + " detail=" + detail.data(), error);
         }
         consumed += count;
     }
     return true;
 #else
-    return validation::AssignError(error, "browser file reader requires Emscripten");
+    return FailRead("browser file reader requires Emscripten", error);
 #endif
 }
 
 std::uint32_t WasmBrowserFileByteRangeReader::FileId() const noexcept {
     return m_fileId;
+}
+
+std::string WasmBrowserFileByteRangeReader::LastReadError() const {
+    std::lock_guard lock(m_errorMutex);
+    return m_lastReadError;
+}
+
+bool WasmBrowserFileByteRangeReader::FailRead(std::string message, std::string* error) {
+    {
+        std::lock_guard lock(m_errorMutex);
+        if (m_lastReadError.empty()) { m_lastReadError = message; }
+    }
+    return validation::AssignError(error, std::move(message));
 }
 
 std::shared_ptr<IByteRangeReader> CreateWasmBrowserFileByteRangeReader(
@@ -130,7 +149,10 @@ std::shared_ptr<IByteRangeReader> CreateWasmBrowserFileByteRangeReader(
 void ReleaseWasmBrowserFile(const std::uint32_t fileId) noexcept {
 #if defined(__EMSCRIPTEN__)
     if (fileId != 0u) {
-        datacodec_wasm_release_browser_file(fileId);
+        MAIN_THREAD_ASYNC_EM_ASM({
+            const fileId = Number($0);
+            if (Module.dataCodecBrowserFiles) Module.dataCodecBrowserFiles.release(fileId);
+        }, fileId);
     }
 #else
     (void)fileId;

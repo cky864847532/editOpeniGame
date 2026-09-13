@@ -9,7 +9,7 @@
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
 #include "DataCodec/Storage/Package/PackageBinaryHeader.h"
 #include "iGameDataCodecIOSettings.h"
-#include "DataCodec/Filter/Adapter/iGameFileByteRangeIO.h"
+#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
 #include "iGameIGDCFrameSequence.h"
 #include "Log/iGameLogger.h"
 
@@ -262,9 +262,9 @@ IGDCReader::Pointer IGDCReader::New() {
     using namespace ::datacodec;
     try {
         DecodeStorageAnalysisRequest request{
-            .inputReader = std::make_shared<iGameFileByteRangeReader>(path),
+            .inputReader = std::make_shared<::datacodec::FileByteRangeReader>(path),
             .attributeSelection = loadAllAttributes ? AttributeSelectionMode::AllAvailable : AttributeSelectionMode::None,
-            .adapterBackedAttributes = true,
+            .adapterBackedAttributes = true, .adapterBackedGeometry = true, .adapterBackedConnectivity = true,
             .stopToken = stop,
         };
         PackageInspection inspection;
@@ -540,7 +540,7 @@ bool IGDCReader::DecodeInput() {
                     selectedPaths.emplace_back(path);
                 }
             }
-            inputReader = std::make_shared<iGameFileByteRangeReader>(
+            inputReader = std::make_shared<::datacodec::FileByteRangeReader>(
                 selectedPaths.front());
             std::string inspectionError;
             if (!::datacodec::InspectPackage(

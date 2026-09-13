@@ -2,7 +2,7 @@
 #define DATACODEC_WORKFLOW_FRAMESEQUENCE_FRAMEDECODESOURCE_H
 
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
-#include "DataCodec/Runtime/Cache/DecodeCacheIdentity.h"
+#include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
 #include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
 
 #include <cstdint>

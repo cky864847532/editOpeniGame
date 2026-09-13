@@ -262,6 +262,8 @@ private:
             "topology exceeds local address space");
         const bool orders = std::any_of(topo.connectivityLayout.blockLayouts.begin(),
             topo.connectivityLayout.blockLayouts.end(), [](const auto& b) { return b.cellPolynomialOrderByteCount != 0u; });
+        if (request.adapterBackedConnectivity && !orders &&
+            request.topologyOutputMode == TopologyDecodeOutputMode::CommitToAdapter) { return 0u; }
         DecodedConnectivityStorageSize size;
         Check(CalculateDecodedConnectivityStorageSize(cells, indices, topo.fixedCellSize <= 0,
             topo.hasCellTypes != 0u, orders, size, &error));
@@ -428,6 +430,7 @@ private:
             if (!supplement) {
                 const auto& meta = leaf.params.geomParams;
                 Check(CalculateGeometryCacheBytes(meta.elementCount, static_cast<std::size_t>(meta.dimension), leaf.geometry, &error));
+                if (request.adapterBackedGeometry) { leaf.geometry = 0u; }
                 Add(DecodeStorageKind::Geometry, leaf.geometry, "geometry", index, leaf.package.path);
                 if (frame.metadata.geometryTemporalRole != TemporalFieldRole::SingleFrame &&
                     frame.metadata.geometryKeyFrameIndex == index && meta.elementCount != 0u && meta.dimension != 0) {

@@ -4,11 +4,10 @@
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
-#include "DataCodec/Workflow/Session/DecodeSession.h"
+#include "DataCodec/API/Entry/PackageDecodeSession.h"
 #include "DataCodec/API/Params/DataCodecControlParams.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Params/EncodedInputCacheParams.h"
-#include "DataCodec/Runtime/Cache/DecodeCacheRuntime.h"
 #include "DataCodec/API/Params/CodecResourceParams.h"
 #include "iGameDataObject.h"
 
@@ -86,7 +85,7 @@ public:
 
 private:
     struct Impl;
-    std::shared_ptr<Impl> m_impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 [[nodiscard]] DataCodecDataObjectDecodeResult DecodeDataCodecDataObject(
