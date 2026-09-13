@@ -78,7 +78,7 @@ void InitializeResourceController(ResourceControllerState& state,
     state = {};
     state.memory.targetRatio = config.targetAvailableMemoryRatio;
     state.memory.absoluteCapacityBytes = config.storageCeilingBytes.value_or(0u);
-    state.normalSlotLimit = config.threaded ? config.computeCeiling + 1u : 1u;
+    state.normalSlotLimit = config.threaded ? (config.threadMode == CodecThreadMode::Unlimited ? 0u : config.computeCeiling + 1u) : 1u;
 }
 
 void NoteMemoryReservation(ResourceControllerState& state, std::uint64_t,
@@ -262,7 +262,8 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
         throw std::invalid_argument("unknown DataCodec resource mode");
     }
     ResolvedResourceConfiguration result;
-    if (params.threadMode != CodecThreadMode::Fixed && params.threadMode != CodecThreadMode::Adaptive) {
+    if (params.threadMode != CodecThreadMode::Fixed && params.threadMode != CodecThreadMode::Adaptive &&
+        params.threadMode != CodecThreadMode::Unlimited) {
         throw std::invalid_argument("unknown DataCodec thread mode");
     }
     if (params.threadMode == CodecThreadMode::Adaptive) {
@@ -275,7 +276,10 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
             throw std::invalid_argument("adaptive threads require an idle ratio in [0,1) and no fixed thread limit");
         }
     } else if (params.targetCpuIdleRatio) {
-        throw std::invalid_argument("fixed threads require an unspecified CPU idle target");
+        throw std::invalid_argument("non-adaptive threads require an unspecified CPU idle target");
+    }
+    if (params.threadMode == CodecThreadMode::Unlimited && params.maxComputeThreads) {
+        throw std::invalid_argument("unlimited threads require an unspecified compute thread limit");
     }
     result.threadMode = params.threadMode;
     result.targetCpuIdleRatio = params.targetCpuIdleRatio.value_or(0.0);
@@ -285,12 +289,15 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
     result.externalSpillAvailable = sample.externalSpillAvailable;
     const auto allowed = ResourceComputeCapacity(sample, params.mode, params.threadMode);
     result.computeCeiling = params.maxComputeThreads.value_or(allowed);
-    if (result.computeCeiling == 0u || result.computeCeiling > allowed) {
+    const bool unlimitedThreads = params.threadMode == CodecThreadMode::Unlimited && sample.threaded;
+    if (unlimitedThreads) { result.computeCeiling = 0u; }
+    if (!unlimitedThreads && (result.computeCeiling == 0u || result.computeCeiling > allowed)) {
         throw std::invalid_argument("compute thread limit exceeds allowed CPU capacity");
     }
     if (!result.threaded && result.computeCeiling != 1u) {
         throw std::invalid_argument("this runtime only supports one compute thread");
     }
+    const auto slots = !sample.threaded ? 1u : unlimitedThreads ? 0u : result.computeCeiling + 1u;
     if (params.mode != CodecResourceMode::Adaptive && params.targetAvailableMemoryRatio) {
         throw std::invalid_argument("memory reserve ratio requires Adaptive mode");
     }
@@ -307,7 +314,7 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
         ResourceControllerState control;
         InitializeResourceController(control, result, sample.sampledAt);
         FlowSnapshot flow;
-        flow.limits = {0u, result.computeCeiling, result.threaded ? result.computeCeiling + 1u : 1u};
+        flow.limits = {0u, result.computeCeiling, slots};
         flow.runActive = true;
         flow.requestId = 1u;
         const auto decision = Advance(control, sample.sampledAt, sample, flow);
@@ -320,8 +327,7 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
             throw std::invalid_argument("Unlimited mode requires an unspecified owned storage limit");
         }
         result.storageCeilingBytes.reset();
-        result.initialLimits = {std::nullopt, result.computeCeiling,
-            result.threaded ? result.computeCeiling + 1u : 1u};
+        result.initialLimits = {std::nullopt, result.computeCeiling, slots};
         return result;
     }
     const auto total = sample.physicalTotalBytes ? std::optional<std::uint64_t>(std::min(*sample.physicalTotalBytes,
@@ -337,8 +343,7 @@ ResolvedResourceConfiguration ResolveResourceConfiguration(const CodecResourcePa
     const auto memoryInitial = total && available
         ? std::min(*result.storageCeilingBytes, (*available - std::min(*available, marks.high)) / 2u)
         : std::min(*result.storageCeilingBytes, 64u * mib);
-    result.initialLimits = {params.ownedStorageLimitBytes.value_or(memoryInitial), result.computeCeiling,
-        result.threaded ? result.computeCeiling + 1u : 1u};
+    result.initialLimits = {params.ownedStorageLimitBytes.value_or(memoryInitial), result.computeCeiling, slots};
     return result;
 }
 

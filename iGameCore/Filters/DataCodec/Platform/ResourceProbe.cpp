@@ -280,7 +280,7 @@ ResourceSample ProbeResources() {
 #if defined(DATACODEC_RUNTIME_THREAD_LIMIT) && DATACODEC_RUNTIME_THREAD_LIMIT > 0
     result.runtimeThreadLimit = static_cast<std::size_t>(DATACODEC_RUNTIME_THREAD_LIMIT);
 #else
-    // 线程池布局由同一个 WASM 构建契约提供
+    // 有限线程模式使用预创建池容量，Unlimited 允许运行时继续创建 worker
     result.runtimeThreadLimit = result.allowedComputeThreads.value_or(1u) + DATACODEC_WASM_POOL_OVERHEAD;
 #endif
     result.reservedHostThreads = DATACODEC_WASM_HOST_THREADS;

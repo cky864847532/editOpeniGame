@@ -21,9 +21,6 @@ public:
         std::uint64_t byteSize);
 
     [[nodiscard]] std::uint64_t ByteSize() const noexcept override;
-    [[nodiscard]] ByteRangePrefetchResult PrefetchRange(
-        std::uint64_t offset,
-        std::uint64_t byteSize) const override;
     bool ReadAt(
         std::uint64_t offset,
         std::span<std::uint8_t> output,

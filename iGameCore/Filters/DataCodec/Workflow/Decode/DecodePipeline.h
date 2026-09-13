@@ -463,9 +463,7 @@ private:
             try {
                 SubmitStageStartProgress(context, stageName);
                 RecordMemoryTraceStageEvent(context, stageName, true);
-                RecordSchedulerInvestigation(context, workspace, std::string("stage.begin.") + std::string(stageName));
                 stageNodes[next].stage->Execute(context, workspace);
-                RecordSchedulerInvestigation(context, workspace, std::string("stage.end.") + std::string(stageName));
                 if (timing) { RecordStageTiming(stageName, context, callback::ElapsedMilliseconds(start)); }
                 RecordMemoryTraceStageEvent(context, stageName, false);
                 SubmitStageProgress(context, stageName);

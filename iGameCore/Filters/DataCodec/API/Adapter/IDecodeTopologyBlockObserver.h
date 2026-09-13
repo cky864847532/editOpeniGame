@@ -17,7 +17,7 @@ struct ConnectivityTopologyDecodeInfo {
     int fixedCellSize{0};
     bool hasOffsets{false};
     bool hasCellTypes{false};
-    // 稳定的 worker 索引范围，运行期实际并发可以在此范围内变化
+    // 非零表示稳定索引范围，零表示索引按需增长；同一索引不并发重入
     std::size_t workerCapacity{1u};
 };
 

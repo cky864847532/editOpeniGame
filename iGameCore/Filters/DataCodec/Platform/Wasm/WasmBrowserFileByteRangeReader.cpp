@@ -75,11 +75,6 @@ std::uint64_t WasmBrowserFileByteRangeReader::ByteSize() const noexcept {
     return m_byteSize;
 }
 
-ByteRangePrefetchResult WasmBrowserFileByteRangeReader::PrefetchRange(
-    const std::uint64_t, const std::uint64_t) const {
-    return {.status = ByteRangePrefetchStatus::Unavailable};
-}
-
 bool WasmBrowserFileByteRangeReader::ReadAt(
     const std::uint64_t offset,
     const std::span<std::uint8_t> output,

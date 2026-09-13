@@ -43,7 +43,7 @@ struct StructuredMeshStorageParams {
 };
 
 struct SpatialBlockStorageParams {
-    // 新编码使用固定规格，反序列化保留文件实际值以读取旧块
+    // 编解码共用固定空间块规格
     std::uint32_t pointElementCount{numericarray::kSpatialBlockElementCount};
     std::uint32_t cellElementCount{numericarray::kSpatialBlockElementCount};
 
@@ -566,7 +566,6 @@ inline bool ValidateNumericArrayBytesCodecForParams(const NumericArrayBytesCodec
     switch (value) {
         case NumericArrayBytesCodec::RawBytes:
         case NumericArrayBytesCodec::NumericArrayCodec:
-        case NumericArrayBytesCodec::IntegerDeltaRunVarint:
         case NumericArrayBytesCodec::IntegerDeltaLiteralRunVarint:
             return true;
     }
@@ -1135,6 +1134,10 @@ inline bool ValidateSpatialBlockStorageParamsForParams(
     bool& requires64Bit,
     std::string* error) {
     const auto& spatial = params.spatialBlockParams;
+    if (spatial.pointElementCount != numericarray::kSpatialBlockElementCount ||
+        spatial.cellElementCount != numericarray::kSpatialBlockElementCount) {
+        return SetParamsError(error, "spatial block size must match the fixed codec block size");
+    }
     const auto pointElementTotal = params.geomParams.elementCount;
     const auto cellElementTotal = params.topoParams.cellCount;
     std::uint32_t expectedPointBlockCount = 0u;

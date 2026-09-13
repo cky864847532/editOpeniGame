@@ -911,7 +911,7 @@ inline bool DecodeSingleAttributeRangeToCache(
                 return validation::AssignError(error, "attribute decode consumed an unexpected payload size");
             }
             return attributes.EndAttribute(payloadRange.attrIndex, error);
-        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::AttributeDecode); }, [&] {
+        }, false, [&] { return cursor.NextWorkType(ResourceWorkPath::AttributeDecode); }, [&] {
             const auto& layout = meta.blockLayouts[cursor.nextBlock];
             const AttrStorageParams* referenceMeta = nullptr;
             if (layout.referenceKind == NumericArrayReferenceKind::IntraArray) {

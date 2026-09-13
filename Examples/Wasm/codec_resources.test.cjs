@@ -17,11 +17,11 @@ function fixture(maximumComputeThreads = 16, configureFailure = null) {
     return { controls, decode, configurations, statuses, setBusy(value) { busy = value; } };
 }
 
-test('always use unlimited memory and the complete device thread capacity', () => {
+test('default to unlimited memory and threads independently of device core count', () => {
     for (const threads of [1, 6, 16, 32]) {
         const { controls, configurations } = fixture(threads);
         controls.apply();
-        assert.deepEqual(configurations, [{ mode: 2, threads, bytes: '' }]);
+        assert.deepEqual(configurations, [{ mode: 2, threadMode: 2, threads: 0, bytes: '' }]);
     }
 });
 
@@ -43,17 +43,20 @@ test('file selection and busy state control the decode button without resource i
     assert.equal(decode.disabled, true);
 });
 
-test('invalid device thread capacity reports an error', () => {
+test('unlimited mode does not require a device thread count', () => {
     for (const count of [undefined, 0, -1, 1.5, NaN]) {
         const statuses = [];
-        assert.throws(() => createCodecResourceControls({
+        const configurations = [];
+        const controls = createCodecResourceControls({
             document: { getElementById: () => ({}) },
             defaults: { maximumComputeThreads: count },
-            configure() {},
+            configure(value) { configurations.push(value); },
             isBusy: () => false,
             messages: { submit: (...args) => statuses.push(args) },
-        }), /invalid device compute thread capacity/);
-        assert.deepEqual(statuses, [['DeviceComputeThreadsUnavailable', {}, 'error']]);
+        });
+        controls.apply();
+        assert.deepEqual(configurations, [{ mode: 2, threadMode: 2, threads: 0, bytes: '' }]);
+        assert.deepEqual(statuses, []);
     }
 });
 

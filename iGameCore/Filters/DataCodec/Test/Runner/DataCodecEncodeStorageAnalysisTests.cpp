@@ -217,6 +217,7 @@ int RunDataCodecEncodeStorageAnalysisTests() {
             CodecResourceParams params;
             params.mode = mode;
             params.maxComputeThreads = 1u;
+            params.threadMode = CodecThreadMode::Fixed;
             DataCodecExecutionResources root(params);
             Ensure(!root.FixedStorageLimitBytes(), "adaptive and unlimited have no fixed preflight limit");
         }

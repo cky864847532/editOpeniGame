@@ -10,6 +10,7 @@
 #include "DataCodec/Test/Experiment/DataCodecResourcePerformance.h"
 #include "DataCodec/Test/Experiment/DataCodecResourceEnvironment.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureEncodedInputCache.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureUnlimitedThreads.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureDecodedFrameCache.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureDecodeReferenceCache.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
@@ -271,16 +272,13 @@ int TestDataCodecReportFileContract() {
             decodeReportDirectory,
             "decode_errors_",
             decodeErrorPaths) ||
-        decodeProcessPaths.size() != 1u || !decodeErrorPaths.empty() ||
-        std::filesystem::exists(decodeReportDirectory / "decode_process.json") ||
-        std::filesystem::exists(decodeReportDirectory / "decode_errors.json")) {
+        decodeProcessPaths.size() != 1u || !decodeErrorPaths.empty()) {
         std::cerr << "successful decode report file contract failed\n";
         return 1;
     }
     for (const auto& entry : std::filesystem::directory_iterator(decodeReportDirectory)) {
-        const auto extension = entry.path().extension().string();
-        if (extension == ".csv" || entry.path().filename().string().starts_with("00_")) {
-            std::cerr << "decode report emitted a legacy detail file\n";
+        if (entry.path() != decodeProcessPaths.front()) {
+            std::cerr << "successful decode must produce exactly one process report\n";
             return 1;
         }
     }
@@ -373,6 +371,16 @@ namespace datacodec::test { int RunDataCodecStorageAnalysisTests(); }
 namespace datacodec::test { int RunDataCodecEncodeStorageAnalysisTests(); }
 
 int main(const int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--budget") {
+        const auto result = datacodec::test::RunDataCodecFeatureBudget();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--robustness") {
+        const auto result = datacodec::test::RunDataCodecFeatureRobustness();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--encode-storage-analysis") {
         return datacodec::test::RunDataCodecEncodeStorageAnalysisTests();
     }
@@ -467,6 +475,11 @@ int main(const int argc, char** argv) {
         PrintResult(result);
         return result.passed ? 0 : 1;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--unlimited-threads") {
+        const auto result = datacodec::test::RunDataCodecFeatureUnlimitedThreads();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--cpu-control") {
         const auto result = datacodec::test::RunDataCodecCpuControlTests();
         PrintResult(result);
@@ -508,6 +521,10 @@ int main(const int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--write-browser-fixture") {
         return WriteBrowserFixture(argv[2]);
     }
+
+    const auto nativeResult = datacodec::test::RunDataCodecFeatureNativeDecodeStorage();
+    PrintResult(nativeResult);
+    if (!nativeResult.passed) { return 1; }
 
     const auto coreResult = datacodec::test::RunDataCodecSelfTest();
     PrintResult(coreResult);

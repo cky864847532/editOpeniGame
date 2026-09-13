@@ -9,7 +9,6 @@
 
 #include <array>
 #include <cstdint>
-#include <iostream>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -65,12 +64,6 @@ struct FailureTestWorkspace {
 
     void CleanupOnFailure() noexcept { ++cleanupCount; }
 };
-
-inline void PrintResult(const TestResult& result) {
-    for (const auto& failure : result.failures) {
-        std::cerr << failure.check << ": " << failure.message << '\n';
-    }
-}
 
 inline void RequireReadFailure(
     TestResult& result,
@@ -140,8 +133,7 @@ inline void RequireMutationFailure(
     RequireMutationReadFailure(result, fieldType, mutationKind, check);
 }
 
-inline bool TestMalformedLeafPackageMemoryInputs() {
-    TestResult result;
+inline void TestMalformedLeafPackageMemoryInputs(TestResult& result) {
 
     const std::array fieldTypes{
         FieldType::Params,
@@ -166,12 +158,9 @@ inline bool TestMalformedLeafPackageMemoryInputs() {
         }
     }
 
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestFailureManagementStopsAndRecords() {
-    TestResult result;
+inline void TestFailureManagementStopsAndRecords(TestResult& result) {
     FailureTestContext context;
     FailureTestWorkspace workspace;
 
@@ -201,12 +190,9 @@ inline bool TestFailureManagementStopsAndRecords() {
         "failure.message",
         "failure message should be preserved");
 
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestFailureScopeCatchesAndCleans() {
-    TestResult result;
+inline void TestFailureScopeCatchesAndCleans(TestResult& result) {
     FailureTestContext context;
     FailureTestWorkspace workspace;
 
@@ -246,12 +232,9 @@ inline bool TestFailureScopeCatchesAndCleans() {
     Require(result, context.cleanupCount == 1, "failureScope.contextCleanup", "context should be cleaned once");
     Require(result, workspace.cleanupCount == 1, "failureScope.workspaceCleanup", "workspace should be cleaned once");
 
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestFailureScopeCleansExplicitFalse() {
-    TestResult result;
+inline void TestFailureScopeCleansExplicitFalse(TestResult& result) {
     FailureTestContext context;
     FailureTestWorkspace workspace;
 
@@ -275,31 +258,20 @@ inline bool TestFailureScopeCleansExplicitFalse() {
         "failureScope.explicitFalseCleanup",
         "explicit false should clean both context and workspace");
 
-    PrintResult(result);
-    return result.passed;
 }
 
 } // namespace datacodec::test::feature_robustness
 
 namespace datacodec::test {
 
-inline int RunDataCodecFeatureRobustness() {
-    if (!feature_robustness::TestMalformedLeafPackageMemoryInputs()) {
-        return 1;
-    }
-    if (!feature_robustness::TestFailureManagementStopsAndRecords()) {
-        return 1;
-    }
-    if (!feature_robustness::TestFailureScopeCatchesAndCleans()) {
-        return 1;
-    }
-    if (!feature_robustness::TestFailureScopeCleansExplicitFalse()) {
-        return 1;
-    }
-    std::cout << "DataCodec malformed feature tests passed\n";
-    return 0;
+inline TestResult RunDataCodecFeatureRobustness() {
+    TestResult result;
+    feature_robustness::TestMalformedLeafPackageMemoryInputs(result);
+    feature_robustness::TestFailureManagementStopsAndRecords(result);
+    feature_robustness::TestFailureScopeCatchesAndCleans(result);
+    feature_robustness::TestFailureScopeCleansExplicitFalse(result);
+    return result;
 }
-
 } // namespace datacodec::test
 
 #endif

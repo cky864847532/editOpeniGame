@@ -87,13 +87,6 @@ inline bool LoadConnectivityEncodedStream(
     return true;
 }
 
-struct ConnectivityDecodedBlock {
-    std::vector<IndexType> connectivity;
-    std::vector<IndexType> offsets;
-    std::vector<IndexType> cellTypes;
-    std::vector<std::uint16_t> polynomialOrders;
-};
-
 inline bool DecodeConnectivityTopologyBlock(
     const IConnectivityTopologyEncodedStreamReader& encoded,
     const std::size_t pointCount,

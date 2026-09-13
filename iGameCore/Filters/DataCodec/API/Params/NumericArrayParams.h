@@ -227,7 +227,7 @@ struct NumericArrayBlockLayoutParams {
 };
 
 struct NumericArrayStorageParams {
-    // 回退或压缩成功后最终落下的 section codec
+    // 实际写入数据段的编码类型
     EncodedFieldCodecType codecType{EncodedFieldCodecType::Unknown};
     // 源 NumericArray 的标量类型
     DataType dataType{DataType::Float32};

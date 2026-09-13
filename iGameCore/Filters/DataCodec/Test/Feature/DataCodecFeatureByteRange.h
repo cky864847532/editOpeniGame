@@ -134,22 +134,6 @@ namespace datacodec::test {
         "byteRange.contiguous.unavailable",
         "reader without contiguous capability did not report unavailable");
 
-    const auto prefetchUnavailable = memoryReader.PrefetchRange(0u, 4u);
-    Require(
-        result,
-        prefetchUnavailable.IsUnavailable(),
-        "byteRange.prefetch.unavailable",
-        "reader without prefetch capability did not report unavailable");
-
-    auto sharedMemoryReader = std::make_shared<MemoryByteRangeReader>(
-        memoryOwner);
-    SubrangeByteRangeReader subrangeReader(sharedMemoryReader, 1u, 2u);
-    const auto prefetchError = subrangeReader.PrefetchRange(2u, 1u);
-    Require(
-        result,
-        prefetchError.IsError() && !prefetchError.error.empty(),
-        "byteRange.prefetch.error",
-        "invalid prefetch range did not produce an error status");
     {
         std::vector<std::uint8_t> target(2u * kIoWindowBytes + 7u);
         std::array<std::size_t, 3u> sizes{};

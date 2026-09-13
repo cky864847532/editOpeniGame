@@ -30,45 +30,14 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
-// 被删除的资源模块不能通过旧头文件重新进入公共构建
-#if __has_include("DataCodec/API/Adapter/IDecodedFrameCache.h") || \
-    __has_include("DataCodec/API/Adapter/IEncodedInputCache.h") || \
-    __has_include("DataCodec/API/Params/CodecPerformanceParams.h") || \
-    __has_include("DataCodec/API/Params/CodecPerformancePresetParams.h") || \
-    __has_include("DataCodec/Filter/Execution/iGameDataCodecThreadPoolTaskRunner.h") || \
-    __has_include("DataCodec/Filter/Adapter/iGameStreamingFrameCacheAdapter.h") || \
-    __has_include("DataCodec/Codec/Attributes/AttributeEncodeScheduler.h") || \
-    __has_include("DataCodec/Storage/ByteIO/Window/WindowBudget.h") || \
-    __has_include("DataCodec/Codec/Topology/Common/TopologyWorkBudget.h")
-#error "Removed DataCodec resource modules must not remain available"
-#endif
-
 namespace datacodec::test {
 
-template<class Request>
-inline constexpr bool HasExternalResourceInjection =
-    requires(Request& request) { request.executionResources; } ||
-    requires(Request& request) { request.runner; } ||
-    requires(Request& request) { request.parallelTaskRunner; } ||
-    requires(Request& request) { request.cacheRuntime; } ||
-    requires(Request& request) { request.decodeCacheRuntime; } ||
-    requires(Request& request) { request.decodedFrameCache; } ||
-    requires(Request& request) { request.encodedInputCache; };
-
-static_assert(!HasExternalResourceInjection<EncodeRequest>);
-static_assert(!HasExternalResourceInjection<DecodePackageRequest>);
-static_assert(!HasExternalResourceInjection<PlaybackOpenRequest>);
-static_assert(!HasExternalResourceInjection<PlaybackSequenceOpenRequest>);
-static_assert(!HasExternalResourceInjection<LeafEncodeRequest>);
-static_assert(!HasExternalResourceInjection<FrameEncodeRequest>);
-template<class Execution>
-inline constexpr bool HasLegacyTaskGroup = requires(Execution& execution) { execution.CreateGroup(); };
-static_assert(!HasLegacyTaskGroup<DataCodecExecutionResources>);
 static_assert(std::is_same_v<decltype(EncodeRequest::resources), CodecResourceParams>);
 static_assert(std::is_same_v<decltype(DecodePackageRequest::resources), CodecResourceParams>);
 static_assert(std::is_same_v<decltype(PlaybackOpenRequest::resources), CodecResourceParams>);
@@ -1099,6 +1068,21 @@ inline bool CheckForcedReferenceFailure(
 inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
     TestResult result;
 
+    {
+        auto dataset = MakePipelineContractUnstructuredDataset();
+        TestEncodeAdapter adapter(dataset);
+        DataCodecExecutionResources resources(ResolvedResourceConfiguration{
+            {1024u, 1u, 1u}, 1024u, 1u, false, true});
+        CodecRunScope run(resources);
+        EncodeContext context(resources);
+        context.adapter = &adapter;
+        EncodeLeafWorkspace workspace;
+        Require(result, !ExecuteAttributeField(context, workspace,
+            {.stageName = "PointAttributeStage"}) && context.HasFailure() &&
+            context.FirstFailure()->code == CodecErrorCode::MissingInput,
+            "pipeline.attribute-requires-controls", "missing resolved controls must enter the failure path");
+    }
+
     std::string error;
     const auto originalOrder = RemapOrderSource::Original();
     const auto computedIdentityOrder = RemapOrderSource::TryComputed(
@@ -1149,13 +1133,15 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
 
     CodecStorageParams spatialParams;
     spatialParams.meshType = MeshType::PointSet;
-    spatialParams.spatialBlockParams.pointElementCount = 4u;
-    spatialParams.spatialBlockParams.cellElementCount = 4u;
     spatialParams.geomParams.codecType = EncodedFieldCodecType::NumericArrayBlocks;
     spatialParams.geomParams.dataType = DataType::Float32;
-    spatialParams.geomParams.elementCount = 10u;
+    constexpr auto fixedBlockCount = numericarray::kSpatialBlockElementCount;
+    spatialParams.geomParams.elementCount = 2u * fixedBlockCount + 3u;
     spatialParams.geomParams.dimension = 3;
-    for (const auto& range : layout) {
+    std::vector<numericarray::SpatialBlockRange> storageLayout;
+    Require(result, numericarray::BuildSpatialBlockLayout(spatialParams.geomParams.elementCount,
+        fixedBlockCount, storageLayout, &error), "pipeline.storageLayout", error);
+    for (const auto& range : storageLayout) {
         NumericArrayBlockLayoutParams block;
         block.mode = NumericArrayBlockMode::NonReference;
         block.elementOffset = range.elementOffset;
@@ -1179,7 +1165,7 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
         "pipeline.sharedSpatialLayoutParams",
         error.empty() ? "shared spatial block params were rejected" : error);
     auto mismatchedSpatialParams = spatialParams;
-    mismatchedSpatialParams.geomParams.blockLayouts[1].elementOffset = 5u;
+    mismatchedSpatialParams.geomParams.blockLayouts[1].elementOffset = fixedBlockCount + 1u;
     requires64Bit = false;
     error.clear();
     Require(
@@ -1188,24 +1174,42 @@ inline TestResult RunDataCodecFeaturePipelineContracts() noexcept {
         "pipeline.rejectSpatialLayoutMismatch",
         "numeric array block mismatch was accepted outside the shared spatial layout");
 
-    for (const auto fileBlockCount : {numericarray::kSpatialBlockElementCount, 262144u}) {
-        auto fileParams = spatialParams;
-        fileParams.spatialBlockParams.pointElementCount = fileBlockCount;
-        fileParams.spatialBlockParams.cellElementCount = fileBlockCount;
-        fileParams.geomParams.elementCount = static_cast<ParamSize>(fileBlockCount) * 2u + 3u;
-        for (std::size_t i = 0u; i < fileParams.geomParams.blockLayouts.size(); ++i) {
-            auto& block = fileParams.geomParams.blockLayouts[i];
-            block.elementOffset = static_cast<std::uint32_t>(i) * fileBlockCount;
-            block.elementCount = i == 2u ? 3u : fileBlockCount;
-        }
+    {
         std::vector<std::uint8_t> bytes;
         CodecStorageParams restored;
-        Require(result, SerializeCodecStorageParams(fileParams, bytes, &error) &&
+        Require(result, SerializeCodecStorageParams(spatialParams, bytes, &error) &&
             DeserializeCodecStorageParams(bytes, restored, &error) &&
-            restored.spatialBlockParams.pointElementCount == fileBlockCount &&
-            restored.spatialBlockParams.cellElementCount == fileBlockCount &&
-            restored.geomParams.blockLayouts.back().elementOffset == 2u * fileBlockCount,
-            "pipeline.persist-file-granularity", "decoding metadata must preserve both new and legacy block boundaries");
+            restored.spatialBlockParams.pointElementCount == fixedBlockCount &&
+            restored.spatialBlockParams.cellElementCount == fixedBlockCount &&
+            restored.geomParams.blockLayouts.back().elementOffset == 2u * fixedBlockCount,
+            "pipeline.persist-fixed-granularity", "metadata must preserve the fixed block size and tail boundary");
+
+        for (const auto invalidCase : {0u, 1u, 2u}) {
+            auto invalid = spatialParams;
+            if (invalidCase == 0u) { invalid.spatialBlockParams.pointElementCount = fixedBlockCount + 1u; }
+            if (invalidCase == 1u) { invalid.spatialBlockParams.cellElementCount = fixedBlockCount + 1u; }
+            if (invalidCase == 2u) {
+                invalid.geomParams.blockLayouts.front().componentLayouts.front().bytesCodec =
+                    static_cast<NumericArrayBytesCodec>(2u);
+            }
+            error.clear();
+            Require(result, !SerializeCodecStorageParams(invalid, bytes, &error) && bytes.empty() && !error.empty(),
+                "pipeline.reject-unsupported-storage-write", "unsupported storage metadata must fail serialization");
+            // 直接构造非法输入，核验读取端独立执行格式校验
+            std::ostringstream stream(std::ios::binary | std::ios::out);
+            {
+                cereal::PortableBinaryOutputArchive archive(stream,
+                    cereal::PortableBinaryOutputArchive::Options::LittleEndian());
+                archive(CodecStorageParamsHeader{}, invalid);
+            }
+            const auto malformed = stream.str();
+            error.clear();
+            CodecErrorCode code{};
+            Require(result, !DeserializeCodecStorageParams(
+                {reinterpret_cast<const std::uint8_t*>(malformed.data()), malformed.size()},
+                restored, &error, &code) && code == CodecErrorCode::InvalidInput && !error.empty(),
+                "pipeline.reject-unsupported-storage-read", "unsupported storage metadata must fail deserialization");
+        }
     }
     {
         auto dataset = MakePipelineContractUnstructuredDataset();

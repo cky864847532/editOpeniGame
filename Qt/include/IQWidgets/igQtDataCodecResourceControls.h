@@ -38,7 +38,7 @@ public:
         m_mode->setObjectName(QStringLiteral("DataCodecResourceMode"));
         m_mode->addItem(QStringLiteral("自适应"), static_cast<int>(::datacodec::CodecResourceMode::Adaptive));
         m_mode->addItem(QStringLiteral("固定上限"), static_cast<int>(::datacodec::CodecResourceMode::Fixed));
-        m_mode->addItem(QStringLiteral("内存不设上限"), static_cast<int>(::datacodec::CodecResourceMode::Unlimited));
+        m_mode->addItem(QStringLiteral("无限制"), static_cast<int>(::datacodec::CodecResourceMode::Unlimited));
         m_mode->setToolTip(QStringLiteral("固定上限：本次请求保持启动时的内存限制\n自适应：按系统可用物理内存保留比例调整分配许可，压力持续时暂停新增工作\n内存不设上限：由系统提供内存，保留线程控制和有界块处理"));
         m_reserve = new QDoubleSpinBox(this);
         m_reserve->setObjectName(QStringLiteral("DataCodecTargetAvailableMemory"));
@@ -49,8 +49,9 @@ public:
         InitializeMemoryReserveHint();
         m_threadMode = new QComboBox(this);
         m_threadMode->setObjectName(QStringLiteral("DataCodecThreadMode"));
-        m_threadMode->addItem(QStringLiteral("固定线程上限"), static_cast<int>(::datacodec::CodecThreadMode::Fixed));
-        m_threadMode->addItem(QStringLiteral("自适应 CPU 空闲量"), static_cast<int>(::datacodec::CodecThreadMode::Adaptive));
+        m_threadMode->addItem(QStringLiteral("无限制"), static_cast<int>(::datacodec::CodecThreadMode::Unlimited));
+        m_threadMode->addItem(QStringLiteral("固定上限"), static_cast<int>(::datacodec::CodecThreadMode::Fixed));
+        m_threadMode->addItem(QStringLiteral("自适应"), static_cast<int>(::datacodec::CodecThreadMode::Adaptive));
         m_idle = new QDoubleSpinBox(this);
         m_idle->setObjectName(QStringLiteral("DataCodecTargetCpuIdle"));
         m_idle->setRange(0.0, 99.0);
@@ -118,7 +119,9 @@ public:
         params.mode = static_cast<::datacodec::CodecResourceMode>(m_mode->currentData().toInt());
         params.threadMode = static_cast<::datacodec::CodecThreadMode>(m_threadMode->currentData().toInt());
         if (params.threadMode == ::datacodec::CodecThreadMode::Adaptive) { params.targetCpuIdleRatio = m_idle->value() / 100.0; }
-        else if (m_threads->value() > 0) { params.maxComputeThreads = static_cast<std::size_t>(m_threads->value()); }
+        else if (params.threadMode == ::datacodec::CodecThreadMode::Fixed && m_threads->value() > 0) {
+            params.maxComputeThreads = static_cast<std::size_t>(m_threads->value());
+        }
         if (params.mode == ::datacodec::CodecResourceMode::Adaptive) {
             params.targetAvailableMemoryRatio = m_reserve->value() / 100.0;
         }
@@ -147,7 +150,8 @@ private:
     void PublishStorageStatus(const ::datacodec::DataCodecStatusRecord& status, bool rejected = false);
     void RefreshMode() {
         const bool adaptive = m_threadMode->currentData().toInt() == static_cast<int>(::datacodec::CodecThreadMode::Adaptive);
-        m_threads->setEnabled(!adaptive);
+        const bool fixed = m_threadMode->currentData().toInt() == static_cast<int>(::datacodec::CodecThreadMode::Fixed);
+        m_threads->setEnabled(fixed);
         m_idle->setEnabled(adaptive);
         const auto mode = static_cast<::datacodec::CodecResourceMode>(m_mode->currentData().toInt());
         const auto showRow = [&](QWidget* field, bool visible) {
@@ -156,7 +160,7 @@ private:
         };
         showRow(m_reserve, mode == ::datacodec::CodecResourceMode::Adaptive);
         showRow(m_memory, mode == ::datacodec::CodecResourceMode::Fixed);
-        showRow(m_threads, !adaptive);
+        showRow(m_threads, fixed);
         showRow(m_idle, adaptive);
         m_reserve->setEnabled(mode == ::datacodec::CodecResourceMode::Adaptive);
         m_memory->setEnabled(mode == ::datacodec::CodecResourceMode::Fixed);

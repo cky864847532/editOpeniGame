@@ -1159,7 +1159,7 @@ struct ExtractDecodedUG : public ExtractCellBoundaries {
 struct ModelGeometryDecodedSurfaceBuilder::Impl {
     explicit Impl(const IGsize pointCountValue, const std::size_t workerCountValue)
         : pointCount(pointCountValue),
-          workerCount(std::max<std::size_t>(workerCountValue, 1u)) {
+          workerCount(workerCountValue) {
         if (pointCount > static_cast<IGsize>(std::numeric_limits<igIndex>::max())) {
             Fail("decoded surface point count exceeds index capacity");
             return;
@@ -1189,6 +1189,7 @@ struct ModelGeometryDecodedSurfaceBuilder::Impl {
     std::size_t workerCount{1u};
     std::unique_ptr<ExtractDecodedUG> extract;
     std::vector<std::unique_ptr<FaceMemoryPool>> pools;
+    std::mutex poolsMutex;
     std::atomic<bool> valid{true};
     mutable std::mutex errorMutex;
     std::string error;
@@ -1233,7 +1234,7 @@ bool ModelGeometryDecodedSurfaceBuilder::AccumulateBlock(
         if (m_impl != nullptr) { m_impl->CopyError(error); }
         return false;
     }
-    if (workerIndex >= m_impl->pools.size()) {
+    if (m_impl->workerCount != 0u && workerIndex >= m_impl->workerCount) {
         m_impl->Fail("decoded surface worker index is invalid");
         m_impl->CopyError(error);
         return false;
@@ -1258,7 +1259,19 @@ bool ModelGeometryDecodedSurfaceBuilder::AccumulateBlock(
         m_impl->CopyError(error);
         return false;
     }
-    auto* outputFacePool = m_impl->pools[workerIndex].get();
+    FaceMemoryPool* outputFacePool = nullptr;
+    {
+        // 容器扩展加锁，独立 pool 的地址稳定，后续提取继续并发执行
+        std::lock_guard<std::mutex> lock(m_impl->poolsMutex);
+        if (workerIndex >= m_impl->pools.max_size()) { throw std::length_error("surface worker storage exhausted"); }
+        if (workerIndex >= m_impl->pools.size()) { m_impl->pools.resize(workerIndex + 1u); }
+        if (!m_impl->pools[workerIndex]) {
+            auto pool = std::make_unique<FaceMemoryPool>();
+            pool->Initialize(static_cast<igIndex>(m_impl->pointCount));
+            m_impl->pools[workerIndex] = std::move(pool);
+        }
+        outputFacePool = m_impl->pools[workerIndex].get();
+    }
     auto* outputFaceMap = m_impl->extract->FaceMap.get();
 #if defined(__EMSCRIPTEN__)
     FaceMemoryPool localFacePool;

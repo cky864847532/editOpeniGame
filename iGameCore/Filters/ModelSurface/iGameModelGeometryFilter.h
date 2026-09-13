@@ -133,6 +133,7 @@ private:
 
 class ModelGeometryDecodedSurfaceBuilder {
 public:
+    // workerCount 为零时按实际 worker 索引延迟创建独立存储
     ModelGeometryDecodedSurfaceBuilder(IGsize pointCount, std::size_t workerCount);
     ~ModelGeometryDecodedSurfaceBuilder();
 

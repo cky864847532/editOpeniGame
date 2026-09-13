@@ -1044,21 +1044,19 @@
                     log('init exception: Module.iGameWeb is unavailable');
                     return;
                 }
-                const codecDefaults = JSON.parse(api.getCodecResourceDefaultsJson());
                 const codecMessages = createCodecHostMessages(JSON.parse(api.getCodecHostMessagesJson()), status => {
                     const separator = status.language === 'en' ? ': ' : '：';
                     log(`[DataCodec/${status.severity}] ${status.text}${status.technicalDetail ? separator + status.technicalDetail : ''}`);
                 });
                 const codecResources = createCodecResourceControls({
                     document,
-                    defaults: codecDefaults,
                     messages: codecMessages,
                     isBusy: () => wasmAsyncCallActive,
-                    configure: ({ mode, threads, bytes }) => {
-                        if (!api.configureNextCodecRun(mode, threads, bytes)) { throw new Error(api.getLastErrorJson()); }
+                    configure: ({ mode, threadMode, threads, bytes }) => {
+                        if (!api.configureNextCodecRun(mode, threadMode, threads, bytes)) { throw new Error(api.getLastErrorJson()); }
                     },
                 });
-                codecMessages.submit('UnlimitedMemoryFixedThreads', { threads: codecDefaults.maximumComputeThreads });
+                codecMessages.submit('UnlimitedMemoryUnlimitedThreads');
                 const applyCodecStartupResources = () => codecResources.apply();
 
                 try {

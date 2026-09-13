@@ -76,7 +76,7 @@ struct iGamePreparedSurfaceDecodeAdapter::Impl {
         hasOffsets = info.hasOffsets;
         hasCellTypes = info.hasCellTypes;
         if (!info.hasCellTypes || info.pointCount == 0u || info.cellCount == 0u ||
-            info.blockCount == 0u || workerCapacity == 0u) {
+            info.blockCount == 0u) {
             if (error != nullptr) {
                 *error = "prepared surface requires explicit cell types and non-empty topology";
             }
@@ -96,7 +96,7 @@ struct iGamePreparedSurfaceDecodeAdapter::Impl {
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (builder == nullptr || completed || failed || block.blockIndex >= expectedBlockCount ||
-                blockProgress[block.blockIndex].state != 0u || block.workerIndex >= workerCapacity ||
+                blockProgress[block.blockIndex].state != 0u || (workerCapacity != 0u && block.workerIndex >= workerCapacity) ||
                 block.fixedCellSize != fixedCellSize || block.cellOffset > expectedCellCount ||
                 block.cellTypes.empty() || block.cellTypes.size() > expectedCellCount - block.cellOffset) {
                 failed = true;

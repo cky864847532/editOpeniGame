@@ -13,14 +13,9 @@ function createCodecHostMessages(catalog, publish) {
     };
 }
 
-// 页面统一使用无内存上限和设备最大固定计算并发
-function createCodecResourceControls({ document, defaults, configure, isBusy, messages }) {
+// 页面默认取消内存与计算线程额度，具体分配交给核心及运行时
+function createCodecResourceControls({ document, configure, isBusy, messages }) {
     const decode = document.getElementById('btnDecodeIgc');
-    const threads = defaults.maximumComputeThreads;
-    if (!Number.isInteger(threads) || threads < 1) {
-        messages.submit('DeviceComputeThreadsUnavailable', {}, 'error');
-        throw new Error('invalid device compute thread capacity');
-    }
     let file = null;
     function refresh() {
         decode.disabled = !file || isBusy();
@@ -28,7 +23,7 @@ function createCodecResourceControls({ document, defaults, configure, isBusy, me
     refresh();
     return {
         apply() {
-            try { configure({ mode: 2, threads, bytes: '' }); }
+            try { configure({ mode: 2, threadMode: 2, threads: 0, bytes: '' }); }
             catch (error) {
                 messages.submit('ResourceConfigurationFailed', {}, 'error', error.message || String(error));
                 throw error;

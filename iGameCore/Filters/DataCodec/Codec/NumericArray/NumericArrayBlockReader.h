@@ -90,7 +90,6 @@ struct NumericDecodeCursor {
     const std::vector<NumericArrayBlockLayoutParams>& layouts;
     const CacheResources& resources;
     std::size_t nextBlock{0u};
-    bool singleRecord{false};
 
     bool Prepare(std::string* error) {
         ParamSize elements = 0u;
@@ -100,11 +99,10 @@ struct NumericDecodeCursor {
             if (!MakeNumericArrayBlockHeader(layout, header, error) ||
                 !ResolveNumericArrayBlockRawByteCount(params, header.elementCount, rawBytes, error)) { return false; }
             if (header.elementCount == 0u || header.elementOffset != elements || elements > params.elementCount ||
-                header.elementCount > params.elementCount - elements) {
+                header.elementCount > kSpatialBlockElementCount || header.elementCount > params.elementCount - elements) {
                 return validation::AssignError(error, "numeric array block layouts are not a contiguous complete field");
             }
             elements += header.elementCount;
-            singleRecord |= header.elementCount > kSpatialBlockElementCount;
         }
         return elements == params.elementCount ||
             validation::AssignError(error, "numeric array block layouts do not cover the full field");
@@ -117,7 +115,7 @@ struct NumericDecodeCursor {
             .codec = static_cast<std::uint32_t>(layout.bytesCodec),
             .scalar = static_cast<std::uint32_t>(params.dataType),
             .components = static_cast<std::uint32_t>(params.componentCount),
-            .blockElements = std::max<std::uint64_t>(kSpatialBlockElementCount, layout.elementCount),
+            .blockElements = kSpatialBlockElementCount,
             .referencePath = (static_cast<std::uint32_t>(layout.mode) << 8u) |
                 static_cast<std::uint32_t>(layout.referenceKind),
         };
@@ -125,7 +123,6 @@ struct NumericDecodeCursor {
             switch (codec) {
             case NumericArrayBytesCodec::RawBytes: key.componentCodecMask |= 1u; break;
             case NumericArrayBytesCodec::NumericArrayCodec: key.componentCodecMask |= 2u; break;
-            case NumericArrayBytesCodec::IntegerDeltaRunVarint: key.componentCodecMask |= 4u; break;
             case NumericArrayBytesCodec::IntegerDeltaLiteralRunVarint: key.componentCodecMask |= 8u; break;
             }
         };

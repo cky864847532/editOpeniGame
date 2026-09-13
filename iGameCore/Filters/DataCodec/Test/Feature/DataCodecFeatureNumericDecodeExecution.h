@@ -14,8 +14,8 @@ namespace datacodec::test {
 inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
     TestResult result;
     static constexpr std::uint64_t limit = 32u * 1024u * 1024u;
-    for (const bool legacy : {false, true}) {
-        const auto blockSize = numericarray::kSpatialBlockElementCount + (legacy ? 3u : 0u);
+    {
+        constexpr auto blockSize = numericarray::kSpatialBlockElementCount;
         const std::size_t count = 2u * blockSize + 7u;
         GeometryStorageParams meta;
         meta.dataType = DataType::Float64;
@@ -42,7 +42,35 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
             offset += size;
         }
         Require(result, encoded, "numericDecode.fixture", error);
-        if (!encoded) { continue; }
+        if (!encoded) { return result; }
+        {
+            auto oversized = meta;
+            oversized.elementCount = blockSize + 1u;
+            oversized.blockLayouts.resize(1u);
+            oversized.blockLayouts.front().elementCount = blockSize + 1u;
+            DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 1u, 1u},
+                limit, 1u, false, true});
+            CodecRunScope scope(root);
+            CacheResources resources;
+            resources.BindRun(root);
+            bytestore::ByteStoreSession session;
+            session.BindStorage(root.StorageCapacity(), false);
+            struct UnreadStream {
+                std::size_t reads{0u};
+                std::uint64_t Position() const noexcept { return 0u; }
+                bool ReadBytes(void*, std::size_t, std::string*) { ++reads; return false; }
+            } stream;
+            DecodedGeometryCache geometry;
+            GeometryDecodeRuntime runtime{
+                .data = {.meta = oversized, .payloadBytes = oversized.blockLayouts.front().encodedByteLength},
+                .cache = {.cacheResources = resources, .byteStoreSession = session, .geometry = geometry},
+            };
+            const auto decoded = DecodeGeometryBlocks(runtime, stream);
+            Require(result, !decoded && decoded.code == CodecErrorCode::InvalidInput &&
+                !decoded.message.empty() && stream.reads == 0u && !geometry.bytes &&
+                root.StorageCapacity()->Snapshot().peakReservedBytes == 0u,
+                "numericDecode.rejectOversized", "oversized blocks must fail before reading or allocating output");
+        }
         for (const bool truncated : {false, true}) {
             DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 2u, 4u},
                 limit, 2u, true, true, false});
@@ -90,8 +118,7 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
             Require(result, matches && CopyExecutionSnapshot(root, snapshot) &&
                 snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u &&
                 root.StorageCapacity()->Snapshot().reservedBytes == 0u,
-                "numericDecode.attributeFlow", "legacy=" + std::to_string(legacy) +
-                ";truncated=" + std::to_string(truncated) + ";decoded=" + std::to_string(decoded) +
+                "numericDecode.attributeFlow", "truncated=" + std::to_string(truncated) + ";decoded=" + std::to_string(decoded) +
                 ";error=" + error + ";failure=" + (root.FirstFailure() ? root.FirstFailure()->message.data() : "none"));
         }
         for (const bool file : {false, true}) {
@@ -108,15 +135,13 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
                 struct Stream {
                     const std::vector<std::uint8_t>& bytes;
                     DataCodecExecutionResources& root;
-                    bool legacy;
                     std::size_t compute, slots, offset{0u}, reads{0u};
                     bool valid{true};
                     std::uint64_t Position() const noexcept { return offset; }
                     bool ReadBytes(void* target, std::size_t count, std::string* error) {
                         ResourceDebugSnapshot snapshot;
                         valid &= CopyExecutionSnapshot(root, snapshot) && snapshot.admittedBlocks != 0u &&
-                            snapshot.activeComputeUnits != 0u && snapshot.singleRecordFlow == legacy &&
-                            (!legacy || snapshot.admittedBlocks == 1u) && count <= kIoWindowBytes;
+                            snapshot.activeComputeUnits != 0u && !snapshot.singleRecordFlow && count <= kIoWindowBytes;
                         if (++reads == 1u) {
                             valid &= root.UpdateLimits({limit, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck);
                         } else if (reads == 2u) {
@@ -129,7 +154,7 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
                         offset += count;
                         return true;
                     }
-                } stream{payload, root, legacy, compute, slots};
+                } stream{payload, root, compute, slots};
                 DecodedGeometryCache geometry;
                 DecodedGeometryReferenceCache reference;
                 GeometryDecodeRuntime runtime{
@@ -153,7 +178,7 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
                     snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u &&
                     snapshot.lastRetired == 2u && snapshot.limits.slotLimit == slots,
                     "numericDecode.geometryFlow", decoded.message.empty() ?
-                        "numeric decode must preserve conversion, raw reference and legacy single-record admission" : decoded.message);
+                        "numeric decode must preserve conversion, raw reference and bounded block admission" : decoded.message);
                 geometry.Release();
                 reference.Reset();
                 Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u &&

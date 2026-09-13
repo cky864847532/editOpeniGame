@@ -8,7 +8,7 @@ namespace datacodec::wasm {
 
 WasmResourceDefaults GetWasmResourceDefaults() {
     const auto sample = ProbeResources();
-    const auto config = ResolveResourceConfiguration({.mode = CodecResourceMode::Fixed}, sample);
+    const auto config = ResolveResourceConfiguration({.mode = CodecResourceMode::Fixed, .threadMode = CodecThreadMode::Fixed}, sample);
     return {*config.initialLimits.ownedStorageLimitBytes,
         sample.hardLimitBytes.value_or(std::numeric_limits<std::uint64_t>::max()), config.computeCeiling};
 }

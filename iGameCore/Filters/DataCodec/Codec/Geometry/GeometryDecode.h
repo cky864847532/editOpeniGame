@@ -289,7 +289,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
                 catch (...) { root.RecordDiagnosticExportFailure(); }
             }
             return committedElements != params.elementCount || finish();
-        }, cursor.singleRecord, [&] { return cursor.NextWorkType(ResourceWorkPath::GeometryDecode); }, [&] {
+        }, false, [&] { return cursor.NextWorkType(ResourceWorkPath::GeometryDecode); }, [&] {
             const auto* referenceMeta = runtime.data.keyFrameReference && runtime.data.keyFrameReference->store
                 ? &runtime.data.keyFrameReference->store->StorageParams() : nullptr;
             nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, meta.blockLayouts[cursor.nextBlock],

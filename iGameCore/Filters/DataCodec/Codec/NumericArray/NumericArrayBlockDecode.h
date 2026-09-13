@@ -4,7 +4,6 @@
 #include "DataCodec/Codec/NumericArray/IntegerResidualCodec.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayCodec.h"
 #include "DataCodec/Codec/NumericArray/NumericArrayBlockFormat.h"
-#include "DataCodec/Codec/SubCodec/VarintCodec.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 #include <cstddef>
@@ -16,64 +15,6 @@
 #include <vector>
 namespace datacodec {
 namespace numericarray {
-
-inline bool DecodeIntegerDeltaRunVarintComponentBytes(
-    const NumericArrayBlockParams& params,
-    const std::uint32_t elementCount,
-    const std::span<const std::uint8_t> bytes,
-    MutableArray<std::uint8_t> decodedComponent,
-    std::string* error = nullptr) {
-    decodedComponent.clear();
-    if (!IsIntegerNumericArrayDataType(params.dataType)) {
-        return validation::AssignError(error, "integer delta-run varint requires an integer data type");
-    }
-
-    std::size_t rawByteCount = 0u;
-    if (!ResolveNumericArrayComponentRawByteCount(params, elementCount, rawByteCount, error)) {
-        return false;
-    }
-    decodedComponent.assign(rawByteCount, 0u);
-    if (elementCount == 0u) {
-        if (!bytes.empty()) {
-            validation::AssignError(error, "empty integer component has payload bytes");
-        }
-        return bytes.empty();
-    }
-
-    const auto valueSize = params.valueSize;
-    const auto mask = IntegerStorageMask(valueSize);
-    std::size_t cursor = 0u;
-    std::uint32_t written = 0u;
-    std::uint64_t previousValue = 0u;
-    while (cursor < bytes.size()) {
-        std::uint64_t delta = 0u;
-        std::uint64_t runLength = 0u;
-        if (!codec::DecodeVarint64(bytes, cursor, delta, error) ||
-            !codec::DecodeVarint64(bytes, cursor, runLength, error)) {
-            decodedComponent.clear();
-            return false;
-        }
-        if (runLength == 0u ||
-            runLength > static_cast<std::uint64_t>(elementCount - written)) {
-            decodedComponent.clear();
-            return validation::AssignError(error, "integer delta-run varint run length is invalid");
-        }
-        for (std::uint64_t runIndex = 0u; runIndex < runLength; ++runIndex) {
-            const auto value = (previousValue + delta) & mask;
-            WriteIntegerStorageValue(
-                value,
-                decodedComponent.data() + static_cast<std::size_t>(written) * valueSize,
-                valueSize);
-            previousValue = value;
-            ++written;
-        }
-    }
-    if (written != elementCount) {
-        decodedComponent.clear();
-        return validation::AssignError(error, "integer delta-run varint did not decode the expected element count");
-    }
-    return true;
-}
 
 inline bool DecodeNumericArrayComponentBytes(
     const NumericArrayBlockParams& params,
@@ -95,14 +36,6 @@ inline bool DecodeNumericArrayComponentBytes(
     std::size_t rawByteCount = 0u;
     if (!ResolveNumericArrayComponentRawByteCount(params, elementCount, rawByteCount, error)) {
         return false;
-    }
-    if (bytesCodec == NumericArrayBytesCodec::IntegerDeltaRunVarint) {
-        return DecodeIntegerDeltaRunVarintComponentBytes(
-            params,
-            elementCount,
-            bytes,
-            decodedComponent,
-            error);
     }
     if (bytesCodec == NumericArrayBytesCodec::IntegerDeltaLiteralRunVarint) {
         return DecodeIntegerDeltaLiteralRunVarintComponentBytes(

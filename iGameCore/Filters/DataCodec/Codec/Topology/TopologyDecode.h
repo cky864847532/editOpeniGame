@@ -161,9 +161,10 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
         return validation::AssignError(error, "topology counts exceed local size capacity");
     }
     std::uint64_t nextCell = 0u, nextIndex = 0u, payloadBytes = 0u;
-    bool singleRecord = false, hasOrders = false;
+    bool hasOrders = false;
     for (const auto& layout : blocks) {
-        if (layout.cellOffset != nextCell || layout.connectivityOffset != nextIndex ||
+        if (layout.cellCount == 0u || layout.cellCount > numericarray::kSpatialBlockElementCount ||
+            layout.cellOffset != nextCell || layout.connectivityOffset != nextIndex ||
             !validation::CheckedAddU64(nextCell, layout.cellCount, nextCell, "topology block cells", error) ||
             !validation::CheckedAddU64(nextIndex, layout.connectivityCount, nextIndex, "topology block indices", error) ||
             nextCell > cells || nextIndex > indices) {
@@ -179,7 +180,6 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
             !validation::CheckedMulSizeT(offsetCount, sizeof(IndexType), checkedBytes, "topology block offsets", error) ||
             !validation::CheckedMulSizeT(static_cast<std::size_t>(layout.connectivityCount), sizeof(IndexType),
                 checkedBytes, "topology block connectivity", error)) { return false; }
-        singleRecord |= layout.cellCount > numericarray::kSpatialBlockElementCount;
         hasOrders |= layout.cellPolynomialOrderByteCount != 0u;
     }
     if (nextCell != cells || nextIndex != indices || payloadBytes != topo.binaryCount) {
@@ -333,7 +333,7 @@ inline bool DecodeConnectivityTopologyBlocksToCache(
                 if (!observer->EndConnectivityTopology(error)) { return false; }
             }
             return true;
-        }, singleRecord, nullptr, [&] {
+        }, false, nullptr, [&] {
             nextMemory = topocodec::MakeConnectivityDecodeMemoryLayout(blocks[cursor],
                 static_cast<int>(topo.fixedCellSize), hasTypes);
             return nextMemory;

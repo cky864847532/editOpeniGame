@@ -554,7 +554,7 @@ void UnlimitedResources() {
         sample.hardLimitBytes = 1u;
         sample.pressure = PressureLevel::Critical;
         DataCodecExecutionResources root(ResolveResourceConfiguration(
-            {.mode = CodecResourceMode::Unlimited}, sample));
+            {.mode = CodecResourceMode::Unlimited, .threadMode = CodecThreadMode::Fixed}, sample));
         CodecRunScope scope(root);
         DecodeBlockMemoryPlan plan;
         const auto output = plan.Append<std::uint8_t>(DecodeMemoryRegion::Output, 128u);

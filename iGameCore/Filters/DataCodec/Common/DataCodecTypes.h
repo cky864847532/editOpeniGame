@@ -240,7 +240,6 @@ enum class NumericArrayReferenceCodecId : std::uint16_t {
 enum class NumericArrayBytesCodec : std::uint8_t {
     RawBytes = 0,
     NumericArrayCodec = 1,
-    IntegerDeltaRunVarint = 2,
     IntegerDeltaLiteralRunVarint = 3,
 };
 

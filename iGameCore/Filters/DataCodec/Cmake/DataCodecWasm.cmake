@@ -47,6 +47,7 @@ function(datacodec_configure_wasm_executable target)
         "SHELL:-s ASYNCIFY_STACK_SIZE=1048576"
         "SHELL:-s EXPORTED_RUNTIME_METHODS=ccall"
         "SHELL:-s PTHREAD_POOL_SIZE=${pool_expression}"
+        "SHELL:-s PTHREAD_POOL_SIZE_STRICT=1"
         "SHELL:-s ALLOW_MEMORY_GROWTH=1" "SHELL:-s ABORTING_MALLOC=0"
         "SHELL:-s STACK_SIZE=1048576" "SHELL:-s MALLOC=dlmalloc"
         "SHELL:-s FORCE_FILESYSTEM=1"

@@ -35,8 +35,8 @@ void DataCodecCpuController::Reset(CodecThreadMode mode, double idle, std::size_
     *this = {};
     m_snapshot.mode = mode;
     m_snapshot.targetIdleRatio = idle;
-    m_snapshot.quota = mode == CodecThreadMode::Fixed ? static_cast<double>(ceiling) : 0.0;
-    m_snapshot.initialized = mode == CodecThreadMode::Fixed;
+    m_snapshot.quota = mode == CodecThreadMode::Adaptive ? 0.0 : static_cast<double>(ceiling);
+    m_snapshot.initialized = mode != CodecThreadMode::Adaptive;
     m_lastValid = now;
     ResetWindow(now);
 }
@@ -66,7 +66,7 @@ CpuControlDecision DataCodecCpuController::Advance(cpu_control::Clock::time_poin
     const CpuUsageSample& sample, const CpuControlFlow& flow) noexcept {
     using namespace cpu_control;
     CpuControlDecision decision;
-    if (m_snapshot.mode == CodecThreadMode::Fixed) { return decision; }
+    if (m_snapshot.mode != CodecThreadMode::Adaptive) { return decision; }
     if (m_snapshot.calibration == CpuCalibrationResult::Measuring &&
         now - m_calibrationStarted >= calibrationDeadline) {
         m_snapshot.calibration = CpuCalibrationResult::TimedOut;

@@ -861,8 +861,7 @@ inline bool TestNativeResourceExemptions() {
             output.CapacitySamples().front().sampledPeakBytes == sizeof(orders),
             "native.polynomial-storage-retired", "abort and the next topology must release high-order staging while preserving its observed peak");
     }
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
-    const auto directory = MakeRemapOutputDirectory("mapped_owner");
+    const auto directory = MakeRemapOutputDirectory("file_range_owner");
     std::filesystem::create_directories(directory);
     const auto file = directory / "source.bin";
     {
@@ -875,25 +874,24 @@ inline bool TestNativeResourceExemptions() {
         std::weak_ptr<IByteRangeReader> weak = reader;
         auto range = std::make_shared<SubrangeByteRangeReader>(reader, kIoWindowBytes - 3u, kIoWindowBytes + 7u);
         auto slot = root.TryAcquireSlot();
-        const auto prefetched = range->PrefetchRange(0u, kIoWindowBytes);
-        std::span<const std::uint8_t> mapped;
-        const auto status = range->PrepareContiguousRange(0u, kIoWindowBytes, mapped, &error);
-        Require(result, written && slot && prefetched.IsAccepted() && status == ContiguousViewStatus::Ready &&
-            mapped.size() == kIoWindowBytes && mapped.front() == bytes[kIoWindowBytes - 3u] &&
-            mapped.back() == bytes[2u * kIoWindowBytes - 4u] && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
-            "native.mapping-prefetch-admitted-window", "Windows must accept a prefetch hint for the admitted mapped window without reserving process pages as controlled storage");
+        std::vector<std::uint8_t> window(kIoWindowBytes);
+        Require(result, written && slot && range->ReadAt(0u, window, &error) &&
+            std::equal(window.begin(), window.end(), bytes.begin() + kIoWindowBytes - 3u) &&
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "native.file-admitted-window", "file ranges must fill the caller's admitted window without additional controlled storage");
         reader.reset();
         std::array<std::uint8_t, 7u> tail{};
         Require(result, !weak.expired() && range->ReadAt(kIoWindowBytes, tail, &error) &&
-            tail.back() == bytes[2u * kIoWindowBytes + 3u] && range->PrefetchRange(kIoWindowBytes + 7u, 1u).IsError(),
-            "native.mapping-range-lifetime", "the final range must retain the file mapping and reject out-of-range prefetch");
-        mapped = {};
+            std::equal(tail.begin(), tail.end(), bytes.begin() + 2u * kIoWindowBytes - 3u),
+            "native.file-range-lifetime", "the subrange must retain the reader and preserve every tail byte");
+        error.clear();
+        Require(result, !range->ReadAt(kIoWindowBytes + 7u, tail, &error) && !error.empty(),
+            "native.file-range-bounds", "reads outside the subrange must fail");
         range.reset();
         slot.reset();
-        Require(result, weak.expired(), "native.mapping-last-owner", "the final range release must retire the mapping reader");
+        Require(result, weak.expired(), "native.file-last-owner", "the final range release must retire the file reader");
     }
     RemoveRemapOutput(directory);
-#endif
     Require(result, scope.Finish(true) && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
         "native.exempt-request-finish", "exempt native operations must leave no controlled reservations");
     PrintResult(result);

@@ -27,15 +27,6 @@ struct DecodeTaskKey {
     bool operator==(const DecodeTaskKey&) const = default;
 };
 
-struct DecodeTaskKeyHash {
-    [[nodiscard]] std::size_t operator()(const DecodeTaskKey& key) const noexcept {
-        auto seed = std::hash<std::uint64_t>{}(key.scope);
-        seed ^= std::hash<std::uint32_t>{}(key.frameIndex) + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
-        seed ^= std::hash<std::string>{}(key.variant) + 0x9e3779b9u + (seed << 6u) + (seed >> 2u);
-        return seed;
-    }
-};
-
 [[nodiscard]] inline bool IsTerminalDecodeTaskState(const DecodeTaskState state) noexcept {
     return state == DecodeTaskState::Succeeded || state == DecodeTaskState::Failed ||
            state == DecodeTaskState::Cancelled;

@@ -69,8 +69,7 @@ inline TestResult RunDataCodecFeatureWorkTypeBoundary() {
         layouts[2] = layouts[0];
         layouts[2].mode = NumericArrayBlockMode::WaveletReference;
         layouts[2].referenceKind = NumericArrayReferenceKind::TemporalKeyFrame;
-        layouts[2].elementCount = numericarray::kSpatialBlockElementCount * 4u;
-        layouts[2].componentLayouts.push_back({.bytesCodec = NumericArrayBytesCodec::IntegerDeltaRunVarint});
+        layouts[2].componentLayouts.push_back({.bytesCodec = NumericArrayBytesCodec::IntegerDeltaLiteralRunVarint});
         int unusedStream = 0;
         numericarray::NumericDecodeCursor<int> cursor{unusedStream, params, layouts, resources};
         const auto ordinary = cursor.NextWorkType(ResourceWorkPath::AttributeDecode);
@@ -79,9 +78,9 @@ inline TestResult RunDataCodecFeatureWorkTypeBoundary() {
         cursor.nextBlock = 2u;
         const auto reference = cursor.NextWorkType(ResourceWorkPath::AttributeDecode);
         Require(result, ordinary == tail && ordinary != reference &&
-            reference.blockElements == 4u * numericarray::kSpatialBlockElementCount &&
-            reference.componentCodecMask == 6u && reference.libraryThreads == 1u,
-            "work-type.metadata-key", "tail blocks must preserve the type while old granularity and actual reference/codec paths distinguish it");
+            reference.blockElements == numericarray::kSpatialBlockElementCount &&
+            reference.componentCodecMask == 10u && reference.libraryThreads == 1u,
+            "work-type.metadata-key", "tail blocks preserve the work type and reference/codec paths distinguish it");
     }
     return result;
 }

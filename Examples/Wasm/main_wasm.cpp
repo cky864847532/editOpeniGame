@@ -17,6 +17,7 @@
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "DataCodec/Filter/Localization/iGameDataCodecHostMessage.h"
 #include "DataCodec/API/Adapter/RunRecordTypes.h"
+#include "DataCodec/Common/DataCodecCallback.h"
 #include "IGDC/iGameIGDCWriter.h"
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
 #include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
@@ -1938,7 +1939,7 @@ struct API {
     static std::string getBuildInfoJson();
     static std::string getLastErrorJson();
     static void clearLastError();
-    static int configureNextCodecRun(int mode, int computeThreads, const std::string& memoryLimitBytes);
+    static int configureNextCodecRun(int mode, int threadMode, int computeThreads, const std::string& memoryLimitBytes);
     static std::string getCodecResourceDefaultsJson();
     static std::string getCodecHostMessagesJson();
     static int setSize(int width, int height);
@@ -5245,7 +5246,7 @@ std::string iGameWeb::API::getCodecHostMessagesJson() {
     const std::pair<const char*, Message> messages[]{
         {"ResourceConfigurationFailed", Message::ResourceConfigurationFailed},
         {"DeviceComputeThreadsUnavailable", Message::DeviceComputeThreadsUnavailable},
-        {"UnlimitedMemoryFixedThreads", Message::UnlimitedMemoryFixedThreads},
+        {"UnlimitedMemoryUnlimitedThreads", Message::UnlimitedMemoryUnlimitedThreads},
         {"WaitBeforeDecode", Message::WaitBeforeDecode},
         {"WaitBeforeLoad", Message::WaitBeforeLoad},
         {"WaitBeforeFileSelection", Message::WaitBeforeFileSelection},
@@ -5264,15 +5265,17 @@ std::string iGameWeb::API::getCodecHostMessagesJson() {
 }
 
 int iGameWeb::API::configureNextCodecRun(
-    const int mode, const int computeThreads, const std::string& memoryLimitBytes) {
+    const int mode, const int threadMode, const int computeThreads, const std::string& memoryLimitBytes) {
     try {
         if ((mode != static_cast<int>(::datacodec::CodecResourceMode::Fixed) &&
-             mode != static_cast<int>(::datacodec::CodecResourceMode::Unlimited)) || computeThreads < 0) {
+             mode != static_cast<int>(::datacodec::CodecResourceMode::Unlimited)) ||
+            (threadMode != static_cast<int>(::datacodec::CodecThreadMode::Fixed) &&
+             threadMode != static_cast<int>(::datacodec::CodecThreadMode::Unlimited)) || computeThreads < 0) {
             return FailWithError(0, "configureNextCodecRun", "invalid resource mode or compute thread count");
         }
         ::datacodec::CodecResourceParams resources;
         resources.mode = static_cast<::datacodec::CodecResourceMode>(mode);
-        resources.threadMode = ::datacodec::CodecThreadMode::Fixed;
+        resources.threadMode = static_cast<::datacodec::CodecThreadMode>(threadMode);
         if (computeThreads != 0) { resources.maxComputeThreads = static_cast<std::size_t>(computeThreads); }
         if (!memoryLimitBytes.empty()) {
             std::uint64_t bytes = 0u;

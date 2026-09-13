@@ -70,7 +70,6 @@ enum class PolyhedronTopologyStreamKind : std::uint8_t {
 };
 
 enum class PolyhedronTopologyStreamCodec : std::uint16_t {
-    // 保留 v1 wire tag，0 曾用于已移除的 Raw 编码
     Varint = 1,
     SegmentedBitpack = 2,
 };

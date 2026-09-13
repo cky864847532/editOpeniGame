@@ -90,7 +90,7 @@ enum class iGameDataCodecHostMessageId : std::uint8_t {
     EncodeDiagnosticsIncomplete,
     ResourceConfigurationFailed,
     DeviceComputeThreadsUnavailable,
-    UnlimitedMemoryFixedThreads,
+    UnlimitedMemoryUnlimitedThreads,
     WaitBeforeDecode,
     WaitBeforeLoad,
     WaitBeforeFileSelection,

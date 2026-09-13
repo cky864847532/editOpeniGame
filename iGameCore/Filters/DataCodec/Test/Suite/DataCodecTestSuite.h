@@ -4,6 +4,7 @@
 #include "DataCodec/Test/Feature/DataCodecFeatureAdapterRoundTrip.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureByteRange.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureBudget.h"
+#include "DataCodec/Test/Feature/DataCodecFeatureRobustness.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureCellGraphTopology.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureFailure.h"
 #include "DataCodec/Test/Feature/DataCodecFeatureStorageOwnership.h"
@@ -43,12 +44,8 @@ TestResult RunDataCodecCpuControlTests();
     auto pipelineResult = RunDataCodecFeaturePipelineContracts();
     appendResult(pipelineResult);
     appendResult(RunDataCodecFeatureByteRange());
-    // 复用原窗口与 payload 用例，显式纳入当前注册入口
-    Require(result, feature_budget::TestWindowedByteSourceReaderChunks(), "window.reader-suite", "window reader checks failed");
-    Require(result, feature_budget::TestWindowedCopyRangesAndFailures(), "window.copy-suite", "window copy checks failed");
-    Require(result, feature_budget::TestFixedWindowFieldDecode(), "window.field-suite", "field stream checks failed");
-    Require(result, feature_budget::TestAttributePayloadSizedStorage(), "payload.storage-suite", "attribute payload checks failed");
-    Require(result, feature_budget::TestPolyhedronIndexStoresShareCapacity(), "polyhedron.index-suite", "index store checks failed");
+    appendResult(RunDataCodecFeatureBudget());
+    appendResult(RunDataCodecFeatureRobustness());
     appendResult(RunDataCodecFeatureFailure());
     appendResult(RunDataCodecFeatureStorageOwnership());
     appendResult(RunDataCodecFeatureMortonResources());

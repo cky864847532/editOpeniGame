@@ -329,7 +329,6 @@ private:
     QLineEdit* m_outputPathEdit{nullptr};
     QPushButton* m_outputPathButton{nullptr};
     igQtDataCodecResourceControls* m_resourceControls{nullptr};
-    QCheckBox* m_compressionEnhancementCheck{nullptr};
     QSpinBox* m_zstdLevelSpin{nullptr};
     QWidget* m_gopControlRow{nullptr};
     QSpinBox* m_gopFrameCountSpin{nullptr};

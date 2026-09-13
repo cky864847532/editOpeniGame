@@ -74,7 +74,7 @@ inline TestResult RunDataCodecFeatureResourceController() {
         Require(result, adaptive.targetAvailableMemoryRatio == 0.20 &&
             adaptive.storageCeilingBytes == 2u * gib &&
             adaptive.initialLimits.ownedStorageLimitBytes == 64u * mib &&
-            adaptive.initialLimits.computeLimit == 4u,
+            adaptive.initialLimits.computeLimit == 0u && adaptive.threadMode == CodecThreadMode::Unlimited,
             "reserve.physical-and-job", "physical denominator and independent environment remaining capacity must be preserved");
         const auto fixed = ResolveResourceConfiguration({.mode = CodecResourceMode::Fixed}, sample);
         Require(result, fixed.storageCeilingBytes == 4u * gib &&

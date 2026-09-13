@@ -37,7 +37,11 @@ QSettings CreateSettings() {
     default: resources.mode = ::datacodec::CodecResourceMode::Adaptive; break;
     }
     bool valid = false;
-    if (storage.value(QStringLiteral("ThreadMode")).toInt() == static_cast<int>(::datacodec::CodecThreadMode::Adaptive)) {
+    const auto threadMode = storage.value(QStringLiteral("ThreadMode"),
+        static_cast<int>(::datacodec::CodecThreadMode::Unlimited)).toInt();
+    if (threadMode == static_cast<int>(::datacodec::CodecThreadMode::Fixed)) {
+        resources.threadMode = ::datacodec::CodecThreadMode::Fixed;
+    } else if (threadMode == static_cast<int>(::datacodec::CodecThreadMode::Adaptive)) {
         resources.threadMode = ::datacodec::CodecThreadMode::Adaptive;
         const auto idle = storage.value(QStringLiteral("TargetCpuIdleRatio"), 0.2).toDouble(&valid);
         resources.targetCpuIdleRatio = valid && std::isfinite(idle) && idle >= 0.0 && idle < 1.0 ? idle : 0.2;

@@ -160,8 +160,8 @@ std::string_view EnglishMessage(const iGameDataCodecHostMessageId id) noexcept {
             return "Failed to configure DataCodec resources";
         case iGameDataCodecHostMessageId::DeviceComputeThreadsUnavailable:
             return "A valid device compute thread count is unavailable";
-        case iGameDataCodecHostMessageId::UnlimitedMemoryFixedThreads:
-            return "Unlimited memory; fixed compute thread count: {threads}";
+        case iGameDataCodecHostMessageId::UnlimitedMemoryUnlimitedThreads:
+            return "Unlimited memory and compute threads";
         case iGameDataCodecHostMessageId::WaitBeforeDecode:
             return "Wait for the current task to finish before decoding";
         case iGameDataCodecHostMessageId::WaitBeforeLoad:
@@ -329,8 +329,8 @@ std::string_view SimplifiedChineseMessage(
             return "DataCodec 资源配置失败";
         case iGameDataCodecHostMessageId::DeviceComputeThreadsUnavailable:
             return "未取得有效的设备计算线程数";
-        case iGameDataCodecHostMessageId::UnlimitedMemoryFixedThreads:
-            return "内存不设上限，固定计算线程={threads}";
+        case iGameDataCodecHostMessageId::UnlimitedMemoryUnlimitedThreads:
+            return "内存与计算线程均不设上限";
         case iGameDataCodecHostMessageId::WaitBeforeDecode:
             return "请等待当前任务完成后再解压";
         case iGameDataCodecHostMessageId::WaitBeforeLoad:

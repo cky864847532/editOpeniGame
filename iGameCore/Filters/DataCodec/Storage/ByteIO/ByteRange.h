@@ -23,31 +23,6 @@
 namespace datacodec {
 class DataCodecExecutionResources;
 
-enum class ByteRangePrefetchStatus : std::uint8_t {
-    Accepted = 0u,
-    RejectedByPolicy = 1u,
-    Unavailable = 2u,
-    Error = 3u,
-};
-
-struct ByteRangePrefetchResult {
-    ByteRangePrefetchStatus status{ByteRangePrefetchStatus::Unavailable};
-    std::string error;
-
-    [[nodiscard]] bool IsAccepted() const noexcept {
-        return status == ByteRangePrefetchStatus::Accepted;
-    }
-    [[nodiscard]] bool IsRejectedByPolicy() const noexcept {
-        return status == ByteRangePrefetchStatus::RejectedByPolicy;
-    }
-    [[nodiscard]] bool IsUnavailable() const noexcept {
-        return status == ByteRangePrefetchStatus::Unavailable;
-    }
-    [[nodiscard]] bool IsError() const noexcept {
-        return status == ByteRangePrefetchStatus::Error;
-    }
-};
-
 class IByteRangeReader {
 public:
     virtual ~IByteRangeReader() = default;
@@ -88,15 +63,6 @@ public:
     // 返回非空值时调用方可以直接复用既有字节，不需要重新复制整份输入
     [[nodiscard]] virtual std::shared_ptr<const std::vector<std::uint8_t>> RetainAllBytes() const noexcept {
         return {};
-    }
-    // 可选的输入预取能力
-    // 默认实现不改变读取语义，文件桥接可据此提前准备映射页面
-    [[nodiscard]] virtual ByteRangePrefetchResult PrefetchRange(
-        std::uint64_t offset,
-        std::uint64_t byteSize) const {
-        (void)offset;
-        (void)byteSize;
-        return {.status = ByteRangePrefetchStatus::Unavailable};
     }
     virtual bool ReadAt(
         std::uint64_t offset,
@@ -235,19 +201,6 @@ public:
             return ContiguousViewStatus::Error;
         }
         return m_source->PrepareContiguousRange(sourceOffset, byteSize, output, error);
-    }
-
-    [[nodiscard]] ByteRangePrefetchResult PrefetchRange(
-        const std::uint64_t offset,
-        const std::uint64_t byteSize) const override {
-        if (m_source == nullptr || offset > m_byteSize || byteSize > m_byteSize - offset ||
-            !validation::CanAddU64(m_offset, offset)) {
-            return {
-                .status = ByteRangePrefetchStatus::Error,
-                .error = "subrange prefetch range is invalid",
-            };
-        }
-        return m_source->PrefetchRange(m_offset + offset, byteSize);
     }
 
     bool ReadAt(

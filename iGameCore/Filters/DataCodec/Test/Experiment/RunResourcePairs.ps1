@@ -2,16 +2,21 @@
 param(
     [ValidateSet('Warmup', 'CPU', 'Memory')]
     [string]$Phase = 'CPU',
+    [ValidateRange(1, 100)]
     [int]$Repetitions = 3,
     [double[]]$MemoryTargets = @(20, 25),
-    [string]$OutputRoot = 'logs/resource-parameters-20260913',
-    [string]$InputFile = 'E:/CAE_data/Driver/10gb_csgn/car_3800W_Fluent_node_HDF5-0001.cgns'
+    [string]$OutputRoot = 'logs/resource-parameters',
+    [Parameter(Mandatory)]
+    [string]$InputFile,
+    [string]$BuildDirectory = 'cmake-build-release-dev',
+    [string]$EnvironmentScript
 )
 $ErrorActionPreference = 'Stop'
-$env:EMSDK_QUIET = '1'
-. C:/Env/clion_env.ps1
-$env:PATH = "$env:UCRT64_HOME/bin;$env:PATH"
-$benchmark = (Resolve-Path 'cmake-build-release-dev/iGameCore/iGameDataCodecFileBenchmark.exe').Path
+if ($EnvironmentScript) {
+    . (Resolve-Path -LiteralPath $EnvironmentScript).Path
+}
+$InputFile = (Resolve-Path -LiteralPath $InputFile).Path
+$benchmark = (Resolve-Path -LiteralPath (Join-Path $BuildDirectory 'iGameCore/iGameDataCodecFileBenchmark.exe')).Path
 $root = [System.IO.Path]::GetFullPath($OutputRoot)
 [System.IO.Directory]::CreateDirectory($root) | Out-Null
 $groups = @(switch ($Phase) {
@@ -48,7 +53,7 @@ for ($round = 1; $round -le $Repetitions; ++$round) {
             started = $started.ToString('o'); ended = (Get-Date).ToString('o'); exitCode = $code } |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $resultFile -Encoding utf8
         Write-Output "END $name exit=$code"
-        $lines = Get-Content -LiteralPath $log
+        $lines = Get-Content -LiteralPath $log -Encoding utf8
         $lines | Where-Object { $_ -match '^RESULT ' } | Write-Output
         if ($code -ne 0 -and -not ($lines -match '^RESULT (encode|decode)_success=0 ')) {
             throw "测试异常中断：$name，退出码 $code"

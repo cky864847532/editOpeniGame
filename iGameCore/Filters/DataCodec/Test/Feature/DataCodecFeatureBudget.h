@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -55,12 +54,6 @@ private:
     std::vector<std::uint8_t> bytes_;
 };
 
-inline void PrintResult(const TestResult& result) {
-    for (const auto& failure : result.failures) {
-        std::cerr << failure.check << ": " << failure.message << '\n';
-    }
-}
-
 inline void RequireBytes(
     TestResult& result,
     const std::span<const std::uint8_t> actual,
@@ -86,8 +79,7 @@ inline void RequireBytes(
         path);
 }
 
-inline bool TestByteStoreResidentBudgetAndSealLifecycle() {
-    TestResult result;
+inline void TestByteStoreResidentBudgetAndSealLifecycle(TestResult& result) {
     ByteStoreSession session;
     session.BindStorage(std::make_shared<resource::ResidentByteBudget>(8u), true);
     auto first = session.CreateMemoryStore();
@@ -154,12 +146,9 @@ inline bool TestByteStoreResidentBudgetAndSealLifecycle() {
             "append store should reject writes after seal");
     }
 
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestScratchPoolRetentionLimits() {
-    TestResult result;
+inline void TestScratchPoolRetentionLimits(TestResult& result) {
     ScratchByteBufferPool pool;
     pool.SetRetainedCount(1u);
     {
@@ -179,8 +168,6 @@ inline bool TestScratchPoolRetentionLimits() {
             stats.allocationCount == 2u,
         "budget.scratchPool.retention",
         "scratch pool retention and reuse statistics do not match the configured limits");
-    PrintResult(result);
-    return result.passed;
 }
 
 // 在真实范围源上限制单次 I/O，验证窗口尾部和失败后停止搬运
@@ -240,8 +227,7 @@ inline std::vector<std::uint8_t> MakeWindowTestBytes() {
     return bytes;
 }
 
-inline bool TestWindowedByteSourceReaderChunks() {
-    TestResult result;
+inline void TestWindowedByteSourceReaderChunks(TestResult& result) {
     const auto input = MakeWindowTestBytes();
     WindowCheckedSource source(input);
     ScratchByteBufferPool pool;
@@ -267,12 +253,9 @@ inline bool TestWindowedByteSourceReaderChunks() {
     Require(result, offset == input.size() && count == 3u && source.readCount == 3u &&
         source.maxReadBytes == kIoWindowBytes,
         "window.reader.bound", "reader must perform two full windows and one tail");
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestWindowedCopyRangesAndFailures() {
-    TestResult result;
+inline void TestWindowedCopyRangesAndFailures(TestResult& result) {
     const auto input = MakeWindowTestBytes();
     ScratchByteBufferPool pool;
     std::string error;
@@ -314,12 +297,9 @@ inline bool TestWindowedCopyRangesAndFailures() {
     Require(result, !CopyByteSourceByWindow(sourceForFailedWriter, failedWriter, pool, &error) &&
         sourceForFailedWriter.readCount == 2u && failedWriter.bytes.size() == kIoWindowBytes,
         "window.copy.writeFailure", "write failure must prevent reading subsequent windows");
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestFixedWindowFieldDecode() {
-    TestResult result;
+inline void TestFixedWindowFieldDecode(TestResult& result) {
     const auto input = MakeWindowTestBytes();
     DataCodecExecutionResources root(CodecResourceParams{
         .mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u,
@@ -330,7 +310,7 @@ inline bool TestFixedWindowFieldDecode() {
     for (const auto mode : {PackageFieldEncodingMode::Raw, PackageFieldEncodingMode::Zstd}) {
         CodecRunScope request(root);
         auto phase = WaitForHeavyPhase(root);
-        if (!request || !phase) { return false; }
+        if (!request || !phase) { Require(result, false, "window.field.prepare", "field decode fixture setup failed"); return; }
         WindowCheckedSource inputSource(input);
         WindowCheckedWriter encodedWriter;
         EncodedFieldCompressionType compression{};
@@ -388,19 +368,15 @@ inline bool TestFixedWindowFieldDecode() {
             Require(result, rejected, "window.field.truncated", "truncated Zstd must fail");
         }
     }
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestAttributePayloadSizedStorage() {
-    TestResult result;
+inline void TestAttributePayloadSizedStorage(TestResult& result) {
     const auto input = MakeWindowTestBytes();
     std::vector<std::uint8_t> encoded;
     std::string error;
     if (!codec::ZstdCodec::Compress(input, 1, 1u, encoded, &error)) {
         Require(result, false, "payload.setup", error);
-        PrintResult(result);
-        return false;
+        return;
     }
     for (const bool externalSpill : {false, true}) {
         const auto residentBytes = externalSpill ? 0u : static_cast<std::uint64_t>(input.size());
@@ -454,12 +430,9 @@ inline bool TestAttributePayloadSizedStorage() {
             Require(result, request.Finish(true), "payload.request-finish", "successful payload preparation must release its phase");
         }
     }
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestDecodeBusinessOptions() {
-    TestResult result;
+inline void TestDecodeBusinessOptions(TestResult& result) {
     const auto defaults = CodecControlParamsFactory::MakeDecodeConfiguration({});
     const auto audit = CodecControlParamsFactory::MakeDecodeConfiguration(
         DataCodecDecodeOptions{
@@ -480,12 +453,9 @@ inline bool TestDecodeBusinessOptions() {
         audit.controlParams.validation.validateFloatingPointValues,
         "configuration.decode.validation",
         "audit validation must compose with cache switches");
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestRuntimeProfileIsSourceMetadata() {
-    TestResult result;
+inline void TestRuntimeProfileIsSourceMetadata(TestResult& result) {
     const auto native = CodecControlParamsFactory::MakeEncodeConfiguration(
         {}, DataCodecRuntimeProfile::Native);
     for (const auto profile : {DataCodecRuntimeProfile::Wasm4GiB, DataCodecRuntimeProfile::Wasm16GiB}) {
@@ -500,12 +470,9 @@ inline bool TestRuntimeProfileIsSourceMetadata() {
             "configuration.runtime.sourceOnly",
             "runtime source metadata must preserve the selected business configuration");
     }
-    PrintResult(result);
-    return result.passed;
 }
 
-inline bool TestPolyhedronIndexStoresShareCapacity() {
-    TestResult result;
+inline void TestPolyhedronIndexStoresShareCapacity(TestResult& result) {
     const std::array<std::uint64_t, 5u> counts{2u, 3u, 5u, 7u, 11u};
     const auto aggregateBytes = static_cast<std::uint64_t>(28u * sizeof(datacodec::IndexType));
     for (const bool externalSpill : {false, true}) {
@@ -544,30 +511,25 @@ inline bool TestPolyhedronIndexStoresShareCapacity() {
         "polyhedron.index-no-spill", "necessary index storage must fail cleanly when exact admission is denied");
     Require(result, !cache.Initialize(std::numeric_limits<std::uint64_t>::max(), session) && !cache.ByteSource(),
         "polyhedron.index-overflow", "index byte-count overflow must fail before allocation");
-    PrintResult(result);
-    return result.passed;
 }
 
 } // namespace datacodec::test::feature_budget
 
 namespace datacodec::test {
 
-inline int RunDataCodecFeatureBudget() {
-    if (!feature_budget::TestByteStoreResidentBudgetAndSealLifecycle() ||
-        !feature_budget::TestScratchPoolRetentionLimits() ||
-        !feature_budget::TestWindowedByteSourceReaderChunks() ||
-        !feature_budget::TestWindowedCopyRangesAndFailures() ||
-        !feature_budget::TestFixedWindowFieldDecode() ||
-        !feature_budget::TestAttributePayloadSizedStorage() ||
-        !feature_budget::TestDecodeBusinessOptions() ||
-        !feature_budget::TestRuntimeProfileIsSourceMetadata() ||
-        !feature_budget::TestPolyhedronIndexStoresShareCapacity()) {
-        return 1;
-    }
-    std::cout << "DataCodec budget feature tests passed\n";
-    return 0;
+inline TestResult RunDataCodecFeatureBudget() {
+    TestResult result;
+    feature_budget::TestByteStoreResidentBudgetAndSealLifecycle(result);
+    feature_budget::TestScratchPoolRetentionLimits(result);
+    feature_budget::TestWindowedByteSourceReaderChunks(result);
+    feature_budget::TestWindowedCopyRangesAndFailures(result);
+    feature_budget::TestFixedWindowFieldDecode(result);
+    feature_budget::TestAttributePayloadSizedStorage(result);
+    feature_budget::TestDecodeBusinessOptions(result);
+    feature_budget::TestRuntimeProfileIsSourceMetadata(result);
+    feature_budget::TestPolyhedronIndexStoresShareCapacity(result);
+    return result;
 }
-
 } // namespace datacodec::test
 
 #endif

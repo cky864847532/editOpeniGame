@@ -100,13 +100,11 @@ constexpr int kPrecisionModeRel = 1;
 constexpr auto kSettingsOrganization = "iGame";
 constexpr auto kSettingsApplication = "iGameVis";
 constexpr auto kEncodeSettingsGroup = "DataCodec/Encode";
-constexpr auto kEncodeCompressionEnhancementKey = "CompressionEnhancement";
 constexpr auto kEncodeZstdLevelKey = "ZstdLevel";
 constexpr auto kEncodeGopFrameCountKey = "GopFrameCount";
 
 struct DataCodecCompressionPerformanceSettings {
     ::datacodec::CodecResourceParams resources;
-    bool compressionEnhancement{false};
     int zstdLevel{3};
     int gopFrameCount{8};
 };
@@ -124,9 +122,6 @@ DataCodecCompressionPerformanceSettings LoadDataCodecCompressionPerformanceSetti
     storage.beginGroup(QString::fromLatin1(kEncodeSettingsGroup));
     const auto resources = igQtDataCodecDecodeSettingsStore::LoadResources(storage);
     const auto definition = ::datacodec::MakeDefaultEncodeConfigurationParams();
-    const bool compressionEnhancement = storage.value(
-        QString::fromLatin1(kEncodeCompressionEnhancementKey),
-        false).toBool();
     const auto zstdLevel = qBound(
         1,
         storage.value(
@@ -139,7 +134,6 @@ DataCodecCompressionPerformanceSettings LoadDataCodecCompressionPerformanceSetti
     storage.endGroup();
     return DataCodecCompressionPerformanceSettings{
         .resources = resources,
-        .compressionEnhancement = compressionEnhancement,
         .zstdLevel = zstdLevel,
         .gopFrameCount = gopFrameCount,
     };
@@ -150,9 +144,6 @@ void SaveDataCodecCompressionPerformanceSettings(
     auto storage = CreateDataCodecCompressionSettings();
     storage.beginGroup(QString::fromLatin1(kEncodeSettingsGroup));
     igQtDataCodecDecodeSettingsStore::SaveResources(storage, settings.resources);
-    storage.setValue(
-        QString::fromLatin1(kEncodeCompressionEnhancementKey),
-        settings.compressionEnhancement);
     storage.setValue(QString::fromLatin1(kEncodeZstdLevelKey), settings.zstdLevel);
     storage.setValue(QString::fromLatin1(kEncodeGopFrameCountKey), settings.gopFrameCount);
     storage.endGroup();
@@ -750,12 +741,6 @@ igQtDataCodecCompressionWidget::igQtDataCodecCompressionWidget(QWidget* parent) 
 
     root->addWidget(body, 1);
     root->addWidget(createStatusPanel(), 0);
-    if (m_compressionEnhancementCheck != nullptr &&
-        m_compressionEnhancementCheck->isChecked()) {
-        publishStatus(dataCodecHostLogText(
-            m_dataCodecLanguage,
-            iGame::iGameDataCodecHostMessageId::CompressionEnhancementEnabled));
-    }
 
     applyStyle();
     refreshFields();
@@ -853,11 +838,6 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     settingsRow->addLayout(compressionColumn, 2);
     layout->addLayout(settingsRow);
 
-    m_compressionEnhancementCheck = new QCheckBox(QStringLiteral("压缩率增强"), panel);
-    m_compressionEnhancementCheck->setToolTip(
-        QStringLiteral("启用单元重排与扩展预测搜索以提高压缩率，不改变 ZSTD压缩等级与资源模式"));
-    compressionColumn->addWidget(m_compressionEnhancementCheck);
-
     auto* zstdRow = new QHBoxLayout;
     auto* zstdLabel = new QLabel(QStringLiteral("ZSTD压缩等级"), panel);
     zstdLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
@@ -887,7 +867,7 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     m_applyLosslessAllButton = new QPushButton(QStringLiteral("全部无损"), panel);
     m_applyLossyAllButton = new QPushButton(QStringLiteral("全部有损"), panel);
     m_applyLossyAllButton->setToolTip(QStringLiteral("将全部数据的相对误差限设为 0.00001"));
-    m_syncDefaultPrecisionButton = new QPushButton(QStringLiteral("应用默认误差限"), panel);
+    m_syncDefaultPrecisionButton = new QPushButton(QStringLiteral("全部应用当前误差限"), panel);
     auto* batchModeRow = new QHBoxLayout;
     batchModeRow->setSpacing(6);
     batchModeRow->addWidget(m_applyLosslessAllButton);
@@ -941,7 +921,6 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
 
     const auto performanceSettings = LoadDataCodecCompressionPerformanceSettings();
     m_resourceControls->SetParams(performanceSettings.resources);
-    m_compressionEnhancementCheck->setChecked(performanceSettings.compressionEnhancement);
     m_zstdLevelSpin->setValue(performanceSettings.zstdLevel);
     m_gopFrameCountSpin->setValue(performanceSettings.gopFrameCount);
     m_resourceControls->OnChanged([this] { persistPerformanceSettings(); });
@@ -971,15 +950,6 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     m_resourceControls->OnStorageStatus([this](const ::datacodec::DataCodecStatusRecord& status) {
         if (!status.text.empty()) { publishStatus(status); }
     });
-    connect(m_compressionEnhancementCheck, &QCheckBox::toggled, this,
-        [this](const bool checked) {
-            persistPerformanceSettings();
-            if (checked) {
-                publishStatus(dataCodecHostLogText(
-                    m_dataCodecLanguage,
-                    iGame::iGameDataCodecHostMessageId::CompressionEnhancementEnabled));
-            }
-        });
     connect(m_zstdLevelSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
         [this](const int) { persistPerformanceSettings(); });
     connect(m_gopFrameCountSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
@@ -2159,9 +2129,6 @@ void igQtDataCodecCompressionWidget::refreshPerformanceControls() {
         static_cast<std::size_t>(std::numeric_limits<int>::max())));
     const bool multiFrame = frameCount > 1;
     const bool hasData = hasNumericFields();
-    if (m_compressionEnhancementCheck != nullptr) {
-        m_compressionEnhancementCheck->setEnabled(hasData);
-    }
     m_gopControlRow->setVisible(multiFrame);
     m_gopControlRow->setEnabled(multiFrame && hasData);
     QSignalBlocker blocker(m_gopFrameCountSpin);
@@ -2174,7 +2141,6 @@ void igQtDataCodecCompressionWidget::refreshPerformanceControls() {
 
 ::datacodec::DataCodecEncodeOptions igQtDataCodecCompressionWidget::selectedEncodeOptions() const {
     ::datacodec::DataCodecEncodeOptions options;
-    options.enableCompressionEnhancement = m_compressionEnhancementCheck && m_compressionEnhancementCheck->isChecked();
     if (m_zstdLevelSpin) { options.packageZstdLevel = m_zstdLevelSpin->value(); }
     if (hasMultiFrameData() && m_gopFrameCountSpin) {
         options.temporalKeyFrameInterval = static_cast<std::uint32_t>(m_gopFrameCountSpin->value());
@@ -2190,8 +2156,6 @@ void igQtDataCodecCompressionWidget::persistPerformanceSettings() const {
         : 8;
     SaveDataCodecCompressionPerformanceSettings({
         .resources = selectedResources(),
-        .compressionEnhancement = m_compressionEnhancementCheck != nullptr &&
-            m_compressionEnhancementCheck->isChecked(),
         .zstdLevel = zstdLevel,
         .gopFrameCount = gopFrameCount,
     });

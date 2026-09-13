@@ -498,11 +498,8 @@ public:
             validation::AssignError(error, "leaf package byte range reader is missing");
             return false;
         }
-        if (leafPackageSize == 0u) {
-            return true;
-        }
         if (leafPackageSize < leafpackagewire::HeaderByteCount()) {
-            validation::AssignError(error, "byte range is too small for an leaf package header");
+            validation::AssignError(error, "byte range is too small for a leaf package header");
             return false;
         }
         if (leafPackageOffset > reader->ByteSize() ||

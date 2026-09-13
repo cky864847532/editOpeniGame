@@ -20,7 +20,7 @@ inline encodeimpl::AttributeEncodeRuntime MakeAttributeEncodeRuntime(
         .data = encodeimpl::AttributeEncodeData{
             .adapter = *context.adapter,
             .storageParams = workspace.StorageParams(),
-            .controlParams = context.controlParams,
+            .controlParams = *context.controlParams,
             .pointOrderSource = workspace.PointOrderSource(),
             .cellOrderSource = workspace.CellOrderSource(),
             .keyFrameReference = context.attributeKeyFrameReference,
@@ -50,19 +50,16 @@ inline bool ExecuteAttributeField(
     EncodeContext& context,
     EncodeLeafWorkspace& workspace,
     const encodeimpl::AttributeFieldRequest& request) {
-    const AttrReferenceControlParams defaultDependency{};
-    const auto& dependency = context.controlParams != nullptr
-        ? context.controlParams->attrReference
-        : defaultDependency;
-    if (context.adapter == nullptr) {
+    if (context.adapter == nullptr || context.controlParams == nullptr) {
         FailEncodeStage(
             context,
             workspace,
             request.stageName,
             CodecErrorCode::MissingInput,
-            "attribute field requires a valid encode adapter");
+            "attribute field requires a valid encode adapter and resolved control parameters");
         return false;
     }
+    const auto& dependency = context.controlParams->attrReference;
     auto attributeOutput = workspace.AttributeOutput();
     auto runtime = MakeAttributeEncodeRuntime(context, workspace, std::move(attributeOutput));
     const auto result = encodeimpl::EncodeAttributeField(runtime, request, dependency);

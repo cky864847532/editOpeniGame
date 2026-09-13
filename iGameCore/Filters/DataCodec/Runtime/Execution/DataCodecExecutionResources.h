@@ -28,6 +28,7 @@ using ResourceClock = std::chrono::steady_clock;
 
 struct RuntimeResourceLimits {
     std::optional<std::uint64_t> ownedStorageLimitBytes{0u};
+    // 零表示不设额度，仅 Unlimited 线程模式使用；槽位仍可被内存恢复策略收缩
     std::size_t computeLimit{1u};
     std::size_t slotLimit{1u};
     bool operator==(const RuntimeResourceLimits&) const = default;
@@ -37,7 +38,7 @@ struct RuntimeResourceLimits {
 struct ResolvedResourceConfiguration {
     RuntimeResourceLimits initialLimits;
     std::optional<std::uint64_t> storageCeilingBytes{0u};
-    std::size_t computeCeiling{1u};
+    std::size_t computeCeiling{1u}; // Unlimited 多线程运行时为零
     bool threaded{true};
     bool gateOpen{true};
     bool externalSpillAvailable{false};
@@ -273,6 +274,7 @@ public:
     DataCodecExecutionResources& operator=(const DataCodecExecutionResources&) = delete;
     ~DataCodecExecutionResources();
     std::size_t Concurrency() const noexcept;
+    // 返回零表示 worker 索引按需增长，观察者必须动态持有每线程存储
     std::size_t WorkerCapacity() const noexcept;
     bool Threaded() const noexcept;
     bool IsDriverThread() const noexcept;

@@ -128,7 +128,7 @@ struct AttributeFieldPayload {
 struct AttributeEncodeData {
     IEncodeAdapter& adapter;
     CodecStorageParams& storageParams;
-    const CodecControlParams* controlParams{nullptr};
+    const CodecControlParams& controlParams;
     const RemapOrderSource& pointOrderSource;
     const RemapOrderSource& cellOrderSource;
     EncodeAttributeReferenceFrame& keyFrameReference;
@@ -658,9 +658,7 @@ inline bool ResolveAttributeField(
 
     const auto* orderProvider = runtime.OrderProvider(request.attachment);
     field.meta = runtime.data.storageParams.attrParams.at(request.metaIndex);
-    if (runtime.data.controlParams != nullptr) {
-        field.controlParams = &runtime.data.controlParams->GetAttrControl(field.meta.name);
-    }
+    field.controlParams = &runtime.data.controlParams.GetAttrControl(field.meta.name);
     numericarray::NumericArraySource source;
     if (!BuildAttributeNumericArraySourceForIndex(
             runtime.data.adapter,
@@ -941,12 +939,7 @@ inline bool BuildAttributeReferenceScheduleForAttachment(
             !ValidateSupportedAttributeField(metas[attrIndex], error)) {
             return false;
         }
-        NumericArrayControlParams fallbackControl;
-        fallbackControl.regionControl = MakeSingleRegionPrecisionControl(
-            MakeDefaultAttributeValueCompressor());
-        const auto& fieldControl = runtime.data.controlParams != nullptr
-            ? runtime.data.controlParams->GetAttrControl(metas[attrIndex].name)
-            : fallbackControl;
+        const auto& fieldControl = runtime.data.controlParams.GetAttrControl(metas[attrIndex].name);
         if (!fieldControl.regionControl.regions.empty()) {
             referenceAllowed[attrIndex] = 0u;
         }
@@ -1148,7 +1141,7 @@ inline bool BuildAttributeReferenceDecision(
 
 struct AttributeReferenceTransferData {
     const AttrStorageParams& meta;
-    const NumericArrayControlParams* controlParams{nullptr};
+    const NumericArrayControlParams& controlParams;
     const numericarray::NumericArraySource& currentSource;
     const ReferenceSourceData& referenceData;
     NumericArrayReferenceCodecId codecId{NumericArrayReferenceCodecId::NonReference};
@@ -1161,16 +1154,6 @@ inline ReferenceSelectionMode ResolveAttributeReferenceSelectionMode(
     return candidate.scope == NumericArrayReferenceScope::IntraArray
         ? dependency.intraField.selectionMode
         : dependency.temporalField.selectionMode;
-}
-
-inline const NumericArrayControlParams& ResolveAttributeControlParams(
-    const NumericArrayControlParams* controlParams,
-    NumericArrayControlParams& fallbackControl) {
-    if (controlParams != nullptr) {
-        return *controlParams;
-    }
-    fallbackControl.regionControl = MakeSingleRegionPrecisionControl(MakeDefaultAttributeValueCompressor());
-    return fallbackControl;
 }
 
 struct AttributeReferenceTransferCache {
@@ -1191,8 +1174,7 @@ inline bool BuildReferenceTransferCache(
         .meta = data.referenceData.meta,
         .source = data.referenceData.source,
     };
-    NumericArrayControlParams fallbackControl;
-    const auto& controlParams = ResolveAttributeControlParams(data.controlParams, fallbackControl);
+    const auto& controlParams = data.controlParams;
     const auto& defaultCompressor = controlParams.regionControl.defaultPrecision.compressor;
     auto selectPredictorOffset = [&data, &defaultCompressor](
         const NumericArrayStorageParams& currentMeta,
@@ -1269,8 +1251,7 @@ inline bool EncodeNonReferenceField(
     if (!numericarray::MakeNumericArrayBlockParamsFromMeta(payload.meta, blockParams, error)) {
         return false;
     }
-    NumericArrayControlParams fallbackControl;
-    const auto& controlParams = ResolveAttributeControlParams(field.controlParams, fallbackControl);
+    const auto& controlParams = *field.controlParams;
     numericarray::ApplyNumericArrayControlParams(blockParams, controlParams);
     NumericArrayTransferCacheRuntime transferRuntime;
     transferRuntime.parallelInputRead = true;
@@ -1323,7 +1304,7 @@ inline bool EncodeReferenceField(
     if (!BuildReferenceTransferCache(
             AttributeReferenceTransferData{
                 .meta = payload.meta,
-                .controlParams = field.controlParams,
+                .controlParams = *field.controlParams,
                 .currentSource = field.source,
                 .referenceData = decision.referenceSource,
                 .codecId = codecId,
@@ -1362,8 +1343,7 @@ inline bool EncodeFieldPayload(
     AttributeEncodeRuntime& runtime,
     AttributeFieldPayload& payload,
     std::string* error = nullptr) {
-    NumericArrayControlParams fallbackControl;
-    const auto& controlParams = ResolveAttributeControlParams(field.controlParams, fallbackControl);
+    const auto& controlParams = *field.controlParams;
     const auto& regionControl = controlParams.regionControl;
     const auto forcedReferenceRequired =
         runtime.data.temporalRole == TemporalFieldRole::PredFrame

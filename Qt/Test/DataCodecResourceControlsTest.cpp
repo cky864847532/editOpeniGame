@@ -43,6 +43,8 @@ int main(int argc, char** argv) {
     if (!modes || !threads || !storage || !reserve) { std::cerr << "resource controls are missing\n"; return 1; }
     require(modes->count() == 3 && !modes->isEditable(), "mode must use a three-option noneditable combo box");
     auto params = controls.Params();
+    require(params.threadMode == datacodec::CodecThreadMode::Unlimited && !threads->isEnabled() && threads->isHidden(),
+        "default threads must be unlimited with no numeric input");
     require(params.mode == datacodec::CodecResourceMode::Adaptive && !params.maxComputeThreads &&
         !params.ownedStorageLimitBytes && params.targetAvailableMemoryRatio == 0.20,
         "Adaptive starts with the 20 percent physical reserve target");
@@ -91,7 +93,10 @@ int main(int argc, char** argv) {
     auto* threadMode = controls.findChild<QComboBox*>(QStringLiteral("DataCodecThreadMode"));
     auto* idle = controls.findChild<QDoubleSpinBox*>(QStringLiteral("DataCodecTargetCpuIdle"));
     if (!threadMode || !idle) { std::cerr << "CPU controls are missing\n"; return 1; }
-    require(threadMode->count() == 2 && !threadMode->isEditable() && !idle->isEnabled(), "thread mode defaults to Fixed");
+    require(threadMode->count() == 3 && !threadMode->isEditable() && !idle->isEnabled(), "thread mode offers all three choices");
+    threadMode->setCurrentIndex(threadMode->findData(static_cast<int>(datacodec::CodecThreadMode::Unlimited)));
+    require(!controls.Params().maxComputeThreads && !controls.Params().targetCpuIdleRatio && threads->isHidden(),
+        "Unlimited must omit both fixed limits and adaptive targets");
     threadMode->setCurrentIndex(threadMode->findData(static_cast<int>(datacodec::CodecThreadMode::Adaptive)));
     idle->setValue(25.0);
     require(!threads->isEnabled() && idle->isEnabled() && !controls.Params().maxComputeThreads &&
@@ -187,6 +192,7 @@ int main(int argc, char** argv) {
         QApplication::processEvents();
         auto* mode = compression.findChild<QComboBox*>(QStringLiteral("DataCodecResourceMode"));
         auto* compute = compression.findChild<QSpinBox*>(QStringLiteral("DataCodecComputeLimit"));
+        auto* encodeThreadMode = compression.findChild<QComboBox*>(QStringLiteral("DataCodecThreadMode"));
         auto* capacity = compression.findChild<QDoubleSpinBox*>(QStringLiteral("DataCodecOwnedStorageLimit"));
         require(mode && compute && capacity && !mode->isEnabled() && !compute->isEnabled() && !capacity->isEnabled(),
             "the real encoding panel must display disabled resource controls without a model");
@@ -215,10 +221,12 @@ int main(int argc, char** argv) {
         compression.SetModel(model);
         QApplication::processEvents();
         auto* memoryReserve = compression.findChild<QDoubleSpinBox*>(QStringLiteral("DataCodecTargetAvailableMemory"));
-        require(mode && compute && capacity && memoryReserve && mode->isEnabled() && compute->isEnabled() && memoryReserve->isEnabled(),
+        require(mode && compute && capacity && memoryReserve && encodeThreadMode && mode->isEnabled() &&
+            encodeThreadMode->isEnabled() && !compute->isEnabled() && memoryReserve->isEnabled(),
             "loading a real point model must enable the encoding resource controls");
-        if (mode && compute && capacity) {
+        if (mode && compute && capacity && encodeThreadMode) {
             mode->setCurrentIndex(mode->findData(static_cast<int>(datacodec::CodecResourceMode::Fixed)));
+            encodeThreadMode->setCurrentIndex(encodeThreadMode->findData(static_cast<int>(datacodec::CodecThreadMode::Fixed)));
             compute->setValue(3);
             capacity->setValue(64.0);
             QSettings saved(QSettings::IniFormat, QSettings::UserScope, QStringLiteral("iGame"), QStringLiteral("iGameVis"));
@@ -322,7 +330,7 @@ int main(int argc, char** argv) {
             params.targetAvailableMemoryRatio == 0.20 &&
             !params.ownedStorageLimitBytes && !settings.contains(QStringLiteral("MaxComputeThreads")) &&
             !settings.contains(QStringLiteral("OwnedStorageLimitBytes")) &&
-            params.threadMode == datacodec::CodecThreadMode::Fixed && !params.targetCpuIdleRatio &&
+            params.threadMode == datacodec::CodecThreadMode::Unlimited && !params.targetCpuIdleRatio &&
             !settings.contains(QStringLiteral("TargetCpuIdleRatio")), "saving defaults must remove explicit resource keys");
         settings.remove(QStringLiteral("ResourceSettingsVersion"));
         settings.setValue(QStringLiteral("OwnedStorageLimitBytes"), 123456u);

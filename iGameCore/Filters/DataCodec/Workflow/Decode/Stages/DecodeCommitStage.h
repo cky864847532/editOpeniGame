@@ -3,7 +3,6 @@
 
 #include "DataCodec/Runtime/Cache/DecodedCacheCommit.h"
 #include "DataCodec/Log/Telemetry/TelemetryMemoryTrace.h"
-#include "DataCodec/Log/Telemetry/TelemetryMemoryControl.h"
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/Validation/Workflow/DecodeOutputValidator.h"
@@ -177,7 +176,6 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
     error.clear();
     stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     SubmitCommitProgress(context, 0.920, DataCodecMessageId::DecodeCommitGeometry);
-    RecordSchedulerInvestigation(context, workspace, "commit.geometry.begin");
     if (!CommitGeometryCache(
             *context.adapter,
             workspace.CacheResourcesRef(),
@@ -194,11 +192,9 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
         return;
     }
     RecordCommitTiming(context, "DecodeCommitStage.Geometry", stageStart);
-    RecordSchedulerInvestigation(context, workspace, "commit.geometry.end");
     error.clear();
     stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     SubmitCommitProgress(context, 0.940, DataCodecMessageId::DecodeCommitTopology);
-    RecordSchedulerInvestigation(context, workspace, "commit.topology.begin");
     if (!CommitDecodedTopologyIfPresent(context, workspace, &error)) {
         RecordCommitTiming(
             context,
@@ -220,7 +216,6 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
     error.clear();
     stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     SubmitCommitProgress(context, 0.970, DataCodecMessageId::DecodeCommitAttribute);
-    RecordSchedulerInvestigation(context, workspace, "commit.attributes.begin");
     if (!CommitAttributeCacheFields(
             *context.adapter,
             workspace.CacheResourcesRef(),
@@ -238,7 +233,6 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
         return;
     }
     workspace.MarkAttributesCommitted(uncommittedAttrIndices);
-    RecordSchedulerInvestigation(context, workspace, "commit.attributes.end");
     RecordCommitTiming(context, "DecodeCommitStage.Attributes", stageStart);
     SubmitCommitProgress(context, 0.990, DataCodecMessageId::DecodeFinalizeResult);
 }

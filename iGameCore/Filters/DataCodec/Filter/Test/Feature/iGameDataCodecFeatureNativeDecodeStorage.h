@@ -2,14 +2,112 @@
 #define IGAME_DATACODEC_FEATURE_NATIVE_DECODE_STORAGE_H
 
 #include "DataCodec/Filter/Adapter/iGameDecodeAdapter.h"
+#include "DataCodec/Filter/Adapter/iGameEncodeAdapter.h"
 #include "DataCodec/Runtime/Cache/DecodedCacheCommit.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
 #include <array>
 #include <cstring>
+#include <thread>
 
 namespace datacodec::test {
+// 用真实宿主适配器核验直接发布、混合回放和取消，逐值检查输出
+inline void TestNativeAttributeCommit(TestResult& result) {
+    using namespace datacodec;
+    using namespace std::chrono_literals;
+    constexpr std::uint64_t MiB = 1024u * 1024u;
+    const std::array<double, 2u> values{3.25, -7.5};
+    for (const auto scenario : {0, 1, 2, 3}) {
+        const bool mixed = scenario == 1, cancelled = scenario == 2, incomplete = scenario == 3;
+        RuntimeResourceLimits limits{MiB, 1u, 2u};
+        DataCodecExecutionResources root(ResolvedResourceConfiguration{limits, MiB, 1u, true, true});
+        CodecRunScope scope(root);
+        CacheResources runtime;
+        runtime.BindRun(root);
+        bytestore::ByteStoreSession stores;
+        stores.BindStorage(root.StorageCapacity(), false);
+        CodecStorageParams params;
+        params.attrParams.resize(mixed ? 2u : 1u);
+        for (std::size_t i = 0u; i < params.attrParams.size(); ++i) {
+            auto& meta = params.attrParams[i];
+            meta.name = "commit-check-" + std::to_string(i);
+            meta.type = AttrRole::Scalar;
+            meta.attachmentType = AttrAttachment::Point;
+            meta.dataType = DataType::Float64;
+            meta.dimension = 1;
+            meta.elementCount = values.size();
+        }
+        iGame::iGameDecodeAdapter adapter;
+        DecodedAttributeCacheSet attributes;
+        if (!scope || !adapter.SetMeshType(MeshType::PointSet) || !attributes.Initialize(params, stores)) { Require(result, false, "native.attribute.prepare", "attribute commit fixture setup failed"); return; }
+        auto native = adapter.CreateAttributeDecodeStore(0u, params.attrParams[0]);
+        if (!native || !attributes.BindAttributeStore(0u, native, true)) { Require(result, false, "native.attribute.prepare", "attribute commit fixture setup failed"); return; }
+        std::vector<std::size_t> indices;
+        for (std::size_t i = 0u; i < params.attrParams.size(); ++i) {
+            if (!attributes.BeginAttribute(i, params.attrParams[i]) ||
+                !attributes.WriteAttributeRange(i, 0u, values.size(), values.data(), sizeof(values)) ||
+                (!incomplete && !attributes.EndAttribute(i))) { Require(result, false, "native.attribute.prepare", "attribute commit fixture setup failed"); return; }
+            indices.push_back(i);
+        }
+        // 直接发布仍需由活动请求的 driver 调用
+        if (scenario == 0) {
+            bool rejected = false;
+            std::jthread other([&] {
+                std::string error;
+                rejected = !CommitAttributeCacheFields(adapter, runtime, attributes, indices, &error) && !error.empty();
+            });
+            other.join();
+            Require(result, rejected, "native.attribute_publish_requires_driver", "attribute publication contract failed");
+        }
+        if (!root.UpdateLimits(limits, false, ResourceDecisionReason::MechanismCheck)) { Require(result, false, "native.attribute.prepare", "attribute commit fixture setup failed"); return; }
+        if (cancelled) { root.RequestStop(); }
+        bool observedReplayWait = false;
+        // 看门线程限定等待时间，混合路径在观察到等待后开门
+        std::jthread reopen([&](std::stop_token stop) {
+            const auto deadline = ResourceClock::now() + 500ms;
+            while (!stop.stop_requested() && ResourceClock::now() < deadline) {
+                ResourceDebugSnapshot s;
+                if (mixed && root.TryCopyResourceDebugSnapshot(s) && !s.gateOpen &&
+                    s.waiting == ResourceWaitReason::PressureRecovery && !s.heavyPhaseAdmitted) {
+                    observedReplayWait = true;
+                    root.UpdateLimits(limits, true, ResourceDecisionReason::MechanismCheck);
+                    return;
+                }
+                std::this_thread::sleep_for(1ms);
+            }
+            if (!stop.stop_requested()) { root.UpdateLimits(limits, true, ResourceDecisionReason::MechanismCheck); }
+        });
+        std::string error;
+        const bool committed = CommitAttributeCacheFields(adapter, runtime, attributes, indices, &error);
+        ResourceDebugSnapshot after;
+        const bool closed = root.TryCopyResourceDebugSnapshot(after) && !after.gateOpen;
+        reopen.request_stop();
+        reopen.join();
+        auto object = adapter.TakeDataObject();
+        iGame::iGameEncodeAdapter output(object);
+        const auto expectedCount = cancelled || incomplete ? 0u : params.attrParams.size();
+        bool contents = output.GetNumberOfPointAttrs() == expectedCount;
+        for (std::size_t i = 0u; contents && i < expectedCount; ++i) {
+            const auto& attribute = output.GetPointAttr(i);
+            for (std::size_t j = 0u; j < values.size(); ++j) {
+                double value = 0.0;
+                attribute.GetTuple(j, &value);
+                contents &= value == values[j];
+            }
+        }
+        attributes.Reset();
+        native.reset();
+        stores.ReleaseAll();
+        const bool finished = scope.Finish(committed);
+        if (scenario == 0) { Require(result, committed && closed && contents && finished, "native.attribute_publish_completes_with_closed_gate", "attribute publication contract failed"); }
+        if (mixed) { Require(result, committed && observedReplayWait && contents && finished, "native.mixed_attribute_replay_waits_and_preserves_values", "attribute publication contract failed"); }
+        if (cancelled) { Require(result, !committed && closed && contents && !finished, "native.cancel_prevents_attribute_publish", "attribute publication contract failed"); }
+        if (incomplete) { Require(result, !committed && closed && contents && !error.empty() && !finished, "native.incomplete_attribute_is_not_published", "attribute publication contract failed"); }
+    }
+}
+
 inline TestResult RunDataCodecFeatureNativeDecodeStorage() {
     TestResult result;
+    TestNativeAttributeCommit(result);
     constexpr std::uint64_t MiB = 1024u * 1024u;
     const auto bytes = [](const auto& values) {
         return std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(values.data()), sizeof(values));

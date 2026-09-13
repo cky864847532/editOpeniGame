@@ -1,9 +1,9 @@
 #Requires -Version 7.2
-param([string]$OutputRoot = 'logs/resource-parameters-20260913')
+param([string]$OutputRoot = 'logs/resource-parameters')
 $ErrorActionPreference = 'Stop'
 $rows = @(Get-ChildItem -LiteralPath $OutputRoot -Filter '*.run.json' | ForEach-Object {
-    $run = Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
-    $log = Get-Content -LiteralPath (Join-Path $OutputRoot "$($run.name).log")
+    $run = Get-Content -LiteralPath $_.FullName -Raw -Encoding utf8 | ConvertFrom-Json
+    $log = Get-Content -LiteralPath (Join-Path $OutputRoot "$($run.name).log") -Encoding utf8
     $encode = $log | Where-Object { $_ -match '^RESULT encode_success=' } | Select-Object -Last 1
     $decode = $log | Where-Object { $_ -match '^RESULT decode_success=' } | Select-Object -Last 1
     $shape = $log | Where-Object { $_ -match '^RESULT shape_matches=' } | Select-Object -Last 1
