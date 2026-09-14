@@ -25,6 +25,11 @@ public:
     igQtModelDialogWidget(QWidget* parent);
     ~igQtModelDialogWidget() override = default;
 
+    /** 返回当前操作应作用的数据对象：
+     *  - 若模型树当前选中的是子块/子块属性行，返回该子块的 DataObject；
+     *  - 否则返回当前模型的顶层 DataObject。 */
+    iGame::DataObject::Pointer getCurrentDataObject();
+
     /** 上半部分：圖層/模型樹，可單獨拖出懸浮 */
     QDockWidget* getTreeDock() const { return m_treeDock; }
     /** 下半部分：屬性 / 模型資訊 */

@@ -325,6 +325,31 @@ igQtModelDialogWidget::igQtModelDialogWidget(QWidget* parent) : QObject(parent),
     connect(modelTreeWidget, &igQtModelTreeWidget::ViewCloudPicture, this, &igQtModelDialogWidget::updateCloudPicture);
 }
 
+iGame::DataObject::Pointer igQtModelDialogWidget::getCurrentDataObject() {
+    if (modelTreeWidget != nullptr) {
+        QTreeWidgetItem* item = modelTreeWidget->currentItem();
+
+        // 当前选中的是子块行：直接返回子块数据对象。
+        if (auto* sub = dynamic_cast<SubObjectTreeWidgetItem*>(item)) {
+            return sub->getDataObject();
+        }
+
+        // 当前选中的是子块属性行：返回它所属子块的数据对象。
+        if (auto* subAttr = dynamic_cast<SubAttribTreeWidgetItem*>(item)) {
+            if (auto* sub = dynamic_cast<SubObjectTreeWidgetItem*>(subAttr->parent())) {
+                return sub->getDataObject();
+            }
+        }
+    }
+
+    // 否则回退到当前模型的顶层数据对象。
+    auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
+    if (scene == nullptr || scene->GetCurrentModel() == nullptr) {
+        return nullptr;
+    }
+    return scene->GetCurrentModel()->GetDataObject();
+}
+
 ModelTreeWidgetItem* igQtModelDialogWidget::getItemFromObject(iGame::DataObject::Pointer obj) {
     // 遍历子项
     for (int i = 0; i < modelTreeWidget->topLevelItemCount(); ++i) {

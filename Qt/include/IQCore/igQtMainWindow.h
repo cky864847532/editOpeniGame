@@ -163,6 +163,13 @@ private:
     /** 与菜单「算法处理 / 特征提取」等一致：无边框 QMessageBox + 暗色圆角边框。 */
     void showDarkFramelessMessage(const QString& title, const QString& text, bool useInformationIcon = false);
 
+    /** 显示并聚焦某个 Dock。
+     *  注意：必须做成成员函数——若写成函数内局部 lambda 再被菜单回调 [&] 捕获，
+     *  回调真正执行时该局部对象早已随栈帧销毁（悬垂引用 → 随机指针 → 崩溃）。 */
+    void showAndRaiseDock(QDockWidget* dock);
+    /** 打开「路径图(DataChange)」面板并初始化。同上：成员函数，避免悬垂引用。 */
+    void openDataChangePanel();
+
     void rebuildActionsAsTwoRowWidget(QToolBar* toolbar, const QList<QAction*>& targetActions, int columns,
                                       QAction* insertBefore = nullptr);
     void addToolbarTitle(QToolBar* toolbar, const QString& title, int iconSizePx);

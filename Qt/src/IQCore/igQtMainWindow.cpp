@@ -1,4 +1,4 @@
-#include "IQCore/igQtMainWindow.h"
+﻿#include "IQCore/igQtMainWindow.h"
 //
 // Created by m_ky on 2024/4/10.
 //
@@ -1176,6 +1176,53 @@ void igQtMainWindow::showDarkFramelessMessage(const QString& title, const QStrin
     igQtShowDarkFramelessMessage(this, title, text, useInformationIcon);
 }
 
+namespace
+{
+// 「数据转换」菜单：解析当前应作用的数据对象。
+// - 普通模型：当前模型的顶层 DataObject；
+// - 多块复合模型（例如 PVD 读取结果）：模型树中选中的子块/子块属性所属的 DataObject。
+//
+// 注意：这里必须是文件级函数，不能写成 initAllFilters() 里的局部 lambda。
+// 菜单回调是「延迟执行」的，若用 [&] 捕获局部 lambda，initAllFilters() 返回后
+// 闭包内存已随栈帧销毁，点击菜单时会读到垃圾指针（表现为 QTreeWidget::currentItem
+// 里 rcx 是 0x8000000000000000 / 字符串字节等随机值）而崩溃。
+iGame::DataObject::Pointer ResolveConvertibleDataObjectForConvertMenu(
+        igQtModelDialogWidget* modelTreeWidget, const QString& actionName, QString& reason) {
+    reason.clear();
+    if (modelTreeWidget == nullptr) {
+        reason = QStringLiteral("模型树尚未初始化");
+        return nullptr;
+    }
+
+    auto obj = modelTreeWidget->getCurrentDataObject();
+    if (obj == nullptr) {
+        reason = QStringLiteral("请先加载模型，或在模型树中选中一个子块");
+        return nullptr;
+    }
+
+    // PVD 等时间序列文件第一帧通常只有一个子块；此时自动使用该子块，
+    // 用户无需先展开模型树手动点选。多子块时仍要求显式选择，避免误操作。
+    if ((obj->GetPoints() == nullptr || obj->GetCellArray() == nullptr) &&
+        obj->GetNumberOfSubDataObjects() == 1) {
+        auto it = obj->SubDataObjectIteratorBegin();
+        if (it != obj->SubDataObjectIteratorEnd()) {
+            obj = it->second;
+        }
+    }
+
+    if (obj->GetPoints() == nullptr || obj->GetCellArray() == nullptr) {
+        if (obj->HasSubDataObject()) {
+            reason = QStringLiteral("当前为多块/复合模型，请先在模型树中选中一个子块，再执行“%1”。")
+                             .arg(actionName);
+        } else {
+            reason = QStringLiteral("当前对象没有可转换的网格数据（缺少点或单元数组）。");
+        }
+        return nullptr;
+    }
+    return obj;
+}
+} // namespace
+
 void igQtMainWindow::initAllFilters() {
     /* Data Processing 前两档：加宽以容纳较长参数标签，并关闭参数区滚动条（内容较少无需滚动） */
     auto tuneMeshSimplifyFilterDialog = [](igQtFilterDialogDockWidget* d) {
@@ -1230,7 +1277,7 @@ void igQtMainWindow::initAllFilters() {
     };
 
     QMenu* mesh_processing = ui->menu_filters->addMenu(QStringLiteral("数据处理 (Data Processing)"));
-    connect(mesh_processing->addAction(QStringLiteral("表面网格简化 (Surface Simplification)")), &QAction::triggered, this, [&](bool checked) {
+    connect(mesh_processing->addAction(QStringLiteral("表面网格简化 (Surface Simplification)")), &QAction::triggered, this, [this, tuneMeshSimplifyFilterDialog](bool checked) {
         if (rendererWidget->GetScene()->GetCurrentModel() == nullptr) return;
 
         igQtFilterDialogDockWidget* dialog = new igQtFilterDialogDockWidget(this, true);
@@ -1355,7 +1402,7 @@ void igQtMainWindow::initAllFilters() {
         });
     });
 
-    connect(mesh_processing->addAction(QStringLiteral("快速表面简化 (Fast Surface Simplification)")), &QAction::triggered, this, [&](bool checked) {
+    connect(mesh_processing->addAction(QStringLiteral("快速表面简化 (Fast Surface Simplification)")), &QAction::triggered, this, [this, tuneMeshSimplifyFilterDialog](bool checked) {
         if (rendererWidget->GetScene() == nullptr
             || rendererWidget->GetScene()->GetCurrentModel() == nullptr) {
             return;
@@ -1793,25 +1840,55 @@ void igQtMainWindow::initAllFilters() {
 
     //    });
     QMenu* convert = ui->menu_filters->addMenu(QStringLiteral("数据转换 (Convert)"));
-    connect(convert->addAction(QStringLiteral("转换为点数据 (Convert To PointData)")), &QAction::triggered, this, [&](bool checked) {
-        if (rendererWidget->GetScene()->GetCurrentModel() == nullptr) return;
-        auto obj = rendererWidget->GetScene()->GetCurrentModel()->GetDataObject();
+    connect(convert->addAction(QStringLiteral("转换为点数据 (Convert To PointData)")), &QAction::triggered, this, [this](bool checked) {
+        QString reason;
+        auto obj = ResolveConvertibleDataObjectForConvertMenu(modelTreeWidget, QStringLiteral("转换为点数据"), reason);
+        if (obj == nullptr) {
+            if (!reason.isEmpty()) { showDarkFramelessMessage(QStringLiteral("提示"), reason); }
+            return;
+        }
+
         ConvertToPointDataFilter::Pointer filter = ConvertToPointDataFilter::New();
         filter->SetInput(obj);
-        if (filter->Execute()) {
-            modelTreeWidget->addDataObjectToModelTree(filter->GetOutput(), Algorithm);
-            rendererWidget->update();
+        // 过滤器输出的是独立的新 DataObject，原模型/原子块保持不变。
+        if (!filter->Execute()) {
+            showDarkFramelessMessage(QStringLiteral("提示"),
+                                     QStringLiteral("当前对象没有可转换的单元数据"));
+            return;
         }
+        auto output = filter->GetOutput();
+        if (output == nullptr) {
+            showDarkFramelessMessage(QStringLiteral("提示"),
+                                     QStringLiteral("转换为点数据失败"));
+            return;
+        }
+        modelTreeWidget->addDataObjectToModelTree(output, Algorithm);
+        rendererWidget->update();
     });
-    connect(convert->addAction(QStringLiteral("转换为单元数据 (Convert To CellData)")), &QAction::triggered, this, [&](bool checked) {
-        if (rendererWidget->GetScene()->GetCurrentModel() == nullptr) return;
-        auto obj = rendererWidget->GetScene()->GetCurrentModel()->GetDataObject();
+    connect(convert->addAction(QStringLiteral("转换为单元数据 (Convert To CellData)")), &QAction::triggered, this, [this](bool checked) {
+        QString reason;
+        auto obj = ResolveConvertibleDataObjectForConvertMenu(modelTreeWidget, QStringLiteral("转换为单元数据"), reason);
+        if (obj == nullptr) {
+            if (!reason.isEmpty()) { showDarkFramelessMessage(QStringLiteral("提示"), reason); }
+            return;
+        }
+
         ConvertToCellDataFilter::Pointer filter = ConvertToCellDataFilter::New();
         filter->SetInput(obj);
-        if (filter->Execute()) {
-            modelTreeWidget->addDataObjectToModelTree(filter->GetOutput(), Algorithm);
-            rendererWidget->update();
+        // 同上：输出独立的新 DataObject，作为新模型加入模型树。
+        if (!filter->Execute()) {
+            showDarkFramelessMessage(QStringLiteral("提示"),
+                                     QStringLiteral("当前对象没有可转换的点数据"));
+            return;
         }
+        auto output = filter->GetOutput();
+        if (output == nullptr) {
+            showDarkFramelessMessage(QStringLiteral("提示"),
+                                     QStringLiteral("转换为单元数据失败"));
+            return;
+        }
+        modelTreeWidget->addDataObjectToModelTree(output, Algorithm);
+        rendererWidget->update();
     });
 
 
@@ -2387,17 +2464,28 @@ void igQtMainWindow::initAllFilters() {
     });
 }
 
-void igQtMainWindow::initAllDockWidgetConnectWithAction() {
-    // 显示并切换到对应 DockWidget / Tab
-    auto showAndRaiseDock = [&](QDockWidget* dock) {
-        if (!dock) return;
-        dock->show();
-        dock->raise();
-        if (dock->widget()) dock->widget()->setFocus(Qt::OtherFocusReason);
-    };
+void igQtMainWindow::showAndRaiseDock(QDockWidget* dock) {
+    if (!dock) return;
+    dock->show();
+    dock->raise();
+    if (dock->widget()) dock->widget()->setFocus(Qt::OtherFocusReason);
+}
 
+void igQtMainWindow::openDataChangePanel() {
+    auto model = rendererWidget->GetScene()->GetCurrentModel();
+    if (model == nullptr) return;
+    openLeftToolPanel(LeftToolPanelId::DataChange);
+    ui->widget_DataChangeField->InitRadialStyle(rendererWidget->GetScene()->GetInteractor());
+    auto name = rendererWidget->GetScene()->GetInteractor()->SetSpecialInteractor(
+            ui->widget_DataChangeField->GetRadialStyle());
+    ui->widget_DataChangeField->SetInteractorName(name);
+    ui->widget_DataChangeField->SetModel(model);
+    ui->widget_DataChangeField->SetScene(rendererWidget->GetScene());
+}
+
+void igQtMainWindow::initAllDockWidgetConnectWithAction() {
     connect(ui->action_IsShowColorBar, &QAction::triggered, this, &igQtMainWindow::updateColorBarShow);
-    connect(ui->action_ExportAnimation, &QAction::triggered, this, [&](bool checked) { showAndRaiseDock(ui->dockWidget_Animation); });
+    connect(ui->action_ExportAnimation, &QAction::triggered, this, [this](bool checked) { showAndRaiseDock(ui->dockWidget_Animation); });
     connect(ui->action_SearchInfo, &QAction::triggered, this, [&](bool checked) {
         if (ui->dockWidget_SearchInfo) {
             ui->dockWidget_SearchInfo->show();
@@ -2421,7 +2509,7 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
             [this](bool) { openLeftToolPanel(LeftToolPanelId::Vector); });
     connect(ui->action_Tensor, &QAction::triggered, this,
             [this](bool) { openLeftToolPanel(LeftToolPanelId::Tensor); });
-    connect(ui->action_ParallelCoordinates, &QAction::triggered, this, [&](bool checked) {
+    connect(ui->action_ParallelCoordinates, &QAction::triggered, this, [this](bool checked) {
         auto model = rendererWidget->GetScene()->GetCurrentModel();
         if (model == nullptr) return;
         showAndRaiseDock(ui->dockWidget_ParallelCoordinatesField);
@@ -2775,21 +2863,9 @@ void igQtMainWindow::initAllDockWidgetConnectWithAction() {
         if (model == nullptr) return;
         ui->widget_VariableDensityField->SetModel(model);
     });
-    auto DataChangeFunc = [&](igQtMainWindow* mainWindow) {
-        auto model = mainWindow->rendererWidget->GetScene()->GetCurrentModel();
-        if (model == nullptr) return;
-        mainWindow->openLeftToolPanel(LeftToolPanelId::DataChange);
-        mainWindow->ui->widget_DataChangeField->InitRadialStyle(
-                mainWindow->rendererWidget->GetScene()->GetInteractor());
-        auto name = mainWindow->rendererWidget->GetScene()->GetInteractor()->SetSpecialInteractor(
-                mainWindow->ui->widget_DataChangeField->GetRadialStyle());
-        mainWindow->ui->widget_DataChangeField->SetInteractorName(name);
-        mainWindow->ui->widget_DataChangeField->SetModel(model);
-        mainWindow->ui->widget_DataChangeField->SetScene(mainWindow->rendererWidget->GetScene());
-    };
-    connect(ui->action_DataChange, &QAction::triggered, this, [&](bool checked) { DataChangeFunc(this); });
+    connect(ui->action_DataChange, &QAction::triggered, this, [this](bool checked) { openDataChangePanel(); });
     connect(ui->widget_DataChangeField, &igQtDataChangeWidget::SIGNAL_RefreshDataClicked, this,
-            [&]() { DataChangeFunc(this); });
+            [this]() { openDataChangePanel(); });
 
     ui->action_ContextPreserving->setVisible(false);
     connect(ui->action_ContextPreserving, &QAction::triggered, this, [&](bool checked) {
