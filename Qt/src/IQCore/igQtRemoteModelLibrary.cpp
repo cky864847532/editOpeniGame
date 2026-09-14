@@ -17,6 +17,7 @@
 #include <QLineEdit>
 #include <QPushButton>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QStorageInfo>
@@ -28,6 +29,7 @@
 namespace
 {
 constexpr auto SettingsGroup = "RemoteModelLibrary";
+constexpr quint64 GiB = quint64{1024} * 1024 * 1024;
 
 QString DefaultCacheRoot()
 {
@@ -181,6 +183,26 @@ igQtRemoteModelLibrary::igQtRemoteModelLibrary(igQtFileLoader* fileLoader,
     m_Table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
     m_Table->setColumnWidth(3, 260);
 
+    auto* memoryBox = new QGroupBox(QStringLiteral("CPU memory cache (this client process)"), this);
+    auto* memoryLayout = new QFormLayout(memoryBox);
+    m_MemoryCacheStatus = new QLabel(memoryBox);
+    m_MemoryCacheStatus->setObjectName(QStringLiteral("RemoteCpuCacheStatus"));
+    m_MemoryCacheStatus->setWordWrap(true);
+    memoryLayout->addRow(m_MemoryCacheStatus);
+    m_MemoryLimitGiB = new QSpinBox(memoryBox);
+    m_MemoryLimitGiB->setObjectName(QStringLiteral("RemoteCpuCacheLimitGiB"));
+    m_MemoryLimitGiB->setRange(1, 4096);
+    m_MemoryLimitGiB->setSuffix(QStringLiteral(" GiB"));
+    m_MemoryLimitGiB->setValue(96);
+    m_MemoryLimitGiB->setToolTip(QStringLiteral(
+            "Limit for retained parsed CPU mesh data, not total process RAM. Preloading does not render the model."));
+    memoryLayout->addRow(QStringLiteral("CPU cache limit"), m_MemoryLimitGiB);
+    m_ClearMemoryButton = new QPushButton(QStringLiteral("Clear Memory Cache"), memoryBox);
+    m_ClearMemoryButton->setObjectName(QStringLiteral("RemoteCpuCacheClear"));
+    m_ClearMemoryButton->setToolTip(QStringLiteral(
+            "Release the CPU cache. Displayed models and disk cache files are unchanged."));
+    memoryLayout->addRow(QString(), m_ClearMemoryButton);
+
     auto* footer = new QHBoxLayout;
     m_StatusLabel = new QLabel(QStringLiteral("Choose an endpoint, then click Fetch."), this);
     m_StatusLabel->setObjectName(QStringLiteral("RemoteCatalogStatus"));
@@ -188,15 +210,22 @@ igQtRemoteModelLibrary::igQtRemoteModelLibrary(igQtFileLoader* fileLoader,
     m_OpenButton = new QPushButton(QStringLiteral("Open"), this);
     m_OpenButton->setObjectName(QStringLiteral("RemoteCatalogOpen"));
     m_OpenButton->setDefault(true);
+    m_PreloadButton = new QPushButton(QStringLiteral("Cache to CPU"), this);
+    m_PreloadButton->setObjectName(QStringLiteral("RemoteCatalogPreloadCpu"));
+    m_PreloadButton->setToolTip(QStringLiteral(
+            "Download and parse the selected package into CPU memory only; do not add a displayed model or upload GPU resources. "
+            "The existing mesh parser runs on the GUI thread: the interface and Cancel may pause while parsing."));
     m_CancelButton = new QPushButton(QStringLiteral("Cancel"), this);
     m_CancelButton->setObjectName(QStringLiteral("RemoteCatalogCancel"));
     footer->addWidget(m_StatusLabel, 1);
+    footer->addWidget(m_PreloadButton);
     footer->addWidget(m_OpenButton);
     footer->addWidget(m_CancelButton);
 
     auto* layout = new QVBoxLayout(this);
     layout->addWidget(endpointBox);
     layout->addWidget(m_Table, 1);
+    layout->addWidget(memoryBox);
     layout->addLayout(footer);
 
     connect(m_FetchButton, &QPushButton::clicked,
@@ -205,6 +234,15 @@ igQtRemoteModelLibrary::igQtRemoteModelLibrary(igQtFileLoader* fileLoader,
             this, &igQtRemoteModelLibrary::BrowseCacheDirectory);
     connect(m_OpenButton, &QPushButton::clicked,
             this, &igQtRemoteModelLibrary::OpenSelectedPackage);
+    connect(m_PreloadButton, &QPushButton::clicked,
+            this, &igQtRemoteModelLibrary::PreloadSelectedPackage);
+    connect(m_ClearMemoryButton, &QPushButton::clicked,
+            this, &igQtRemoteModelLibrary::ClearMemoryCache);
+    connect(m_MemoryLimitGiB, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
+        if (!m_FileLoader || m_CatalogBusy || m_PackageBusy || m_FileLoader->IsRemotePackageRunning()) { return; }
+        m_FileLoader->SetRemoteMemoryCacheLimitBytes(static_cast<quint64>(value) * GiB);
+        UpdateMemoryCacheStatus();
+    });
     connect(m_CancelButton, &QPushButton::clicked,
             this, &igQtRemoteModelLibrary::CancelActivity);
     connect(m_Table, &QTableWidget::itemSelectionChanged,
@@ -290,24 +328,43 @@ igQtRemoteModelLibrary::igQtRemoteModelLibrary(igQtFileLoader* fileLoader,
         connect(m_FileLoader, &igQtFileLoader::RemotePackageFailed,
                 this, [this](const QString& message) {
                     m_PackageFailed = true;
-                    m_StatusLabel->setText(QStringLiteral("Open failed: %1").arg(message));
+                    // CLI-driven requests share this dialog's status signals;
+                    // the previous GUI operation must not relabel their failure.
+                    m_StatusLabel->setText(QStringLiteral("Remote request failed: %1").arg(message));
                 });
         connect(m_FileLoader, &igQtFileLoader::RemotePackageDatasetOpened,
                 this, [this](const QString&) {
                     m_PackageOpened = true;
+                    m_RequestPreload = false;
                     m_StatusLabel->setText(QStringLiteral("Remote model loaded."));
                 });
+        connect(m_FileLoader, &igQtFileLoader::RemotePackagePreloaded,
+                this, [this](const QString&) {
+                    m_PackagePreloaded = true;
+                    m_RequestPreload = true;
+                    m_StatusLabel->setText(QStringLiteral(
+                            "CPU preload completed. No model was opened; click Open to display it."));
+                    UpdateMemoryCacheStatus();
+                });
+        connect(m_FileLoader, &igQtFileLoader::RemoteMemoryCacheChanged,
+                this, &igQtRemoteModelLibrary::UpdateMemoryCacheStatus);
         connect(m_FileLoader, &igQtFileLoader::RemotePackageFinished,
                 this, [this]() {
                     if (!m_PackageFailed &&
                         !m_StatusLabel->text().contains(QStringLiteral("cancel"), Qt::CaseInsensitive)) {
-                        m_StatusLabel->setText(m_PackageOpened
-                                ? QStringLiteral("Remote model loaded.")
-                                : QStringLiteral("Remote package request completed, but no model was opened."));
+                        if (m_PackagePreloaded) {
+                            m_StatusLabel->setText(QStringLiteral(
+                                    "CPU preload completed. No model was opened; click Open to display it."));
+                        } else {
+                            m_StatusLabel->setText(m_PackageOpened
+                                    ? QStringLiteral("Remote model loaded.")
+                                    : QStringLiteral("Remote package request completed, but no model was opened."));
+                        }
                     }
                 });
         SetPackageBusy(m_FileLoader->IsRemotePackageRunning());
     }
+    UpdateMemoryCacheStatus();
     UpdateActions();
 }
 
@@ -352,15 +409,26 @@ void igQtRemoteModelLibrary::BrowseCacheDirectory()
 
 void igQtRemoteModelLibrary::OpenSelectedPackage()
 {
-    if (m_CatalogBusy || m_PackageBusy || m_FileLoader == nullptr) { return; }
+    StartSelectedPackage(false);
+}
+
+void igQtRemoteModelLibrary::PreloadSelectedPackage()
+{
+    StartSelectedPackage(true);
+}
+
+void igQtRemoteModelLibrary::StartSelectedPackage(bool preload)
+{
+    if (m_CatalogBusy || m_PackageBusy || m_FileLoader == nullptr ||
+        m_FileLoader->IsRemotePackageRunning()) { return; }
     const QString packageId = SelectedPackageId();
     const QString cacheRoot = m_CacheEdit->text().trimmed();
     if (packageId.isEmpty()) {
-        m_StatusLabel->setText(QStringLiteral("Select one remote model to open."));
+        m_StatusLabel->setText(QStringLiteral("Select one remote model."));
         return;
     }
     if (cacheRoot.isEmpty()) {
-        m_StatusLabel->setText(QStringLiteral("Choose a cache directory before opening."));
+        m_StatusLabel->setText(QStringLiteral("Choose a disk cache directory before starting."));
         m_CacheEdit->setFocus();
         return;
     }
@@ -393,13 +461,46 @@ void igQtRemoteModelLibrary::OpenSelectedPackage()
     SaveSettings();
     m_PackageFailed = false;
     m_PackageOpened = false;
-    if (!m_FileLoader->OpenRemotePackage(
-                m_CatalogHost, m_CatalogPort, packageId, packageCache)) {
+    m_PackagePreloaded = false;
+    // Set the operation before Start: status/failure signals may be synchronous.
+    m_RequestPreload = preload;
+    m_StatusLabel->setText(preload ? QStringLiteral("Starting CPU-only preload...")
+                                   : QStringLiteral("Opening selected remote model..."));
+    const bool started = preload
+            ? m_FileLoader->PreloadRemotePackage(m_CatalogHost, m_CatalogPort, packageId, packageCache)
+            : m_FileLoader->OpenRemotePackage(m_CatalogHost, m_CatalogPort, packageId, packageCache);
+    if (!started) {
         if (!m_PackageFailed) {
             m_StatusLabel->setText(QStringLiteral("Could not start the package request."));
         }
         UpdateActions();
     }
+}
+
+void igQtRemoteModelLibrary::ClearMemoryCache()
+{
+    if (!m_FileLoader || m_CatalogBusy || m_PackageBusy || m_FileLoader->IsRemotePackageRunning()) { return; }
+    m_FileLoader->InvalidateRemoteMemoryCache(QStringLiteral("User cleared CPU cache"));
+    UpdateMemoryCacheStatus();
+    m_StatusLabel->setText(m_FileLoader->HasRemoteMemoryCache()
+            ? QStringLiteral("CPU cache was not cleared; see the cache status.")
+            : QStringLiteral("CPU memory cache cleared. Displayed models and disk cache files are unchanged."));
+}
+
+void igQtRemoteModelLibrary::UpdateMemoryCacheStatus()
+{
+    if (!m_FileLoader) {
+        m_MemoryCacheStatus->setText(QStringLiteral("CPU cache unavailable."));
+    } else {
+        const quint64 limit = m_FileLoader->RemoteMemoryCacheLimitBytes();
+        m_MemoryCacheStatus->setText(QStringLiteral("%1\nRetained CPU data: %2 / %3")
+                .arg(m_FileLoader->RemoteMemoryCacheStatus(),
+                     FormatBytes(m_FileLoader->RemoteMemoryCacheBytes()), FormatBytes(limit)));
+        const QSignalBlocker blocker(m_MemoryLimitGiB);
+        const quint64 limitGiB = limit / GiB;
+        m_MemoryLimitGiB->setValue(static_cast<int>(qBound(quint64{1}, limitGiB, quint64{4096})));
+    }
+    UpdateActions();
 }
 
 void igQtRemoteModelLibrary::CancelActivity()
@@ -417,13 +518,18 @@ void igQtRemoteModelLibrary::CancelActivity()
 
 void igQtRemoteModelLibrary::UpdateActions()
 {
-    const bool busy = m_CatalogBusy || m_PackageBusy;
+    const bool busy = m_CatalogBusy || m_PackageBusy ||
+            (m_FileLoader && m_FileLoader->IsRemotePackageRunning());
     m_HostEdit->setEnabled(!busy);
     m_PortSpin->setEnabled(!busy);
     m_CacheEdit->setEnabled(!busy);
     m_FetchButton->setEnabled(!busy && !m_HostEdit->text().trimmed().isEmpty());
     m_Table->setEnabled(!busy);
-    m_OpenButton->setEnabled(!busy && !SelectedPackageId().isEmpty());
+    const bool selectable = !busy && m_FileLoader && !SelectedPackageId().isEmpty();
+    m_OpenButton->setEnabled(selectable);
+    m_PreloadButton->setEnabled(selectable);
+    m_MemoryLimitGiB->setEnabled(!busy && m_FileLoader);
+    m_ClearMemoryButton->setEnabled(!busy && m_FileLoader && m_FileLoader->HasRemoteMemoryCache());
     m_CancelButton->setEnabled(true);
 }
 
@@ -435,6 +541,11 @@ void igQtRemoteModelLibrary::SetCatalogBusy(bool busy)
 
 void igQtRemoteModelLibrary::SetPackageBusy(bool busy)
 {
+    if (busy && !m_PackageBusy) {
+        m_PackageFailed = false;
+        m_PackageOpened = false;
+        m_PackagePreloaded = false;
+    }
     m_PackageBusy = busy;
     UpdateActions();
 }

@@ -15,6 +15,9 @@
 
 #include <iostream>
 #include <utility>
+#include <algorithm>
+#include <functional>
+#include <unordered_set>
 
 IGAME_NAMESPACE_BEGIN
 #ifdef __EMSCRIPTEN__
@@ -144,7 +147,8 @@ void DrawObject::ConvertToDrawableData() {
 }
 
 bool DrawObject::IsUseSinglePassWireframeRendering() {
-    if (m_TriangleIndices->GetNumberOfElements() && m_TriangleEdgeMasks->GetNumberOfElements()) {
+    if (m_TriangleIndices->GetNumberOfElements() && m_TriangleEdgeMasks->GetNumberOfElements() &&
+        (m_ColorWithCell ? m_CellEdgeMaskAvailable : m_EdgeMaskAvailable)) {
         return true;
     } else {
         return false;
@@ -173,6 +177,109 @@ void DrawObject::MarkWireframeGeometryDirtyIfNeeded(IGenum viewStyle) {
 }
 
 IGenum DrawObject::GetDataObjectType() const { return IG_DRAW_OBJECT; }
+
+bool DrawObject::HasGpuResources() const {
+    std::unordered_set<const DataObject*> visited;
+    auto live = [](const auto& object) { return object && object->Handle() != 0; };
+    std::function<bool(DataObject*)> inspect = [&](DataObject* node) {
+        if (!node || !visited.insert(node).second) { return false; }
+        if (auto* draw = dynamic_cast<DrawObject*>(node)) {
+            if (live(draw->m_PointVAO) || live(draw->m_LineVAO) || live(draw->m_TriangleVAO) ||
+                live(draw->m_CellVAO) || live(draw->m_PositionVBO) || live(draw->m_ColorVBO) ||
+                live(draw->m_NormalVBO) || live(draw->m_TextureVBO) || live(draw->m_PointEBO) ||
+                live(draw->m_LineEBO) || live(draw->m_TriangleEBO) ||
+                live(draw->m_CellPositionVBO) || live(draw->m_CellColorVBO) ||
+                live(draw->m_EdgeMaskBuffer) || live(draw->m_EdgeMaskTexture) ||
+                live(draw->m_CellEdgeMaskBuffer) || live(draw->m_CellEdgeMaskTexture) ||
+                (draw->m_RenderableMesh.mMeshleter && draw->m_RenderableMesh.mMeshleter->HasGpuResources())) {
+                return true;
+            }
+            if (inspect(draw->m_RenderableMesh.SurfaceMesh.get()) ||
+                inspect(draw->m_RenderableMesh.SimplifiedMesh.get())) { return true; }
+        }
+        if (node->HasSubDataObject()) {
+            for (auto it = node->SubDataObjectIteratorBegin(); it != node->SubDataObjectIteratorEnd(); ++it) {
+                if (inspect(it->second.get())) { return true; }
+            }
+        }
+        return false;
+    };
+    // Existing hierarchy accessors are not const-qualified; inspection itself
+    // reads only identities and GL handle metadata, never arrays or GL state.
+    return inspect(const_cast<DrawObject*>(this));
+}
+
+void DrawObject::ReleaseDrawableResources() {
+    std::unordered_set<const DataObject*> visited;
+    auto destroy = [](const auto& object) { if (object) { object->Destroy(); } };
+    auto floatArray = [](int dimension) {
+        auto result = FloatArray::New(); result->SetDimension(dimension); return result;
+    };
+    auto indexArray = [](int dimension) {
+        auto result = UnsignedIntArray::New(); result->SetDimension(dimension); return result;
+    };
+    auto masksArray = []() {
+        auto result = UnsignedCharArray::New(); result->SetDimension(1); return result;
+    };
+    std::function<void(DataObject*)> release = [&](DataObject* node) {
+        if (!node || !visited.insert(node).second) { return; }
+        // Breaking Surface -> Meshleter -> Surface or fallback-LOD self cycles
+        // must not destroy the object while this routine still operates on it.
+        DataObject::Pointer keepAlive = node;
+        if (auto* draw = dynamic_cast<DrawObject*>(node)) {
+            auto surface = draw->m_RenderableMesh.SurfaceMesh;
+            auto simplified = draw->m_RenderableMesh.SimplifiedMesh;
+            auto meshleter = draw->m_RenderableMesh.mMeshleter;
+            if (meshleter) {
+                draw->m_RestoreMeshletColoring = meshleter->GetRenderWithMeshlet();
+                meshleter->ReleaseGpuBuffers();
+                meshleter->SetInput(nullptr);
+            }
+            draw->m_RenderableMesh = {};
+            release(surface.get());
+            release(simplified.get());
+
+            // Remove all VAO/texture references before deleting buffer handles.
+            // Destroy is a no-op for zero handles, including CPU-only preloads.
+            destroy(draw->m_PointVAO); destroy(draw->m_LineVAO); destroy(draw->m_TriangleVAO);
+            destroy(draw->m_CellVAO); destroy(draw->m_EdgeMaskTexture); destroy(draw->m_CellEdgeMaskTexture);
+            destroy(draw->m_PositionVBO); destroy(draw->m_ColorVBO); destroy(draw->m_NormalVBO);
+            destroy(draw->m_TextureVBO); destroy(draw->m_PointEBO); destroy(draw->m_LineEBO);
+            destroy(draw->m_TriangleEBO); destroy(draw->m_CellPositionVBO); destroy(draw->m_CellColorVBO);
+            destroy(draw->m_EdgeMaskBuffer); destroy(draw->m_CellEdgeMaskBuffer);
+            draw->m_Flag = false;
+            draw->m_ConstantEdgeMask = -1;
+            draw->m_ConstantCellEdgeMask = -1;
+            draw->m_EdgeMaskAvailable = false;
+            draw->m_CellEdgeMaskAvailable = false;
+            draw->m_CellPositionSize = 0;
+
+            // NEVER Reset/Initialize these old arrays: positions can alias the
+            // original Points backing array. Drop references, preserving raw
+            // coordinates, connectivity, scalar values and their timestamps.
+            draw->m_Positions = floatArray(3);
+            draw->m_Colors = floatArray(4);
+            draw->m_Normals = floatArray(3);
+            draw->m_Textures = floatArray(2);
+            draw->m_PointIndices = indexArray(1);
+            draw->m_LineIndices = indexArray(2);
+            draw->m_TriangleIndices = indexArray(3);
+            draw->m_TriangleEdgeMasks = masksArray();
+            draw->m_CellPositions = floatArray(3);
+            draw->m_CellColors = floatArray(4);
+            draw->m_CellTriangleEdgeMasks = masksArray();
+            draw->m_ReConvertToDrawableData = true;
+            draw->m_AttributeChanged = true;
+            draw->m_ForceGpuBufferUpload = true;
+        }
+        if (node->HasSubDataObject()) {
+            for (auto it = node->SubDataObjectIteratorBegin(); it != node->SubDataObjectIteratorEnd(); ++it) {
+                release(it->second.get());
+            }
+        }
+    };
+    release(this);
+}
 
 IGsize DrawObject::GetRealMemorySize() {
     IGsize res = this->DataObject::GetRealMemorySize();
@@ -467,17 +574,27 @@ void DrawObject::SetRenderableObject(DataObject::Pointer dataObject) {
     // Interaction switches to the simplified representation only when a
     // single renderable piece exceeds one million triangles (see Model::Draw).
     // Building and retaining an LOD for smaller pieces wastes memory and can
-    // dominate the cost of large partitioned VTM data sets.
+    // dominate the cost of large partitioned VTM data sets. Also bound the
+    // automatic work: simplification allocates topology, adjacency, and edge
+    // collapse arrays in addition to the original mesh, before any upload.
+    // Very large single meshes must remain loadable without this hidden job.
+    constexpr IGsize maxAutomaticLodFaces = 20000000;
     auto surfaceMesh = DynamicCast<SurfaceMesh>(dataObject);
     if (m_AutoBuildInteractionLod && m_ShellRendering && surfaceMesh != nullptr &&
         surfaceMesh->GetNumberOfFaces() > 1000000) {
-        BuildSimplifiedRenderableObject();
+        if (surfaceMesh->GetNumberOfFaces() <= maxAutomaticLodFaces) {
+            BuildSimplifiedRenderableObject();
+        } else {
+            IGAME_RENDERING_INFO("{}: automatic interaction LOD skipped for {} faces (limit {}); interaction retains the full-resolution mesh.",
+                                surfaceMesh->GetName(), surfaceMesh->GetNumberOfFaces(), maxAutomaticLodFaces);
+        }
     }
 #endif
 
     // 设置Meshleter
     m_RenderableMesh.mMeshleter = SurfaceMeshMeshleter::New();
     m_RenderableMesh.mMeshleter->SetInput(dataObject);
+    m_RenderableMesh.mMeshleter->SetRenderWithMeshlet(m_RestoreMeshletColoring);
 }
 
 DrawObject::Pointer DrawObject::GetRenderableObject(bool useSimplified) {
@@ -599,11 +716,14 @@ void DrawObject::SetAccelerationOption(bool enabled) {
 bool DrawObject::GetAccelerationOption() const { return m_AccelerationOption; }
 
 void DrawObject::SetRenderWithMeshlet(bool val) {
-    m_RenderableMesh.mMeshleter->SetRenderWithMeshlet(val);
+    m_RestoreMeshletColoring = val;
+    if (m_RenderableMesh.mMeshleter) { m_RenderableMesh.mMeshleter->SetRenderWithMeshlet(val); }
     if (val) { m_ColorWithCell = true; }
 }
 
-bool DrawObject::GetRenderWithMeshlet() const { return m_RenderableMesh.mMeshleter->GetRenderWithMeshlet(); }
+bool DrawObject::GetRenderWithMeshlet() const {
+    return m_RenderableMesh.mMeshleter ? m_RenderableMesh.mMeshleter->GetRenderWithMeshlet() : m_RestoreMeshletColoring;
+}
 
 void DrawObject::CreateDrawBuffer() {
     if (!m_Flag) {
@@ -775,7 +895,7 @@ void DrawObject::SyncGpuBuffers() {
     if (m_AccelerationOption) { m_RenderableMesh.mMeshleter->SyncGpuBuffers(); }
 
     this->CreateDrawBuffer();
-    if (m_Positions->GetMTime() > m_PositionVBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_Positions->GetMTime() > m_PositionVBO->GetMTime()) {
         GLAllocateGLBuffer(m_PositionVBO, m_Positions->GetNumberOfValues() * sizeof(float), m_Positions->RawPointer());
         m_PositionVBO->Modified();
         SetPositionBufferToVAO(m_PointVAO, m_PositionVBO);
@@ -783,7 +903,7 @@ void DrawObject::SyncGpuBuffers() {
         SetPositionBufferToVAO(m_TriangleVAO, m_PositionVBO);
     }
 
-    if (m_Colors->GetMTime() > m_ColorVBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_Colors->GetMTime() > m_ColorVBO->GetMTime()) {
         GLAllocateGLBuffer(m_ColorVBO, m_Colors->GetNumberOfValues() * sizeof(float), m_Colors->RawPointer());
         m_ColorVBO->Modified();
         SetColorBufferToVAO(m_PointVAO, m_ColorVBO);
@@ -791,7 +911,7 @@ void DrawObject::SyncGpuBuffers() {
         SetColorBufferToVAO(m_TriangleVAO, m_ColorVBO);
     }
 
-    if (m_Normals->GetMTime() > m_NormalVBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_Normals->GetMTime() > m_NormalVBO->GetMTime()) {
         GLAllocateGLBuffer(m_NormalVBO, m_Normals->GetNumberOfValues() * sizeof(float), m_Normals->RawPointer());
         m_NormalVBO->Modified();
 
@@ -800,7 +920,7 @@ void DrawObject::SyncGpuBuffers() {
         SetNormalBufferToVAO(m_TriangleVAO, m_NormalVBO);
     }
 
-    if (m_Textures->GetMTime() > m_TextureVBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_Textures->GetMTime() > m_TextureVBO->GetMTime()) {
         GLAllocateGLBuffer(m_TextureVBO, m_Textures->GetNumberOfValues() * sizeof(float), m_Textures->RawPointer());
         m_TextureVBO->Modified();
 
@@ -809,7 +929,7 @@ void DrawObject::SyncGpuBuffers() {
         SetTextureBufferToVAO(m_TriangleVAO, m_TextureVBO);
     }
 
-    if (m_PointIndices->GetMTime() > m_PointEBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_PointIndices->GetMTime() > m_PointEBO->GetMTime()) {
         GLAllocateGLBuffer(m_PointEBO, m_PointIndices->GetNumberOfValues() * sizeof(igIndex),
                            m_PointIndices->RawPointer());
         m_PointEBO->Modified();
@@ -817,7 +937,7 @@ void DrawObject::SyncGpuBuffers() {
         m_PointVAO->ElementBuffer(m_PointEBO);
     }
 
-    if (m_LineIndices->GetMTime() > m_LineEBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_LineIndices->GetMTime() > m_LineEBO->GetMTime()) {
         GLAllocateGLBuffer(m_LineEBO, m_LineIndices->GetNumberOfValues() * sizeof(igIndex),
                            m_LineIndices->RawPointer());
         m_LineEBO->Modified();
@@ -825,7 +945,7 @@ void DrawObject::SyncGpuBuffers() {
         m_LineVAO->ElementBuffer(m_LineEBO);
     }
 
-    if (m_TriangleIndices->GetMTime() > m_TriangleEBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_TriangleIndices->GetMTime() > m_TriangleEBO->GetMTime()) {
         GLAllocateGLBuffer(m_TriangleEBO, m_TriangleIndices->GetNumberOfValues() * sizeof(igIndex),
                            m_TriangleIndices->RawPointer());
         m_TriangleEBO->Modified();
@@ -834,16 +954,47 @@ void DrawObject::SyncGpuBuffers() {
     }
 
 #ifndef __EMSCRIPTEN__
-    if (m_TriangleEdgeMasks->GetMTime() > m_EdgeMaskBuffer->GetMTime()) {
-        GLAllocateGLBuffer(m_EdgeMaskBuffer, m_TriangleEdgeMasks->GetNumberOfValues() * sizeof(unsigned char),
-                           m_TriangleEdgeMasks->RawPointer());
-        m_EdgeMaskBuffer->Modified();
-
-        m_EdgeMaskTexture->Buffer(GL_R8, m_EdgeMaskBuffer);
-    }
+    auto syncEdgeMasks = [this](UnsignedCharArray::Pointer masks, GLBuffer::Pointer buffer,
+                               GLTextureBuffer::Pointer texture, int& constantMask, bool& available) {
+        if (!m_ForceGpuBufferUpload && masks->GetMTime() <= buffer->GetMTime()) { return; }
+        const IGsize count = masks->GetNumberOfValues();
+        constantMask = -1;
+        available = false;
+        if (count) {
+            const auto* data = masks->RawPointer();
+            if (std::all_of(data + 1, data + count, [data](unsigned char value) { return value == data[0]; })) {
+                // Pure triangles have mask 7 for every primitive. A uniform
+                // preserves every edge without a texture or giant GPU buffer.
+                constantMask = data[0];
+                available = true;
+                GLAllocateGLBuffer(buffer, 0, nullptr);
+                if (count > 1000000) {
+                    IGAME_RENDERING_INFO("{} uses constant edge mask {} for {} triangles; no edge-mask texture allocation.",
+                                        GetName(), constantMask, count);
+                }
+            } else {
+                GLint maxTexels = 0;
+                glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &maxTexels);
+                if (maxTexels > 0 && count <= static_cast<IGsize>(maxTexels)) {
+                    GLAllocateGLBuffer(buffer, count * sizeof(unsigned char), data);
+                    texture->Buffer(GL_R8, buffer);
+                    available = true;
+                } else {
+                    // Never bind an unsupported texture. Filled Surface stays
+                    // usable; the single-pass wireframe path is unavailable.
+                    GLAllocateGLBuffer(buffer, 0, nullptr);
+                    IGAME_RENDERING_WARN("{} has {} nonconstant edge masks, exceeding GL_MAX_TEXTURE_BUFFER_SIZE={}; single-pass wireframe is unavailable for this mesh.",
+                                        GetName(), count, maxTexels);
+                }
+            }
+        }
+        buffer->Modified();
+    };
+    syncEdgeMasks(m_TriangleEdgeMasks, m_EdgeMaskBuffer, m_EdgeMaskTexture,
+                  m_ConstantEdgeMask, m_EdgeMaskAvailable);
 #endif
 
-    if (m_CellPositions->GetMTime() > m_CellPositionVBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_CellPositions->GetMTime() > m_CellPositionVBO->GetMTime()) {
         GLAllocateGLBuffer(m_CellPositionVBO, m_CellPositions->GetNumberOfValues() * sizeof(float),
                            m_CellPositions->RawPointer());
         m_CellPositionVBO->Modified();
@@ -851,7 +1002,7 @@ void DrawObject::SyncGpuBuffers() {
         SetPositionBufferToVAO(m_CellVAO, m_CellPositionVBO);
     }
 
-    if (m_CellColors->GetMTime() > m_CellColorVBO->GetMTime()) {
+    if (m_ForceGpuBufferUpload || m_CellColors->GetMTime() > m_CellColorVBO->GetMTime()) {
         GLAllocateGLBuffer(m_CellColorVBO, m_CellColors->GetNumberOfValues() * sizeof(float),
                            m_CellColors->RawPointer());
         m_CellColorVBO->Modified();
@@ -860,14 +1011,11 @@ void DrawObject::SyncGpuBuffers() {
     }
 
 #ifndef __EMSCRIPTEN__
-    if (m_CellTriangleEdgeMasks->GetMTime() > m_CellEdgeMaskBuffer->GetMTime()) {
-        GLAllocateGLBuffer(m_CellEdgeMaskBuffer, m_CellTriangleEdgeMasks->GetNumberOfValues() * sizeof(unsigned char),
-                           m_CellTriangleEdgeMasks->RawPointer());
-        m_CellEdgeMaskBuffer->Modified();
-
-        m_CellEdgeMaskTexture->Buffer(GL_R8, m_CellEdgeMaskBuffer);
-    }
+    syncEdgeMasks(m_CellTriangleEdgeMasks, m_CellEdgeMaskBuffer, m_CellEdgeMaskTexture,
+                  m_ConstantCellEdgeMask, m_CellEdgeMaskAvailable);
 #endif
+
+    m_ForceGpuBufferUpload = false;
 
     GLCheckError();
 #ifdef __EMSCRIPTEN__

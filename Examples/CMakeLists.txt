@@ -180,7 +180,8 @@ function(igame_register_example_test EXAMPLE_TARGET)
 
         if ("${EXAMPLE_TARGET}" STREQUAL "testModelGeometryParallelValidation" OR
             "${EXAMPLE_TARGET}" STREQUAL "testVTKXMLDataArrayDecoderValidation" OR
-            "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation")
+            "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation" OR
+            "${EXAMPLE_TARGET}" STREQUAL "testVTPRawAppendedValidation")
             list(APPEND _TEST_COMMAND -TimeoutSeconds 180 -RequireExit)
             set(_TEST_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${EXAMPLE_TARGET}>")
         elseif ("${EXAMPLE_TARGET}" STREQUAL "testLosslessEncode")
@@ -199,7 +200,8 @@ function(igame_register_example_test EXAMPLE_TARGET)
 
     if ("${EXAMPLE_TARGET}" STREQUAL "testModelGeometryParallelValidation" OR
         "${EXAMPLE_TARGET}" STREQUAL "testVTKXMLDataArrayDecoderValidation" OR
-        "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation")
+        "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation" OR
+        "${EXAMPLE_TARGET}" STREQUAL "testVTPRawAppendedValidation")
         add_test(
             NAME ${EXAMPLE_TARGET}
             COMMAND "$<TARGET_FILE:${EXAMPLE_TARGET}>"
@@ -295,6 +297,7 @@ igame_add_example(testSplineReaderCPU IO/SplineReaderCPU.cpp)
 igame_add_example(testVTKXMLDataArrayDecoderValidation IO/VTKXMLDataArrayDecoderValidation.cpp)
 igame_add_example(testUtf8FilePathValidation IO/Utf8FilePathValidation.cpp)
 igame_add_example(testVTMReaderPathValidation IO/VTMReaderPathValidation.cpp)
+igame_add_example(testVTPRawAppendedValidation IO/VTPRawAppendedValidation.cpp)
 
 if (ENABLE_CGNS_MODULE)
     igame_add_example(testCGNS IO/CGNSReader.cpp)
@@ -376,6 +379,22 @@ foreach(EXAMPLE_TARGET IN LISTS IGAME_EXAMPLE_TARGETS)
 endforeach()
 
 enable_testing()
+add_executable(testDrawObjectResourcesValidation IO/DrawObjectResourcesValidation.cpp)
+igame_link_standard_example(testDrawObjectResourcesValidation)
+add_test(NAME testDrawObjectResourcesValidation COMMAND testDrawObjectResourcesValidation)
+set_tests_properties(testDrawObjectResourcesValidation PROPERTIES TIMEOUT 30)
+if (TARGET Qt_module)
+find_package(Qt5 REQUIRED COMPONENTS Core)
+add_executable(testResidentModelCacheValidation
+    IO/ResidentModelCacheValidation.cpp
+    "${CMAKE_SOURCE_DIR}/Qt/src/IQCore/igQtResidentModelCache.cpp")
+target_include_directories(testResidentModelCacheValidation PRIVATE "${CMAKE_SOURCE_DIR}/Qt/include")
+target_compile_definitions(testResidentModelCacheValidation PRIVATE IG_QT_COMPILE_EXPORT)
+target_link_libraries(testResidentModelCacheValidation PRIVATE Qt5::Core)
+igame_link_standard_example(testResidentModelCacheValidation)
+add_test(NAME testResidentModelCacheValidation COMMAND testResidentModelCacheValidation)
+set_tests_properties(testResidentModelCacheValidation PROPERTIES TIMEOUT 30)
+endif ()
 foreach(EXAMPLE_TARGET IN LISTS IGAME_EXAMPLE_TARGETS)
     igame_register_example_test(${EXAMPLE_TARGET})
 endforeach()

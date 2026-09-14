@@ -147,7 +147,7 @@ two requests from mutating the same cache concurrently.
 
 Legacy single-package mode remains available on the command line. The download,
 SHA-256 verification and extraction run outside the GUI thread; after the
-package is published to the cache, its root VTM is passed to the normal
+package is published to the cache, its dataset entry point is passed to the normal
 `igQtFileLoader::OpenFile()` path.
 
 ```powershell
@@ -167,8 +167,14 @@ Within a package cache namespace, the transfer cache contains:
 Restarting the same command queries INFO, validates the server version token,
 and resumes at the UInt64 length of the matching `.part`. A complete cached
 archive is rechecked against the advertised SHA-256 before reuse. The extracted
-cache is accepted only when it has one root VTM entry point and every referenced
-dataset resolves to a regular file within the extracted package.
+cache is accepted when it has one root VTM entry point and every referenced
+dataset resolves to a regular file within the extracted package. Legacy packages
+with one nested VTM remain supported. A package with no VTM may instead contain
+exactly one root `.vtp` or `.vtu` file; this opens directly as one dataset without
+a wrapper VTM. Its extension, XML dataset type, and safe package-local path are
+checked with bounded header I/O, including for raw appended-binary files. Normal
+dataset loading then validates the data arrays. More than one standalone root
+dataset is rejected as ambiguous.
 
 ## Protocol v1
 

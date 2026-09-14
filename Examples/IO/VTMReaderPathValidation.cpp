@@ -1,10 +1,13 @@
 #include <iGameFileIO.h>
+#include <iGameFileSystem.h>
+#include <VTK XML/iGameVTMReader.h>
 #include <iGameDrawObject.h>
 #include <iGameFlatArray.h>
 #include <iGameSurfaceMesh.h>
 #include <iGameUnstructuredMesh.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -20,6 +23,12 @@ bool WriteTextFile(const std::filesystem::path& path, const std::string& content
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     stream << contents;
     return stream.good();
+}
+
+std::string ForwardSlashUtf8Path(const std::filesystem::path& path) {
+    auto result = iGame::FileSystem::PathToUtf8(path);
+    std::replace(result.begin(), result.end(), '\\', '/');
+    return result;
 }
 
 std::string MakePointScalarVtu(const std::string& scalarName,
@@ -67,7 +76,7 @@ bool HasExpectedGlobalRange(const iGame::DoubleArray::Pointer& range) {
 }
 
 bool ValidatePublishedCommonScalar(const std::filesystem::path& path) {
-    const auto output = iGame::FileIO::ReadFile(path.string());
+    const auto output = iGame::FileIO::ReadFile(iGame::FileSystem::PathToUtf8(path));
     const auto root = iGame::DynamicCast<iGame::DrawObject>(output);
     if (root == nullptr || root->GetNumberOfSubDataObjects() != 2) {
         std::cerr << "Common-schema VTM did not produce a two-leaf drawable root\n";
@@ -133,7 +142,7 @@ bool ValidatePublishedCommonScalar(const std::filesystem::path& path) {
 }
 
 bool ValidateHeterogeneousSchemaIsNotPublished(const std::filesystem::path& path) {
-    const auto output = iGame::FileIO::ReadFile(path.string());
+    const auto output = iGame::FileIO::ReadFile(iGame::FileSystem::PathToUtf8(path));
     const auto root = iGame::DynamicCast<iGame::DrawObject>(output);
     if (root == nullptr || root->GetNumberOfSubDataObjects() != 2) {
         std::cerr << "Heterogeneous-schema VTM did not produce a two-leaf drawable root\n";
@@ -146,13 +155,13 @@ bool ValidateHeterogeneousSchemaIsNotPublished(const std::filesystem::path& path
     return root->GetCurrentAttributeIndex() == -1 && root->GetCurrentAttributeDimension() == -1;
 }
 
-bool HasOneReferencedDataSet(const std::filesystem::path& path) {
-    const auto output = iGame::FileIO::ReadFile(path.string());
+bool HasOneReferencedDataSet(const std::string& utf8Path) {
+    const auto output = iGame::FileIO::ReadFile(utf8Path);
     return output != nullptr && output->GetNumberOfSubDataObjects() == 1;
 }
 
 bool ValidateSurfaceDrawableTransitions(const std::filesystem::path& path) {
-    const auto output = iGame::FileIO::ReadFile(path.string());
+    const auto output = iGame::FileIO::ReadFile(iGame::FileSystem::PathToUtf8(path));
     if (output == nullptr || output->GetNumberOfSubDataObjects() != 1) { return false; }
 
     const auto child = output->SubDataObjectIteratorBegin()->second;
@@ -264,25 +273,24 @@ int main() {
 
     bool passed = true;
 
-    // generic_string() uses forward slashes while the manifest still contains
-    // a relative pieces/... reference.
-    if (!HasOneReferencedDataSet(fs::path(relativePathVtm.generic_string()))) {
+    // Use UTF-8 in both slash forms; never convert through the Windows ACP.
+    if (!HasOneReferencedDataSet(ForwardSlashUtf8Path(relativePathVtm))) {
         std::cerr << "Forward-slash VTM path with a relative child failed\n";
         passed = false;
     }
-    if (!ValidateSurfaceDrawableTransitions(fs::path(relativePathVtm.generic_string()))) {
+    if (!ValidateSurfaceDrawableTransitions(relativePathVtm)) {
         std::cerr << "Surface drawable sharing or lazy wireframe transition failed\n";
         passed = false;
     }
 
-    // On Windows, path::string() uses native backslashes.  This is the exact
-    // entry-path form used by the desktop file dialog and --filepath option.
-    if (!HasOneReferencedDataSet(fs::path(nativePathVtm.string()))) {
+    // PathToUtf8 preserves native backslashes on Windows while encoding names
+    // correctly for the public FileIO and XML reader entry points.
+    if (!HasOneReferencedDataSet(iGame::FileSystem::PathToUtf8(nativePathVtm))) {
         std::cerr << "Native VTM path with a relative child failed\n";
         passed = false;
     }
 
-    if (iGame::FileIO::ReadFile(missingPathVtm.string()) != nullptr) {
+    if (iGame::FileIO::ReadFile(iGame::FileSystem::PathToUtf8(missingPathVtm)) != nullptr) {
         std::cerr << "VTM reader accepted a missing referenced file\n";
         passed = false;
     }
@@ -299,6 +307,52 @@ int main() {
         passed = false;
     } else if (!ValidateHeterogeneousSchemaIsNotPublished(scalarPathVtm)) {
         passed = false;
+    }
+
+    // Regression: the XML base already opens UTF-8 paths via _wfopen on
+    // Windows, but VTM used to reinterpret both the manifest directory and
+    // XML child filename as ACP and then convert the resolved path back to ACP.
+    const fs::path unicodeParent = testRoot / iGame::FileSystem::PathFromUtf8("中文父目录");
+    const fs::path unicodePieces = unicodeParent / iGame::FileSystem::PathFromUtf8("子分块");
+    const fs::path unicodePiece = unicodePieces / iGame::FileSystem::PathFromUtf8("车身网格.vtu");
+    const fs::path unicodeManifest = unicodeParent / iGame::FileSystem::PathFromUtf8("整车模型.vtm");
+    const std::string unicodeVtm = R"xml(<?xml version="1.0" encoding="UTF-8"?>
+<VTKFile type="vtkMultiBlockDataSet" version="1.0" byte_order="LittleEndian">
+  <vtkMultiBlockDataSet>
+    <DataSet index="0" file="子分块/车身网格.vtu"/>
+  </vtkMultiBlockDataSet>
+</VTKFile>
+)xml";
+    error.clear();
+    if (!fs::create_directories(unicodePieces, error) || error ||
+        !WriteTextFile(unicodePiece, vtu) || !WriteTextFile(unicodeManifest, unicodeVtm)) {
+        std::cerr << "Could not write Unicode VTM regression inputs\n";
+        passed = false;
+    } else {
+        const auto nativeUtf8 = iGame::FileSystem::PathToUtf8(unicodeManifest);
+        const auto output = iGame::FileIO::ReadFile(nativeUtf8);
+        if (!output || output->GetNumberOfSubDataObjects() != 1 ||
+            output->SubDataObjectIteratorBegin()->second->GetName() != "车身网格") {
+            std::cerr << "FileIO failed Chinese VTM parent/child names or changed the UTF-8 child name\n";
+            passed = false;
+        }
+        if (!HasOneReferencedDataSet(ForwardSlashUtf8Path(unicodeManifest))) {
+            std::cerr << "FileIO failed forward-slash Chinese VTM path\n";
+            passed = false;
+        }
+        auto directReader = iGame::iGameVTMReader::New();
+        directReader->SetFilePath(nativeUtf8);
+        if (!directReader->Execute() || !directReader->GetOutput() ||
+            directReader->GetOutput()->GetNumberOfSubDataObjects() != 1) {
+            std::cerr << "Direct XML/VTM reader failed Chinese paths\n";
+            passed = false;
+        }
+        const auto child = iGame::DynamicCast<iGame::UnstructuredMesh>(
+                iGame::FileIO::ReadFile(iGame::FileSystem::PathToUtf8(unicodePiece)));
+        if (!child || child->GetNumberOfPoints() != 3 || child->GetNumberOfCells() != 1) {
+            std::cerr << "Direct FileIO VTU entry failed Chinese directory and filename\n";
+            passed = false;
+        }
     }
 
     fs::remove_all(testRoot, error);

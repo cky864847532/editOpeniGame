@@ -13,6 +13,7 @@
 #include "iGameVTUReader.h"
 #include "iGameDrawObject.h"
 #include "iGameFlatArray.h"
+#include "iGameFileSystem.h"
 #include "iGameUnstructuredMesh.h"
 #include "CGNS/iGameCGNSReader.h"
 #include "Log/iGameLogger.h"
@@ -236,7 +237,10 @@ bool iGameVTMReader::Parsing() {
     parseData = nullptr;
     m_Output = nullptr;
 
-    const fs::path manifestPath = fs::path(m_FilePath);
+    // Public reader paths and XML file attributes are UTF-8. Constructing a
+    // Windows path from std::string (or calling path::string()) uses the active
+    // code page instead, corrupting non-ASCII manifest and child names.
+    const fs::path manifestPath = FileSystem::PathFromUtf8(m_FilePath);
     const fs::path manifestDirectory = manifestPath.parent_path();
 
     tinyxml2::XMLElement* vtkMultiBlockElem = FindTargetItem(root, "vtkMultiBlockDataSet");
@@ -287,10 +291,10 @@ bool iGameVTMReader::Parsing() {
         ++currentFileCount;
 
         const std::string fileName(fileAttribute);
-        const fs::path referencedPath = fs::path(fileName);
+        const fs::path referencedPath = FileSystem::PathFromUtf8(fileName);
         const fs::path resolvedPath =
                 (referencedPath.is_absolute() ? referencedPath : manifestDirectory / referencedPath).lexically_normal();
-        const std::string resolvedFileName = resolvedPath.string();
+        const std::string resolvedFileName = FileSystem::PathToUtf8(resolvedPath);
 
         IGAME_CORE_INFO("[VTM] Reading file {}/{}: {} -> {}",
                         currentFileCount,
@@ -306,7 +310,7 @@ bool iGameVTMReader::Parsing() {
             return nullptr;
         }
 
-        std::string fileSuffix = resolvedPath.extension().string();
+        std::string fileSuffix = FileSystem::PathToUtf8(resolvedPath.extension());
         if (!fileSuffix.empty() && fileSuffix.front() == '.') { fileSuffix.erase(fileSuffix.begin()); }
         std::transform(fileSuffix.begin(), fileSuffix.end(), fileSuffix.begin(), [](unsigned char value) {
             return static_cast<char>(std::tolower(value));
@@ -349,7 +353,7 @@ bool iGameVTMReader::Parsing() {
             return nullptr;
         }
 
-        object->SetName(referencedPath.stem().string());
+        object->SetName(FileSystem::PathToUtf8(referencedPath.stem()));
         if (disableEagerPieceLod) {
             if (auto drawObject = DynamicCast<DrawObject>(object)) {
                 // AddSubDataObject converts drawable leaves immediately. Set

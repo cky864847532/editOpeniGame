@@ -35,6 +35,21 @@ public:
   void ChangeInteractorStyle(IGenum style);
   void update() { QOpenGLWidget::update(); }
 
+  // GUI-thread only. The caller binds the intended model, scalar and visible
+  // blocks first, then requests one full-resolution GPU-completed Qt frame.
+  // Hidden/not-exposed windows may never swap; the caller owns the timeout.
+  void RequestCompletedFrame(quint64 requestId);
+  // Cancels only the matching request, without emitting CompletedFrame.
+  void CancelCompletedFrame(quint64 requestId);
+
+signals:
+  void CompletedFrame(quint64 requestId, bool success, const QString& detail);
+  // Emitted synchronously with this widget's GL context current, before its
+  // Scene/context are released. External owners must release cached GL objects.
+  void ContextAboutToBeReleased();
+
+public:
+
     iGame::Interactor* getInteractor();
 
   protected:
@@ -51,4 +66,15 @@ public:
 
   iGame::SmartPointer<iGame::Scene> m_Scene;
   iGame::SmartPointer<iGame::Interactor> m_Interactor;
+
+private:
+  void CompleteRequestedFrame(bool success, const QString& detail);
+  void OnFrameSwapped();
+
+  bool m_CompletedFrameRequestPending = false;
+  bool m_CompletedFrameAwaitingSwap = false;
+  quint64 m_CompletedFrameRequestId = 0;
+  std::uint64_t m_RequestedAfterFrameSerial = 0;
+  std::uint64_t m_RequestedGpuFrameSerial = 0;
+  QString m_CompletedFrameDetail;
 };

@@ -467,6 +467,72 @@ bool testCacheNamespace()
     return ok;
 }
 
+bool testStandaloneDatasetEntryPoints()
+{
+    QTemporaryDir temporary;
+    if (!require(temporary.isValid(), "temporary standalone package root")) { return false; }
+    bool ok = true;
+    const auto check = [&](const QString& scenario, const QStringList& names,
+                           const QVector<QByteArray>& content, const QString& expected) {
+        const QString root = QDir(temporary.path()).filePath(scenario);
+        if (!QDir().mkpath(root)) { return require(false, "create standalone scenario"); }
+        for (int index = 0; index < names.size(); ++index) {
+            const QString path = QDir(root).filePath(names[index]);
+            QDir().mkpath(QFileInfo(path).absolutePath());
+            if (!writeTestFile(path, content[index])) { return require(false, "write standalone file"); }
+        }
+        QString error;
+        const QString result = igQtFindRemoteDatasetEntryPoint(root, error);
+        const QString wanted = expected.isEmpty() ? QString() : QDir(root).filePath(expected);
+        if (result != wanted) {
+            std::cerr << "FAILED: standalone " << scenario.toStdString() << ": "
+                      << result.toStdString() << " / " << error.toStdString() << '\n';
+            return false;
+        }
+        return true;
+    };
+    const QByteArray vtp = QByteArrayLiteral(
+            "<VTKFile type=\"PolyData\"><PolyData><Piece NumberOfPoints=\"402217901\" "
+            "NumberOfPolys=\"801357926\"></Piece></PolyData><AppendedData encoding=\"raw\">_") +
+            QByteArray(32, '\0');
+    const QByteArray vtu = QByteArrayLiteral(
+            "<VTKFile type=\"UnstructuredGrid\"><UnstructuredGrid>"
+            "<Piece NumberOfPoints=\"4\" NumberOfCells=\"1\"/></UnstructuredGrid></VTKFile>");
+    const QByteArray vtm = QByteArrayLiteral(
+            "<VTKFile><vtkMultiBlockDataSet><DataSet file=\"model.vtp\"/>"
+            "</vtkMultiBlockDataSet></VTKFile>");
+    ok &= check("raw-vtp", {"model.vtp"}, {vtp}, "model.vtp");
+    // Real appended Float64/Int64 bytes may be invalid UTF-8. Qt's decoder
+    // can inspect them before it delivers even the preceding Piece token.
+    const QByteArray rawInvalidUtf8 = vtp + QByteArray::fromHex("8098fffe3f02c01e18ca");
+    ok &= check("raw-vtp-invalid-utf8", {"model.vtp"}, {rawInvalidUtf8}, "model.vtp");
+    ok &= check("raw-vtu-invalid-utf8", {"model.vtu"},
+                {QByteArrayLiteral("<VTKFile type=\"UnstructuredGrid\"><UnstructuredGrid>"
+                                   "<Piece NumberOfPoints=\"4\" NumberOfCells=\"1\"/>"
+                                   "</UnstructuredGrid><AppendedData encoding=\"raw\">_") +
+                 QByteArray::fromHex("8098fffe3f02c01e18ca")}, "model.vtu");
+    ok &= check("raw-type-mismatch", {"model.vtu"}, {rawInvalidUtf8}, {});
+    ok &= check("raw-missing-piece", {"model.vtp"},
+                {QByteArrayLiteral("<VTKFile type=\"PolyData\"><PolyData></PolyData>"
+                                   "<AppendedData encoding=\"raw\">_") +
+                 QByteArray::fromHex("8098fffe")}, {});
+    ok &= check("vtu", {"model.vtu"}, {vtu}, "model.vtu");
+    ok &= check("ambiguous", {"model.vtp", "other.vtu"}, {vtp, vtu}, {});
+    ok &= check("type-mismatch", {"model.vtp"}, {vtu}, {});
+    ok &= check("invalid-points", {"model.vtp"}, {QByteArrayLiteral(
+            "<VTKFile type=\"PolyData\"><PolyData><Piece NumberOfPoints=\"bad\"/>")}, {});
+    ok &= check("wrong-container", {"model.vtp"}, {QByteArrayLiteral(
+            "<VTKFile type=\"PolyData\"><UnstructuredGrid><Piece NumberOfPoints=\"4\"/>")}, {});
+    ok &= check("nested-standalone-rejected", {"nested/model.vtp"}, {vtp}, {});
+    ok &= check("root-vtm-precedence", {"model.vtm", "model.vtp", "other.vtu"},
+                {vtm, vtp, vtu}, "model.vtm");
+    ok &= check("legacy-nested-vtm", {"nested/model.vtm", "nested/model.vtp"},
+                {vtm, vtp}, "nested/model.vtm");
+    ok &= check("ambiguous-vtm", {"first.vtm", "second.vtm", "model.vtp"},
+                {vtm, vtm, vtp}, {});
+    return ok;
+}
+
 struct FetchOutcome
 {
     QVector<igQtRemoteCatalogEntry> entries;
@@ -623,6 +689,7 @@ int main(int argc, char** argv)
     try {
         SocketRuntime socketRuntime;
         bool ok = testVtmManifestReaderSemantics();
+        ok &= testStandaloneDatasetEntryPoints();
         ok &= testCacheNamespace();
         ok &= testPagedCatalogClientLifecycle();
         if (!ok) { return 1; }

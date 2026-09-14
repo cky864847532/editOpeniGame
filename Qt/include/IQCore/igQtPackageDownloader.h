@@ -11,6 +11,7 @@
 
 #include <IQCore/igQtExportModule.h>
 
+#include <QByteArray>
 #include <QObject>
 #include <QString>
 
@@ -38,6 +39,13 @@ public:
     bool StartDownload(const QString& packageId,
                        const QString& cacheDirectory = QStringLiteral("D:/iGameVis-cs-cache"));
 
+    /**
+     * Queries and validates INFO on a dedicated worker without accessing any
+     * disk cache, hashing an archive, or requesting package bytes. Completion
+     * uses RunningChanged(false); metadata is delivered before that signal.
+     */
+    bool QueryPackageInfo(const QString& packageId);
+
     bool IsRunning() const { return m_Running; }
     QString ServerAddress() const { return m_ServerAddress; }
     quint16 ServerPort() const { return m_ServerPort; }
@@ -62,6 +70,19 @@ signals:
                              const QString& fileName,
                              const QString& versionToken,
                              quint64 fileSize);
+    /**
+     * Emitted only after protocol, requested id, filename and advertised
+     * limits have been validated, for both queries and normal downloads.
+     * sha256 is the raw digest (32 bytes), or empty for legacy servers. An
+     * empty digest is not sufficient proof for a decoded-memory-cache hit.
+     */
+    void ValidatedPackageInfoReceived(const QString& serverAddress,
+                                      quint16 serverPort,
+                                      const QString& packageId,
+                                      const QString& fileName,
+                                      const QString& versionToken,
+                                      const QByteArray& sha256,
+                                      quint64 fileSize);
     void DownloadStarted(quint64 resumeOffset, quint64 totalBytes);
     void DownloadProgress(quint64 receivedBytes, quint64 totalBytes);
     void PackageReady(const QString& packagePath);
@@ -72,6 +93,8 @@ private slots:
     void OnThreadFinished();
 
 private:
+    bool StartRequest(const QString& packageId, const QString& cacheDirectory,
+                      bool infoOnly);
     QString m_ServerAddress{QStringLiteral("127.0.0.1")};
     quint16 m_ServerPort{34567};
     QThread* m_Thread{nullptr};

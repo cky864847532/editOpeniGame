@@ -4,6 +4,7 @@
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QDir>
 #include <QEventLoop>
 #include <QFile>
 #include <QTemporaryDir>
@@ -15,6 +16,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -148,14 +150,34 @@ void sendFrame(TestSocket socket,
     if (!payload.empty()) { sendAll(socket, payload.data(), payload.size()); }
 }
 
+enum class InfoFault
+{
+    None,
+    WrongPackageId,
+    UnsafeFileName,
+    NullFileName,
+    EmptyVersion,
+    FrameTooSmall,
+    FrameTooLarge,
+    ChunkZero,
+    ChunkTooLarge,
+    FrameChunkMismatch,
+    FileTooLarge,
+    WrongRequestId,
+    TruncatedDigest,
+    EmptyLegacyDigest
+};
+
 class FakePackageServer final
 {
 public:
-    FakePackageServer(QByteArray contents, bool expectGet, bool stallAfterGet = false)
+    FakePackageServer(QByteArray contents, bool expectGet, bool stallAfterGet = false,
+                      InfoFault infoFault = InfoFault::None)
         : m_Contents(std::move(contents))
         , m_Digest(QCryptographicHash::hash(m_Contents, QCryptographicHash::Sha256))
         , m_ExpectGet(expectGet)
         , m_StallAfterGet(stallAfterGet)
+        , m_InfoFault(infoFault)
     {
         m_Listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (m_Listener == InvalidSocket) { throw std::runtime_error("socket failed"); }
@@ -236,8 +258,26 @@ private:
             info.versionToken = m_Digest.toHex().toStdString();
             info.sha256.assign(m_Digest.constData(),
                                static_cast<std::size_t>(m_Digest.size()));
+            switch (m_InfoFault) {
+                case InfoFault::WrongPackageId: info.packageId = "another.tar.zst"; break;
+                case InfoFault::UnsafeFileName: info.fileName = "../escape.tar.zst"; break;
+                case InfoFault::NullFileName: info.fileName.push_back('\0'); break;
+                case InfoFault::EmptyVersion: info.versionToken.clear(); break;
+                case InfoFault::FrameTooSmall: info.maxFrameSize = 1; break;
+                case InfoFault::FrameTooLarge: info.maxFrameSize = igpk::kMaxFrameSize + 1; break;
+                case InfoFault::ChunkZero: info.maxChunkSize = 0; break;
+                case InfoFault::ChunkTooLarge: info.maxChunkSize = igpk::kMaxChunkSize + 1; break;
+                case InfoFault::FrameChunkMismatch: info.maxFrameSize = 64; break;
+                case InfoFault::FileTooLarge:
+                    info.fileSize = std::numeric_limits<std::uint64_t>::max(); break;
+                case InfoFault::EmptyLegacyDigest: info.sha256.clear(); break;
+                default: break;
+            }
+            auto infoPayload = igpk::encodeInfoResponse(info);
+            if (m_InfoFault == InfoFault::TruncatedDigest) { infoPayload.pop_back(); }
             sendFrame(client, igpk::MessageType::InfoResponse,
-                      infoFrame.header.requestId, igpk::encodeInfoResponse(info));
+                      m_InfoFault == InfoFault::WrongRequestId ? 99 : infoFrame.header.requestId,
+                      infoPayload);
 
             ReceivedFrame next = receiveFrame(client);
             if (m_ExpectGet) {
@@ -296,6 +336,7 @@ private:
     QByteArray m_Digest;
     bool m_ExpectGet{false};
     bool m_StallAfterGet{false};
+    InfoFault m_InfoFault{InfoFault::None};
     std::thread m_Thread;
     std::string m_Failure;
     std::mutex m_Mutex;
@@ -318,6 +359,8 @@ struct DownloadOutcome
     bool started{false};
     bool cancelled{false};
     bool timedOut{false};
+    int validatedMetadataCount{0};
+    int legacyMetadataCount{0};
 };
 
 DownloadOutcome runDownload(igQtPackageDownloader& downloader,
@@ -335,6 +378,15 @@ DownloadOutcome runDownload(igQtPackageDownloader& downloader,
     const auto quitWhenStopped = [&]() {
         if (terminalSignal && !downloader.IsRunning()) { loop.quit(); }
     };
+    QObject::connect(&downloader, &igQtPackageDownloader::ValidatedPackageInfoReceived,
+                     &connectionScope, [&](const QString&, quint16, const QString&,
+                                           const QString&, const QString&, const QByteArray&, quint64) {
+                         ++outcome.validatedMetadataCount;
+                     });
+    QObject::connect(&downloader, &igQtPackageDownloader::PackageInfoReceived,
+                     &connectionScope, [&](const QString&, const QString&, const QString&, quint64) {
+                         ++outcome.legacyMetadataCount;
+                     });
     QObject::connect(&downloader, &igQtPackageDownloader::PackageReady,
                      &connectionScope, [&](const QString& path) {
                          outcome.readyPath = path;
@@ -403,6 +455,8 @@ bool testHostnameAndRepeatedDownloaderLifecycle()
     ok &= require(firstServer.failure().empty() && firstServer.sawGet() &&
                           firstServer.sawGoodbye(),
                   "hostname download preserves package id and completes INFO/GET/GOODBYE");
+    ok &= require(first.validatedMetadataCount == 1 && first.legacyMetadataCount == 1,
+                  "normal download emits validated and legacy metadata once");
     QFile downloaded(first.readyPath);
     ok &= require(downloaded.open(QIODevice::ReadOnly) &&
                           downloaded.readAll() == contents,
@@ -422,6 +476,201 @@ bool testHostnameAndRepeatedDownloaderLifecycle()
     ok &= require(cacheHitServer.failure().empty() &&
                           !cacheHitServer.sawGet() && cacheHitServer.sawGoodbye(),
                   "cache hit performs INFO/GOODBYE without retransferring data");
+    ok &= require(cacheHit.validatedMetadataCount == 1 && cacheHit.legacyMetadataCount == 1,
+                  "cached download preserves both validated and legacy metadata");
+    return ok;
+}
+
+struct InfoOutcome
+{
+    QString serverAddress;
+    quint16 serverPort{0};
+    QString packageId;
+    QString fileName;
+    QString versionToken;
+    QByteArray sha256;
+    quint64 fileSize{0};
+    QString failure;
+    int validatedCount{0};
+    int legacyCount{0};
+    bool started{false};
+    bool concurrentRejected{false};
+    bool cancelled{false};
+    bool timedOut{false};
+    bool transferSignal{false};
+    bool hashStatus{false};
+};
+
+InfoOutcome runInfoQuery(igQtPackageDownloader& downloader, std::uint16_t port)
+{
+    InfoOutcome outcome;
+    QEventLoop loop;
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    timeout.setInterval(10000);
+    QObject connectionScope;
+    const auto quitWhenStopped = [&]() {
+        if (!downloader.IsRunning() &&
+            (outcome.validatedCount || !outcome.failure.isEmpty() || outcome.cancelled || outcome.timedOut)) {
+            loop.quit();
+        }
+    };
+    QObject::connect(&downloader, &igQtPackageDownloader::ValidatedPackageInfoReceived,
+                     &connectionScope, [&](const QString& address, quint16 serverPort,
+                                           const QString& packageId, const QString& fileName,
+                                           const QString& token, const QByteArray& sha, quint64 size) {
+                         outcome.serverAddress = address;
+                         outcome.serverPort = serverPort;
+                         outcome.packageId = packageId;
+                         outcome.fileName = fileName;
+                         outcome.versionToken = token;
+                         outcome.sha256 = sha;
+                         outcome.fileSize = size;
+                         ++outcome.validatedCount;
+                         quitWhenStopped();
+                     });
+    QObject::connect(&downloader, &igQtPackageDownloader::PackageInfoReceived,
+                     &connectionScope, [&](const QString&, const QString&, const QString&, quint64) {
+                         ++outcome.legacyCount;
+                     });
+    QObject::connect(&downloader, &igQtPackageDownloader::PackageReady,
+                     &connectionScope, [&](const QString&) { outcome.transferSignal = true; });
+    QObject::connect(&downloader, &igQtPackageDownloader::DownloadStarted,
+                     &connectionScope, [&](quint64, quint64) { outcome.transferSignal = true; });
+    QObject::connect(&downloader, &igQtPackageDownloader::DownloadProgress,
+                     &connectionScope, [&](quint64, quint64) { outcome.transferSignal = true; });
+    QObject::connect(&downloader, &igQtPackageDownloader::StatusChanged,
+                     &connectionScope, [&](const QString& status) {
+                         if (status.contains(QStringLiteral("Verifying")) ||
+                             status.contains(QStringLiteral("Using the complete cached"))) {
+                             outcome.hashStatus = true;
+                         }
+                     });
+    QObject::connect(&downloader, &igQtPackageDownloader::DownloadFailed,
+                     &connectionScope, [&](const QString& message) {
+                         outcome.failure = message;
+                         quitWhenStopped();
+                     });
+    QObject::connect(&downloader, &igQtPackageDownloader::DownloadCancelled,
+                     &connectionScope, [&]() { outcome.cancelled = true; quitWhenStopped(); });
+    QObject::connect(&downloader, &igQtPackageDownloader::RunningChanged,
+                     &connectionScope, [&](bool running) { if (!running) quitWhenStopped(); });
+    QObject::connect(&timeout, &QTimer::timeout, &connectionScope, [&]() {
+        outcome.timedOut = true;
+        downloader.Cancel();
+        QTimer::singleShot(2000, &loop, &QEventLoop::quit);
+        quitWhenStopped();
+    });
+    if (!downloader.SetServerEndpoint(QStringLiteral("127.0.0.1"), port)) {
+        outcome.failure = QStringLiteral("Cannot set query endpoint");
+        return outcome;
+    }
+    outcome.started = downloader.QueryPackageInfo(QStringLiteral(" sample.tar.zst"));
+    if (!outcome.started) {
+        outcome.failure = QStringLiteral("Cannot start INFO query");
+        return outcome;
+    }
+    outcome.concurrentRejected = !downloader.QueryPackageInfo(QStringLiteral(" sample.tar.zst")) &&
+            !downloader.StartDownload(QStringLiteral(" sample.tar.zst"), QStringLiteral("must-not-create")) &&
+            !downloader.SetServerEndpoint(QStringLiteral("127.0.0.1"), port);
+    timeout.start();
+    loop.exec();
+    timeout.stop();
+    if (outcome.timedOut && downloader.IsRunning()) { downloader.Shutdown(); }
+    return outcome;
+}
+
+class CurrentDirectoryGuard final
+{
+public:
+    explicit CurrentDirectoryGuard(const QString& directory) : m_Previous(QDir::currentPath())
+    {
+        if (!QDir::setCurrent(directory)) { throw std::runtime_error("cannot set test working directory"); }
+    }
+    ~CurrentDirectoryGuard() { QDir::setCurrent(m_Previous); }
+private:
+    QString m_Previous;
+};
+
+bool testInfoOnlyHasNoTransferOrCacheSideEffects()
+{
+    QTemporaryDir directory;
+    if (!require(directory.isValid(), "INFO-only temporary directory")) { return false; }
+    CurrentDirectoryGuard currentDirectory(directory.path());
+    QFile sentinel(QStringLiteral(" sample.tar.zst"));
+    const QByteArray oldContents("existing cache must not be examined or replaced");
+    if (!require(sentinel.open(QIODevice::WriteOnly) && sentinel.write(oldContents) == oldContents.size(),
+                 "create INFO-only cache sentinel")) { return false; }
+    sentinel.close();
+    const QStringList before = QDir(directory.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot);
+    const QByteArray contents("query content differs from local sentinel");
+    FakePackageServer server(contents, false);
+    server.start();
+    igQtPackageDownloader downloader;
+    const InfoOutcome result = runInfoQuery(downloader, server.port());
+    server.join();
+    bool ok = require(result.started && result.concurrentRejected && !result.timedOut &&
+                              !result.cancelled && result.failure.isEmpty() && !downloader.IsRunning(),
+                      "INFO-only succeeds and releases its worker; concurrent requests are rejected");
+    const QByteArray digest = QCryptographicHash::hash(contents, QCryptographicHash::Sha256);
+    ok &= require(result.validatedCount == 1 && result.legacyCount == 1 &&
+                          result.serverAddress == QStringLiteral("127.0.0.1") &&
+                          result.serverPort == server.port() &&
+                          result.packageId == QStringLiteral(" sample.tar.zst") &&
+                          result.fileName == QStringLiteral(" sample.tar.zst") &&
+                          result.versionToken == QString::fromLatin1(digest.toHex()) &&
+                          result.sha256 == digest && result.fileSize == static_cast<quint64>(contents.size()),
+                  "INFO-only emits exact validated identity including endpoint and raw SHA-256");
+    ok &= require(server.failure().empty() && server.sawGoodbye() && !server.sawGet() &&
+                          !result.transferSignal && !result.hashStatus,
+                  "INFO-only performs INFO/GOODBYE without GET, ready/progress or hash work");
+    ok &= require(QDir(directory.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot) == before &&
+                          sentinel.open(QIODevice::ReadOnly) && sentinel.readAll() == oldContents,
+                  "INFO-only preserves working-directory contents and cached bytes");
+    sentinel.close();
+
+    // Query completion must leave the same public object usable for a normal
+    // download; no Cancel race or partially-running worker may be required.
+    FakePackageServer downloadServer(contents, true);
+    downloadServer.start();
+    const DownloadOutcome download = runDownload(downloader, downloadServer.port(), directory.path());
+    downloadServer.join();
+    ok &= require(download.started && !download.timedOut && download.failure.isEmpty() &&
+                          !download.readyPath.isEmpty() && download.validatedMetadataCount == 1 &&
+                          downloadServer.failure().empty() && downloadServer.sawGet(),
+                  "normal download works on the same downloader after INFO-only completes");
+    return ok;
+}
+
+bool testInfoOnlyRejectsUnvalidatedMetadata()
+{
+    bool ok = true;
+    igQtPackageDownloader downloader;
+    const std::array faults{InfoFault::WrongPackageId, InfoFault::UnsafeFileName,
+            InfoFault::NullFileName, InfoFault::EmptyVersion, InfoFault::FrameTooSmall,
+            InfoFault::FrameTooLarge, InfoFault::ChunkZero, InfoFault::ChunkTooLarge,
+            InfoFault::FrameChunkMismatch, InfoFault::FileTooLarge,
+            InfoFault::WrongRequestId, InfoFault::TruncatedDigest};
+    for (const auto fault : faults) {
+        FakePackageServer server(QByteArray("invalid INFO must not be published"), false, false, fault);
+        server.start();
+        const InfoOutcome result = runInfoQuery(downloader, server.port());
+        server.join();
+        const bool rejected = result.started && !result.timedOut && !result.cancelled &&
+                !result.failure.isEmpty() && result.validatedCount == 0 && result.legacyCount == 0 &&
+                !result.transferSignal && !result.hashStatus && !downloader.IsRunning() &&
+                server.failure().empty() && server.sawGoodbye() && !server.sawGet();
+        if (!rejected) { std::cerr << "INFO fault case " << static_cast<int>(fault) << '\n'; }
+        ok &= require(rejected, "invalid INFO fails before publishing metadata or touching transfer/cache");
+    }
+    FakePackageServer legacy(QByteArray("legacy server without digest"), false, false,
+                             InfoFault::EmptyLegacyDigest);
+    legacy.start();
+    const InfoOutcome result = runInfoQuery(downloader, legacy.port());
+    legacy.join();
+    ok &= require(result.validatedCount == 1 && result.sha256.isEmpty() && result.failure.isEmpty() &&
+                          !result.transferSignal && legacy.failure().empty() && legacy.sawGoodbye(),
+                  "legacy empty digest is preserved explicitly, never manufactured as a verified digest");
     return ok;
 }
 
@@ -467,6 +716,8 @@ int main(int argc, char** argv)
     try {
         SocketRuntime socketRuntime;
         bool ok = testHostnameAndRepeatedDownloaderLifecycle();
+        ok &= testInfoOnlyHasNoTransferOrCacheSideEffects();
+        ok &= testInfoOnlyRejectsUnvalidatedMetadata();
         ok &= testSynchronousShutdownWaitsForWorker();
         if (!ok) { return 1; }
         std::cout << "Remote package downloader tests passed\n";

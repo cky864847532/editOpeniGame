@@ -31,6 +31,8 @@ uniform float lineWidth;
 
 uniform vec4 vpDims;
 uniform samplerBuffer edgeMasks;
+uniform int constantEdgeMask;
+uniform int edgeMaskPrimitiveOffset;
 
 #define FLT_MAX 3.402823466e+38
 #define FLT_MIN 1.175494351e-38
@@ -57,7 +59,8 @@ void main() {
     }
 
     // The shader normalizes the value and multiplies it by 255 to reconstruct the original value.
-    float edgeValues = 255.0f * texelFetch(edgeMasks, gl_PrimitiveIDIn).r;
+    float edgeValues = constantEdgeMask >= 0 ? float(constantEdgeMask) :
+        255.0f * texelFetch(edgeMasks, gl_PrimitiveIDIn + edgeMaskPrimitiveOffset).r;
     if (mod(edgeValues, 2.0f) < 1.0f) { edgeEqn[0].w = lineWidth; }
     if (mod(edgeValues, 4.0f) < 2.0f) { edgeEqn[1].w = lineWidth; }
     if (edgeValues < 4.0f) { edgeEqn[2].w = lineWidth; }

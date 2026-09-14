@@ -1,7 +1,7 @@
 /**
  * @class igQtRemotePackageLoader
  * @brief Downloads, verifies and extracts a versioned data package before
- *        exposing its VTM entry point to the normal iGameVis file loader.
+ *        exposing its VTM or standalone VTP/VTU to the normal file loader.
  */
 
 #pragma once
@@ -40,9 +40,13 @@ public slots:
 signals:
     void StatusChanged(const QString& message);
     void ProgressChanged(double progress);
-    void DatasetReady(const QString& vtmPath);
+    void DatasetReady(const QString& datasetPath);
     void Failed(const QString& message);
     void Finished();
+    void ValidatedPackageInfoReceived(const QString& serverAddress, quint16 serverPort,
+                                      const QString& packageId, const QString& fileName,
+                                      const QString& versionToken, const QByteArray& sha256,
+                                      quint64 fileSize);
 
 private:
     void RequestFinished();
@@ -55,7 +59,7 @@ private:
                             bool success,
                             bool cancelled,
                             const QString& errorMessage);
-    QString FindSingleVtm(const QString& directory, QString& errorMessage) const;
+    QString FindDatasetEntryPoint(const QString& directory, QString& errorMessage) const;
 
     igQtPackageDownloader* m_Downloader{nullptr};
     std::unique_ptr<QLockFile> m_CacheLock;

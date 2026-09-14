@@ -36,12 +36,16 @@ private slots:
     void FetchCatalog();
     void BrowseCacheDirectory();
     void OpenSelectedPackage();
+    void PreloadSelectedPackage();
+    void ClearMemoryCache();
+    void UpdateMemoryCacheStatus();
     void CancelActivity();
     void UpdateActions();
 
 private:
     void SetCatalogBusy(bool busy);
     void SetPackageBusy(bool busy);
+    void StartSelectedPackage(bool preload);
     void SaveSettings() const;
     QString SelectedPackageId() const;
     quint64 SelectedPackageSize() const;
@@ -55,6 +59,10 @@ private:
     QPushButton* m_FetchButton{nullptr};
     QTableWidget* m_Table{nullptr};
     QLabel* m_StatusLabel{nullptr};
+    QLabel* m_MemoryCacheStatus{nullptr};
+    QSpinBox* m_MemoryLimitGiB{nullptr};
+    QPushButton* m_PreloadButton{nullptr};
+    QPushButton* m_ClearMemoryButton{nullptr};
     QPushButton* m_OpenButton{nullptr};
     QPushButton* m_CancelButton{nullptr};
     QString m_CatalogHost;
@@ -63,4 +71,6 @@ private:
     bool m_PackageBusy{false};
     bool m_PackageFailed{false};
     bool m_PackageOpened{false};
+    bool m_PackagePreloaded{false};
+    bool m_RequestPreload{false};
 };

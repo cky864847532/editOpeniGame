@@ -118,7 +118,7 @@ bool IsSafeFileName(const QString& fileName)
         return false;
     }
     if (fileName.contains(QLatin1Char('/')) || fileName.contains(QLatin1Char('\\')) ||
-        fileName.contains(QLatin1Char(':'))) {
+        fileName.contains(QLatin1Char(':')) || fileName.contains(QChar::Null)) {
         return false;
     }
     return QFileInfo(fileName).fileName() == fileName;
@@ -497,11 +497,13 @@ public:
                           quint16 port,
                           QString packageId,
                           QString cacheDirectory,
+                          bool infoOnly,
                           std::shared_ptr<igQtPackageDownloadCancellationState> cancelState)
         : m_Address(std::move(address))
         , m_Port(port)
         , m_PackageId(std::move(packageId))
         , m_CacheDirectory(std::move(cacheDirectory))
+        , m_InfoOnly(infoOnly)
         , m_CancelState(std::move(cancelState))
     {
     }
@@ -570,6 +572,13 @@ signals:
                               const QString& fileName,
                               const QString& versionToken,
                               quint64 fileSize);
+    void ValidatedInfoAvailable(const QString& serverAddress,
+                                quint16 serverPort,
+                                const QString& packageId,
+                                const QString& fileName,
+                                const QString& versionToken,
+                                const QByteArray& sha256,
+                                quint64 fileSize);
     void Started(quint64 resumeOffset, quint64 totalBytes);
     void Progress(quint64 receivedBytes, quint64 totalBytes);
     void Ready(const QString& packagePath);
@@ -596,8 +605,6 @@ private:
             }
             return infoResult;
         }
-        emit PackageInfoAvailable(info.packageId, info.fileName, info.versionToken, info.fileSize);
-
         if (info.packageId != m_PackageId) {
             failure = QStringLiteral("Server returned package id '%1' for request '%2'")
                               .arg(info.packageId, m_PackageId);
@@ -611,7 +618,9 @@ private:
         }
         if (info.maximumFrameSize > igpk::kMaxFrameSize ||
             info.maximumFrameSize < igpk::kHeaderSize ||
-            info.maximumChunkSize == 0 || info.maximumChunkSize > igpk::kMaxChunkSize) {
+            info.maximumChunkSize == 0 || info.maximumChunkSize > igpk::kMaxChunkSize ||
+            info.maximumChunkSize + igpk::kHeaderSize + igpk::kDataChunkPrefixSize >
+                    info.maximumFrameSize) {
             failure = QStringLiteral("Server announced incompatible frame or chunk limits");
             SendGoodbye(socket);
             return DownloadAttemptResult::Failed;
@@ -620,6 +629,17 @@ private:
             failure = QStringLiteral("Package is larger than QFile's signed 64-bit size limit");
             SendGoodbye(socket);
             return DownloadAttemptResult::Failed;
+        }
+
+        if (IsCancelled()) { return DownloadAttemptResult::Cancelled; }
+        emit ValidatedInfoAvailable(m_Address, m_Port, info.packageId, info.fileName,
+                                    info.versionToken, info.sha256, info.fileSize);
+        // Preserve the old signal, but never publish unvalidated metadata.
+        emit PackageInfoAvailable(info.packageId, info.fileName, info.versionToken, info.fileSize);
+        if (m_InfoOnly) {
+            emit Status(QStringLiteral("Package INFO validated; no download or disk cache access"));
+            SendGoodbye(socket);
+            return DownloadAttemptResult::Complete;
         }
 
         QDir cacheDirectory;
@@ -993,6 +1013,7 @@ private:
     quint16 m_Port;
     QString m_PackageId;
     QString m_CacheDirectory;
+    bool m_InfoOnly{false};
     std::shared_ptr<igQtPackageDownloadCancellationState> m_CancelState;
 };
 } // namespace
@@ -1039,7 +1060,20 @@ bool igQtPackageDownloader::SetServerEndpoint(const QString& address, quint16 po
 
 bool igQtPackageDownloader::StartDownload(const QString& packageId, const QString& cacheDirectory)
 {
-    if (m_Running || packageId.trimmed().isEmpty() || cacheDirectory.trimmed().isEmpty()) { return false; }
+    return StartRequest(packageId, cacheDirectory, false);
+}
+
+bool igQtPackageDownloader::QueryPackageInfo(const QString& packageId)
+{
+    return StartRequest(packageId, QString(), true);
+}
+
+bool igQtPackageDownloader::StartRequest(const QString& packageId,
+                                         const QString& cacheDirectory,
+                                         bool infoOnly)
+{
+    if (m_Running || packageId.trimmed().isEmpty() ||
+        (!infoOnly && cacheDirectory.trimmed().isEmpty())) { return false; }
 
     if (m_Thread != nullptr) {
         if (m_Thread->isRunning()) { return false; }
@@ -1049,11 +1083,13 @@ bool igQtPackageDownloader::StartDownload(const QString& packageId, const QStrin
 
     m_CancelState = std::make_shared<igQtPackageDownloadCancellationState>();
     m_Thread = new QThread(this);
-    m_Thread->setObjectName(QStringLiteral("iGameVis package download"));
+    m_Thread->setObjectName(infoOnly ? QStringLiteral("iGameVis package INFO query")
+                                   : QStringLiteral("iGameVis package download"));
     auto* worker = new PackageDownloadWorker(m_ServerAddress,
                                              m_ServerPort,
                                              packageId,
-                                             QDir::cleanPath(cacheDirectory.trimmed()),
+                                             infoOnly ? QString() : QDir::cleanPath(cacheDirectory.trimmed()),
+                                             infoOnly,
                                              m_CancelState);
     worker->moveToThread(m_Thread);
 
@@ -1063,6 +1099,8 @@ bool igQtPackageDownloader::StartDownload(const QString& packageId, const QStrin
             &PackageDownloadWorker::PackageInfoAvailable,
             this,
             &igQtPackageDownloader::PackageInfoReceived);
+    connect(worker, &PackageDownloadWorker::ValidatedInfoAvailable,
+            this, &igQtPackageDownloader::ValidatedPackageInfoReceived);
     connect(worker, &PackageDownloadWorker::Started, this, &igQtPackageDownloader::DownloadStarted);
     connect(worker, &PackageDownloadWorker::Progress, this, &igQtPackageDownloader::DownloadProgress);
     connect(worker, &PackageDownloadWorker::Ready, this, &igQtPackageDownloader::PackageReady);

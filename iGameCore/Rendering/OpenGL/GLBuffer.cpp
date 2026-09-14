@@ -38,6 +38,10 @@ void GLBuffer::CopySubData(const SmartPointer<GLBuffer> source,
 }
 
 void GLBuffer::Allocate(size_t size, const void* data, GLenum usage) {
+    const bool largeAllocation = size >= (size_t{1} << 30);
+    if (largeAllocation) {
+        IGAME_RENDERING_INFO("[GLBuffer] Allocating handle={} bytes={}", m_Handle, size);
+    }
 #ifdef IGAME_OPENGL_VERSION_330
     #ifdef __EMSCRIPTEN__
     if (!IsSupportedBufferTarget(m_Target)) { return; }
@@ -47,6 +51,25 @@ void GLBuffer::Allocate(size_t size, const void* data, GLenum usage) {
     glBindBuffer(m_Target, 0);
 #elif IGAME_OPENGL_VERSION_460
     glNamedBufferData(m_Handle, size, data, usage);
+#endif
+#ifndef __EMSCRIPTEN__
+    if (largeAllocation) {
+        const GLenum error = glGetError();
+        GLint64 allocatedBytes = 0;
+#ifdef IGAME_OPENGL_VERSION_460
+        glGetNamedBufferParameteri64v(m_Handle, GL_BUFFER_SIZE, &allocatedBytes);
+#else
+        glBindBuffer(m_Target, m_Handle);
+        glGetBufferParameteri64v(m_Target, GL_BUFFER_SIZE, &allocatedBytes);
+        glBindBuffer(m_Target, 0);
+#endif
+        if (error != GL_NO_ERROR || allocatedBytes != static_cast<GLint64>(size)) {
+            IGAME_RENDERING_ERROR("[GLBuffer] Allocation failed handle={} requested={} actual={} GLerror={}",
+                                  m_Handle, size, allocatedBytes, error);
+        } else {
+            IGAME_RENDERING_INFO("[GLBuffer] Allocation complete handle={} bytes={}", m_Handle, allocatedBytes);
+        }
+    }
 #endif
 }
 

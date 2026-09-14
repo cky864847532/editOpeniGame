@@ -40,14 +40,21 @@ public:
     void Release() const;
 
     void DrawArrays(GLenum mode, GLint first, GLsizei count);
-    void DrawElements(GLenum mode, int elementCount, GLenum type,
+    void DrawElements(GLenum mode, IGsize elementCount, GLenum type,
                       const void* indices = 0);
-    void DrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count,
-                           GLenum type, const void* indices = 0);
+    void DrawRangeElements(GLenum mode, GLuint start, GLuint end, IGsize count,
+                           GLenum type, const void* indices = 0,
+                           GLint primitiveOffsetLocation = -1);
 
 protected:
     GLVertexArray();
     ~GLVertexArray() override;
+
+    void DrawIndexed(GLenum mode, GLuint start, GLuint end, IGsize count,
+                     GLenum type, const void* indices, bool useRange,
+                     GLint primitiveOffsetLocation);
+    IGsize m_LoggedLargeIndexCount{0};
+    bool m_LoggedDrawError{false};
 
     friend class GLObject<GLVertexArray>;
     static void CreateHandle(GLsizei count, GLuint* handles);

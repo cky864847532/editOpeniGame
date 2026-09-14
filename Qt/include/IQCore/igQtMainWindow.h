@@ -118,6 +118,9 @@ public:
 private slots:
     void updateRecentFilePaths();
     void updateColorBarShow();
+    void ConfigureRemoteCacheBenchmark(const QString& package, const QString& host,
+                                       quint16 port, const QString& cacheDirectory,
+                                       int rounds, const QString& outputPath);
 
     //void ChangeViewStyle();
     //void ChangeScalarView();

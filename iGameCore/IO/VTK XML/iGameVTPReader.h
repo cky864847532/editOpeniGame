@@ -19,6 +19,7 @@ public:
 
     static Pointer New() { return new iGameVTPReader; }
 
+    bool Execute() override;
     bool Parsing() override;
     bool CreateDataObject() override;
 
@@ -27,6 +28,8 @@ protected:
     ~iGameVTPReader() override = default;
 
 private:
+    // -1: layout belongs to the general XML reader; 0: invalid input; 1: success.
+    int ReadRawAppendedTriangles();
     bool ReadVTPPointData();
     bool ReadVTPPointAttribute();
     bool ReadVTPCellData();

@@ -53,6 +53,7 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
     InitRecentFilePaths();
     m_SceneManager = SceneManager::Instance();
     m_RemotePackageLoader = new igQtRemotePackageLoader(this);
+    InitializeResidentRemoteSupport();
     connect(m_RemotePackageLoader, &igQtRemotePackageLoader::StatusChanged,
             this, [this](const QString& message) {
                 igDebug("[PackageTransfer] {}", message.toStdString());
@@ -66,7 +67,25 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
             });
     connect(m_RemotePackageLoader, &igQtRemotePackageLoader::DatasetReady,
             this, [this](const QString& vtmPath) {
+                if (ResidentRemoteEnabled() && !ResidentRemoteAcceptsDataset()) {
+                    m_RemotePackageLoader->FinalizeDatasetOpen(false);
+                    return;
+                }
+                if (ResidentRemotePreloadOnly()) {
+                    const bool ready = ReadResidentRemotePreload(vtmPath);
+                    m_RemotePackageLoader->FinalizeDatasetOpen(ready);
+                    // Finish only after the package loader releases its worker
+                    // and lock. Otherwise the UI can observe running=true while
+                    // handling our terminal signal and leave its buttons disabled.
+                    if (!ready) { FailResidentRemoteRequest(QStringLiteral(
+                            "CPU preload failed (reader, unsupported/static-data guard or cache admission limit); check the log. No model was displayed.")); }
+                    return;
+                }
                 const bool opened = this->TryOpenFile(vtmPath.toStdString());
+                if (ResidentRemoteEnabled() && !ResidentRemoteAcceptsDataset()) {
+                    m_RemotePackageLoader->FinalizeDatasetOpen(false);
+                    return;
+                }
                 const QString cacheDiagnostic =
                         m_RemotePackageLoader->FinalizeDatasetOpen(opened);
                 if (!opened) {
@@ -77,7 +96,8 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
                         message += QLatin1Char(' ') + cacheDiagnostic;
                     }
                     igError("[PackageTransfer] {}", message.toStdString());
-                    emit RemotePackageFailed(message);
+                    if (!ResidentRemoteEnabled()) { emit RemotePackageFailed(message); }
+                    FailResidentRemoteRequest(message);
                     return;
                 }
                 QString message = QStringLiteral("Remote model loaded: %1").arg(vtmPath);
@@ -86,24 +106,31 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
                 }
                 igDebug("[PackageTransfer] {}", message.toStdString());
                 emit RemotePackageStatusChanged(message);
-                emit RemotePackageDatasetOpened(vtmPath);
+                if (!ResidentRemoteEnabled()) { emit RemotePackageDatasetOpened(vtmPath); }
+                PrepareResidentRemoteFrame(vtmPath);
             });
     connect(m_RemotePackageLoader, &igQtRemotePackageLoader::Failed,
             this, [this](const QString& message) {
                 igError("[PackageTransfer] {}", message.toStdString());
                 iGame::ProgressObserver::Instance()->UpdateText("");
                 iGame::ProgressObserver::Instance()->UpdateProgress(1.0);
-                emit RemotePackageFailed(message);
+                if (!ResidentRemoteEnabled()) { emit RemotePackageFailed(message); }
+                FailResidentRemoteRequest(message);
             });
     connect(m_RemotePackageLoader, &igQtRemotePackageLoader::Finished,
             this, [this]() {
+                // A measured request is finished only after its complete
+                // GPU frame has been presented, not when file I/O returns.
+                if (ResidentRemoteEnabled()) {
+                    if (ResidentRemotePreloadOnly()) { FinishResidentRemotePreload(); }
+                    return;
+                }
                 iGame::ProgressObserver::Instance()->UpdateText("");
                 emit RemotePackageFinished();
                 emit RemotePackageRunningChanged(false);
             });
 }
 
-igQtFileLoader::~igQtFileLoader() {}
 void igQtFileLoader::LoadOnlineS() {
 #if defined(_WIN32) || defined(_WIN64)
     std::thread server_thread(serverThread);
@@ -264,6 +291,9 @@ bool igQtFileLoader::OpenRemotePackage(const QString& serverAddress,
                                        const QString& packageId,
                                        const QString& cacheDirectory) {
     if (m_RemotePackageLoader == nullptr) { return false; }
+    if (ResidentRemoteEnabled()) {
+        return StartResidentRemoteRequest(serverAddress, serverPort, packageId, cacheDirectory);
+    }
     const bool started = m_RemotePackageLoader->Start(
             serverAddress, serverPort, packageId, cacheDirectory);
     if (!started) {
@@ -277,11 +307,13 @@ bool igQtFileLoader::OpenRemotePackage(const QString& serverAddress,
 
 bool igQtFileLoader::IsRemotePackageRunning() const
 {
-    return m_RemotePackageLoader != nullptr && m_RemotePackageLoader->IsRunning();
+    return ResidentRemoteActive() ||
+           (m_RemotePackageLoader != nullptr && m_RemotePackageLoader->IsRunning());
 }
 
 void igQtFileLoader::CancelRemotePackage()
 {
+    CancelResidentRemoteRequest();
     if (m_RemotePackageLoader != nullptr) { m_RemotePackageLoader->Cancel(); }
 }
 

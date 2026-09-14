@@ -77,6 +77,7 @@ public:
      * @warning 调用该函数后必须重新调用SyncToGpu()才能继续渲染
      */
     void ReleaseGpuBuffers();
+    bool HasGpuResources() const;
 
     void SetRenderWithMeshlet(bool val) {
         if (val != m_RenderWithMeshlet) {

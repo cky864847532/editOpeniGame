@@ -35,6 +35,14 @@ public:
     IGenum GetDataObjectType() const override;
     IGsize GetRealMemorySize() override;
 
+    // Explicit CPU-only cache boundary. Recursively release GL objects and
+    // derived CPU draw arrays, including shell/LOD/meshlet ownership cycles.
+    // Original points, cells, attributes and display settings are retained.
+    // If HasGpuResources() is true, the owning GL context MUST be current.
+    // Safe without GL for data that has never been uploaded; next draw rebuilds.
+    void ReleaseDrawableResources();
+    bool HasGpuResources() const;
+
     bool IsUseColor();        //是否使用颜色
     bool IsUseNormalSmooth(); //是否使用法线平滑
 
@@ -126,6 +134,8 @@ protected:
 
     Object::Pointer m_ReConvertHelper = Object::New();
     bool m_AttributeChanged = false;
+    bool m_ForceGpuBufferUpload = false;
+    bool m_RestoreMeshletColoring = false;
     bool m_ReConvertToDrawableData; // 是否需要重新转换数据
 
     bool m_AutoUpdateDrawData;    // 是否自动更新GPU数据
@@ -163,12 +173,16 @@ protected:
     UnsignedCharArray::Pointer m_TriangleEdgeMasks;
     GLBuffer::Pointer m_EdgeMaskBuffer;
     GLTextureBuffer::Pointer m_EdgeMaskTexture;
+    int m_ConstantEdgeMask{-1};
+    bool m_EdgeMaskAvailable{false};
     // 单元数据
     FloatArray::Pointer m_CellPositions;
     FloatArray::Pointer m_CellColors;
     UnsignedCharArray::Pointer m_CellTriangleEdgeMasks;
     GLBuffer::Pointer m_CellEdgeMaskBuffer;
     GLTextureBuffer::Pointer m_CellEdgeMaskTexture;
+    int m_ConstantCellEdgeMask{-1};
+    bool m_CellEdgeMaskAvailable{false};
 
     unsigned int m_ViewStyle; // 视图样式
     bool m_Visibility;        //是否可见

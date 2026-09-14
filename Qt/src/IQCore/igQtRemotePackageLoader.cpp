@@ -6,7 +6,6 @@
 
 #include <QCryptographicHash>
 #include <QDir>
-#include <QDirIterator>
 #include <QFileInfo>
 #include <QLockFile>
 #include <QMetaObject>
@@ -72,6 +71,8 @@ igQtRemotePackageLoader::igQtRemotePackageLoader(QObject* parent)
 {
     connect(m_Downloader, &igQtPackageDownloader::StatusChanged,
             this, &igQtRemotePackageLoader::StatusChanged);
+    connect(m_Downloader, &igQtPackageDownloader::ValidatedPackageInfoReceived,
+            this, &igQtRemotePackageLoader::ValidatedPackageInfoReceived);
     connect(m_Downloader, &igQtPackageDownloader::PackageInfoReceived,
             this,
             [this](const QString&, const QString&, const QString& versionToken, quint64) {
@@ -275,11 +276,11 @@ void igQtRemotePackageLoader::BeginExtraction(const QString& packagePath)
     const bool finalIsLink = igQtIsLinkOrReparsePoint(finalDirectory);
     if (existingFinal.exists() || finalIsLink) {
         if (existingFinal.isDir() && !finalIsLink) {
-            const QString existingVtm = FindSingleVtm(finalDirectory, existingError);
-            if (!existingVtm.isEmpty()) {
+            const QString existingDataset = FindDatasetEntryPoint(finalDirectory, existingError);
+            if (!existingDataset.isEmpty()) {
                 emit StatusChanged(QStringLiteral("Using the extracted package cache"));
                 emit ProgressChanged(1.0);
-                emit DatasetReady(existingVtm);
+                emit DatasetReady(existingDataset);
                 RequestFinished();
                 return;
             }
@@ -391,6 +392,12 @@ void igQtRemotePackageLoader::CompleteExtraction(const QString& stagingDirectory
                                                  const QString& errorMessage)
 {
     m_Extracting = false;
+    // The worker may have queued success just before the user cancelled.
+    // Re-check on the GUI thread before publishing or opening that result.
+    if (m_CancelExtraction.load(std::memory_order_acquire)) {
+        success = false;
+        cancelled = true;
+    }
     if (!success) {
         QString cleanupError;
         const bool cleanupSucceeded = RemoveCachePath(stagingDirectory, cleanupError);
@@ -414,8 +421,8 @@ void igQtRemotePackageLoader::CompleteExtraction(const QString& stagingDirectory
     }
 
     QString validationError;
-    const QString stagingVtm = FindSingleVtm(stagingDirectory, validationError);
-    if (stagingVtm.isEmpty()) {
+    const QString stagingDataset = FindDatasetEntryPoint(stagingDirectory, validationError);
+    if (stagingDataset.isEmpty()) {
         QString cleanupError;
         const bool cleanupSucceeded = RemoveCachePath(stagingDirectory, cleanupError);
         QString message = QStringLiteral("Extracted package validation failed: %1")
@@ -444,59 +451,22 @@ void igQtRemotePackageLoader::CompleteExtraction(const QString& stagingDirectory
     }
 
     QString finalError;
-    const QString finalVtm = FindSingleVtm(finalDirectory, finalError);
-    if (finalVtm.isEmpty()) {
+    const QString finalDataset = FindDatasetEntryPoint(finalDirectory, finalError);
+    if (finalDataset.isEmpty()) {
         emit Failed(FailureWithQuarantine(
                 QStringLiteral("Published package validation failed: %1").arg(finalError)));
         RequestFinished();
         return;
     }
 
-    emit StatusChanged(QStringLiteral("Package is ready; opening VTM"));
+    emit StatusChanged(QStringLiteral("Package is ready; opening %1")
+                               .arg(QFileInfo(finalDataset).suffix().toUpper()));
     emit ProgressChanged(1.0);
-    emit DatasetReady(finalVtm);
+    emit DatasetReady(finalDataset);
     RequestFinished();
 }
 
-QString igQtRemotePackageLoader::FindSingleVtm(const QString& directory, QString& errorMessage) const
+QString igQtRemotePackageLoader::FindDatasetEntryPoint(const QString& directory, QString& errorMessage) const
 {
-    // A root-level VTM is the package entry point.  Nested test/LOD manifests
-    // are allowed.  For legacy packages without a root manifest, accept one
-    // and only one recursively discovered VTM.
-    const QFileInfo rootInfo(directory);
-    if (!rootInfo.isDir() || igQtIsLinkOrReparsePoint(directory)) {
-        errorMessage = QStringLiteral(
-                "Extracted package root is not a real directory (links and reparse points are rejected)");
-        return {};
-    }
-    const QDir packageDirectory(directory);
-    const QStringList rootVtms = packageDirectory.entryList(
-            QStringList{QStringLiteral("*.vtm")}, QDir::Files | QDir::NoSymLinks, QDir::Name);
-    QString found;
-    if (rootVtms.size() == 1) {
-        found = packageDirectory.filePath(rootVtms.front());
-    } else if (rootVtms.size() > 1) {
-        errorMessage = QStringLiteral("Package contains more than one root VTM entry point");
-        return {};
-    } else {
-        QDirIterator iterator(directory,
-                              QStringList{QStringLiteral("*.vtm")},
-                              QDir::Files | QDir::NoSymLinks,
-                              QDirIterator::Subdirectories);
-        while (iterator.hasNext()) {
-            const QString candidate = iterator.next();
-            if (!found.isEmpty()) {
-                errorMessage = QStringLiteral("Package contains more than one VTM entry point");
-                return {};
-            }
-            found = QDir::cleanPath(candidate);
-        }
-    }
-    if (found.isEmpty()) {
-        errorMessage = QStringLiteral("Package does not contain a VTM entry point");
-        return {};
-    }
-
-    return igQtValidateRemoteVtmManifest(found, directory, errorMessage)
-            ? found : QString();
+    return igQtFindRemoteDatasetEntryPoint(directory, errorMessage);
 }

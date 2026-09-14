@@ -53,6 +53,11 @@ if(WIN32)
 endif()
 
 enable_testing()
+add_executable(iGameVisRemoteModelIdentityTests RemoteModelIdentityTests.cpp)
+target_include_directories(iGameVisRemoteModelIdentityTests PRIVATE "${IGAMEVIS_ROOT}/Qt/include")
+target_link_libraries(iGameVisRemoteModelIdentityTests PRIVATE Qt5::Core)
+add_test(NAME iGameVisRemoteModelIdentityTests COMMAND iGameVisRemoteModelIdentityTests)
+set_tests_properties(iGameVisRemoteModelIdentityTests PROPERTIES TIMEOUT 30)
 add_test(NAME iGameVisRemoteCatalogClientTests
          COMMAND iGameVisRemoteCatalogClientTests)
 set_tests_properties(iGameVisRemoteCatalogClientTests PROPERTIES TIMEOUT 30)

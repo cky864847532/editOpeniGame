@@ -58,6 +58,11 @@
 #include <iGameBlockMapping.h>
 #include <P3SAM/iGameP3SAMSegmenter.h>
 #include <QByteArray>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSaveFile>
+#include <limits>
 #include <QDebug>
 #include <QLabel>
 #include <QMessageBox>
@@ -613,6 +618,11 @@ void igQtMainWindow::resizeEvent(QResizeEvent* event) {
 }
 
 igQtMainWindow::~igQtMainWindow() {
+    // Release independent cache ownership before QObject destroys the renderer.
+    if (fileLoader) {
+        fileLoader->CancelRemotePackage();
+        fileLoader->InvalidateRemoteMemoryCache(QStringLiteral("Client shutdown"));
+    }
     // 清理命令管理器
     if (commandManager) {
         commandManager->stopConnection();
@@ -626,6 +636,20 @@ void igQtMainWindow::initArgs(const QStringList& args) {
     QString remoteHost = QStringLiteral("127.0.0.1");
     quint16 remotePort = 34567;
     QString remoteCache = QStringLiteral("D:/iGameVis-cs-cache");
+    int cacheRepeat = 1;
+    QString cacheBenchmarkOutput;
+    const bool cpuPreload = args.contains(QStringLiteral("--remote-cpu-preload-first")) ||
+                            args.contains(QStringLiteral("--remote-cpu-preload-only"));
+    const bool residentCache = !args.contains(QStringLiteral("--remote-no-memory-cache"));
+    if (cpuPreload && (!residentCache || args.contains(QStringLiteral("--remote-cache-retain-gpu")))) {
+        igError("CPU preload requires memory caching and cannot be combined with --remote-cache-retain-gpu");
+        return;
+    }
+    fileLoader->SetRemoteMemoryCacheEnabled(residentCache);
+    fileLoader->SetRemoteCpuOnlyCacheEnabled(!args.contains(QStringLiteral("--remote-cache-retain-gpu")));
+    fileLoader->SetRemoteCacheStrictValidation(
+            args.contains(QStringLiteral("--remote-cache-repeat")) ||
+            args.contains(QStringLiteral("--remote-cache-benchmark-json")));
     for (int i = 1; i < argc; ++i) {
         const QString& cur_arg = args[i].toLower();
         if (cur_arg == "--filepath" && ++i < argc) {
@@ -648,10 +672,46 @@ void igQtMainWindow::initArgs(const QStringList& args) {
             }
         } else if (cur_arg == "--remote-cache" && ++i < argc) {
             remoteCache = args[i];
+        } else if (cur_arg == "--remote-cpu-cache-limit-gib" && ++i < argc) {
+            bool ok = false;
+            const quint64 gib = args[i].toULongLong(&ok);
+            if (!ok || gib < 1 || gib > 4096) { igError("Invalid CPU cache limit (1..4096 GiB)"); return; }
+            fileLoader->SetRemoteMemoryCacheLimitBytes(gib * 1024ull * 1024 * 1024);
+        } else if (cur_arg == "--remote-cache-repeat" && ++i < argc) {
+            bool ok = false;
+            cacheRepeat = args[i].toInt(&ok);
+            if (!ok || cacheRepeat < 1 || cacheRepeat > 20) {
+                igError("[RemoteOpenBenchmark] --remote-cache-repeat must be in [1,20]");
+                return;
+            }
+        } else if (cur_arg == "--remote-cache-benchmark-json" && ++i < argc) {
+            cacheBenchmarkOutput = args[i];
+        }
+    }
+    if (residentCache) {
+        // Static-model mode is conservative around application editing tools.
+        // Raw-pointer edits outside these paths must explicitly invalidate the cache.
+        connect(ui->menu_filters, &QMenu::triggered, this, [this](QAction*) {
+            fileLoader->InvalidateRemoteMemoryCache(QStringLiteral("Algorithm action entered"));
+        });
+        connect(ui->menu_clip, &QMenu::triggered, this, [this](QAction*) {
+            fileLoader->InvalidateRemoteMemoryCache(QStringLiteral("Clipping action entered"));
+        });
+        for (QAction* action : {ui->action_deformation, ui->action_SelectView,
+                                ui->action_AiChat,
+                                ui->action_ExportAnimation}) {
+            connect(action, &QAction::triggered, this, [this, action]() {
+                fileLoader->InvalidateRemoteMemoryCache(QStringLiteral("Editing/tool action: ") + action->objectName());
+            });
         }
     }
     if (!remotePackage.isEmpty()) {
-        fileLoader->OpenRemotePackage(remoteHost, remotePort, remotePackage, remoteCache);
+        if (residentCache && (cpuPreload || cacheRepeat > 1 || !cacheBenchmarkOutput.isEmpty())) {
+            ConfigureRemoteCacheBenchmark(remotePackage, remoteHost, remotePort, remoteCache,
+                                           cacheRepeat, cacheBenchmarkOutput);
+        } else {
+            fileLoader->OpenRemotePackage(remoteHost, remotePort, remotePackage, remoteCache);
+        }
     }
 }
 void igQtMainWindow::initAllUnDefinedComponents() {
@@ -659,6 +719,7 @@ void igQtMainWindow::initAllUnDefinedComponents() {
     igQtOpenGLManager::Instance()->setQtRenderWidget(rendererWidget);
     //    rendererWidget->setParent(this);
     fileLoader = new igQtFileLoader(this);
+    fileLoader->SetRemoteCacheRenderWidget(rendererWidget);
     remoteModelLibrary = new igQtRemoteModelLibrary(fileLoader, this);
     remoteModelLibrary->hide();
     this->setCentralWidget(rendererWidget);
@@ -876,6 +937,18 @@ void igQtMainWindow::initAllComponents() {
         remoteModelLibrary->show();
         remoteModelLibrary->raise();
         remoteModelLibrary->activateWindow();
+    });
+    auto* clearRemoteMemory = new QAction(QStringLiteral("Clear C/S Memory Cache"), this);
+    clearRemoteMemory->setObjectName(QStringLiteral("action_ClearRemoteMemoryCache"));
+    clearRemoteMemory->setToolTip(QStringLiteral(
+            "Release the cached dataset; visible models and disk cache files are kept."));
+    ui->menu_file->insertAction(ui->menu_RecentFiles->menuAction(), clearRemoteMemory);
+    connect(fileLoader, &igQtFileLoader::RemotePackageRunningChanged, clearRemoteMemory,
+            [clearRemoteMemory](bool running) { clearRemoteMemory->setEnabled(!running); });
+    connect(clearRemoteMemory, &QAction::triggered, this, [this]() {
+        fileLoader->InvalidateRemoteMemoryCache(QStringLiteral("User cleared C/S memory cache"));
+        statusBar()->showMessage(QStringLiteral(
+                "C/S memory cache cleared. Visible models and disk cache files are unchanged."), 7000);
     });
 
     connect(ui->action_ShowOrientationAxes, &QAction::triggered, this, [&](bool checked){
@@ -3270,12 +3343,47 @@ void igQtMainWindow::closeLeftToolPanel(LeftToolPanelId id) {
 }
 
 void igQtMainWindow::initAllMySignalConnections() {
+    connect(fileLoader, &igQtFileLoader::RemoteCachedDatasetReattach, this,
+            [this](DataObject::Pointer object) {
+        if (!modelTreeWidget->getItemFromObject(object)) {
+            modelTreeWidget->addDataObjectToModelTree(object, ItemSource::File);
+        }
+    }, Qt::DirectConnection);
+    connect(fileLoader, &igQtFileLoader::RemoteCachedDatasetDetach, this,
+            [this](DataObject::Pointer object, bool* detached) {
+        auto* item = modelTreeWidget->getItemFromObject(object);
+        if (!item) { return; }
+        modelTreeWidget->setCurrentItem(item);
+        modelTreeWidget->deleteCurrentModel();
+        *detached = modelTreeWidget->getItemFromObject(object) == nullptr;
+        igDebug("[RemoteMemoryCache] Detach tree verification: item_present={}",
+                modelTreeWidget->getItemFromObject(object) != nullptr);
+    }, Qt::DirectConnection);
+    connect(fileLoader, &igQtFileLoader::RemoteRenderRequested,
+            rendererWidget, &igQtRenderWidget::RequestCompletedFrame);
+    connect(fileLoader, &igQtFileLoader::RemoteRenderCancelled,
+            rendererWidget, &igQtRenderWidget::CancelCompletedFrame);
+    connect(rendererWidget, &igQtRenderWidget::CompletedFrame,
+            fileLoader, &igQtFileLoader::NotifyRemoteFrameCompleted);
+    connect(fileLoader, &igQtFileLoader::RemoteCachedModelSelected, this,
+            [this](DataObject::Pointer object) {
+        auto item = modelTreeWidget->getItemFromObject(object);
+        if (item) {
+            item->setExpanded(true);
+            // Selection only. Do NOT call viewAttribute()/FinishReading():
+            // those would regenerate the complete scalar color arrays.
+            modelTreeWidget->setCurrentItem(item);
+        }
+        rendererWidget->update();
+        rendererWidget->getColorBarWidget()->update();
+    });
     // connect(rendererWidget, &igQtModelDrawWidget::insertToModelListView,
     // ui->modelTreeView, &igQtModelListView::InsertModel);
 
     connect(fileLoader, &igQtFileLoader::NewModel, modelTreeWidget, &igQtModelDialogWidget::addDataObjectToModelTree);
     connect(fileLoader, &igQtFileLoader::FinishReading, this, &igQtMainWindow::updateRecentFilePaths);
     connect(ui->action_DeleteMesh, &QAction::triggered, modelTreeWidget, &igQtModelDialogWidget::deleteCurrentModel);
+    connect(ui->action_DeleteMesh, &QAction::triggered, fileLoader, &igQtFileLoader::ReleaseDetachedRemoteGpuResources);
 
     connect(ui->action_DeleteMesh, &QAction::triggered, this, [&](bool){
         if (vortexMetricsLabel) {
@@ -3295,6 +3403,11 @@ void igQtMainWindow::initAllMySignalConnections() {
     connect(fileLoader, &igQtFileLoader::FinishReading, DeformationWidget, &igQtDeformationWidget::updateInfo);
 
     connect(fileLoader, &igQtFileLoader::FinishReading, this, [&]() {
+        if (qEnvironmentVariableIsSet("IGAMEVIS_DISABLE_DEFAULT_SCALAR_MAPPING")) {
+            qInfo() << "Default scalar mapping disabled by IGAMEVIS_DISABLE_DEFAULT_SCALAR_MAPPING";
+            return;
+        }
+
         auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
         if (!scene) return;
 

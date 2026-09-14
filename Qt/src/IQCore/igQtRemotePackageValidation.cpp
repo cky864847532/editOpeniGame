@@ -1,6 +1,7 @@
 #include <IQCore/igQtRemotePackageValidation.h>
 
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QVector>
@@ -55,6 +56,108 @@ bool igQtIsLinkOrReparsePoint(const QString& path)
 #else
     return false;
 #endif
+}
+
+QString igQtFindRemoteDatasetEntryPoint(const QString& packageRoot, QString& errorMessage)
+{
+    errorMessage.clear();
+    const QFileInfo rootInfo(packageRoot);
+    if (!rootInfo.isDir() || igQtIsLinkOrReparsePoint(packageRoot)) {
+        errorMessage = QStringLiteral("Extracted package root is not a real directory");
+        return {};
+    }
+    const QString canonicalRoot = rootInfo.canonicalFilePath();
+    if (canonicalRoot.isEmpty()) {
+        errorMessage = QStringLiteral("Cannot resolve the extracted package root");
+        return {};
+    }
+    const QDir directory(packageRoot);
+    const QStringList rootVtms = directory.entryList(
+            {QStringLiteral("*.vtm")}, QDir::Files | QDir::NoSymLinks, QDir::Name);
+    QString found;
+    if (rootVtms.size() == 1) {
+        found = directory.filePath(rootVtms.front());
+    } else if (rootVtms.size() > 1) {
+        errorMessage = QStringLiteral("Package contains more than one root VTM entry point");
+        return {};
+    } else {
+        // Preserve legacy nested-manifest behavior before considering new
+        // standalone datasets. A VTM may itself reference root VTP/VTU files.
+        QDirIterator iterator(packageRoot, {QStringLiteral("*.vtm")},
+                              QDir::Files | QDir::NoSymLinks, QDirIterator::Subdirectories);
+        while (iterator.hasNext()) {
+            const QString candidate = iterator.next();
+            if (!found.isEmpty()) {
+                errorMessage = QStringLiteral("Package contains more than one VTM entry point");
+                return {};
+            }
+            found = QDir::cleanPath(candidate);
+        }
+    }
+    if (!found.isEmpty()) {
+        return igQtValidateRemoteVtmManifest(found, packageRoot, errorMessage) ? found : QString();
+    }
+
+    const QStringList datasets = directory.entryList(
+            {QStringLiteral("*.vtp"), QStringLiteral("*.vtu")},
+            QDir::Files | QDir::NoSymLinks, QDir::Name);
+    if (datasets.size() != 1) {
+        errorMessage = datasets.isEmpty()
+                ? QStringLiteral("Package does not contain a VTM or standalone root VTP/VTU entry point")
+                : QStringLiteral("Package contains more than one standalone root VTP/VTU entry point");
+        return {};
+    }
+    found = directory.filePath(datasets.front());
+    const QFileInfo datasetInfo(found);
+    const QString canonicalDataset = datasetInfo.canonicalFilePath();
+    if (igQtIsLinkOrReparsePoint(found) || canonicalDataset.isEmpty() ||
+        !IsWithinRoot(canonicalDataset, canonicalRoot)) {
+        errorMessage = QStringLiteral("Dataset entry point is missing, a link, or outside the package");
+        return {};
+    }
+    QFile dataset(found);
+    if (!dataset.open(QIODevice::ReadOnly)) {
+        errorMessage = QStringLiteral("Cannot read dataset entry point: %1").arg(dataset.errorString());
+        return {};
+    }
+    // Qt may decode its entire input buffer before yielding the first XML
+    // token. Raw appended Float64/Int64 bytes can be invalid UTF-8, so merely
+    // returning when Piece is encountered is too late. Only give the parser
+    // the bounded XML prefix preceding AppendedData, never its binary payload.
+    QByteArray header = dataset.read(1024 * 1024);
+    const int appendedStart = header.indexOf("<AppendedData");
+    if (appendedStart >= 0) { header.truncate(appendedStart); }
+    QXmlStreamReader xml(header);
+    const QString expectedType = datasetInfo.suffix().compare(QStringLiteral("vtp"), Qt::CaseInsensitive) == 0
+            ? QStringLiteral("PolyData") : QStringLiteral("UnstructuredGrid");
+    int depth = 0;
+    bool datasetStarted = false;
+    while (!xml.atEnd()) {
+        xml.readNext();
+        if (xml.isStartElement()) {
+            ++depth;
+            if (depth == 1 && (xml.name() != QStringLiteral("VTKFile") ||
+                              xml.attributes().value(QStringLiteral("type")) != expectedType)) {
+                errorMessage = QStringLiteral("Standalone dataset VTKFile type does not match its extension");
+                return {};
+            }
+            if (depth == 2 && xml.name() == expectedType) { datasetStarted = true; }
+            if (datasetStarted && depth == 3 && xml.name() == QStringLiteral("Piece")) {
+                bool validCount = false;
+                xml.attributes().value(QStringLiteral("NumberOfPoints")).toULongLong(&validCount);
+                if (!validCount) {
+                    errorMessage = QStringLiteral("Standalone dataset Piece has an invalid NumberOfPoints");
+                    return {};
+                }
+                return found;
+            }
+        } else if (xml.isEndElement()) {
+            if (depth == 2) { datasetStarted = false; }
+            --depth;
+        }
+    }
+    errorMessage = QStringLiteral("Standalone dataset is missing a valid VTK Piece header within 1 MiB");
+    return {};
 }
 
 bool igQtValidateRemoteVtmManifest(const QString& manifestPath,

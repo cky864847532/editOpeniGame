@@ -317,8 +317,12 @@ void Model::Draw() {
             auto edgeMaskTexture =
                     colorWithCell ? renderableObject->m_CellEdgeMaskTexture
                                   : renderableObject->m_EdgeMaskTexture;
-            edgeMaskTexture->Active(GL_TEXTURE1);
+            const int constantEdgeMask = colorWithCell ? renderableObject->m_ConstantCellEdgeMask
+                                                      : renderableObject->m_ConstantEdgeMask;
+            if (constantEdgeMask < 0) { edgeMaskTexture->Active(GL_TEXTURE1); }
             shader->SetUniformi("edgeMasks", 1);
+            shader->SetUniformi("constantEdgeMask", constantEdgeMask);
+            shader->SetUniformi("edgeMaskPrimitiveOffset", 0);
 
             if (useColor && !colorWithCell) {
                 shader->SetUniformi("edgeColorMode", 0);
@@ -343,7 +347,8 @@ void Model::Draw() {
                                 1,
                         renderableObject->m_TriangleIndices
                                 ->GetNumberOfValues(),
-                        GL_UNSIGNED_INT);
+                        GL_UNSIGNED_INT, nullptr,
+                        glGetUniformLocation(shader->ProgramID(), "edgeMaskPrimitiveOffset"));
             }
         } else {
 #else
