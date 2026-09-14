@@ -26,6 +26,7 @@
 #include <IQComponents/Dialog/igQtSplineOptionDialog.h>
 #include <IQCore/igQtFileLoader.h>
 #include <IQCore/igQtFileType.h>
+#include <QMetaObject>
 #include <iGameType.h>
 
 #include <QCoreApplication>
@@ -57,7 +58,10 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
     m_SceneManager = SceneManager::Instance();
 }
 
-igQtFileLoader::~igQtFileLoader() {}
+igQtFileLoader::~igQtFileLoader() {
+    // 退出时等待正在进行的加载线程结束，避免它访问/回调已经销毁的对象。
+    if (m_LoadThread.joinable()) { m_LoadThread.join(); }
+}
 void igQtFileLoader::LoadOnlineS() {
 #if defined(_WIN32) || defined(_WIN64)
     std::thread server_thread(serverThread);
@@ -187,23 +191,41 @@ void igQtFileLoader::OpenFile(const std::string& filePath) {
     }
 #endif
 
-    auto obj = iGame::FileIO::ReadFile(filePath);
-    //_obj = obj;
-    if (obj == nullptr) {
-        igDebug("This file read error.");
+    // 异步加载：读盘 + 解析放到工作线程，避免阻塞 GUI 线程。
+    // （同步版会让事件循环在加载期间停摆，进度条只能在加载结束后一次性回放。）
+    if (m_Loading) {
+        igDebug("A file is already being loaded, ignore: " + filePath);
         return;
     }
-    auto filename = filePath.substr(filePath.find_last_of('/') + 1);
-    obj->SetName(filename.substr(0, filename.find_last_of('.')).c_str());
-    obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(filePath);
-    //Q_EMIT AddFileToModelList(QString(filePath.substr(filePath.find_last_of('/') + 1).c_str()));
+    if (m_LoadThread.joinable()) { m_LoadThread.join(); } // 回收上一次已经结束的线程
+    m_Loading = true;
 
-    this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
+    const std::string path = filePath;
+    m_LoadThread = std::thread([this, path]() {
+        // ---- 工作线程：只读数据，不碰 UI ----
+        auto obj = iGame::FileIO::ReadFile(path);
 
+        // ---- 回到 GUI 线程：挂模型 / 更新最近文件 / 发信号 ----
+        QMetaObject::invokeMethod(
+                this,
+                [this, obj, path]() {
+                    m_Loading = false;
+                    if (obj == nullptr) {
+                        igDebug("This file read error.");
+                        return;
+                    }
+                    auto filename = path.substr(path.find_last_of('/') + 1);
+                    obj->SetName(filename.substr(0, filename.find_last_of('.')).c_str());
+                    obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(path);
+                    //Q_EMIT AddFileToModelList(QString(path.substr(path.find_last_of('/') + 1).c_str()));
 
-    //return;
-    emit NewModel(obj, ItemSource::File);
-    emit FinishReading();
+                    this->SaveCurrentFileToRecentFile(FromUtf8FilePath(path));
+
+                    emit NewModel(obj, ItemSource::File);
+                    emit FinishReading();
+                },
+                Qt::QueuedConnection);
+    });
 }
 
 void igQtFileLoader::OpenFiles(const QStringList& filePaths) {

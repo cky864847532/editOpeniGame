@@ -15,6 +15,8 @@
 #include <QWidget>
 #include <IQCore/igQtExportModule.h>
 
+class QTimer;
+
 class IG_QT_MODULE_EXPORT igQtProgressBarWidget : public QWidget{
 public:
     static constexpr const char* DEFAULT = "进度条";
@@ -26,9 +28,12 @@ public:
     void updateProgressBarLabel(const char* info);
 private:
     void resetTextMode();
+    /** GUI 线程里的进度处理：走原逻辑，并（可选）驱动"合成爬升"动画 */
+    void onProgressEvent(double value);
 
     QProgressBar* progressBar;
     QLabel *progressBarLabel;
     iGame::ProgressObserver* progressObserver;
     bool hasExternalText{false};
+    QTimer* m_creepTimer{nullptr};
 };
