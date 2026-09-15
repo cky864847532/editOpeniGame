@@ -14,6 +14,7 @@
 #include "iGameScalarsToColors.h"
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
+#include "ModelSurface/iGameModelGeometryFilter.h"
 
 #include <cmath>
 #include <cstddef>
@@ -276,9 +277,8 @@ namespace iGame::datacodec_test {
             [&] { return next < 2u; },
             [&](std::size_t& index) { index = 1u - next++; return true; },
             [&](const std::size_t index, std::size_t&, ::datacodec::WorkerContext& worker) {
-                ::datacodec::ResourceDebugSnapshot snapshot;
-                if (!run.TryCopyResourceDebugSnapshot(snapshot) || snapshot.admittedBlocks == 0u ||
-                    snapshot.activeComputeUnits == 0u || snapshot.activeComputeUnits > workers) { return false; }
+                // 并发任务直接检查 worker 身份，非阻塞诊断快照允许因锁竞争暂时不可用
+                if (run.IsDriverThread() || worker.Index() >= workers || worker.ComputeUnits() != 1u) { return false; }
                 std::string localError;
                 return observer.ObserveConnectivityBlock({.blockIndex = index, .cellOffset = index,
                     .fixedCellSize = 4, .connectivity = vertices[index], .cellTypes = cellTypes,
@@ -303,7 +303,52 @@ namespace iGame::datacodec_test {
     return true;
 }
 
+[[nodiscard]] inline bool TestSurfaceAttributeRanges() {
+    auto input = AttributeSet::New();
+    std::vector<DoubleArray::Pointer> expectedRanges;
+    for (int field = 0; field < 24; ++field) {
+        auto values = FloatArray::New();
+        values->SetName("field_" + std::to_string(field));
+        values->SetDimension(3);
+        for (int tuple = 0; tuple < 3; ++tuple) {
+            values->AddElement({static_cast<float>(tuple - field),
+                static_cast<float>(tuple + field + 1), static_cast<float>(2 * tuple - field)});
+        }
+        AttributeSet::Attribute reference;
+        reference.pointer = values;
+        expectedRanges.push_back(reference.GetDataRange());
+        input->AddAttribute(IG_VECTOR, field % 2 == 0 ? IG_POINT : IG_CELL, values,
+            field == 0 ? expectedRanges.back() : nullptr);
+    }
+    auto filter = ModelGeometryFilter::New();
+    std::vector<igIndex> faceToCell{2, 0, 2};
+    AttributeSet::Pointer output;
+    filter->CompositeCellAttribute(faceToCell, input, output);
+    if (output == nullptr || output->GetNumberOfAttributes() != expectedRanges.size()) { return false; }
+    for (int field = 0; field < static_cast<int>(expectedRanges.size()); ++field) {
+        auto& attribute = output->GetAttribute(field);
+        const auto range = attribute.GetDataRange();
+        if (range != input->GetAttribute(field).dataRange ||
+            attribute.pointer->GetName() != input->GetAttribute(field).pointer->GetName()) { return false; }
+        for (IGsize value = 0; value < range->GetNumberOfValues(); ++value) {
+            if (range->GetValue(value) != expectedRanges[field]->GetValue(value)) { return false; }
+        }
+        for (IGsize tuple = 0; tuple < faceToCell.size(); ++tuple) {
+            for (int component = 0; component < 3; ++component) {
+                const auto sourceTuple = field % 2 == 0 ? tuple : static_cast<IGsize>(faceToCell[tuple]);
+                if (attribute.pointer->GetElementValue(tuple, component) !=
+                    input->GetAttribute(field).pointer->GetElementValue(sourceTuple, component)) { return false; }
+            }
+        }
+    }
+    return output->GetAttribute(0).dataRange == expectedRanges.front();
+}
+
 [[nodiscard]] inline int RunDataCodecFeaturePreparedSurfaceAttributes() {
+    if (!TestSurfaceAttributeRanges()) {
+        std::cerr << "surface attribute ranges or tuple mapping changed\n";
+        return 1;
+    }
     if (!TestSynchronousPreparedSurfaceObserver()) {
         std::cerr << "synchronous prepared surface observer contract failed\n";
         return 1;

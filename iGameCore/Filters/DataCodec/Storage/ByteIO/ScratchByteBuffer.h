@@ -37,13 +37,12 @@ struct PoolState {
     }
 
     void Return(std::vector<std::uint8_t> block, std::uint64_t generation) noexcept {
-        block.clear();
         {
             std::lock_guard lock(mutex);
             --activeBlockCount;
             if (!closed && generation == returnGeneration && block.capacity() != 0u &&
                 block.capacity() <= kMaxRetainedScratchBlockBytes &&
-                freeBlocks.size() < retainedLimit && freeBlocks.size() < freeBlocks.capacity()) {
+                freeBlocks.size() + fixedBlocks.size() < retainedLimit && freeBlocks.size() < freeBlocks.capacity()) {
                 retainedBytes += block.capacity();
                 freeBlocks.push_back(std::move(block));
             }
@@ -62,6 +61,7 @@ struct PoolState {
     std::uint64_t allocationCount{0u};
     std::uint64_t returnGeneration{0u};
     bool closed{false};
+    bool trimFixedRequested{false};
 };
 
 }
@@ -176,12 +176,23 @@ public:
     }
 
     // 发布只修改数量，不析构数组；根在发布目标后于锁外调用 TrimRetained
-    void SetRetainedCount(std::size_t count) noexcept {
+    void SetRetainedCount(std::size_t count, bool trimFixed = false) noexcept {
         std::lock_guard lock(m_state->mutex);
         m_state->retainedLimit = m_state->closed ? 0u : std::min(count, m_state->freeBlocks.capacity());
+        m_state->trimFixedRequested |= trimFixed;
     }
 
     [[nodiscard]] ScratchByteBuffer Acquire(std::size_t bytes) {
+        return AcquireImpl(bytes, true);
+    }
+
+    // 调用方必须完整覆盖借出的字节，复用已有长度以避免重复清零
+    [[nodiscard]] ScratchByteBuffer AcquireForOverwrite(std::size_t bytes) {
+        return AcquireImpl(bytes, false);
+    }
+
+private:
+    ScratchByteBuffer AcquireImpl(std::size_t bytes, bool initialize) {
         std::vector<std::uint8_t> block;
         bool reused = false;
         std::uint64_t generation = 0u;
@@ -202,7 +213,9 @@ public:
                 reused = true;
             }
         }
+        const auto existing = std::min(bytes, block.size());
         block.resize(bytes);
+        if (initialize) { std::fill_n(block.begin(), existing, std::uint8_t{0u}); }
         {
             std::lock_guard lock(m_state->mutex);
             m_state->acquiredBytes += std::min<std::uint64_t>(bytes,
@@ -214,16 +227,25 @@ public:
         return ScratchByteBuffer(m_state, std::move(block), generation);
     }
 
+public:
     void TrimRetained() noexcept {
-        ClearFixed();
         for (;;) {
             std::vector<std::uint8_t> retired;
+            FixedByteBacking retiredFixed;
             {
                 std::lock_guard lock(m_state->mutex);
-                if (m_state->freeBlocks.size() <= m_state->retainedLimit) { return; }
-                retired = std::move(m_state->freeBlocks.back());
-                m_state->freeBlocks.pop_back();
-                m_state->retainedBytes -= retired.capacity();
+                if (m_state->fixedBlocks.empty()) { m_state->trimFixedRequested = false; }
+                if (!m_state->trimFixedRequested &&
+                    m_state->freeBlocks.size() + m_state->fixedBlocks.size() <= m_state->retainedLimit) { return; }
+                if (!m_state->fixedBlocks.empty()) {
+                    retiredFixed = std::move(m_state->fixedBlocks.back());
+                    m_state->fixedBlocks.pop_back();
+                    m_state->retainedBytes -= retiredFixed.size;
+                } else {
+                    retired = std::move(m_state->freeBlocks.back());
+                    m_state->freeBlocks.pop_back();
+                    m_state->retainedBytes -= retired.capacity();
+                }
             }
         }
     }

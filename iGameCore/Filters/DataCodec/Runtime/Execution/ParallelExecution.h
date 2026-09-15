@@ -214,7 +214,7 @@ bool RunOrderedBlocks(DataCodecExecutionResources& run, More&& more, Read&& read
         }
         run.SetFlowProgress(false);
         run.ClearByteWait();
-        run.Scratch().ClearFixed();
+        run.Scratch().TrimRetained();
         drain.Complete();
         return !run.Stopped();
         } catch (...) {

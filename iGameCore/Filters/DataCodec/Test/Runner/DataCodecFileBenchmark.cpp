@@ -9,6 +9,7 @@
 #include "DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
 #include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
+#include "ModelSurface/iGameModelGeometryFilter.h"
 #include <windows.h>
 #include <psapi.h>
 #include <chrono>
@@ -178,29 +179,54 @@ int main(int argc, char** argv) {
             Describe(decoded.decodedFramePackage ? assembly.Output() : adapter.TakeDataObject(), "bounded_decoded");
             return storage.peakReservedBytes <= limit ? 0 : 6;
         }
-        if (argc == 3 && std::string_view(argv[1]) == "--decode") {
+        if (argc == 3 && (std::string_view(argv[1]) == "--decode" || std::string_view(argv[1]) == "--surface")) {
+            const bool surface = std::string_view(argv[1]) == "--surface";
             std::cout << std::fixed << std::setprecision(3);
-            std::cout << "CONFIG decode_only=true mode=Adaptive threads=automatic storage=automatic all_attributes=true" << std::endl;
+            std::cout << "CONFIG decode_only=true mode=" << (surface ? "Unlimited" : "Adaptive")
+                      << " threads=unlimited storage=automatic all_attributes=true surface=" << surface << std::endl;
             Memory("before_decode");
             const auto start = Clock::now();
             iGame::DataCodecDataObjectDecodeRequest request;
             request.inputReader = std::make_shared<::datacodec::FileByteRangeReader>(argv[2]);
             request.loadAllAvailableAttributes = true;
             request.runRecordSink = std::make_shared<Records>();
+            if (surface) { request.resources.mode = datacodec::CodecResourceMode::Unlimited; }
             const auto decoded = iGame::DecodeDataCodecDataObject(request);
-            std::cout << "RESULT decode_success=" << decoded.success << " decode_seconds=" << Seconds(start)
+            const auto decodeSeconds = Seconds(start);
+            std::cout << "RESULT decode_success=" << decoded.success << " decode_seconds=" << decodeSeconds
                       << " decoded_cache_hit=" << decoded.decodedFrameCacheHit << std::endl;
             Memory("after_decode");
             if (!decoded.success || decoded.output == nullptr) {
                 for (const auto& m : decoded.messages) { std::cerr << m.code << ' ' << m.text << ' ' << m.technicalDetail << '\n'; }
                 return 5;
             }
+            if (surface) {
+                const auto surfaceStart = Clock::now();
+                std::size_t surfacePoints = 0u, surfaceFaces = 0u;
+                iGame::iGameBlockTreeAdapter tree(decoded.output);
+                for (const auto& leaf : tree.GetLeaves()) {
+                    auto filter = iGame::ModelGeometryFilter::New();
+                    iGame::SurfaceMesh::Pointer mesh;
+                    if (!filter->Execute(leaf.object, mesh) || mesh == nullptr) {
+                        std::cerr << "Surface extraction failed\n";
+                        return 8;
+                    }
+                    surfacePoints += mesh->GetNumberOfPoints();
+                    surfaceFaces += mesh->GetNumberOfFaces();
+                }
+                const auto surfaceSeconds = Seconds(surfaceStart);
+                std::cout << "RESULT surface_seconds=" << surfaceSeconds
+                          << " decode_to_surface_seconds=" << decodeSeconds + surfaceSeconds
+                          << " surface_points=" << surfacePoints << " surface_faces=" << surfaceFaces << std::endl;
+                Memory("after_surface");
+            }
             Describe(decoded.output, "decoded");
             return 0;
         }
         if (argc < 3 || (argc - 3) % 2 != 0) {
             std::cerr << "Usage: iGameDataCodecFileBenchmark input.cgns new-output.igc "
-                "[--memory unlimited|fixed|adaptive] [--threads N | --cpu-idle percent] [--memory-reserve percent]\n";
+                "[--memory unlimited|fixed|adaptive] [--threads N | --cpu-idle percent] [--memory-reserve percent]\n"
+                "       iGameDataCodecFileBenchmark --decode|--surface input.igc\n";
             return 2;
         }
         datacodec::CodecResourceParams resources;

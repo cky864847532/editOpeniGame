@@ -39,12 +39,35 @@ inline TestResult RunDataCodecFeatureUnlimitedThreads() {
         Require(result, snapshot.createdWorkers == 0u && run.WorkerCapacity() == 0u,
             "threads.lazy", "constructing unlimited resources must not create workers");
         Require(result, run.BeginRun(), "threads.begin", "unlimited request must start");
-        for (int wave = 0; wave < 2; ++wave) {
-            constexpr std::size_t count = 6u;
+        {
+            auto first = run.Scratch().Acquire(32u);
+            auto second = run.Scratch().Acquire(64u);
+            first.Release();
+            second.Release();
+            const auto before = run.Scratch().SnapshotStats();
+            auto reused = run.Scratch().Acquire(32u);
+            const auto after = run.Scratch().SnapshotStats();
+            Require(result, before.retainedBlockCount == 2u &&
+                after.allocationCount == before.allocationCount &&
+                after.reusedBlockCount == before.reusedBlockCount + 1u,
+                "threads.scratch-reuse", "unlimited workers must retain and reuse scratch between blocks");
+        }
+        constexpr std::size_t count = 24u;
+        std::vector<std::thread::id> threads(count);
+        std::vector<const void*> compressors(count);
+        for (int wave = 0; wave < 3; ++wave) {
+            if (wave == 2) {
+                Require(result, run.EndRun(), "threads.end", "completed request must drain");
+                run.TryCopyResourceDebugSnapshot(snapshot);
+                Require(result, snapshot.createdWorkers == count && snapshot.activeComputeUnits == 0u,
+                    "threads.retain", "normal request completion must retain idle workers");
+                Require(result, run.BeginRun(), "threads.reopen", "unlimited resources must support another request");
+            }
             std::mutex mutex;
             std::condition_variable_any changed;
             std::size_t entered = 0u;
             bool released = false;
+            bool reused = true;
             std::vector<SlotLease> slots;
             std::vector<std::shared_ptr<TerminalWork>> tasks;
             slots.reserve(count);
@@ -56,6 +79,15 @@ inline TestResult RunDataCodecFeatureUnlimitedThreads() {
                 slots.push_back(std::move(*slot));
                 tasks.push_back(std::make_shared<TerminalWork>([&](WorkerContext& worker) {
                     std::unique_lock lock(mutex);
+                    const auto index = worker.Index();
+                    const auto* compressor = &worker.NumericCompressor();
+                    if (index >= count) { reused = false; }
+                    else if (wave == 0) {
+                        threads[index] = std::this_thread::get_id();
+                        compressors[index] = compressor;
+                    } else {
+                        reused &= threads[index] == std::this_thread::get_id() && compressors[index] == compressor;
+                    }
                     ++entered;
                     changed.notify_all();
                     return changed.wait(lock, worker.StopToken(), [&] { return released; });
@@ -70,9 +102,9 @@ inline TestResult RunDataCodecFeatureUnlimitedThreads() {
                 released = true;
             }
             changed.notify_all();
-            Require(result, concurrent && snapshot.createdWorkers == count && snapshot.activeComputeUnits == count,
+            Require(result, concurrent && reused && snapshot.createdWorkers == count && snapshot.activeComputeUnits == count,
                 wave == 0 ? "threads.exceed-device" : "threads.reuse",
-                "six tasks must run concurrently on a one-core sample and reuse the same workers in the next flow");
+                "tasks must exceed the device hint and reuse threads and compressors across flows and requests");
             bool completed = submitted;
             for (std::size_t i = 0u; i < tasks.size(); ++i) {
                 if (wait(run, *tasks[i])) { completed &= run.CommitSlot(slots[i]); }
@@ -82,16 +114,11 @@ inline TestResult RunDataCodecFeatureUnlimitedThreads() {
             slots.clear();
             if (!completed) { break; }
         }
-        Require(result, run.EndRun(), "threads.end", "completed request must drain");
+        Require(result, run.EndRun(), "threads.final-end", "completed request must drain");
+        run.ShutdownAndJoin();
         run.TryCopyResourceDebugSnapshot(snapshot);
         Require(result, snapshot.createdWorkers == 0u && snapshot.activeComputeUnits == 0u,
-            "threads.retire", "unlimited workers must be joined at request completion");
-        Require(result, run.BeginRun(), "threads.reopen", "unlimited resources must support another request");
-        auto slot = run.TryAcquireSlot();
-        Require(result, slot && RunTerminalWork(run, *slot, [](WorkerContext&) { return true; }),
-            "threads.reopened-work", "reopened unlimited executor must run work");
-        if (slot) { run.CommitSlot(*slot); slot.reset(); }
-        run.EndRun();
+            "threads.retire", "shutdown must join every retained unlimited worker");
     }
     {
         DataCodecExecutionResources run(config);

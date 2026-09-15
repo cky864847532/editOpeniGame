@@ -293,7 +293,7 @@ inline bool TestNativePolyhedronResourceBoundary() {
             .uniqueVertexIdCount = p.uniqueVertexIdCount, .localFaceVertexIdCount = p.localFaceVertexIdCount};
         iGameDecodeAdapter output;
         bool emitted = output.SetMeshType(MeshType::PolyhedronMesh, &error) && output.BeginPoints(3u, 3u, &error);
-        const auto controlledBeforeEmit = root.StorageCapacity()->Snapshot().reservedBytes;
+        const auto controlledBeforeEmit = root.StorageCapacity()->Snapshot().reservedBytes - root.Scratch().RetainedFixedBytes();
         std::uint64_t batches = 0u;
         std::size_t sampleGroups = 0u;
         bool windows = true;
@@ -311,7 +311,7 @@ inline bool TestNativePolyhedronResourceBoundary() {
                     samples[static_cast<std::size_t>(Sample::LocalIds)].capacityBytes == count * 27u * sizeof(IndexType);
             });
         Require(result, emitted && windows && batches == 2u && sampleGroups == 2u &&
-            root.StorageCapacity()->Snapshot().reservedBytes == controlledBeforeEmit,
+            root.StorageCapacity()->Snapshot().reservedBytes == controlledBeforeEmit + root.Scratch().RetainedFixedBytes(),
             "polyhedron.native-emit-windows", error.empty() ?
                 "native emission must cross the fixed cell boundary with a 1 MiB face scan and exempt host output" : error);
         iGameEncodeAdapter replay(output.TakeDataObject());

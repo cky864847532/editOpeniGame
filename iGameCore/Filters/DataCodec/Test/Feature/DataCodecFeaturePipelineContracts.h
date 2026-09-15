@@ -257,7 +257,9 @@ inline void CheckDecodeSessionOwnerLifetime(TestResult& result, EncodedBuffer en
     Require(result, !weakWorkspace.expired() && root.StorageCapacity()->Snapshot().reservedBytes != 0u,
         "pipeline.decode-session-alias-retains-workspace", "the aliasing byte-store session must retain the actual workspace and its data");
     sessionOwner.reset();
-    Require(result, weakWorkspace.expired() && root.StorageCapacity()->Snapshot().reservedBytes == 0u && scope.Finish(true),
+    Require(result, weakWorkspace.expired() &&
+        root.StorageCapacity()->Snapshot().reservedBytes == root.Scratch().RetainedFixedBytes() &&
+        scope.Finish(true) && root.StorageCapacity()->Snapshot().reservedBytes == 0u,
         "pipeline.decode-session-final-owner", "the last real workspace alias must release all decoded storage capacity");
 }
 

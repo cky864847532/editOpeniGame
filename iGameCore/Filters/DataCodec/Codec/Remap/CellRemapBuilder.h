@@ -229,11 +229,18 @@ inline bool BuildMortonRemapProvider(
     remapOptions.providerFactory = options.providerFactory;
     remapOptions.byteStoreSession = options.byteStoreSession;
     remapOptions.buildInverse = false;
+    const auto* pointInverse = options.pointInverse != nullptr && options.pointInverse->IsIdentity()
+        ? nullptr : options.pointInverse;
+    const auto* storedInverse = dynamic_cast<const RemapStoreProvider*>(pointInverse);
+    // 只读内存可以并行，自定义存储和文件读取保持原有顺序
+    remapOptions.parallelKeyRead = pointInverse == nullptr ||
+        dynamic_cast<const VectorRemapProvider*>(pointInverse) != nullptr ||
+        (storedInverse != nullptr && dynamic_cast<const bytestore::MemoryStore*>(storedInverse->ByteSource()) != nullptr);
 
     mortonremap::MortonRemapResult result;
     try {
         const auto keyGetter = [&](const std::size_t cellIndex) {
-            return ComputeIntervalMortonKey(topology, options.pointInverse, cellIndex);
+            return ComputeIntervalMortonKey(topology, pointInverse, cellIndex);
         };
         if (!mortonremap::BuildMortonRemapProvider(
                 topology.cellCount,

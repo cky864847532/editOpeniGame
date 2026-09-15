@@ -125,6 +125,61 @@ inline TestResult RunDataCodecFeatureExecutionMechanism() {
             "execution.commit-driven-cursor", "final commit must stop admission without reading an extra empty block");
     }
     {
+        ScratchByteBufferPool pool(1u);
+        auto dirty = pool.Acquire(64u);
+        std::fill(dirty.Bytes().begin(), dirty.Bytes().end(), std::uint8_t{42u});
+        dirty.Release();
+        auto overwrite = pool.AcquireForOverwrite(64u);
+        Require(result, std::all_of(overwrite.Bytes().begin(), overwrite.Bytes().end(),
+                [](auto value) { return value == 42u; }),
+            "scratch.overwrite-reuse", "overwrite acquisition must preserve reusable storage without clearing");
+        overwrite.Release();
+        auto initialized = pool.Acquire(32u);
+        Require(result, std::all_of(initialized.Bytes().begin(), initialized.Bytes().end(),
+                [](auto value) { return value == 0u; }) && pool.SnapshotStats().allocationCount == 1u,
+            "scratch.initialized-reuse", "ordinary acquisition must keep its zero initialization contract");
+    }
+    {
+        DataCodecExecutionResources run(fixed);
+        run.BeginRun();
+        DecodeBlockMemoryPlan plan;
+        const auto input = plan.Append<std::uint8_t>(DecodeMemoryRegion::Input, 32u);
+        const auto flow = [&](unsigned field) {
+            bool pending = true;
+            return RunOrderedBlocks<unsigned, unsigned>(run,
+                [&] { return pending; },
+                [&](unsigned& value, const SlotLease&, DecodeBlockWorkspace& workspace) {
+                    pending = false;
+                    value = field;
+                    auto bytes = workspace.View<std::uint8_t>(input);
+                    bytes.assign(32u, static_cast<std::uint8_t>(field));
+                    return true;
+                },
+                [&](unsigned value, unsigned& output, WorkerContext&, DecodeBlockWorkspace& workspace) {
+                    auto bytes = workspace.View<std::uint8_t>(input);
+                    bytes.resize(32u);
+                    output = bytes[0];
+                    return output == value;
+                }, [&](unsigned value) { return value == field; }, true,
+                [&] { return ResourceWorkType{.path = ResourceWorkPath::AttributeDecode, .codec = field}; },
+                [&] { return plan; });
+        };
+        const bool first = flow(1u);
+        const auto allocated = run.Scratch().SnapshotStats().allocationCount;
+        run.UpdateLimits(fixed.initialLimits, true, ResourceDecisionReason::MechanismCheck);
+        const bool second = flow(2u);
+        Require(result, first && second && allocated == 1u &&
+            run.Scratch().SnapshotStats().allocationCount == allocated &&
+            run.StorageCapacity()->Snapshot().reservedBytes == 32u,
+            "scratch.cross-flow", "field changes and unchanged targets must reuse budgeted workspace across flows");
+        run.UpdateLimits({16u, 1u, 1u}, true, ResourceDecisionReason::MechanismCheck);
+        Require(result, run.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "scratch.shrink-fixed", "a memory target reduction must release idle fixed workspace");
+        run.UpdateLimits(fixed.initialLimits, true, ResourceDecisionReason::MechanismCheck);
+        Require(result, flow(3u) && run.EndRun() && run.StorageCapacity()->Snapshot().reservedBytes == 0u,
+            "scratch.end-fixed", "request completion must release retained workspace reservations");
+    }
+    {
         ScratchByteBuffer survivor;
         {
             ScratchByteBufferPool pool(4u);

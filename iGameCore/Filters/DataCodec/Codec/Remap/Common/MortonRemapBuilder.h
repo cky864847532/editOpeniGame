@@ -41,6 +41,8 @@ struct MortonRemapOptions {
     WritableRemapProviderFactory providerFactory{};
     bytestore::ByteStoreSession* byteStoreSession{nullptr};
     bool buildInverse{false};
+    // 仅在 getter 支持并发只读访问时开启
+    bool parallelKeyRead{false};
 };
 
 struct MortonRemapResult {
@@ -117,8 +119,8 @@ inline void EmitMortonSamples(const MortonRemapOptions& options,
     catch (...) { options.resources.RecordDiagnosticExportFailure(); }
 }
 
-// 分段由 driver 逐次提交，终端工作不等待同池子任务
- template<class TWork>
+// 共享分桶写出由 driver 逐次提交，独立键生成使用现有块执行器
+template<class TWork>
 inline bool RunMortonRanges(DataCodecExecutionResources& root, const HeavyPhaseLease& phase,
     const std::size_t count, TWork&& work) {
     for (std::size_t first = 0u; first < count;) {
@@ -128,6 +130,28 @@ inline bool RunMortonRanges(DataCodecExecutionResources& root, const HeavyPhaseL
         first = end;
     }
     return true;
+}
+
+template<class TKeyGetter, class TStore>
+inline bool ComputeMortonKeys(DataCodecExecutionResources& root, std::size_t count,
+    TKeyGetter&& getter, TStore&& store) {
+    std::size_t next = 0u;
+    return RunOrderedBlocks<std::size_t, std::size_t>(root,
+        [&] { return next < count; },
+        [&](std::size_t& first) {
+            first = next;
+            next += std::min<std::size_t>(numericarray::kSpatialBlockElementCount, count - next);
+            return true;
+        },
+        [&](std::size_t first, std::size_t&, WorkerContext& worker) {
+            const auto stop = worker.StopToken();
+            const auto end = first + std::min<std::size_t>(numericarray::kSpatialBlockElementCount, count - first);
+            for (auto i = first; i < end; ++i) {
+                if (stop.stop_requested()) { return false; }
+                store(i, getter(i));
+            }
+            return !stop.stop_requested();
+        }, [](std::size_t&) { return true; });
 }
 
 inline constexpr std::size_t ResolveLeafBudgetElements() noexcept {
@@ -340,9 +364,10 @@ inline bool WriteHighBucketRun(
         return true;
     };
     const auto progressStep = std::max<std::size_t>(elementCount / 64u, 1u);
+    const auto stop = options.resources.StopToken();
     if (!RunMortonRanges(options.resources, phase, elementCount, [&](std::size_t first, std::size_t end) {
     for (std::size_t elementIndex = first; elementIndex < end; ++elementIndex) {
-        if (options.resources.Stopped()) { return false; }
+        if (stop.stop_requested()) { return false; }
         const auto key = keyGetter(elementIndex);
         const auto highBucket = static_cast<std::uint16_t>((key >> 16u) & kMortonBucketMask16);
         const auto lowKey = static_cast<std::uint16_t>(key & kMortonBucketMask16);
@@ -372,7 +397,7 @@ inline bool WriteHighBucketRun(
 
     if (!RunTerminalWork(options.resources, phase, [&](WorkerContext&) {
     for (std::size_t highBucket = 0; highBucket < kMortonBucketCount16; ++highBucket) {
-        if (options.resources.Stopped() || !flush(highBucket)) {
+        if (stop.stop_requested() || !flush(highBucket)) {
             return false;
         }
     }
@@ -637,15 +662,16 @@ struct MortonRemapOutput {
             return validation::AssignError(error, "Morton remap output provider is null");
         }
         constexpr std::size_t window = kIoWindowBytes / sizeof(IndexType);
+        const auto stop = root.StopToken();
         for (std::size_t first = 0u; first < order.size();) {
-            if (root.Stopped()) { return false; }
+            if (stop.stop_requested()) { return false; }
             const auto count = std::min(window, order.size() - first);
             const auto values = order.subspan(first, count);
             if (!RunTerminalWork(root, phase, [&](WorkerContext&) {
                 if (!orderProvider->AppendRange(values, error)) { return false; }
                 if (inverseProvider != nullptr) {
                     for (std::size_t i = 0u; i < values.size(); ++i) {
-                        if (root.Stopped() || !inverseProvider->WriteAt(values[i],
+                        if (stop.stop_requested() || !inverseProvider->WriteAt(values[i],
                                 static_cast<IndexType>(nextIndex + i), error)) { return false; }
                     }
                 }
@@ -763,7 +789,7 @@ inline bool AppendRunSegmentByMortonKey(
 template<typename TKeyGetter>
 inline bool BuildInMemoryMortonRemapProvider(
     const std::size_t elementCount, TKeyGetter&& keyGetter, MortonRemapResult& result,
-    const MortonRemapOptions& options, const HeavyPhaseLease& phase, std::string* error) {
+    const MortonRemapOptions& options, HeavyPhaseLease& phase, std::string* error) {
     auto provider = options.providerFactory(elementCount, false, options.resourcePrefix + ".order", error, {});
     if (!provider) { return false; }
     bytestore::KnownStorageOwners coexist;
@@ -779,11 +805,27 @@ inline bool BuildInMemoryMortonRemapProvider(
     if (options.recordCapacitySamples) { samples.emplace(); }
     std::vector<MortonKeyedIndex> keyed;
     std::vector<IndexType> order;
+    const auto stop = options.resources.StopToken();
+    const bool parallel = options.parallelKeyRead && options.resources.Threaded() &&
+        elementCount > numericarray::kSpatialBlockElementCount;
+    if (parallel) {
+        keyed.resize(elementCount);
+        phase.Reset();
+        if (!ComputeMortonKeys(options.resources, elementCount, keyGetter,
+                [&](std::size_t i, std::uint32_t key) { keyed[i] = {key, static_cast<IndexType>(i)}; })) {
+            return false;
+        }
+        auto nextPhase = WaitForHeavyPhase(options.resources);
+        if (!nextPhase) { return false; }
+        phase = std::move(*nextPhase);
+    }
     if (!RunTerminalWork(options.resources, phase, [&](WorkerContext&) {
-        keyed.reserve(elementCount);
-        for (std::size_t i = 0u; i < elementCount; ++i) {
-            if (options.resources.Stopped()) { return false; }
-            keyed.push_back({keyGetter(i), static_cast<IndexType>(i)});
+        if (!parallel) {
+            keyed.reserve(elementCount);
+            for (std::size_t i = 0u; i < elementCount; ++i) {
+                if (stop.stop_requested()) { return false; }
+                keyed.push_back({keyGetter(i), static_cast<IndexType>(i)});
+            }
         }
         std::stable_sort(keyed.begin(), keyed.end(), [](const auto& left, const auto& right) {
             return left.key != right.key ? left.key < right.key : left.index < right.index;
@@ -861,6 +903,19 @@ inline bool BuildMortonRemapProvider(
         }
     }
     const bool useKeyCache = keyCache != nullptr;
+    const auto stop = options.resources.StopToken();
+    const bool parallel = useKeyCache && options.parallelKeyRead && options.resources.Threaded();
+    if (parallel) {
+        // 所有任务写入已获准缓存中的不相交区间，统计阶段在任务收束后读取
+        const auto keys = keyCache->WritableBytes();
+        phase.reset();
+        if (!ComputeMortonKeys(options.resources, elementCount, keyGetter,
+                [&](std::size_t i, std::uint32_t key) {
+                    std::memcpy(keys.data() + i * sizeof(key), &key, sizeof(key));
+                })) { return false; }
+        phase = WaitForHeavyPhase(options.resources);
+        if (!phase) { return false; }
+    }
 
     std::optional<MortonCapacitySamples> samples;
     if (options.recordCapacitySamples) { samples.emplace(); }
@@ -871,9 +926,12 @@ inline bool BuildMortonRemapProvider(
     const auto progressStep = std::max<std::size_t>(elementCount / 64u, 1u);
     if (!RunMortonRanges(options.resources, *phase, elementCount, [&](std::size_t first, std::size_t end) {
     for (std::size_t elementIndex = first; elementIndex < end; ++elementIndex) {
-        if (options.resources.Stopped()) { return false; }
-        const auto key = keyGetter(elementIndex);
-        if (useKeyCache) {
+        if (stop.stop_requested()) { return false; }
+        std::uint32_t key = 0u;
+        if (parallel) {
+            std::memcpy(&key, keyCache->ContiguousBytes().data() + elementIndex * sizeof(key), sizeof(key));
+        } else { key = keyGetter(elementIndex); }
+        if (useKeyCache && !parallel) {
             if (!keyCache->WriteAt(elementIndex * sizeof(key),
                     std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(&key), sizeof(key)), error)) {
                 return false;

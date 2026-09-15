@@ -190,7 +190,8 @@ void Supplement(const LeafPackage& leaf) {
         .leafPackage = &leaf, .attributeSelection = AttributeSelectionMode::AllAvailable, .resources = &root});
     Ensure(extra.success, extra.failure ? FormatCodecFailure(*extra.failure) : "supplement decode failed");
     const auto repeat = session.AnalyzeAttributeStorage(request, root);
-    Ensure(repeat.success && *repeat.minimumExecutionLimitBytes == root.StorageCapacity()->Snapshot().reservedBytes,
+    Ensure(repeat.success && *repeat.minimumExecutionLimitBytes + root.Scratch().RetainedFixedBytes() ==
+        root.StorageCapacity()->Snapshot().reservedBytes,
         "completed fields must not be allocated twice");
     std::cout << "storage_supplement planned=" << *estimate.minimumExecutionLimitBytes
         << " retained=" << *repeat.minimumExecutionLimitBytes << '\n';
@@ -448,15 +449,18 @@ void MemoryAdmissionMechanisms() {
         }
         Ensure(success && committed == 8u, root.FirstFailure() ? FormatCodecFailure(*root.FirstFailure()) : "joint admission completes");
         Ensure(snapshot.peakAdmittedBlocks <= 2u && snapshot.peakActiveComputeUnits <= 4u &&
-            snapshot.storage.peakReservedBytes <= limit && snapshot.storage.reservedBytes == 0u, "joint admission obeys both ceilings");
+            snapshot.storage.peakReservedBytes <= limit && snapshot.storage.reservedBytes == root.Scratch().RetainedFixedBytes(),
+            "joint admission obeys both ceilings and retains only idle workspace");
         if (limit == 128u) {
             Ensure(snapshot.peakAdmittedBlocks == 1u && snapshot.byteWaitDuration != ResourceClock::duration{},
                 "minimum memory serializes a four-compute flow through byte admission");
         } else {
             Ensure(snapshot.peakAdmittedBlocks == 2u, "larger memory admits overlapping blocks");
         }
-        Ensure(root.StorageCapacity()->AllocatedStorage().liveBytes == 0u, "transferred results are outside owned audit");
-        Ensure(run.Finish(true), "joint admission drains cleanly");
+        Ensure(root.StorageCapacity()->AllocatedStorage().liveBytes == root.Scratch().RetainedFixedBytes(),
+            "transferred results are outside owned audit and idle workspace remains accounted");
+        Ensure(run.Finish(true) && root.StorageCapacity()->Snapshot().reservedBytes == 0u &&
+            root.StorageCapacity()->AllocatedStorage().liveBytes == 0u, "joint admission drains cleanly");
         std::cout << "admission limit=" << limit << " peak_slots=" << snapshot.peakAdmittedBlocks
             << " peak_compute=" << snapshot.peakActiveComputeUnits << '\n';
     }

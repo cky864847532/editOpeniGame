@@ -65,7 +65,7 @@ struct NumericArrayReader {
         if (!PrepareElementRead(elementOffset, elementCount, outputBytes, error)) {
             return false;
         }
-        output = scratchBytePool.Acquire(outputBytes);
+        output = scratchBytePool.AcquireForOverwrite(outputBytes);
         if (outputBytes == 0u) {
             return true;
         }
@@ -85,7 +85,7 @@ struct NumericArrayReader {
         if (!PrepareComponentRead(elementOffset, elementCount, componentIndex, outputBytes, error)) {
             return false;
         }
-        output = scratchBytePool.Acquire(outputBytes);
+        output = scratchBytePool.AcquireForOverwrite(outputBytes);
         if (outputBytes == 0u) {
             return true;
         }

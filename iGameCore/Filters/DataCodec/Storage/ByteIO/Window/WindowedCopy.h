@@ -40,7 +40,7 @@ public:
         const auto remaining = byteSize - m_offset;
         const auto currentBytes = static_cast<std::size_t>(
             std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(kIoWindowBytes)));
-        m_scratchBuffer = m_scratchBytePool.Acquire(currentBytes);
+        m_scratchBuffer = m_scratchBytePool.AcquireForOverwrite(currentBytes);
         auto buffer = m_scratchBuffer.Span();
         if (!m_source.Read(m_offset, buffer, error)) {
             return false;
@@ -163,7 +163,7 @@ inline bool CopyByteSourceRangeByWindow(
         const auto remaining = rangeByteCount - copiedBytes;
         const auto currentBytes = static_cast<std::size_t>(
             std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(kIoWindowBytes)));
-        auto scratchBuffer = scratchBytePool.Acquire(currentBytes);
+        auto scratchBuffer = scratchBytePool.AcquireForOverwrite(currentBytes);
         auto buffer = scratchBuffer.Span();
         if (!source.Read(rangeOffset + copiedBytes, buffer, error) ||
             !writer.Write(std::span<const std::uint8_t>(buffer.data(), buffer.size()), error)) {

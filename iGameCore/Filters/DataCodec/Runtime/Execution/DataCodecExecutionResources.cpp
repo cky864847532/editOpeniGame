@@ -63,6 +63,7 @@ bool ValidLimits(const RuntimeResourceLimits& limits, const ResolvedResourceConf
 }
 
 struct ExecutionState {
+    static constexpr std::size_t noAdmission = std::numeric_limits<std::size_t>::max();
     struct Admission {
         std::uint64_t generation{0u};
         std::uint64_t sequence{0u};
@@ -71,6 +72,7 @@ struct ExecutionState {
         bool committed{false};
         bool releaseAfterWork{false};
         BlockCompletion completion{BlockCompletion::Pending};
+        std::size_t nextFree{noAdmission};
     };
 
     explicit ExecutionState(const ResolvedResourceConfiguration& config)
@@ -78,6 +80,11 @@ struct ExecutionState {
           capacity(std::make_shared<resource::ResidentByteBudget>(0u)),
           admissions(std::max<std::size_t>(config.computeCeiling, 1u) + std::min<std::size_t>(config.computeCeiling, 8u) + 1u),
           heavyIndex(admissions.size() - 1u), queue(admissions.size()), workerIds(config.computeCeiling) {
+        for (std::size_t i = heavyIndex; i != 0u;) {
+            --i;
+            admissions[i].nextFree = firstFreeAdmission;
+            firstFreeAdmission = i;
+        }
         debug.storageCeilingBytes = config.storageCeilingBytes;
         debug.computeCeiling = config.computeCeiling;
         debug.mode = config.mode;
@@ -318,6 +325,8 @@ struct ExecutionState {
             debug.heavyPhaseAdmitted = false;
         } else {
             --debug.admittedBlocks;
+            admission.nextFree = firstFreeAdmission;
+            firstFreeAdmission = index;
             debug.lastRetired = admission.sequence;
             if (observation.lastSequence && admission.sequence == *observation.lastSequence) {
                 observation.retiredAt = ResourceClock::now();
@@ -344,12 +353,15 @@ struct ExecutionState {
     }
 
     mutable std::mutex mutex;
+    // driver 的容量和完成事件与 worker 的任务唤醒分开，避免每次归还缓冲都唤醒整个线程池
     std::condition_variable changed;
+    std::condition_variable workAvailable;
     std::condition_variable controllerChanged;
     const ResolvedResourceConfiguration configuration;
     std::shared_ptr<resource::ResidentByteBudget> capacity;
     std::vector<Admission> admissions;
     const std::size_t heavyIndex;
+    std::size_t firstFreeAdmission{noAdmission};
     std::vector<std::shared_ptr<TerminalWork>> queue;
     std::vector<std::thread::id> workerIds;
     std::size_t queueHead{0u};
@@ -378,9 +390,16 @@ struct ExecutionState {
 };
 
 struct DataCodecExecutionResources::Impl {
+    static std::size_t ScratchWorkerHint(const ResolvedResourceConfiguration& config) noexcept {
+        // 硬件并发度只用于预留空闲缓冲的索引容量，Unlimited 线程仍按任务需求增长
+        return config.threaded && config.threadMode == CodecThreadMode::Unlimited
+            ? std::max<std::size_t>(1u, config.initialSample.allowedComputeThreads.value_or(1u))
+            : config.computeCeiling;
+    }
+
     explicit Impl(const ResolvedResourceConfiguration& config)
         : state(std::make_shared<ExecutionState>(config)),
-          scratch(2u * (config.computeCeiling + std::min<std::size_t>(config.computeCeiling, 8u))),
+          scratch(2u * (ScratchWorkerHint(config) + std::min<std::size_t>(ScratchWorkerHint(config), 8u))),
           inlineWorker(scratch, 0u) {
         workers.reserve(config.computeCeiling);
     }
@@ -527,7 +546,7 @@ bool DataCodecExecutionResources::BeginRun() noexcept {
         }
         m_impl->scratch.SetRetainedCount(state.debug.limits.ownedStorageLimitBytes != 0u &&
             !state.debug.optionalRetentionPausedByPressure
-            ? 2u * (state.UnlimitedThreads() ? state.admissions.size() :
+            ? 2u * (state.UnlimitedThreads() ? std::max(state.admissions.size(), Impl::ScratchWorkerHint(state.configuration) + 1u) :
                 std::max(state.debug.limits.slotLimit, state.debug.limits.computeLimit)) : 0u);
         state.Event(ResourceEventKind::BeginRequest);
         lock.unlock();
@@ -546,8 +565,10 @@ bool DataCodecExecutionResources::BeginRun() noexcept {
 bool DataCodecExecutionResources::EndRun() noexcept {
     auto& state = *m_impl->state;
     bool failed = false;
+    bool stopped = false;
     {
         std::lock_guard lock(state.mutex);
+        stopped = state.debug.runStopped;
         failed = state.driver != std::this_thread::get_id() || !state.debug.runActive ||
             state.debug.admittedBlocks != 0u || state.runningTasks != 0u ||
             state.debug.queuedTasks != 0u || state.debug.heavyPhaseAdmitted;
@@ -560,11 +581,13 @@ bool DataCodecExecutionResources::EndRun() noexcept {
         }
     }
     if (failed) { RecordFailure(ExecutionFailure("run-not-drained", "request completion requires all work to drain"), true); }
-    if (!failed && state.UnlimitedThreads()) {
+    // 正常请求保留 worker 和压缩器，取消后的线程在这里收束
+    if (!failed && state.UnlimitedThreads() && stopped) {
         {
             std::lock_guard lock(state.mutex);
             state.retireWorkers = true;
         }
+        state.workAvailable.notify_all();
         state.changed.notify_all();
         for (auto& worker : m_impl->workers) { if (worker.joinable()) { worker.join(); } }
         m_impl->workers.clear();
@@ -576,6 +599,7 @@ bool DataCodecExecutionResources::EndRun() noexcept {
         }
         m_impl->scratch.TrimRetained();
     }
+    if (!failed) { m_impl->scratch.ClearFixed(); }
     state.changed.notify_all();
     return !failed;
 }
@@ -658,30 +682,34 @@ std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot(
     if (!state->CpuAdmissionOpen() ||
         (debug.limits.slotLimit != 0u && debug.admittedBlocks >= debug.limits.slotLimit) || debug.heavyPhaseAdmitted ||
         (debug.singleRecordFlow && debug.admittedBlocks != 0u)) { return std::nullopt; }
-    for (std::size_t i = 0u; ; ++i) {
-        if (i == state->admissions.size()) {
-            if (!state->UnlimitedThreads()) { break; }
-            // 扩展前先检查本次字节需求，重型阶段保留稳定索引
-            if (!state->capacity->Snapshot().CanReserve(bytes)) {
-                state->DemandLocked(bytes, MemoryDemandKind::Block);
-                return std::nullopt;
-            }
-            if (state->admissions.size() == state->admissions.max_size()) {
-                throw std::length_error("admission storage exhausted");
-            }
-            if (state->queue.size() <= state->admissions.size()) {
-                std::vector<std::shared_ptr<TerminalWork>> grown(state->admissions.size() + 1u);
-                for (std::size_t n = 0u; n < debug.queuedTasks; ++n) {
-                    grown[n] = std::move(state->queue[(state->queueHead + n) % state->queue.size()]);
-                }
-                state->queue.swap(grown);
-                state->queueHead = 0u;
-            }
-            state->admissions.emplace_back();
+    if (state->firstFreeAdmission == ExecutionState::noAdmission && state->UnlimitedThreads()) {
+        // 扩展前先检查本次字节需求，重型阶段保留稳定索引
+        if (!state->capacity->Snapshot().CanReserve(bytes)) {
+            state->DemandLocked(bytes, MemoryDemandKind::Block);
+            return std::nullopt;
         }
-        if (i == state->heavyIndex) { continue; }
+        const auto oldSize = state->admissions.size();
+        const auto maximum = std::min(state->admissions.max_size(), state->queue.max_size());
+        if (oldSize == maximum) {
+            throw std::length_error("admission storage exhausted");
+        }
+        // 槽位和环形队列几何增长，空闲索引链避免反复扫描活动记录
+        const auto nextSize = oldSize + std::min(oldSize, maximum - oldSize);
+        std::vector<std::shared_ptr<TerminalWork>> grown(nextSize);
+        state->admissions.resize(nextSize);
+        for (std::size_t n = 0u; n < debug.queuedTasks; ++n) {
+            grown[n] = std::move(state->queue[(state->queueHead + n) % state->queue.size()]);
+        }
+        state->queue.swap(grown);
+        state->queueHead = 0u;
+        for (std::size_t i = nextSize; i != oldSize;) {
+            --i;
+            state->admissions[i].nextFree = state->firstFreeAdmission;
+            state->firstFreeAdmission = i;
+        }
+    }
+    if (const auto i = state->firstFreeAdmission; i != ExecutionState::noAdmission) {
         auto& admission = state->admissions[i];
-        if (admission.active) { continue; }
         if (admission.generation == std::numeric_limits<std::uint64_t>::max() ||
             (debug.lastAdmitted && *debug.lastAdmitted == std::numeric_limits<std::uint64_t>::max())) {
             lock.unlock();
@@ -695,6 +723,7 @@ std::optional<SlotLease> DataCodecExecutionResources::TryAcquireSlot(
         }
         state->ReservedLocked(bytes, debug.lastAdmitted ? *debug.lastAdmitted + 1u : 0u);
         reservation = std::move(*lease);
+        state->firstFreeAdmission = admission.nextFree;
         admission = ExecutionState::Admission{admission.generation + 1u,
             debug.lastAdmitted ? *debug.lastAdmitted + 1u : 0u, true};
         ++debug.admittedBlocks;
@@ -923,6 +952,7 @@ bool DataCodecExecutionResources::Submit(const SlotLease& slot, const std::share
     if (failure) { RecordFailure(*failure, true); }
     state.changed.notify_all();
     if (failure) { return false; }
+    if (!inlineWork) { state.workAvailable.notify_one(); }
     if (inlineWork) {
         bool success = false;
         try { success = work->m_function(m_impl->inlineWorker); }
@@ -957,19 +987,23 @@ void DataCodecExecutionResources::WorkerMain(std::size_t index) noexcept {
     for (;;) {
         std::shared_ptr<TerminalWork> work;
         std::size_t units = 0u;
+        bool wakeWorker = false;
         {
             std::unique_lock lock(state->mutex);
             while (!state->debug.closing && !state->retireWorkers && !state->CanStartLocked()) {
                 if (state->AutomaticCpu() && state->debug.queuedTasks != 0u && !state->debug.runStopped) {
-                    state->changed.wait_until(lock, state->cpuBudget.NextWake(ResourceClock::now(), state->debug.activeComputeUnits));
-                } else { state->changed.wait(lock); }
+                    state->workAvailable.wait_until(lock, state->cpuBudget.NextWake(ResourceClock::now(), state->debug.activeComputeUnits));
+                } else { state->workAvailable.wait(lock); }
             }
             if (state->debug.closing || state->retireWorkers) { break; }
             work = state->PopLocked();
             units = state->StartLocked(*work);
             worker.m_units = units;
             worker.m_stop = state->stopSource.get_token();
+            wakeWorker = state->CanStartLocked();
         }
+        // 可执行任务逐个传递唤醒，额度增加时也能填满并行窗口
+        if (wakeWorker) { state->workAvailable.notify_one(); }
         bool success = false;
         std::optional<CodecFailureRecord> failure;
         try { success = work->m_function(worker); }
@@ -991,9 +1025,11 @@ void DataCodecExecutionResources::WorkerMain(std::size_t index) noexcept {
             }
             stop = state->debug.runStopped;
             runStop = state->stopSource;
+            wakeWorker = state->CanStartLocked();
         }
         if (growthFailure) { RecordFailure(*growthFailure, true); }
         if (stop) { runStop.request_stop(); }
+        if (wakeWorker) { state->workAvailable.notify_one(); }
         state->changed.notify_all();
     }
     {
@@ -1069,8 +1105,10 @@ std::optional<CodecFailureRecord> DataCodecExecutionResources::PublishLimitsLock
     if (changed || resetObservation) { state.ResetObservationLocked(ResourceClock::now()); }
     const bool retain = limits.ownedStorageLimitBytes != 0u && !state.debug.optionalRetentionPausedByPressure &&
         !state.debug.closing && !state.debug.runStopped;
-    m_impl->scratch.SetRetainedCount(retain ? 2u * (state.UnlimitedThreads() ? state.admissions.size() :
-        std::max(limits.slotLimit, limits.computeLimit)) : 0u);
+    m_impl->scratch.SetRetainedCount(retain ? 2u * (state.UnlimitedThreads() ?
+        std::max(state.admissions.size(), Impl::ScratchWorkerHint(state.configuration) + 1u) :
+        std::max(limits.slotLimit, limits.computeLimit)) : 0u,
+        trim || limits.ownedStorageLimitBytes < before.ownedStorageLimitBytes);
     if (!state.debug.closing && !state.debug.runStopped && state.configuration.threaded) {
         return GrowWorkersLocked();
     }
@@ -1090,6 +1128,7 @@ bool DataCodecExecutionResources::UpdateLimits(const RuntimeResourceLimits& limi
         RecordFailure(*failure, true);
         if (error) { try { error->assign("resource target publication failed"); } catch (...) {} }
     }
+    state.workAvailable.notify_one();
     state.changed.notify_all();
     return !failure;
 }
@@ -1198,7 +1237,10 @@ void DataCodecExecutionResources::ControlMain() noexcept {
         // 控制线程只回收纯自有空闲 scratch，宿主缓存留给 driver
         m_impl->scratch.TrimRetained();
         if (failure) { RecordFailure(*failure); }
-        if (observed != before || failure || memoryDue) { state.changed.notify_all(); }
+        if (observed != before || failure || memoryDue) {
+            state.workAvailable.notify_one();
+            state.changed.notify_all();
+        }
         lock.lock();
         const auto wakeAt = std::min(memoryAdaptive ? nextSampleAt : ResourceClock::time_point::max(),
             state.AutomaticCpu() ? nextCpuAt : ResourceClock::time_point::max());
@@ -1247,6 +1289,7 @@ bool DataCodecExecutionResources::RecordFailure(const CodecFailureRecord& failur
     }
     m_impl->scratch.Clear();
     stop.request_stop();
+    state.workAvailable.notify_all();
     state.changed.notify_all();
     return first;
 }
@@ -1285,6 +1328,7 @@ void DataCodecExecutionResources::CancelAndWaitRun() noexcept {
         stop = state.stopSource;
     }
     stop.request_stop();
+    state.workAvailable.notify_all();
     state.changed.notify_all();
     if (invalidDriver) { return; }
     m_impl->scratch.Clear();
@@ -1327,6 +1371,7 @@ void DataCodecExecutionResources::ShutdownAndJoin() noexcept {
         state.debug.closing = true;
         state.Event(ResourceEventKind::Close);
     }
+    state.workAvailable.notify_all();
     state.changed.notify_all();
     if (worker) {
         RecordFailure(ExecutionFailure("worker-self-join", "worker cannot join its own root"), true);

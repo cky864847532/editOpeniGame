@@ -136,28 +136,68 @@ inline bool BuildPointMortonRemapProviders(
     TGetter&& reader,
     RemapProviders& result,
     std::string* error,
-    const BuildOptions& remapOptions) {
+    const BuildOptions& remapOptions,
+    const bool parallelInputRead = false) {
     result = {};
 
     float minValues[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
     float maxValues[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
-    float value[3]{0.0f, 0.0f, 0.0f};
-    auto phase = WaitForHeavyPhase(remapOptions.resources);
-    if (!phase || !mortonremap::RunMortonRanges(remapOptions.resources, *phase, pointCount,
-            [&](std::size_t first, std::size_t end) {
-    for (std::size_t pointIndex = first; pointIndex < end; ++pointIndex) {
-        if (remapOptions.resources.Stopped()) { return false; }
-        if (!reader(pointIndex, value, error)) {
-            return false;
-        }
-        for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
-            minValues[axisIndex] = std::min(minValues[axisIndex], value[axisIndex]);
-            maxValues[axisIndex] = std::max(maxValues[axisIndex], value[axisIndex]);
-        }
+    const auto stop = remapOptions.resources.StopToken();
+    if (parallelInputRead && remapOptions.resources.Threaded() &&
+        pointCount > numericarray::kSpatialBlockElementCount) {
+        struct Bounds {
+            float min[3]{FLT_MAX, FLT_MAX, FLT_MAX};
+            float max[3]{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        };
+        std::size_t next = 0u;
+        if (!RunOrderedBlocks<std::size_t, Bounds>(remapOptions.resources,
+                [&] { return next < pointCount; },
+                [&](std::size_t& first) {
+                    first = next;
+                    next += std::min<std::size_t>(numericarray::kSpatialBlockElementCount, pointCount - next);
+                    return true;
+                },
+                [&](std::size_t first, Bounds& bounds, WorkerContext& worker) {
+                    std::string localError;
+                    const auto token = worker.StopToken();
+                    const auto end = first + std::min<std::size_t>(numericarray::kSpatialBlockElementCount, pointCount - first);
+                    for (auto i = first; i < end; ++i) {
+                        if (token.stop_requested()) { return false; }
+                        float value[3];
+                        if (!reader(i, value, &localError)) {
+                            remapOptions.resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                                "point-bounds-read", "BuildPointMortonRemapProviders", localError));
+                            return false;
+                        }
+                        for (int axis = 0; axis < 3; ++axis) {
+                            bounds.min[axis] = std::min(bounds.min[axis], value[axis]);
+                            bounds.max[axis] = std::max(bounds.max[axis], value[axis]);
+                        }
+                    }
+                    return true;
+                }, [&](const Bounds& bounds) {
+                    for (int axis = 0; axis < 3; ++axis) {
+                        minValues[axis] = std::min(minValues[axis], bounds.min[axis]);
+                        maxValues[axis] = std::max(maxValues[axis], bounds.max[axis]);
+                    }
+                    return true;
+                })) { return false; }
+    } else {
+        float value[3]{0.0f, 0.0f, 0.0f};
+        auto phase = WaitForHeavyPhase(remapOptions.resources);
+        if (!phase || !mortonremap::RunMortonRanges(remapOptions.resources, *phase, pointCount,
+                [&](std::size_t first, std::size_t end) {
+            for (std::size_t pointIndex = first; pointIndex < end; ++pointIndex) {
+                if (stop.stop_requested()) { return false; }
+                if (!reader(pointIndex, value, error)) { return false; }
+                for (int axisIndex = 0; axisIndex < 3; ++axisIndex) {
+                    minValues[axisIndex] = std::min(minValues[axisIndex], value[axisIndex]);
+                    maxValues[axisIndex] = std::max(maxValues[axisIndex], value[axisIndex]);
+                }
+            }
+            return true;
+        })) { return false; }
     }
-    return true;
-    })) { return false; }
-    phase.reset();
 
     float extent = 0.0f;
     extent = std::max(extent, maxValues[0] - minValues[0]);
@@ -172,12 +212,11 @@ inline bool BuildPointMortonRemapProviders(
     options.byteStoreSession = remapOptions.byteStoreSession;
     options.recordCapacitySamples = remapOptions.recordCapacitySamples;
     options.buildInverse = true;
-    bool readFailed = false;
-    std::string readError;
+    options.parallelKeyRead = parallelInputRead;
     const auto keyGetter = [&](const std::size_t pointIndex) {
         float localValue[3]{0.0f, 0.0f, 0.0f};
+        std::string readError;
         if (!reader(pointIndex, localValue, &readError)) {
-            readFailed = true;
             remapOptions.resources.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
                 "point-key-read", "BuildPointMortonRemapProviders", readError));
             return std::uint32_t{0u};
@@ -187,11 +226,7 @@ inline bool BuildPointMortonRemapProviders(
     if (!mortonremap::BuildMortonRemapProvider(pointCount, keyGetter, remapResult, options, error)) {
         return false;
     }
-    if (readFailed) {
-        return validation::AssignError(
-            error,
-            readError.empty() ? "failed to read geometry tuple for point remap" : readError);
-    }
+    if (stop.stop_requested()) { return false; }
     result.orderProvider = std::move(remapResult.orderProvider);
     result.inverseProvider = std::move(remapResult.inverseProvider);
     return result.orderProvider != nullptr && result.inverseProvider != nullptr;
@@ -218,7 +253,7 @@ inline bool BuildPointMortonRemapProviders(
         },
         result,
         error,
-        remapOptions);
+        remapOptions, true);
 }
 
 inline bool BuildPointMortonRemapProviders(
@@ -241,7 +276,7 @@ inline bool BuildPointMortonRemapProviders(
         },
         result,
         error,
-        remapOptions);
+        remapOptions, geometry.layout != ArrayLayout::GetterOnly);
 }
 
 } // namespace pointremap

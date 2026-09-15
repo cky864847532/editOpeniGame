@@ -791,11 +791,11 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     panel->setObjectName(QStringLiteral("DataCodecPanel"));
     panel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Maximum);
     auto* layout = new QVBoxLayout(panel);
-    layout->setContentsMargins(10, 10, 10, 10);
-    layout->setSpacing(8);
+    layout->setContentsMargins(12, 12, 12, 12);
+    layout->setSpacing(12);
 
     auto* titleRow = new QHBoxLayout;
-    auto* title = new QLabel(QStringLiteral("输出"), panel);
+    auto* title = new QLabel(QStringLiteral("输出与压缩"), panel);
     title->setObjectName(QStringLiteral("DataCodecSectionTitle"));
     titleRow->addWidget(title);
     titleRow->addStretch();
@@ -805,88 +805,129 @@ QWidget* igQtDataCodecCompressionWidget::createOutputPanel() {
     outputLabel->setObjectName(QStringLiteral("DataCodecLabel"));
 
     auto* pathRow = new QHBoxLayout;
-    pathRow->setSpacing(6);
+    pathRow->setSpacing(8);
     pathRow->addWidget(outputLabel);
     m_outputPathEdit = new QLineEdit(panel);
     m_outputPathEdit->setObjectName(QStringLiteral("DataCodecEncodeOutputPath"));
     m_outputPathEdit->setReadOnly(true);
+    m_outputPathEdit->setPlaceholderText(QStringLiteral("请选择压缩文件的保存位置"));
     m_outputPathEdit->setFocusPolicy(Qt::StrongFocus);
     m_outputPathEdit->installEventFilter(this);
-    m_outputPathButton = new QPushButton(QStringLiteral("..."), panel);
-    m_outputPathButton->setFixedWidth(34);
+    m_outputPathButton = new QPushButton(QStringLiteral("浏览…"), panel);
+    m_outputPathButton->setMinimumWidth(56);
+    m_outputPathButton->setToolTip(QStringLiteral("选择压缩文件的保存位置"));
+    outputLabel->setBuddy(m_outputPathButton);
     pathRow->addWidget(m_outputPathEdit, 1);
     pathRow->addWidget(m_outputPathButton, 0);
     layout->addLayout(pathRow);
 
     auto* settingsRow = new QHBoxLayout;
-    settingsRow->setSpacing(16);
-    auto* resourceColumn = new QVBoxLayout;
+    settingsRow->setSpacing(12);
+    auto* resourcePanel = new QFrame(panel);
+    resourcePanel->setObjectName(QStringLiteral("DataCodecSettingsGroup"));
+    auto* resourceColumn = new QVBoxLayout(resourcePanel);
+    resourceColumn->setContentsMargins(10, 10, 10, 10);
     resourceColumn->setSpacing(8);
-    auto* resourceLabel = new QLabel(QStringLiteral("资源控制"), panel);
-    resourceLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
+    auto* resourceLabel = new QLabel(QStringLiteral("资源控制"), resourcePanel);
+    resourceLabel->setObjectName(QStringLiteral("DataCodecSettingsTitle"));
     resourceColumn->addWidget(resourceLabel);
-    m_resourceControls = new igQtDataCodecResourceControls(panel);
+    m_resourceControls = new igQtDataCodecResourceControls(resourcePanel);
+    auto* resourceForm = qobject_cast<QFormLayout*>(m_resourceControls->layout());
+    resourceForm->setHorizontalSpacing(8);
+    resourceForm->setVerticalSpacing(8);
+    resourceForm->setFormAlignment(Qt::AlignTop);
+    resourceForm->setLabelAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    resourceForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    // 长标签在资源分组内换行，为比例输入及容量提示保留宽度
+    for (int row = 0; row < resourceForm->rowCount(); ++row) {
+        auto* item = resourceForm->itemAt(row, QFormLayout::LabelRole);
+        auto* label = item ? qobject_cast<QLabel*>(item->widget()) : nullptr;
+        if (label == nullptr) continue;
+        label->setObjectName(QStringLiteral("DataCodecFormLabel"));
+        label->setFixedWidth(72);
+        label->setWordWrap(true);
+    }
     resourceColumn->addWidget(m_resourceControls);
     resourceColumn->addStretch();
-    settingsRow->addLayout(resourceColumn, 3);
+    settingsRow->addWidget(resourcePanel, 3);
 
-    auto* compressionColumn = new QVBoxLayout;
+    auto* compressionPanel = new QFrame(panel);
+    compressionPanel->setObjectName(QStringLiteral("DataCodecSettingsGroup"));
+    auto* compressionColumn = new QVBoxLayout(compressionPanel);
+    compressionColumn->setContentsMargins(10, 10, 10, 10);
     compressionColumn->setSpacing(8);
-    auto* compressionLabel = new QLabel(QStringLiteral("压缩设置"), panel);
-    compressionLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
+    auto* compressionLabel = new QLabel(QStringLiteral("编码选项"), compressionPanel);
+    compressionLabel->setObjectName(QStringLiteral("DataCodecSettingsTitle"));
     compressionColumn->addWidget(compressionLabel);
-    settingsRow->addLayout(compressionColumn, 2);
+    settingsRow->addWidget(compressionPanel, 2);
     layout->addLayout(settingsRow);
 
     auto* zstdRow = new QHBoxLayout;
-    auto* zstdLabel = new QLabel(QStringLiteral("ZSTD压缩等级"), panel);
-    zstdLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
-    m_zstdLevelSpin = new QSpinBox(panel);
+    zstdRow->setSpacing(8);
+    auto* zstdLabel = new QLabel(QStringLiteral("ZSTD 等级"), compressionPanel);
+    zstdLabel->setObjectName(QStringLiteral("DataCodecFormLabel"));
+    m_zstdLevelSpin = new QSpinBox(compressionPanel);
     m_zstdLevelSpin->setRange(1, 22);
+    m_zstdLevelSpin->setMinimumWidth(64);
+    m_zstdLevelSpin->setAlignment(Qt::AlignCenter);
+    m_zstdLevelSpin->setToolTip(QStringLiteral("ZSTD 压缩等级，范围 1–22"));
+    zstdLabel->setBuddy(m_zstdLevelSpin);
     zstdRow->addWidget(zstdLabel, 1);
     zstdRow->addWidget(m_zstdLevelSpin, 0);
     compressionColumn->addLayout(zstdRow);
 
-    m_gopControlRow = new QWidget(panel);
+    m_gopControlRow = new QWidget(compressionPanel);
     auto* gopRow = new QHBoxLayout(m_gopControlRow);
     gopRow->setContentsMargins(0, 0, 0, 0);
+    gopRow->setSpacing(8);
     auto* gopLabel = new QLabel(QStringLiteral("关键帧间隔"), m_gopControlRow);
-    gopLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
+    gopLabel->setObjectName(QStringLiteral("DataCodecFormLabel"));
     m_gopFrameCountSpin = new QSpinBox(m_gopControlRow);
     m_gopFrameCountSpin->setMinimum(1);
+    m_gopFrameCountSpin->setMinimumWidth(64);
+    m_gopFrameCountSpin->setAlignment(Qt::AlignCenter);
+    gopLabel->setBuddy(m_gopFrameCountSpin);
     m_gopFrameCountSpin->setToolTip(
         QStringLiteral("每隔指定数量的帧写入一个关键帧"));
     gopRow->addWidget(gopLabel, 1);
     gopRow->addWidget(m_gopFrameCountSpin, 0);
     compressionColumn->addWidget(m_gopControlRow);
 
-    auto* batchLabel = new QLabel(QStringLiteral("批量设置"), panel);
-    batchLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
-    compressionColumn->addWidget(batchLabel);
+    compressionColumn->addSpacing(2);
+    auto* predictionLabel = new QLabel(QStringLiteral("预测编码"), compressionPanel);
+    predictionLabel->setObjectName(QStringLiteral("DataCodecFormLabel"));
+    compressionColumn->addWidget(predictionLabel);
 
+    m_intraAttributePredictionCheck = new QCheckBox(QStringLiteral("帧内预测"), compressionPanel);
+    m_temporalAttributePredictionCheck = new QCheckBox(QStringLiteral("帧间预测"), compressionPanel);
+    m_intraAttributePredictionCheck->setChecked(true);
+    m_temporalAttributePredictionCheck->setChecked(true);
+    auto* predictionRow = new QHBoxLayout;
+    predictionRow->setSpacing(8);
+    predictionRow->addWidget(m_intraAttributePredictionCheck);
+    predictionRow->addWidget(m_temporalAttributePredictionCheck);
+    compressionColumn->addLayout(predictionRow);
+    compressionColumn->addStretch();
+
+    // 批量操作独占底部一行，避免挤高右侧编码选项
+    auto* batchDivider = new QFrame(panel);
+    batchDivider->setObjectName(QStringLiteral("DataCodecSettingsDivider"));
+    batchDivider->setFixedHeight(1);
+    layout->addWidget(batchDivider);
+    auto* batchRow = new QHBoxLayout;
+    batchRow->setSpacing(8);
+    auto* batchLabel = new QLabel(QStringLiteral("批量设置"), panel);
+    batchLabel->setObjectName(QStringLiteral("DataCodecSettingsTitle"));
+    batchRow->addWidget(batchLabel);
+    batchRow->addSpacing(4);
     m_applyLosslessAllButton = new QPushButton(QStringLiteral("全部无损"), panel);
     m_applyLossyAllButton = new QPushButton(QStringLiteral("全部有损"), panel);
     m_applyLossyAllButton->setToolTip(QStringLiteral("将全部数据的相对误差限设为 0.00001"));
     m_syncDefaultPrecisionButton = new QPushButton(QStringLiteral("全部应用当前误差限"), panel);
-    auto* batchModeRow = new QHBoxLayout;
-    batchModeRow->setSpacing(6);
-    batchModeRow->addWidget(m_applyLosslessAllButton);
-    batchModeRow->addWidget(m_applyLossyAllButton);
-    compressionColumn->addLayout(batchModeRow);
-    compressionColumn->addWidget(m_syncDefaultPrecisionButton);
-    compressionColumn->addSpacing(2);
-
-    auto* predictionLabel = new QLabel(QStringLiteral("预测编码"), panel);
-    predictionLabel->setObjectName(QStringLiteral("DataCodecLabelStrong"));
-    compressionColumn->addWidget(predictionLabel);
-
-    m_intraAttributePredictionCheck = new QCheckBox(QStringLiteral("帧内数据预测编码"), panel);
-    m_temporalAttributePredictionCheck = new QCheckBox(QStringLiteral("帧间数据预测编码"), panel);
-    m_intraAttributePredictionCheck->setChecked(true);
-    m_temporalAttributePredictionCheck->setChecked(true);
-    compressionColumn->addWidget(m_intraAttributePredictionCheck);
-    compressionColumn->addWidget(m_temporalAttributePredictionCheck);
-    compressionColumn->addStretch();
+    batchRow->addWidget(m_applyLosslessAllButton, 1);
+    batchRow->addWidget(m_applyLossyAllButton, 1);
+    batchRow->addWidget(m_syncDefaultPrecisionButton, 2);
+    layout->addLayout(batchRow);
 
     // 容量提示横跨两列，为完整说明保留换行空间
     auto* storageStatus = m_resourceControls->StorageStatusLabel();
@@ -1431,6 +1472,27 @@ QFrame#DataCodecInnerPanel {
     background: #252526;
     border: 1px solid #3c3c3c;
     border-radius: 8px;
+}
+QFrame#DataCodecSettingsGroup {
+    background: #202022;
+    border: 1px solid #353538;
+    border-radius: 6px;
+}
+QFrame#DataCodecSettingsDivider {
+    background: #3c3c3c;
+    border: none;
+}
+QLabel#DataCodecSettingsTitle {
+    color: #e6e6e6;
+    font-weight: 700;
+}
+QLabel#DataCodecFormLabel {
+    color: #adb3b8;
+    font-weight: 400;
+}
+QFrame#DataCodecSettingsGroup QCheckBox {
+    spacing: 6px;
+    min-height: 22px;
 }
 QFrame#DataCodecBasisScope {
     background: #1f2524;

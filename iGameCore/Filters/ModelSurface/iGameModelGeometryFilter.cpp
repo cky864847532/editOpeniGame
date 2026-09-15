@@ -1830,6 +1830,17 @@ void ModelGeometryFilter::CompositeCellAttribute(std::vector<igIndex>& F2C, Attr
     IGsize fcnt = F2C.size();
     auto f2c = F2C.data();
     auto inDataArrayNum = inAllDataArray->GetAllAttributes()->GetNumberOfElements();
+    bool needsRanges = false;
+    for (IGsize field = 0; field < inDataArrayNum; ++field) {
+        if (inAllDataArray->GetAttribute(field).dataRange == nullptr) { needsRanges = true; break; }
+    }
+    if (needsRanges) {
+        // 字段范围彼此独立，复用线程池并行计算，输出属性仍按原顺序组装
+        // 按值持有输入，任务异常时仍保证已提交任务访问的数据存活
+        ThreadPool::parallelFor(0, inDataArrayNum, [attributes = inAllDataArray](int begin, int end) {
+            for (int field = begin; field < end; ++field) { attributes->GetAttribute(field).GetDataRange(); }
+        });
+    }
     for (i = 0; i < inDataArrayNum; i++) {
         auto& inData = inAllDataArray->GetAttribute(i).pointer;
         ArrayObject::Pointer outData = inData;
