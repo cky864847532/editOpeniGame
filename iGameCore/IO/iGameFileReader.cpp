@@ -37,13 +37,6 @@ bool FileReader::Execute() {
         }
     };
 
-    // 阶段式进度上报：让"打开 → 解析 → 收尾 → 构建 DataObject"每一步都能推进进度条。
-    // 否则只按文件/帧数上报的读取器（例如旧版 .vtk 只在结束时上报 1.0）会让进度条一直停在 0%。
-    // 单调递增：自带精细进度的读取器（如 VTU 报 0.1~0.9）不会被这里的小值拉回去。
-    auto bumpProgress = [this](double v) -> void {
-        if (v > m_Progress) { this->UpdateProgress(v); }
-    };
-
     clock_t start, end;
     start = clock();
 
@@ -55,25 +48,21 @@ bool FileReader::Execute() {
     }
     clock_t time2 = clock();
     //std::cout << "Read file to buffer Cost " << time2 - time1 << "ms\n";
-    bumpProgress(0.05);  // 文件已打开 / 已读入缓冲
     if (!Parsing()) {
         IGAME_CORE_ERROR("Parsing failure");
         resetProgressUI();
         return false;
     }
-    bumpProgress(0.60);  // 解析完成
     if (!Close()) {
         IGAME_CORE_ERROR("Close failure");
         resetProgressUI();
         return false;
     }
-    bumpProgress(0.70);  // 收尾完成
     if (!CreateDataObject()) {
         IGAME_CORE_ERROR("Generate DataObject failure");
         resetProgressUI();
         return false;
     }
-    bumpProgress(0.95);  // DataObject 构建完成
     clock_t time3 = clock();
 
     if (m_Output) {

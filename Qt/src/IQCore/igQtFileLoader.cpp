@@ -26,17 +26,11 @@
 #include <IQComponents/Dialog/igQtSplineOptionDialog.h>
 #include <IQCore/igQtFileLoader.h>
 #include <IQCore/igQtFileType.h>
-#include <QMetaObject>
 #include <iGameType.h>
 
 #include <QCoreApplication>
 #include <QByteArray>
-#include <QDir>
-#include <QFile>
-#include <QFileInfo>
-#include <QMap>
 #include <QMessageBox>
-#include <QSet>
 #include <iostream>
 #include <qaction.h>
 #include <qdebug.h>
@@ -58,10 +52,7 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
     m_SceneManager = SceneManager::Instance();
 }
 
-igQtFileLoader::~igQtFileLoader() {
-    // 退出时等待正在进行的加载线程结束，避免它访问/回调已经销毁的对象。
-    if (m_LoadThread.joinable()) { m_LoadThread.join(); }
-}
+igQtFileLoader::~igQtFileLoader() {}
 void igQtFileLoader::LoadOnlineS() {
 #if defined(_WIN32) || defined(_WIN64)
     std::thread server_thread(serverThread);
@@ -191,41 +182,23 @@ void igQtFileLoader::OpenFile(const std::string& filePath) {
     }
 #endif
 
-    // 异步加载：读盘 + 解析放到工作线程，避免阻塞 GUI 线程。
-    // （同步版会让事件循环在加载期间停摆，进度条只能在加载结束后一次性回放。）
-    if (m_Loading) {
-        igDebug("A file is already being loaded, ignore: " + filePath);
+    auto obj = iGame::FileIO::ReadFile(filePath);
+    //_obj = obj;
+    if (obj == nullptr) {
+        igDebug("This file read error.");
         return;
     }
-    if (m_LoadThread.joinable()) { m_LoadThread.join(); } // 回收上一次已经结束的线程
-    m_Loading = true;
+    auto filename = filePath.substr(filePath.find_last_of('/') + 1);
+    obj->SetName(filename.substr(0, filename.find_last_of('.')).c_str());
+    obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(filePath);
+    //Q_EMIT AddFileToModelList(QString(filePath.substr(filePath.find_last_of('/') + 1).c_str()));
 
-    const std::string path = filePath;
-    m_LoadThread = std::thread([this, path]() {
-        // ---- 工作线程：只读数据，不碰 UI ----
-        auto obj = iGame::FileIO::ReadFile(path);
+    this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
 
-        // ---- 回到 GUI 线程：挂模型 / 更新最近文件 / 发信号 ----
-        QMetaObject::invokeMethod(
-                this,
-                [this, obj, path]() {
-                    m_Loading = false;
-                    if (obj == nullptr) {
-                        igDebug("This file read error.");
-                        return;
-                    }
-                    auto filename = path.substr(path.find_last_of('/') + 1);
-                    obj->SetName(filename.substr(0, filename.find_last_of('.')).c_str());
-                    obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(path);
-                    //Q_EMIT AddFileToModelList(QString(path.substr(path.find_last_of('/') + 1).c_str()));
 
-                    this->SaveCurrentFileToRecentFile(FromUtf8FilePath(path));
-
-                    emit NewModel(obj, ItemSource::File);
-                    emit FinishReading();
-                },
-                Qt::QueuedConnection);
-    });
+    //return;
+    emit NewModel(obj, ItemSource::File);
+    emit FinishReading();
 }
 
 void igQtFileLoader::OpenFiles(const QStringList& filePaths) {
@@ -606,29 +579,16 @@ void igQtFileLoader::SaveFileAs() {
 
 void igQtFileLoader::SaveCurrentFileToRecentFile(QString path) {
     if (path.isEmpty()) return;
-    // 统一用 '/'，避免同一文件同时出现 E:/... 和 E:\... 两条记录，
-    // 同时避免反斜杠在 INI 中每读写一次就翻倍。
-    const QString normalized = QDir::cleanPath(QDir::fromNativeSeparators(path).trimmed());
-    if (normalized.isEmpty() || normalized.length() > 4096) return;
-
     for (int i = 0; i < recentFileActionList.size(); i++) {
-        QAction* act = recentFileActionList.at(i);
-        if (QDir::cleanPath(QDir::fromNativeSeparators(act->data().toString())) == normalized) {
-            // 注意：不能 delete 这个 action，它仍可能挂在“最近文件”菜单里，
-            // 删掉会导致后续更新菜单时访问悬空指针并崩溃。
-            // 这里只把它移到列表末尾表示“最近打开”。
+        if (recentFileActionList.at(i)->data() == path) {
+            delete recentFileActionList.at(i);
             recentFileActionList.removeAt(i);
-            act->setText(normalized);
-            act->setData(normalized);
-            recentFileActionList.append(act);
-            UpdateRecentActionList();
-            UpdateIniFileInfo();
-            return;
+            break;
         }
     }
-
-    AddCurrentFileToRecentFilePath(normalized);
+    AddCurrentFileToRecentFilePath(path);
     UpdateIniFileInfo();
+    return;
 }
 void igQtFileLoader::AddCurrentFileToRecentFilePath(QString filePath) {
     auto recentFileActions = this->GetRecentActionList();
@@ -644,72 +604,34 @@ void igQtFileLoader::AddCurrentFileToRecentFilePath(QString filePath) {
 void igQtFileLoader::UpdateIniFileInfo() {
     //为了能记住上次打开的路径
     QSettings setting(QCoreApplication::applicationDirPath() + "/config/savePath.ini", QSettings::IniFormat);
-    // 先清掉旧的 LastFilePath*，避免历史脏数据/翻倍转义残留。
-    const QStringList oldKeys = setting.allKeys();
-    for (const QString& key : oldKeys) {
-        if (key.startsWith(QStringLiteral("LastFilePath"))) setting.remove(key);
-    }
-
     int num = this->recentFileActionList.size();
     int idx = 0;
-    for (int i = 0; i < num && idx < maxFileNr; i++) {
-        if (!recentFileActionList.at(i)->isVisible()) continue;
-
-        const QString p = QDir::cleanPath(QDir::fromNativeSeparators(
-                recentFileActionList.at(i)->data().toString()).trimmed());
-        // 防护：空路径或异常超长路径不允许写回，避免再次把 savePath.ini 撑爆。
-        if (p.isEmpty() || p.length() > 4096) continue;
-
-        idx++;
-        const QString name = "LastFilePath" + QString::fromStdString(std::to_string(idx));
-        setting.setValue(name, p);
+    for (int i = 0; i < num; i++) {
+        if (recentFileActionList.at(i)->isVisible()) {
+            idx++;
+            QString name = "LastFilePath" + QString::fromStdString(std::to_string(idx));
+            setting.setValue(name, this->recentFileActionList[i]->data());
+        }
     }
 }
 
 
 void igQtFileLoader::InitRecentFilePaths() {
-    const QString path = QCoreApplication::applicationDirPath() + "/config/savePath.ini";
-
-    // 防护：最近文件记录一旦异常膨胀（上次崩溃/脏数据写入超长路径），
-    // 直接废弃重建，避免启动时读取超大 INI 文件。
-    QFileInfo info(path);
-    if (info.exists() && info.size() > 1024 * 1024) {
-        QFile::remove(path);
-        return;
-    }
-
-    // 用 QSettings 读取，交给 Qt 处理 INI 的转义/反转义。
-    // 旧实现手动 readLine 且不做反转义，导致路径中的反斜杠每读写一次就翻倍，
-    // 最终 savePath.ini 被撑爆并在启动时引发卡死/崩溃。
-    QSettings setting(path, QSettings::IniFormat);
-    QMap<int, QString> entries;
-    QSet<QString> seenPaths;
-    const QStringList keys = setting.allKeys();
-    for (const QString& key : keys) {
-        if (!key.startsWith(QStringLiteral("LastFilePath"))) continue;
-
-        bool ok = false;
-        const int idx = key.mid(QStringLiteral("LastFilePath").size()).toInt(&ok);
-        if (!ok) continue;
-
-        const QString p = QDir::cleanPath(QDir::fromNativeSeparators(setting.value(key).toString().trimmed()));
-        if (p.isEmpty() || p.length() > 4096) continue;
-        if (seenPaths.contains(p)) continue;
-
-        seenPaths.insert(p);
-        entries.insert(idx, p);
-    }
-
+    QString path = QCoreApplication::applicationDirPath() + "/config/savePath.ini";
+    QFile* file = new QFile(this);
     std::vector<QString> FilePaths;
-    for (auto it = entries.begin(); it != entries.end(); ++it) {
-        FilePaths.emplace_back(it.value());
-        if (FilePaths.size() >= static_cast<size_t>(maxFileNr)) break;
+    file->setFileName(path);
+    if (!file->open(QIODevice::ReadOnly)) { return; }
+    while (!file->atEnd()) {
+        QString str = file->readLine();
+        //std::cout << str.toStdString()<< std::endl;
+        if (str.toStdString().find('=') == std::string::npos) continue;
+        QStringList list = str.split("=");
+        if (!list.isEmpty()) { FilePaths.emplace_back(list.at(1).trimmed()); }
     }
+    file->close();
+    delete file;
     InitRecentFileActions(FilePaths);
-
-    // 启动时立即回写一次规范化后的最近文件列表：
-    // 清掉历史脏 key、去掉重复项、避免旧 INI 中的反斜杠残留继续膨胀。
-    UpdateIniFileInfo();
 }
 
 void igQtFileLoader::InitRecentFileActions(std::vector<QString> FilePaths) {

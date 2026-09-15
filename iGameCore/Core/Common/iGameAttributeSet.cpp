@@ -1,9 +1,7 @@
 #include "iGameAttributeSet.h"
 #include "iGameAttributeSet.h"
 #include "iGameDrawObject.h"
-#include <cfloat>
 #include <utility>
-#include <vector>
 
 IGAME_NAMESPACE_BEGIN
 
@@ -259,12 +257,8 @@ bool iGame::AttributeSet::Attribute::DeepCopy(const iGame::AttributeSet::Attribu
         p->DeepCopy(DynamicCast<DoubleArray>(other.pointer));
         p->SetName(other.pointer->GetName());
         pointer = p;
-    } else if (other.pointer != nullptr) {
-        // 其他数组类型（如 IntArray / UnsignedIntArray）暂不支持深拷贝。
-        // 这里共享原数组，避免 pointer 变成空指针导致后续 UI/模型树访问崩溃。
-        pointer = other.pointer;
     } else {
-        pointer = nullptr;
+        return false;
     }
     type = other.type;
     attachmentType = other.attachmentType;
@@ -276,16 +270,8 @@ bool iGame::AttributeSet::Attribute::DeepCopy(const iGame::AttributeSet::Attribu
     runningMax = other.runningMax;
     runningRangeValid = other.runningRangeValid;
 
-    if (other.dataRange != nullptr && other.pointer != nullptr &&
-        other.dataRange->GetDimension() == 2 &&
-        other.dataRange->GetNumberOfElements() >=
-                static_cast<IGsize>(other.pointer->GetDimension() + 1)) {
-        dataRange = DoubleArray::New();
-        dataRange->DeepCopy(other.dataRange);
-    } else {
-        // 保持为空，后续 GetDataRange()/UpdateAllDataRange() 会按实际维度懒初始化。
-        dataRange = nullptr;
-    }
+    dataRange = DoubleArray::New();
+    dataRange->DeepCopy(other.dataRange);
     return true;
 }
 
@@ -325,21 +311,8 @@ bool iGame::AttributeSet::Attribute::UpdateAllDataRange() {
     }
     // 范围锁定：保留固定范围，不按数据重算（供"固定范围"开关使用）
     if (rangeLocked) { return true; }
-    if (this->pointer == nullptr) { return false; }
-
-    const int dim = this->pointer->GetDimension();
-    if (dim <= 0) { return false; }
-
-    // 历史/外部 dataRange 可能维度或长度不匹配，直接写入会越界并破坏堆内存。
-    // 这里先校验并重建为规范的 (dim + 1) 个元素、每个元素 2 个 double 的布局。
-    if (dataRange->GetDimension() != 2 ||
-        dataRange->GetNumberOfElements() < static_cast<IGsize>(dim + 1)) {
-        dataRange = DoubleArray::New();
-        dataRange->SetDimension(2);
-        dataRange->Resize(dim + 1);
-    }
-
-    std::vector<double> dimensionRanges(2 * (dim + 1));
+    int dim = this->pointer->GetDimension();
+    double dimensionRanges[128];
     for (int i = 0; i < 2 * (dim + 1); i += 2) {
         dimensionRanges[i + 0] = DBL_MAX;
         dimensionRanges[i + 1] = DBL_MIN;
