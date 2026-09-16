@@ -15,6 +15,65 @@
 
 namespace {
 
+datacodec::test::TestResult TestIndependentAttributeDecode() {
+    using namespace datacodec;
+    using namespace datacodec::test;
+    TestResult result;
+    // 同类字段跨边界供给，并覆盖多块尾部与不同分量类型的切换
+    for (const std::size_t count : std::array<std::size_t, 2>{17u, numericarray::kSpatialBlockElementCount + 3u}) {
+        TestDataset data;
+        data.points.resize(count * 3u);
+        for (std::size_t i = 0; i < count; ++i) { data.points[i * 3u] = static_cast<float>(i); }
+        for (std::size_t f = 0; f < 6u; ++f) {
+            TestNumericField field;
+            field.name = "independent_" + std::to_string(f);
+            field.componentCount = f == 2u || f == 3u ? 3u : 1u;
+            field.values.resize(count * field.componentCount);
+            for (std::size_t i = 0; i < field.values.size(); ++i) { field.values[i] = static_cast<float>((i * 17u + f * 31u) % 65536u) / 1024.0f; }
+            data.pointFields.push_back(std::move(field));
+        }
+        auto configuration = MakeDefaultEncodeConfigurationParams();
+        configuration.controlParams.attrReference.intraField.codec = IntraFieldReferenceCodec::Disabled;
+        auto encoded = Encode({.input = EncodeInput::LeafAdapter(std::make_shared<TestEncodeAdapter>(data)),
+            .output = EncodeOutput::Memory(EncodePackageKind::LeafPackage), .configuration = configuration,
+            .resources = {.mode = CodecResourceMode::Unlimited}});
+        if (!Require(result, encoded.success, "independent.encode", "independent fixture encoding failed")) { return result; }
+        auto owner = std::make_shared<const EncodedBuffer>(std::move(encoded.encodedBytes));
+        for (const bool subset : {false, true}) {
+            DecodePackageRequest request{.input = EncodedInput::Memory(owner), .resources = {.mode = CodecResourceMode::Unlimited}};
+            if (subset) {
+                request.attributeSelection = AttributeSelectionMode::Explicit;
+                request.attributeTargets = {{.attrIndex = 1u}, {.attrIndex = 3u}, {.attrIndex = 5u}};
+            }
+            const auto decoded = DecodePackage(request);
+            if (!Require(result, decoded.success && decoded.output.leaves.size() == 1u,
+                    "independent.decode", "independent fields did not decode")) { return result; }
+            const auto& leaf = decoded.output.leaves.front();
+            Require(result, leaf.attributes.size() == (subset ? 3u : 6u), "independent.count", "unexpected attribute selection");
+            const auto* points = reinterpret_cast<const float*>(leaf.geometry.values.data());
+            for (const auto& field : leaf.attributes) {
+                const auto& expected = data.pointFields.at(field.sourceIndex);
+                bool equal = field.values.size() == expected.values.size() * sizeof(float);
+                const auto* values = reinterpret_cast<const float*>(field.values.data());
+                for (std::size_t i = 0; equal && i < count; ++i) {
+                    const auto source = static_cast<std::size_t>(points[i * 3u]);
+                    for (std::size_t c = 0; c < expected.componentCount; ++c) {
+                        equal &= source < count && values[i * expected.componentCount + c] == expected.values[source * expected.componentCount + c];
+                    }
+                }
+                Require(result, equal, "independent.values", "independent field values differ from the source");
+            }
+        }
+        // 截断输入必须失败，失败请求结束后仍能重新解码完整输入
+        const auto failed = DecodePackage({.input = EncodedInput::Memory(owner, owner->span().first(owner->size() / 2u)),
+            .resources = {.mode = CodecResourceMode::Unlimited}});
+        Require(result, !failed.success, "independent.truncated", "truncated input unexpectedly succeeded");
+        const auto reopened = DecodePackage({.input = EncodedInput::Memory(owner), .resources = {.mode = CodecResourceMode::Unlimited}});
+        Require(result, reopened.success, "independent.retry", "decoding after failure did not recover");
+    }
+    return result;
+}
+
 datacodec::test::TestResult TestPackageSession() {
     using namespace datacodec;
     using namespace datacodec::test;
@@ -121,7 +180,8 @@ int main() {
         const bool roundTrip = PrintResult(datacodec::test::RunDataCodecFeatureAdapterRoundTrip());
         const bool session = PrintResult(TestPackageSession());
         const bool bridge = PrintResult(datacodec::test::RunDataCodecFeatureBridgeAudit());
-        return roundTrip && session && bridge ? 0 : 1;
+        const bool independent = PrintResult(TestIndependentAttributeDecode());
+        return roundTrip && session && bridge && independent ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

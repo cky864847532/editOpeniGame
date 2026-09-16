@@ -938,6 +938,138 @@ inline bool DecodeSingleAttributeRangeToCache(
         });
 }
 
+// 独立字段共用一个块流，字段边界不再强制收束同类计算任务
+template<typename TPayloadBacking>
+inline bool DecodeIndependentAttributeRangesToCache(
+    AttributePayloadDecodeRuntime& runtime, const TPayloadBacking& backing,
+    const std::vector<AttributePayloadRange>& ranges, const std::vector<std::size_t>& order,
+    std::string* error) {
+    const auto& storage = runtime.data.storageParams;
+    const auto& resources = runtime.cache.cacheResources;
+    auto& attributes = runtime.cache.attributes;
+    auto& root = resources.Run();
+    const bool timing = static_cast<bool>(runtime.context.timingCallback);
+    struct Field {
+        AttributePayloadRange range;
+        numericarray::NumericArrayBlockParams params;
+        AttributePayloadRangeStream stream;
+        numericarray::NumericDecodeCursor<AttributePayloadRangeStream> cursor;
+        std::span<std::uint8_t> target;
+        ParamSize committed{0u};
+        AttributeDecodeWorkBreakdown work;
+        callback::PhaseTimePoint start;
+        Field(const TPayloadBacking& backing, const AttributePayloadRange& range,
+              const AttrStorageParams& meta, const CacheResources& resources)
+            : range(range), stream(backing, range.offset, range.byteCount),
+              cursor{stream, params, meta.blockLayouts, resources} {}
+    };
+    std::vector<std::unique_ptr<Field>> fields;
+    struct Guard {
+        DecodedAttributeCacheSet& attributes;
+        std::vector<std::unique_ptr<Field>>& fields;
+        ~Guard() {
+            for (const auto& field : fields) {
+                if (!attributes.Complete(field->range.attrIndex)) { attributes.ReleaseFieldBytes(field->range.attrIndex); }
+            }
+        }
+    } guard{attributes, fields};
+    auto phase = WaitForHeavyPhase(root);
+    if (!phase) { return false; }
+    const auto backingBytes = AttributePayloadBackingByteSize(backing);
+    for (const auto index : order) {
+        if (root.Stopped()) { return false; }
+        if (attributes.Complete(index)) { continue; }
+        const auto& meta = storage.attrParams[index];
+        const auto& range = ranges[index];
+        if (range.byteCount != meta.binaryCount || range.offset > backingBytes || range.byteCount > backingBytes - range.offset) {
+            return validation::AssignError(error, "attribute payload range does not match its backing and metadata");
+        }
+        auto field = std::make_unique<Field>(backing, range, meta, resources);
+        if (!numericarray::MakeNumericArrayBlockParamsFromMeta(meta, field->params, error) || !field->cursor.Prepare(error)) { return false; }
+        std::uint64_t payloadBytes = 0u;
+        for (const auto& layout : meta.blockLayouts) {
+            if (!validation::CheckedAddU64(payloadBytes, layout.encodedByteLength, payloadBytes, "attribute block payload bytes", error)) { return false; }
+        }
+        if (payloadBytes != range.byteCount) { return validation::AssignError(error, "attribute block payload sizes do not cover the field"); }
+        fields.push_back(std::move(field));
+        auto& current = *fields.back();
+        if (!attributes.BeginAttribute(index, meta, error)) { return false; }
+        if (auto* memory = dynamic_cast<bytestore::MemoryStore*>(attributes.Bytes(index).get())) { current.target = memory->WritableBytes(); }
+        if (meta.elementCount == 0u) {
+            if (!attributes.EndAttribute(index, error)) { return false; }
+            if (timing) { runtime.context.timingCallback(BuildAttributeDecodeTimingDetail(index, meta, 0.0, current.work)); }
+        }
+    }
+    phase.reset();
+    struct Input { std::size_t field; numericarray::NumericArrayBlockPayload block; };
+    struct Output { std::size_t field; AttributeDecodedBlock block; };
+    std::size_t next = 0u;
+    numericarray::NumericDecodeMemoryLayout memory;
+    const auto more = [&] {
+        while (next < fields.size() && !fields[next]->cursor.HasMore()) { ++next; }
+        return next < fields.size();
+    };
+    return RunOrderedBlocks<Input, Output>(root, more,
+        [&](Input& input, const SlotLease&, DecodeBlockWorkspace& workspace) {
+            input.field = next;
+            auto& field = *fields[next];
+            if (field.cursor.nextBlock == 0u) { field.start = callback::StartTiming(timing); }
+            const auto start = callback::StartTiming(timing);
+            if (!field.cursor.ReadNext(input.block, memory, workspace, error)) { return false; }
+            if (timing) { field.work.payloadBlockReadMs += callback::ElapsedMilliseconds(start); }
+            return true;
+        },
+        [&](const Input& input, Output& output, WorkerContext& worker, DecodeBlockWorkspace& workspace) {
+            output.field = input.field;
+            const auto& field = *fields[input.field];
+            if (runtime.context.recordCapacitySamples) { output.block.capacitySamples.emplace(); }
+            std::string localError;
+            if (!ComputeAttributeDecodedBlock(storage, storage.attrParams[field.range.attrIndex], attributes, nullptr,
+                    input.block, output.block, worker, workspace, timing, &localError, field.target)) {
+                root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+                    "attribute-block-decode", "ComputeAttributeDecodedBlock", localError));
+                return false;
+            }
+            return true;
+        },
+        [&](Output& output) {
+            auto& field = *fields[output.field];
+            auto& block = output.block;
+            const auto index = field.range.attrIndex;
+            const auto& meta = storage.attrParams[index];
+            if (block.header.elementOffset != field.committed) { return validation::AssignError(error, "attribute commit range is not contiguous"); }
+            const auto start = callback::StartTiming(timing);
+            if (field.target.empty() && !WriteDecodedAttributeBlock(attributes, index, meta, block.header, block.bytes.Span(), error)) { return false; }
+            std::size_t expected = 0u;
+            if (!numericarray::ResolveNumericArrayBlockRawByteCount(field.params, block.header.elementCount, expected, error) || block.bytes.Span().size() != expected) {
+                return validation::AssignError(error, "attribute decoded block does not match its logical shape");
+            }
+            if (timing) {
+                AccumulateAttributeDecodeWork(field.work, block.work);
+                field.work.cacheWriteMs += callback::ElapsedMilliseconds(start);
+                field.work.cacheWriteBytes = SaturatingParamSizeAdd(field.work.cacheWriteBytes, field.target.empty() ? block.bytes.Span().size() : 0u);
+            }
+            if (block.capacitySamples && runtime.context.recordCapacitySamples) {
+                block.capacitySamples->Observe(numericarray::NumericBufferSample::Output, block.bytes.Bytes());
+                try { runtime.context.recordCapacitySamples(block.capacitySamples->values); }
+                catch (...) { root.RecordDiagnosticExportFailure(); }
+            }
+            field.committed += block.header.elementCount;
+            if (field.committed != meta.elementCount) { return true; }
+            if (field.stream.Position() != field.range.byteCount) { return validation::AssignError(error, "attribute decode consumed an unexpected payload size"); }
+            if (!attributes.EndAttribute(index, error)) { return false; }
+            if (timing) { runtime.context.timingCallback(BuildAttributeDecodeTimingDetail(index, meta, callback::ElapsedMilliseconds(field.start), field.work)); }
+            return true;
+        }, false,
+        [&] { return fields[next]->cursor.NextWorkType(ResourceWorkPath::AttributeDecode); },
+        [&] {
+            const auto& field = *fields[next];
+            const auto& meta = storage.attrParams[field.range.attrIndex];
+            memory = numericarray::MakeNumericDecodeMemoryLayout(meta, meta.blockLayouts[field.cursor.nextBlock], nullptr, false, !field.target.empty());
+            return memory;
+        });
+}
+
 template<typename TPayloadBacking, typename TReferenceDecoder>
 inline bool DecodeAttributePayloadRangesToCache(
     AttributePayloadDecodeRuntime& decodeRuntime,
@@ -985,6 +1117,17 @@ inline bool DecodeAttributePayloadRangesToCache(
 
     std::vector<std::size_t> executionOrder;
     if (!ResolveAttributeExecutionOrder(storageParams, targetAttrIndices, executionOrder, error)) { return false; }
+
+    bool independent = executionOrder.size() > 1u && !cacheResources.Run().StorageCapacity()->Snapshot().limitBytes;
+    for (const auto index : executionOrder) {
+        if (!independent) { break; }
+        if (attributes.Complete(index)) { continue; }
+        for (const auto& layout : storageParams.attrParams[index].blockLayouts) {
+            independent &= layout.referenceKind == NumericArrayReferenceKind::None &&
+                NumericArrayBlockModeCodecId(layout.mode) == NumericArrayReferenceCodecId::NonReference;
+        }
+    }
+    if (independent && !DecodeIndependentAttributeRangesToCache(decodeRuntime, payloadBacking, rangeByAttr, executionOrder, error)) { return false; }
 
     const bool collectTiming = static_cast<bool>(timingCallback);
     for (const auto attrIndex : executionOrder) {

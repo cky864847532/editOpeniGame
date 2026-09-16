@@ -21,6 +21,7 @@
 #include <mutex>
 #include <thread>
 #include <cmath>
+#include "DataCodec/Test/Experiment/DataCodecDecodeFixture.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -109,6 +110,14 @@ Shape Describe(iGame::DataObject::Pointer object, const char* phase) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 6 && std::string_view(argv[1]) == "--make-decode-fixture") {
+            return datacodec::test::MakeDecodeFixture(argv[2], std::stoull(argv[3]), std::stoull(argv[4]), std::string_view(argv[5]) == "zstd");
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--decode-fixture") {
+            const auto result = datacodec::test::RunDecodeFixture(argv[2], std::stoull(argv[3]));
+            Memory("after_decode");
+            return result;
+        }
         if ((argc == 3 || argc == 4 || argc == 5) && std::string_view(argv[1]) == "--storage-bound") {
             std::int64_t deltaMiB = 0;
             if (argc >= 4) {
