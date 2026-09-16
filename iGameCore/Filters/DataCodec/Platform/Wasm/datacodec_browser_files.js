@@ -1,7 +1,7 @@
 'use strict';
 
 // 每个 WASM Module 持有独立文件表，页面只通过登记和释放接口管理 File 生命周期
-// 释放阻止后续读取，已开始的异步读取持有自己的 File 引用直至完成
+// 每个输入描述保留一个引用，最后引用释放后移除登记，在途读取保持自己的 File 引用
 function createDataCodecBrowserFiles({ onRead, onRelease } = {}) {
     const files = new Map();
     let nextId = 1;
@@ -19,13 +19,13 @@ function createDataCodecBrowserFiles({ onRead, onRelease } = {}) {
             }
             if (nextId > 0xffffffff) throw new Error('browser file identifiers are exhausted');
             const id = nextId++;
-            files.set(id, file);
+            files.set(id, { file, references: 1 });
             lastError = '';
             return id;
         },
         async read(id, offset, count) {
             try {
-                const file = files.get(id);
+                const file = files.get(id)?.file;
                 if (!file) throw new Error(`browser file ${id} is unavailable`);
                 if (!Number.isSafeInteger(offset) || offset < 0 ||
                     !Number.isSafeInteger(count) || count < 0 || count > 1048576 ||
@@ -44,8 +44,15 @@ function createDataCodecBrowserFiles({ onRead, onRelease } = {}) {
                 throw error;
             }
         },
+        retain(id) {
+            const entry = files.get(id);
+            if (!entry || entry.references >= Number.MAX_SAFE_INTEGER) return false;
+            ++entry.references;
+            return true;
+        },
         release(id) {
-            if (files.delete(id)) observe(onRelease, id);
+            const entry = files.get(id);
+            if (entry && --entry.references === 0) { files.delete(id); observe(onRelease, id); }
         },
         recordError(detail) { lastError = String(detail); },
         lastError() { return lastError; },

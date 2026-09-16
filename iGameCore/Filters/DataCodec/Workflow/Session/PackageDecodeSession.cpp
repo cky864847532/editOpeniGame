@@ -1,8 +1,10 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #include "DataCodec/API/Entry/PackageDecodeSession.h"
 
 #include "DataCodec/Workflow/Session/DecodeSession.h"
 #include "DataCodec/Workflow/Session/CodecRunEntry.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
+#include "DataCodec/Workflow/Decode/DecodedResultBuilder.h"
 
 #include <map>
 #include <tuple>
@@ -27,8 +29,10 @@ struct PackageDecodeSession::Impl {
     DecodeSession session;
     std::shared_ptr<IByteRangeReader> reader;
     DataCodecDecodePackageConfigurationParams configuration{MakeDefaultDecodePackageConfigurationParams()};
-    std::map<PreparedKey, std::unique_ptr<IDecodeAdapter>> prepared;
+    std::map<PreparedKey, std::unique_ptr<DecodedLeafBuilder>> prepared;
+    std::shared_ptr<const ICellTypeMapping> mapping;
     std::uint64_t inputBytes{0u};
+    InputMemoryObservation inputMemory;
     bool framePackage{false};
     bool open{false};
 
@@ -36,9 +40,11 @@ struct PackageDecodeSession::Impl {
         // 先清理解码状态，再释放其借用的适配器和资源根
         session.AbortFramePackage();
         prepared.clear();
+        mapping.reset();
         reader.reset();
         resources.reset();
         inputBytes = 0u;
+        inputMemory = {};
         framePackage = false;
         open = false;
     }
@@ -50,7 +56,9 @@ struct PackageDecodeSession::Impl {
         if (resources->FirstFailure()) result.failure = resources->FirstFailure();
         result.cancelled = result.cancelled || (result.failure && result.failure->cancelled);
         result.inputBytes = inputBytes;
+        result.inputMemory = inputMemory;
         result.decodedFramePackage = framePackage;
+        if (!result.success) { result.output = {}; }
         return result;
     }
 };
@@ -63,10 +71,15 @@ DecodePackageResult PackageDecodeSession::Open(const PackageDecodeSessionOpenReq
     auto& state = *m_impl;
     DecodePackageResult result;
     try {
-        if (!request.decode.inputReader) {
+        if (request.decode.stopToken.stop_requested()) {
+            return SessionFailure("cancelled", "decode session cancelled", true);
+        }
+        if (!request.decode.input) {
             return SessionFailure("missing-input", "decode session requires an input reader");
         }
-        state.inputBytes = request.decode.inputReader->ByteSize();
+        state.reader = EncodedInputAccess::Open(request.decode.input);
+        state.inputMemory = request.decode.input.ObserveMemory();
+        state.inputBytes = state.reader->ByteSize();
         state.resources = std::make_shared<DataCodecExecutionResources>(request.decode.resources);
         const auto resources = state.resources;
         {
@@ -76,8 +89,9 @@ DecodePackageResult PackageDecodeSession::Open(const PackageDecodeSessionOpenReq
                 result = SessionFailure("run-start", "decode session could not start");
             } else {
                 auto decode = request.decode;
-                state.reader = decode.inputReader;
+
                 state.configuration = decode.configuration;
+                state.mapping = decode.cellTypeMapping;
                 if (request.encodedInputCachePolicy.enabled && request.sourceIdentity.IsStable()) {
                     auto& caches = resources->Caches();
                     std::string error;
@@ -90,7 +104,7 @@ DecodePackageResult PackageDecodeSession::Open(const PackageDecodeSessionOpenReq
                     }
                 }
                 if (state.reader) {
-                    decode.inputReader = state.reader;
+                    decode.input = EncodedInputAccess::Retain(state.reader);
                     result = DecodePackageInRun(decode, *resources, &state.session);
                     state.framePackage = result.decodedFramePackage;
                 }
@@ -117,7 +131,7 @@ DecodePackageResult PackageDecodeSession::RequestAttributes(
     auto& state = *m_impl;
     if (!state.open) return SessionFailure("session-closed", "decode session is not open");
     if (request.targets.empty()) return {.success = true, .decodedFramePackage = state.framePackage,
-                                         .inputBytes = state.inputBytes};
+                                         .inputBytes = state.inputBytes, .inputMemory = state.inputMemory};
     DecodePackageResult result;
     try {
         using TargetKey = std::pair<std::uint32_t, BlockPath>;
@@ -157,13 +171,8 @@ DecodePackageResult PackageDecodeSession::RequestAttributes(
                         result = SessionFailure("attribute-cache", "prepared attribute adapter is unavailable");
                         break;
                     }
-                    std::string error;
-                    auto adapter = request.createAdapter ? request.createAdapter(target.second, &error) : nullptr;
-                    if (!adapter) {
-                        result = SessionFailure("attribute-adapter", error.empty()
-                            ? "failed to create attribute supplement adapter" : error);
-                        break;
-                    }
+                    auto adapter = std::make_unique<DecodedLeafBuilder>(state.mapping);
+                    adapter->output.path = target.second;
                     prepared = state.prepared.emplace(key, std::move(adapter)).first;
                 }
                 auto& adapter = *prepared->second;
@@ -176,7 +185,6 @@ DecodePackageResult PackageDecodeSession::RequestAttributes(
                     .supplementAttributesOnly = true,
                     .attributeRequestMode = request.mode,
                     .controlParams = state.configuration.controlParams,
-                    .execution = state.configuration.execution,
                     .configurationSource = state.configuration.source,
                     .language = state.configuration.language,
                     .runRecordSink = request.runRecordSink.get(),
@@ -187,8 +195,11 @@ DecodePackageResult PackageDecodeSession::RequestAttributes(
                 result.success = leaf.success;
                 result.failure = leaf.failure;
                 if (!result.success) break;
-                if (request.afterDecode) request.afterDecode(adapter, targets);
-                if (request.mode != AttributeDecodeRequestMode::DecodeToCache) state.prepared.erase(prepared);
+                if (request.mode != AttributeDecodeRequestMode::DecodeToCache) {
+                    result.output.frameIndex = target.first;
+                    result.output.leaves.push_back(std::move(adapter.output));
+                    state.prepared.erase(prepared);
+                }
             }
             result = state.Finish(run, std::move(result));
         }
@@ -214,9 +225,6 @@ std::vector<DecodeAttributeDescriptor> PackageDecodeSession::AvailableAttributes
     return result;
 }
 
-DecodedFrameCacheStats PackageDecodeSession::DecodedCacheStatistics() const {
-    return m_impl->resources ? m_impl->resources->Caches().DefaultFrameCache()->Statistics() : DecodedFrameCacheStats{};
-}
 EncodedInputCacheStats PackageDecodeSession::InputCacheStatistics() const {
     return m_impl->resources ? m_impl->resources->Caches().DefaultEncodedInputCache()->Statistics() : EncodedInputCacheStats{};
 }

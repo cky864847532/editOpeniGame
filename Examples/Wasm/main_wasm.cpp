@@ -12,8 +12,8 @@
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
 #include "iGameVolumeMesh.h"
-#include "DataCodec/Filter/Wasm/iGameWasmDataCodecBridge.h"
-#include "DataCodec/Filter/Wasm/iGameWasmDecodedModelRegistry.h"
+#include "Codec/iGameWasmDataCodecBridge.h"
+#include "Codec/iGameWasmDecodedModelRegistry.h"
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "DataCodec/Filter/Localization/iGameDataCodecHostMessage.h"
 #include "DataCodec/API/Adapter/RunRecordTypes.h"
@@ -22,7 +22,7 @@
 #include "DataCodec/Platform/Wasm/WasmRuntime.h"
 #include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
 #include "DataCodec/Platform/Wasm/WasmBrowserFileByteRangeReader.h"
-#include "DataCodec/Storage/Package/PackageBinaryHeader.h"
+#include "DataCodec/API/Entry/InspectEncodedInput.h"
 
 #include <GLFW/glfw3.h>
 #include <algorithm>
@@ -85,6 +85,7 @@ struct WebErrorState {
     std::string func;
     std::string detail;
     long long timestamp = 0;
+    std::optional<::datacodec::CodecFailureRecord> codecFailure;
 };
 
 WebErrorState g_lastError;
@@ -297,59 +298,24 @@ std::string ShortContentIdentity(const ::datacodec::DecodeSourceIdentity& source
     return sourceIdentity.stableId.substr(sourceIdentity.stableId.size() - maxLength);
 }
 
-class PackageInspectionPrefixReader final : public ::datacodec::IByteRangeReader {
-public:
-    PackageInspectionPrefixReader(
-        std::span<const std::uint8_t> prefix,
-        const std::uint64_t sourceBytes)
-        : m_prefix(prefix.begin(), prefix.end()),
-          m_sourceBytes(sourceBytes) {}
-
-    [[nodiscard]] std::uint64_t ByteSize() const noexcept override {
-        return m_sourceBytes;
-    }
-
-    bool ReadAt(
-        const std::uint64_t offset,
-        const std::span<std::uint8_t> output,
-        std::string* error = nullptr) override {
-        if (offset > m_prefix.size() ||
-            output.size() > m_prefix.size() - static_cast<std::size_t>(offset)) {
-            return ::datacodec::validation::AssignError(
-                error,
-                "package inspection prefix is incomplete");
-        }
-        if (!output.empty()) {
-            std::memcpy(
-                output.data(),
-                m_prefix.data() + static_cast<std::size_t>(offset),
-                output.size());
-        }
-        return true;
-    }
-
-private:
-    std::vector<std::uint8_t> m_prefix;
-    std::uint64_t m_sourceBytes{0u};
-};
-
 std::string InspectIgcPackagePrefixJson(
     const std::span<const std::uint8_t> prefix,
     const std::uint64_t sourceBytes,
-    std::string* error) {
-    PackageInspectionPrefixReader reader(prefix, sourceBytes);
-    ::datacodec::PackageInspection inspection;
-    if (!::datacodec::InspectPackage(reader, inspection, error)) {
+    std::string* error, std::optional<::datacodec::CodecFailureRecord>* failure) {
+    const auto inspection = ::datacodec::InspectEncodedPrefix(prefix, sourceBytes);
+    if (failure) { *failure = inspection.failure; }
+    if (!inspection.success) {
+        if (error) { *error = inspection.failure ? ::datacodec::FormatCodecFailure(*inspection.failure) : "invalid package prefix"; }
         return {};
     }
-    const auto* format = inspection.format == ::datacodec::PackageBinaryFormat::LeafPackage
+    const auto* format = inspection.kind == ::datacodec::EncodedPackageKind::Leaf
         ? "leaf"
         : "frame";
     std::ostringstream output;
     output << "{\"format\":\"" << format
            << "\",\"version\":" << inspection.version
            << ",\"identity\":\""
-           << ::datacodec::PackageIdentityToHex(inspection.identity)
+           << inspection.contentIdentity
            << "\",\"sourceIdentity\":\""
            << EscapeJsonString(inspection.sourceIdentity.stableId)
            << "\"}";
@@ -642,6 +608,7 @@ std::string Ms(Clock::duration duration) {
 }
 
 void SetLastError(int code, const char* func, const std::string& detail) {
+    g_lastError.codecFailure.reset();
     g_lastError.code = code;
     g_lastError.func = (func != nullptr) ? func : "unknown";
     g_lastError.detail = detail;
@@ -650,6 +617,7 @@ void SetLastError(int code, const char* func, const std::string& detail) {
 }
 
 void ClearLastError() {
+    g_lastError.codecFailure.reset();
     g_lastError.code = 0;
     g_lastError.func.clear();
     g_lastError.detail.clear();
@@ -662,6 +630,14 @@ std::string GetLastErrorJson() {
     json += "\"func\":\"" + EscapeJsonString(g_lastError.func) + "\",";
     json += "\"detail\":\"" + EscapeJsonString(g_lastError.detail) + "\",";
     json += "\"timestamp\":" + std::to_string(g_lastError.timestamp);
+    json += ",\"codecFailure\":";
+    if (g_lastError.codecFailure) {
+        const auto& failure = *g_lastError.codecFailure;
+        json += "{\"code\":\"" + std::string(::datacodec::CodecErrorCodeName(failure.code)) +
+            "\",\"cancelled\":" + (failure.cancelled ? "true" : "false") +
+            ",\"actualVersion\":" + (failure.actualVersion ? std::to_string(*failure.actualVersion) : "null") +
+            ",\"supportedVersion\":" + (failure.supportedVersion ? std::to_string(*failure.supportedVersion) : "null") + "}";
+    } else { json += "null"; }
     json += "}";
     return json;
 }
@@ -669,6 +645,13 @@ std::string GetLastErrorJson() {
 int FailWithError(int code, const char* func, const std::string& detail) {
     SetLastError(code, func, detail);
     return code;
+}
+
+int FailWithCodecError(const char* func, const std::string& detail,
+    const std::optional<::datacodec::CodecFailureRecord>& failure) {
+    SetLastError(0, func, detail);
+    g_lastError.codecFailure = failure;
+    return 0;
 }
 
 std::string FormatVec3(const iGame::Vector3d& v) {
@@ -1669,17 +1652,12 @@ int StartStagedIgcDecode(
     if (filePath.empty() || filePath != g_stagedFilePath || g_stagedFile != nullptr) {
         return FailWithError(0, "StartStagedIgcDecode", "completed WasmFS staging input is required");
     }
-    ::datacodec::DecodeSourceIdentity sourceIdentity;
-    std::string identityError;
-    if (!iGame::ResolveiGameWasmDataCodecFileSourceIdentity(
-            filePath,
-            sourceIdentity,
-            &identityError)) {
-        return FailWithError(
-            0,
-            "StartStagedIgcDecode",
-            identityError.empty() ? "failed to inspect staged package" : identityError);
+    const auto inspection = ::datacodec::InspectEncodedInput(::datacodec::EncodedInput::File(filePath));
+    if (!inspection.success) {
+        return FailWithCodecError("StartStagedIgcDecode", inspection.failure
+            ? ::datacodec::FormatCodecFailure(*inspection.failure) : "failed to inspect staged package", inspection.failure);
     }
+    const auto sourceIdentity = inspection.sourceIdentity;
     if (g_stagedSourceIdentity.empty() ||
         sourceIdentity.stableId != g_stagedSourceIdentity) {
         return FailWithError(
@@ -1740,9 +1718,6 @@ int StartStagedIgcDecode(
                 auto bridgeResult = iGame::DecodeiGameWasmDataCodecFile(
                     task->inputPath,
                     task->enableReuseCache,
-                    task->enableReuseCache
-                        ? iGame::iGameWasmTopologyOutputMode::CommitToAdapter
-                        : iGame::iGameWasmTopologyOutputMode::PreparedSurface,
                     task->enableEncodedInputCache,
                     progressSink,
                     task->sourceIdentity,
@@ -1762,17 +1737,10 @@ int StartStagedIgcDecode(
                     }
                     const auto drawablePrepareStart = std::chrono::steady_clock::now();
                     WebDrawablePreparationStats preparationStats;
-                    if (bridgeResult.decodeResult.decodedFrameCacheHit) {
-                        success = ValidateWebDrawableDataPrepared(
-                            bridgeResult.output,
-                            &preparationStats,
-                            &failureDetail);
-                    } else {
-                        success = PrepareWebDrawableData(
-                            bridgeResult.output,
-                            &preparationStats,
-                            &failureDetail);
-                    }
+                    success = PrepareWebDrawableData(
+                        bridgeResult.output,
+                        &preparationStats,
+                        &failureDetail);
                     const auto drawablePrepareEnd = std::chrono::steady_clock::now();
                     const auto drawablePrepareMs = std::chrono::duration<double, std::milli>(
                         drawablePrepareEnd - drawablePrepareStart).count();
@@ -1859,10 +1827,12 @@ int FinishStagedIgcDecode() {
     std::string inputPath;
     bool replaceExisting = false;
     std::string failureDetail;
+    std::optional<::datacodec::CodecFailureRecord> codecFailure;
     int reusedModelId = 0;
     {
         std::lock_guard<std::mutex> lock(task->mutex);
         reusedModelId = task->reusedModelId;
+        codecFailure = task->result.failure;
         if (task->state == StagedIgcDecodeTaskState::Completed && reusedModelId > 0) {
             sourceName = task->sourceName;
             inputPath = task->inputPath;
@@ -1888,7 +1858,7 @@ int FinishStagedIgcDecode() {
     if (dataObject == nullptr || session == nullptr) {
         std::remove(task->inputPath.c_str());
         g_stagedIgcDecodeTask.reset();
-        return FailWithError(0, "FinishStagedIgcDecode", failureDetail);
+        return FailWithCodecError("FinishStagedIgcDecode", failureDetail, codecFailure);
     }
 
     WebDrawablePreparationStats preparationStats;
@@ -1982,6 +1952,7 @@ struct API {
         const std::string& sourceIdentity,
         bool replaceExisting);
     static std::string getModelListJson();
+    static std::string getModelCapabilitiesJson(int modelId);
     static int setActiveModel(int modelId);
     static int setModelVisibility(int modelId, bool visible);
     static int removeModel(int modelId);
@@ -2227,12 +2198,12 @@ int LoadIgcFromMemory(std::string bytes, const std::string& sourceName, bool rep
         inputOwner,
         std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(inputOwner->data()),
-            inputOwner->size()), true, iGame::iGameWasmTopologyOutputMode::CommitToAdapter,
+            inputOwner->size()), true,
         {}, CopyCodecStartupResources());
     auto t1 = std::chrono::steady_clock::now();
 
     if (!bridgeResult.success || bridgeResult.output == nullptr) {
-        return FailWithError(0, "LoadIgcFromMemory", bridgeResult.error);
+        return FailWithCodecError("LoadIgcFromMemory", bridgeResult.error, bridgeResult.decodeResult.failure);
     }
 
     LogIgcSummary(bridgeResult.output, sourceName);
@@ -2285,15 +2256,12 @@ int LoadIgcFromBrowserFileEx(
         browserFileId,
         browserFileSize,
         enableReuseCache,
-        enableReuseCache
-            ? iGame::iGameWasmTopologyOutputMode::CommitToAdapter
-            : iGame::iGameWasmTopologyOutputMode::PreparedSurface,
         enableEncodedInputCache, {}, CopyCodecStartupResources());
     if (!bridgeResult.timingDetail.empty()) {
         DebugLog("INFO", "Direct browser DataCodec timing " + bridgeResult.timingDetail);
     }
     if (!bridgeResult.success || bridgeResult.output == nullptr) {
-        return FailWithError(0, "LoadIgcFromBrowserFileEx", bridgeResult.error);
+        return FailWithCodecError("LoadIgcFromBrowserFileEx", bridgeResult.error, bridgeResult.decodeResult.failure);
     }
 
     if (enableReuseCache) {
@@ -2321,6 +2289,10 @@ int SaveIgcToFileEx(const int modelId, const std::string& filePath) {
     auto model = g_scene != nullptr ? g_scene->GetModelById(modelId) : nullptr;
     if (model == nullptr || model->GetDataObject() == nullptr) {
         return FailWithError(0, "SaveIgcToFileEx", "model is unavailable");
+    }
+    if (const auto* entry = g_igcModelRegistry.Find(static_cast<std::uint32_t>(modelId));
+        entry && (!entry->codec || !entry->codec->IsOpen())) {
+        return FailWithError(0, "SaveIgcToFileEx", "restore original model data before encoding");
     }
     auto writer = iGame::IGDCWriter::New();
     writer->SetEncodeControls(::datacodec::wasm::MakeWasmEncodeConfiguration());
@@ -2352,7 +2324,7 @@ int RequestIgcAttribute(
         const auto detail = result.messages.empty()
             ? std::string("DataCodec attribute request failed")
             : result.messages.back().text;
-        return FailWithError(0, "RequestIgcAttribute", detail);
+        return FailWithCodecError("RequestIgcAttribute", detail, result.failure);
     }
     if (mode == ::datacodec::AttributeDecodeRequestMode::DecodeToCache) {
         ClearLastError();
@@ -4078,13 +4050,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE const char* igameAnalyzeIgcBrowserFile(
             throw std::invalid_argument("invalid browser file size or identity");
         }
         const auto result = ::datacodec::AnalyzeDecodeStorage({
-            .inputReader = std::make_shared<::datacodec::wasm::WasmBrowserFileByteRangeReader>(
+            .input = ::datacodec::EncodedInput::BrowserFile(
                 fileId, static_cast<std::uint64_t>(fileSize)),
             .attributeSelection = ::datacodec::AttributeSelectionMode::None,
-            .adapterBackedAttributes = true,
-            .topologyOutputMode = enableReuseCache
-                ? ::datacodec::TopologyDecodeOutputMode::CommitToAdapter
-                : ::datacodec::TopologyDecodeOutputMode::ObserverOnly,
         });
         if (!result.success || !result.minimumExecutionLimitBytes) {
             throw std::runtime_error(result.failure ? ::datacodec::FormatCodecFailure(*result.failure) : "storage analysis unavailable");
@@ -4121,6 +4089,42 @@ extern "C" EMSCRIPTEN_KEEPALIVE int igameLoadIgcBrowserFile(
         replaceExisting != 0,
         enableDecodedFrameCache != 0,
         enableEncodedInputCache != 0);
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int igameAttachIgcSource(
+    const int modelId, const std::uint32_t fileId, const double fileSize) {
+    try {
+        auto* entry = g_igcModelRegistry.Find(static_cast<std::uint32_t>(modelId));
+        if (!entry || !std::isfinite(fileSize) || fileSize <= 0.0 ||
+            std::floor(fileSize) != fileSize || fileSize > 9007199254740991.0) {
+            return FailWithError(0, "igameAttachIgcSource", "model or original input is invalid");
+        }
+        entry->deferredInput = ::datacodec::EncodedInput::BrowserFile(fileId, static_cast<std::uint64_t>(fileSize));
+        return 1;
+    } catch (const std::exception& error) {
+        return FailWithError(0, "igameAttachIgcSource", error.what());
+    } catch (...) {
+        return FailWithError(0, "igameAttachIgcSource", "failed to retain original input");
+    }
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE int igameRestoreIgcRawData(const int modelId) try {
+    auto model = g_scene ? g_scene->GetModelById(modelId) : nullptr;
+    if (!model) { return FailWithError(0, "igameRestoreIgcRawData", "model is unavailable"); }
+    std::string error;
+    std::optional<::datacodec::CodecFailureRecord> failure;
+    const auto output = g_igcModelRegistry.RestoreRawData(
+        static_cast<std::uint32_t>(modelId), CopyCodecStartupResources(), &error, &failure);
+    if (!output) { return FailWithCodecError("igameRestoreIgcRawData", error, failure); }
+    model->SetDataObject(output);
+    if (g_interactor && g_scene->GetCurrentModelID() == modelId) { g_interactor->SetDataObject(output); }
+    g_scene->Update();
+    ClearLastError();
+    return 1;
+} catch (const std::exception& error) {
+    return FailWithError(0, "igameRestoreIgcRawData", error.what());
+} catch (...) {
+    return FailWithError(0, "igameRestoreIgcRawData", "original data restoration failed");
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE int igameEnsureIgcAttribute(
@@ -4355,14 +4359,15 @@ std::string iGameWeb::API::inspectIgcPackage(
         return {};
     }
     std::string inspectionError;
+    std::optional<::datacodec::CodecFailureRecord> failure;
     auto result = InspectIgcPackagePrefixJson(
         std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(prefixBuffer.data()),
             prefixBuffer.size()),
         static_cast<std::uint64_t>(sourceBytes),
-        &inspectionError);
+        &inspectionError, &failure);
     if (result.empty()) {
-        FailWithError(0, "API.inspectIgcPackage", inspectionError);
+        FailWithCodecError("API.inspectIgcPackage", inspectionError, failure);
         return {};
     }
     ClearLastError();
@@ -4658,43 +4663,49 @@ int iGameWeb::API::loadSharedSurfaceData(
         return FailWithError(0, "API.loadSharedSurfaceData", "source identity is required");
     }
 
-    std::string positionBuffer;
-    std::string triangleBuffer;
-    std::string edgeMaskBuffer;
-    if (!ReadBytesFromJsValue(positionBytes, positionBuffer, "API.loadSharedSurfaceData.positions", false) ||
-        !ReadBytesFromJsValue(triangleBytes, triangleBuffer, "API.loadSharedSurfaceData.triangles", false) ||
-        !ReadBytesFromJsValue(edgeMaskBytes, edgeMaskBuffer, "API.loadSharedSurfaceData.edgeMasks", false)) {
-        return 0;
-    }
-    if (positionBuffer.empty() || positionBuffer.size() % (3u * sizeof(float)) != 0u ||
-        triangleBuffer.empty() || triangleBuffer.size() % (3u * sizeof(std::uint32_t)) != 0u) {
-        return FailWithError(0, "API.loadSharedSurfaceData", "shared surface array sizes are invalid");
-    }
-    const auto pointCount = positionBuffer.size() / (3u * sizeof(float));
-    const auto triangleCount = triangleBuffer.size() / (3u * sizeof(std::uint32_t));
-    if (edgeMaskBuffer.size() != triangleCount) {
-        return FailWithError(0, "API.loadSharedSurfaceData", "shared surface edge mask count is invalid");
-    }
-
+    const auto byteView = [](const val& bytes) {
+        const auto array = val::global("Uint8Array");
+        if (bytes["buffer"].isUndefined()) { return array.new_(bytes); }
+        return array.new_(bytes["buffer"], bytes["byteOffset"], bytes["byteLength"]);
+    };
     auto points = iGame::Points::New();
-    points->Resize(static_cast<IGsize>(pointCount));
-    std::memcpy(points->RawPointer(), positionBuffer.data(), positionBuffer.size());
-
-    auto positions = iGame::FloatArray::New();
-    positions->SetDimension(3);
-    positions->Resize(static_cast<IGsize>(pointCount));
-    std::memcpy(positions->RawPointer(), positionBuffer.data(), positionBuffer.size());
-
     auto triangles = iGame::UnsignedIntArray::New();
-    triangles->SetDimension(3);
-    triangles->Resize(static_cast<IGsize>(triangleCount));
-    std::memcpy(triangles->RawPointer(), triangleBuffer.data(), triangleBuffer.size());
-
     auto edgeMasks = iGame::UnsignedCharArray::New();
-    edgeMasks->SetDimension(1);
-    edgeMasks->Resize(static_cast<IGsize>(triangleCount));
-    std::memcpy(edgeMasks->RawPointer(), edgeMaskBuffer.data(), edgeMaskBuffer.size());
-
+    try {
+        const auto positionSource = byteView(positionBytes);
+        const auto triangleSource = byteView(triangleBytes);
+        const auto edgeSource = byteView(edgeMaskBytes);
+        const auto positionSize = positionSource["byteLength"].as<std::size_t>();
+        const auto triangleSize = triangleSource["byteLength"].as<std::size_t>();
+        const auto edgeSize = edgeSource["byteLength"].as<std::size_t>();
+        if (positionSize == 0u || positionSize % (3u * sizeof(float)) != 0u ||
+            triangleSize == 0u || triangleSize % (3u * sizeof(std::uint32_t)) != 0u ||
+            positionSize > MAX_SAFE_INPUT_BYTES || triangleSize > MAX_SAFE_INPUT_BYTES ||
+            edgeSize != triangleSize / (3u * sizeof(std::uint32_t))) {
+            return FailWithError(0, "API.loadSharedSurfaceData", "shared surface array sizes are invalid");
+        }
+        const auto pointCount = positionSize / (3u * sizeof(float));
+        const auto triangleCount = edgeSize;
+        points->Resize(static_cast<IGsize>(pointCount));
+        triangles->SetDimension(3);
+        triangles->Resize(static_cast<IGsize>(triangleCount));
+        edgeMasks->SetDimension(1);
+        edgeMasks->Resize(static_cast<IGsize>(triangleCount));
+        // 直接复制到最终数组，几何与渲染共享同一份坐标
+        val(typed_memory_view(positionSize, reinterpret_cast<unsigned char*>(points->RawPointer())))
+            .call<void>("set", positionSource);
+        val(typed_memory_view(triangleSize, reinterpret_cast<unsigned char*>(triangles->RawPointer())))
+            .call<void>("set", triangleSource);
+        val(typed_memory_view(edgeSize, edgeMasks->RawPointer())).call<void>("set", edgeSource);
+        for (std::size_t i = 0u; i < triangles->GetNumberOfValues(); ++i) {
+            if (triangles->RawPointer()[i] >= pointCount) {
+                return FailWithError(0, "API.loadSharedSurfaceData", "surface triangle index is outside positions");
+            }
+        }
+    } catch (...) {
+        return FailWithError(0, "API.loadSharedSurfaceData", "failed to import surface arrays");
+    }
+    auto positions = points->ConvertToArray();
     auto surface = iGame::SurfaceMesh::New();
     surface->SetPoints(points);
     surface->SetSharedRenderData(positions, triangles, edgeMasks);
@@ -4716,6 +4727,16 @@ int iGameWeb::API::loadSharedSurfaceData(
     return modelId;
 }
 
+std::string iGameWeb::API::getModelCapabilitiesJson(const int modelId) {
+    const auto* entry = g_igcModelRegistry.Find(static_cast<std::uint32_t>(modelId));
+    const bool display = g_modelRegistry.contains(static_cast<IGuint>(modelId));
+    const bool raw = entry && entry->codec && entry->codec->IsOpen();
+    return std::string("{\"display\":") + (display ? "true" : "false") +
+        ",\"rawData\":" + (raw ? "true" : "false") +
+        ",\"canRestoreRawData\":" + (entry && entry->deferredInput ? "true" : "false") +
+        ",\"attributes\":" + (raw ? "true" : "false") +
+        ",\"reencode\":" + (raw ? "true" : "false") + "}";
+}
 std::string iGameWeb::API::getModelListJson() {
     DebugLog("INFO", "API.getModelListJson called");
     std::string s = iGameWeb::GetModelListJson();
@@ -5337,6 +5358,7 @@ EMSCRIPTEN_BINDINGS(iGameWeb_bindings) {
             .class_function("loadZipFromMemEx", &iGameWeb::API::loadZipFromMemEx)
             .class_function("exportModelSharedSurfaceData", &iGameWeb::API::exportModelSharedSurfaceData)
             .class_function("loadSharedSurfaceData", &iGameWeb::API::loadSharedSurfaceData)
+            .class_function("getModelCapabilitiesJson", &iGameWeb::API::getModelCapabilitiesJson)
             .class_function("getModelListJson", &iGameWeb::API::getModelListJson)
             .class_function("setActiveModel", &iGameWeb::API::setActiveModel)
             .class_function("setModelVisibility", &iGameWeb::API::setModelVisibility)

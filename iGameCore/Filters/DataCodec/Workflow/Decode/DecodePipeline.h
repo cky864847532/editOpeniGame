@@ -249,12 +249,12 @@ public:
                 }
             }
             if (hasCommitWork) {
-                SubmitStageStartProgress(context, DecodeCommitStage::kTypeName);
+                SubmitStageStartProgress(context, StageKind::Commit);
                 CommitAttributeOutput(context, workspace);
                 if (context.HasFailure() || workspace.StopRequested()) {
                     return true;
                 }
-                SubmitStageProgress(context, DecodeCommitStage::kTypeName);
+                SubmitStageProgress(context, StageKind::Commit);
             }
             SubmitProgress(
                 context,
@@ -340,7 +340,7 @@ private:
     static void ExecuteStage(DecodeStage& stage, DecodeContext& context, DecodeLeafWorkspace& workspace) {
         const auto stageName = stage.Id().name;
         const auto collectTiming = context.runRecords.Wants(RunRecordKind::StageTiming);
-        SubmitStageStartProgress(context, stageName);
+        SubmitStageStartProgress(context, stage.Kind());
         RecordMemoryTraceStageEvent(context, stageName, true);
         const auto startTime = callback::StartTiming(collectTiming);
         try {
@@ -352,40 +352,37 @@ private:
                     callback::ElapsedMilliseconds(startTime));
             }
             RecordMemoryTraceStageEvent(context, stageName, false);
-            SubmitStageProgress(context, stageName);
+            SubmitStageProgress(context, stage.Kind());
         } catch (...) {
             RecordMemoryTraceStageEvent(context, stageName, false);
             throw;
         }
     }
 
-    static double DecodeStageProgress(const std::string_view stageName) {
-        if (stageName.find("Params") != std::string_view::npos) return 0.10;
-        if (stageName.find("Geometry") != std::string_view::npos) return 0.35;
-        if (stageName.find("Topo") != std::string_view::npos) return 0.55;
-        if (stageName.find("Attr") != std::string_view::npos ||
-            stageName.find("Attribute") != std::string_view::npos) return 0.85;
-        if (stageName.find("Commit") != std::string_view::npos) return 0.95;
+    static double DecodeStageProgress(const StageKind kind) {
+        if (kind == StageKind::Parameters) return 0.10;
+        if (kind == StageKind::Geometry) return 0.35;
+        if (kind == StageKind::Topology) return 0.55;
+        if (kind == StageKind::Attribute) return 0.85;
+        if (kind == StageKind::Commit) return 0.95;
         return 0.0;
     }
 
-    static double DecodeStageStartProgress(const std::string_view stageName) {
-        if (stageName.find("Params") != std::string_view::npos) return 0.02;
-        if (stageName.find("Geometry") != std::string_view::npos) return 0.15;
-        if (stageName.find("Topo") != std::string_view::npos) return 0.35;
-        if (stageName.find("Attr") != std::string_view::npos ||
-            stageName.find("Attribute") != std::string_view::npos) return 0.60;
-        if (stageName.find("Commit") != std::string_view::npos) return 0.90;
+    static double DecodeStageStartProgress(const StageKind kind) {
+        if (kind == StageKind::Parameters) return 0.02;
+        if (kind == StageKind::Geometry) return 0.15;
+        if (kind == StageKind::Topology) return 0.35;
+        if (kind == StageKind::Attribute) return 0.60;
+        if (kind == StageKind::Commit) return 0.90;
         return 0.0;
     }
 
-    static DataCodecMessageId DecodeStageProgressMessageId(const std::string_view stageName) {
-        if (stageName.find("Params") != std::string_view::npos) return DataCodecMessageId::DecodeParams;
-        if (stageName.find("Geometry") != std::string_view::npos) return DataCodecMessageId::DecodeGeometry;
-        if (stageName.find("Topo") != std::string_view::npos) return DataCodecMessageId::DecodeTopology;
-        if (stageName.find("Attr") != std::string_view::npos ||
-            stageName.find("Attribute") != std::string_view::npos) return DataCodecMessageId::DecodeAttribute;
-        if (stageName.find("Commit") != std::string_view::npos) return DataCodecMessageId::DecodeCommit;
+    static DataCodecMessageId DecodeStageProgressMessageId(const StageKind kind) {
+        if (kind == StageKind::Parameters) return DataCodecMessageId::DecodeParams;
+        if (kind == StageKind::Geometry) return DataCodecMessageId::DecodeGeometry;
+        if (kind == StageKind::Topology) return DataCodecMessageId::DecodeTopology;
+        if (kind == StageKind::Attribute) return DataCodecMessageId::DecodeAttribute;
+        if (kind == StageKind::Commit) return DataCodecMessageId::DecodeCommit;
         return DataCodecMessageId::DecodeInProgress;
     }
 
@@ -403,25 +400,25 @@ private:
             success);
     }
 
-    static void SubmitStageProgress(DecodeContext& context, const std::string_view stageName) {
-        const double normalized = DecodeStageProgress(stageName);
+    static void SubmitStageProgress(DecodeContext& context, const StageKind kind) {
+        const double normalized = DecodeStageProgress(kind);
         if (normalized <= 0.0) return;
         SubmitProgress(
             context,
             RunProgressPhase::Update,
             normalized,
-            DecodeStageProgressMessageId(stageName),
+            DecodeStageProgressMessageId(kind),
             false);
     }
 
-    static void SubmitStageStartProgress(DecodeContext& context, const std::string_view stageName) {
-        const double normalized = DecodeStageStartProgress(stageName);
+    static void SubmitStageStartProgress(DecodeContext& context, const StageKind kind) {
+        const double normalized = DecodeStageStartProgress(kind);
         if (normalized <= 0.0) return;
         SubmitProgress(
             context,
             RunProgressPhase::Update,
             normalized,
-            DecodeStageProgressMessageId(stageName),
+            DecodeStageProgressMessageId(kind),
             false);
     }
 
@@ -461,12 +458,12 @@ private:
             const auto timing = context.runRecords.Wants(RunRecordKind::StageTiming);
             const auto start = callback::StartTiming(timing);
             try {
-                SubmitStageStartProgress(context, stageName);
+                SubmitStageStartProgress(context, stageNodes[next].stage->Kind());
                 RecordMemoryTraceStageEvent(context, stageName, true);
                 stageNodes[next].stage->Execute(context, workspace);
                 if (timing) { RecordStageTiming(stageName, context, callback::ElapsedMilliseconds(start)); }
                 RecordMemoryTraceStageEvent(context, stageName, false);
-                SubmitStageProgress(context, stageName);
+                SubmitStageProgress(context, stageNodes[next].stage->Kind());
             } catch (const std::bad_alloc&) {
                 context.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "allocation-failed", "DecodePipeline", "memory allocation failed"));

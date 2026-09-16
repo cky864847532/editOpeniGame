@@ -1,8 +1,9 @@
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeaturePlaybackSession.h"
-#include "DataCodec/Filter/Test/Feature/iGameDataCodecFeaturePreparedSurfaceAttributes.h"
+#include "Test/iGameDataCodecFeaturePreparedSurfaceAttributes.h"
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureRemap.h"
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureLocalization.h"
 #include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureNativeDecodeStorage.h"
+#include "DataCodec/Filter/Test/Feature/iGameDataCodecFeatureBridgeAudit.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h"
 #include "DataCodec/Filter/Output/iGameDataCodecOutputSinks.h"
 #include "DataCodec/Log/Report/DataCodecProcessReportJson.h"
@@ -493,6 +494,11 @@ int main(const int argc, char** argv) {
         PrintResult(result);
         return result.passed ? 0 : 1;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--bridge-audit") {
+        const auto result = datacodec::test::RunNativeBridgeAudit();
+        PrintResult(result);
+        return result.passed ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) == "--storage-ownership") {
         const auto result = datacodec::test::RunDataCodecFeatureStorageOwnership();
         PrintResult(result);
@@ -522,6 +528,9 @@ int main(const int argc, char** argv) {
         return WriteBrowserFixture(argv[2]);
     }
 
+    const auto bridgeResult = datacodec::test::RunNativeBridgeAudit();
+    PrintResult(bridgeResult);
+    if (!bridgeResult.passed) { return 1; }
     const auto nativeResult = datacodec::test::RunDataCodecFeatureNativeDecodeStorage();
     PrintResult(nativeResult);
     if (!nativeResult.passed) { return 1; }

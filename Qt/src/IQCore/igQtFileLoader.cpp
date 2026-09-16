@@ -8,6 +8,8 @@
 #include <cstring>
 
 #include "iGameFileIO.h"
+#include "DataCodec/Localization/DataCodecMessageCatalog.h"
+#include "IGDC/iGameDataCodecIOSettings.h"
 #include "iGameProgressObserver.h"
 //#include "CSTest.h"
 #include "iGamePointSet.h"
@@ -308,6 +310,7 @@ void igQtFileLoader::OpenDataCodecFilesAsync(std::vector<std::string> filePaths)
         decodeAttributesOnDemand]() mutable {
         iGame::AttributeDataSourcePointer source;
         std::string error;
+        std::optional<::datacodec::CodecFailureRecord> failure;
         iGame::DataObject::Pointer object;
         auto filePath = filePaths.front();
         if (filePaths.size() > 1u) {
@@ -322,6 +325,7 @@ void igQtFileLoader::OpenDataCodecFilesAsync(std::vector<std::string> filePaths)
                 }
             }
             if (object == nullptr) {
+                failure = reader->GetFailure();
                 error.clear();
                 for (const auto& message: reader->GetMessages()) {
                     if (!error.empty()) { error += "; "; }
@@ -337,6 +341,7 @@ void igQtFileLoader::OpenDataCodecFilesAsync(std::vector<std::string> filePaths)
                 source = reader->GetAttributeDataSource();
             }
             if (object == nullptr) {
+                failure = reader->GetFailure();
                 for (const auto& message: reader->GetMessages()) {
                     if (!error.empty()) { error += "; "; }
                     error += message.text;
@@ -347,6 +352,7 @@ void igQtFileLoader::OpenDataCodecFilesAsync(std::vector<std::string> filePaths)
             reader->SetFilePath(filePath);
             if (reader->Execute()) { object = reader->GetOutput(); }
             if (object == nullptr) {
+                failure = reader->GetFailure();
                 for (const auto& message: reader->GetMessages()) {
                     if (!error.empty()) { error += "; "; }
                     error += message.text;
@@ -355,12 +361,16 @@ void igQtFileLoader::OpenDataCodecFilesAsync(std::vector<std::string> filePaths)
         }
         if (!self) return;
 
-        QMetaObject::invokeMethod(self, [self, source, object, filePath, error]() {
+        QMetaObject::invokeMethod(self, [self, source, object, filePath, error, failure]() {
             if (!self) return;
             if (object == nullptr) {
                 igDebug("DataCodec file read error: {}", error);
-                if (error.find("版本不符合") != std::string::npos) {
-                    QMessageBox::warning(nullptr, "错误", "版本不符合");
+                if (failure && (failure->code == ::datacodec::CodecErrorCode::UnsupportedVersion ||
+                    failure->code == ::datacodec::CodecErrorCode::IncompleteInput ||
+                    failure->code == ::datacodec::CodecErrorCode::InvalidFormat)) {
+                    const auto text = ::datacodec::FormatCodecFailureMessage(
+                        iGame::DataCodecIOSettings::GetDefaultDecodeOptions().language, *failure);
+                    QMessageBox::warning(nullptr, tr("错误"), QString::fromUtf8(text.data(), static_cast<int>(text.size())));
                 }
                 emit self->FinishReading();
                 return;

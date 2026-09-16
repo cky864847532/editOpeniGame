@@ -3,7 +3,7 @@
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
-#include "DataCodec/Storage/ByteIO/ByteRange.h"
+#include "DataCodec/API/Input/EncodedInput.h"
 #include "DataCodec/API/Entry/PackageDecodeSession.h"
 #include "DataCodec/API/Params/DataCodecControlParams.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
@@ -23,15 +23,13 @@
 IGAME_NAMESPACE_BEGIN
 
 struct DataCodecDataObjectDecodeRequest {
-    std::shared_ptr<::datacodec::IByteRangeReader> inputReader;
+    ::datacodec::EncodedInput input;
     // 解码结果缓存和编码输入缓存需要调用方提供稳定身份和内容版本
     ::datacodec::DecodeSourceIdentity inputSourceIdentity;
     const ::datacodec::DecodeControlParams* controlParams{nullptr};
-    const ::datacodec::DecodeExecutionOptions* executionOptions{nullptr};
     const ::datacodec::DataCodecDecodeConfigurationSource* configurationSource{nullptr};
     ::datacodec::DataCodecLanguage language{
         ::datacodec::DataCodecLanguage::SimplifiedChinese};
-    ::datacodec::DecodedFrameCachePolicy decodedFrameCachePolicy;
     ::datacodec::EncodedInputCachePolicy encodedInputCachePolicy;
     ::datacodec::CodecResourceParams resources;
     std::optional<std::uint32_t> requestedFrameIndex;
@@ -52,9 +50,10 @@ struct DataCodecDataObjectAttributeRequest {
 
 struct DataCodecDataObjectDecodeResult {
     bool success{false};
-    bool decodedFrameCacheHit{false};
+    std::optional<::datacodec::CodecFailureRecord> failure;
     DataObject::Pointer output;
     std::uint64_t inputBytes{0u};
+    ::datacodec::InputMemoryObservation inputMemory;
     std::vector<::datacodec::TelemetryMessageRecord> messages;
 };
 
@@ -79,7 +78,6 @@ public:
         const ::datacodec::AttributeTarget& target) const;
     [[nodiscard]] DataObject::Pointer GetOutput() const;
     [[nodiscard]] bool IsOpen() const;
-    [[nodiscard]] ::datacodec::DecodedFrameCacheStats DecodedCacheStatistics() const;
     [[nodiscard]] ::datacodec::EncodedInputCacheStats InputCacheStatistics() const;
     void Reset();
 

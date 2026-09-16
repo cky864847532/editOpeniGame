@@ -9,7 +9,11 @@ endif ()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
 
-add_executable(iGameWeb main_wasm.cpp)
+add_executable(iGameWeb main_wasm.cpp
+    Codec/iGameWasmDataCodecBridge.cpp
+    Codec/iGameWasmDataCodecTiming.cpp
+    Codec/iGameWasmDecodedModelRegistry.cpp)
+target_include_directories(iGameWeb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 target_link_libraries(iGameWeb PUBLIC iGameCore)
 datacodec_configure_wasm_executable(iGameWeb)

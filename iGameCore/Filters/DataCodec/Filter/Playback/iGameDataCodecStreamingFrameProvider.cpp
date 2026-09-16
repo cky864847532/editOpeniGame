@@ -2,6 +2,7 @@
 
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
+#include "DataCodec/Filter/Adapter/iGameDecodedFrameAttributeDataSource.h"
 #include "Log/iGameLogger.h"
 
 #include <utility>
@@ -31,6 +32,11 @@ std::vector<Object::Pointer> DataCodecStreamingFrameProvider::RequestFrame(
     });
     const auto output = DataObjectFromDecodedFrame(result.frame);
     if (result.success && output != nullptr) {
+        auto source = std::make_shared<DecodedFrameAttributeDataSource>(m_session->CreateAttributeAccess(result.frame), output);
+        {
+            std::lock_guard lock(m_attributeMutex);
+            m_currentAttributeSource = std::move(source);
+        }
         return {output};
     }
     for (const auto& message : result.messages) {
@@ -56,15 +62,21 @@ void DataCodecStreamingFrameProvider::NotifyFramePresented(const unsigned int or
 
 void DataCodecStreamingFrameProvider::ConfigureCacheCapacity(
         const unsigned int bufferedFrameCount) {
-    // 动画控件的帧数仅描述iGame播放缓存，不覆盖DataCodec完整帧LRU参数
-    // 完整帧LRU由解码请求中的DecodedFrameCachePolicy统一配置
-    (void)bufferedFrameCount;
+    if (m_session == nullptr) { return; }
+    auto policy = m_session->GetDecodedFrameCachePolicy();
+    policy.enabled = bufferedFrameCount != 0u;
+    m_session->ConfigureDecodedFrameCachePolicy(policy);
 }
 
 void DataCodecStreamingFrameProvider::ClearCachedFrames() {
-    m_currentOrdinal.store(std::numeric_limits<unsigned int>::max());
-    // iGame动画缓存的清理不失效DataCodec跨读取完整帧LRU
-    // 显式调用PlaybackSession::ClearDecodedFrameCache时才按数据源清理完整帧
+    if (m_session != nullptr) { m_session->ClearDecodedFrameCache(); }
+}
+
+std::shared_ptr<IAttributeDataSource> DataCodecStreamingFrameProvider::AttributeSourceForFrame(
+    const Object::Pointer& object) const {
+    std::lock_guard lock(m_attributeMutex);
+    if (m_currentAttributeSource == nullptr || m_currentAttributeSource->RootObject().get() != object.get()) { return {}; }
+    return std::exchange(m_currentAttributeSource, {});
 }
 
 std::size_t DataCodecStreamingFrameProvider::CachedFrameCount() const {

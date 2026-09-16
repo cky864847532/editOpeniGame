@@ -2,7 +2,7 @@
 #define DATACODEC_RUNTIME_CACHE_DECODECACHE_DECODEDTOPOLOGYCACHE_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedIndexCache.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
 #include "DataCodec/Common/DataCodecTypes.h"

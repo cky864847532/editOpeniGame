@@ -33,7 +33,8 @@ public:
         }
         if (!geometry.complete ||
             geometry.pointCount != expectedPoints ||
-            geometry.dimension != expectedDimension) {
+            geometry.dimension != expectedDimension ||
+            geometry.dataType != params.geomParams.dataType) {
             return ValidationResult::Failure(
                 CodecErrorCode::DecodeFailure,
                 ValidationDomain::Geometry,

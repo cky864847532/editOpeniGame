@@ -42,6 +42,7 @@ private:
     std::uint64_t byteSize,
     std::string* error = nullptr);
 
+[[nodiscard]] bool RetainWasmBrowserFile(std::uint32_t fileId) noexcept;
 void ReleaseWasmBrowserFile(std::uint32_t fileId) noexcept;
 
 } // namespace datacodec::wasm

@@ -6,7 +6,7 @@
 #include "DataCodec/API/Params/DecodedFrameCacheParams.h"
 #include "DataCodec/API/Params/EncodedInputCacheParams.h"
 #include "DataCodec/API/Params/EncodePipelineParams.h"
-#include "DataCodec/API/Adapter/IDecodeTopologyBlockObserver.h"
+
 #include "DataCodec/Localization/DataCodecLanguage.h"
 #include "DataCodec/Validation/Policy/CodecValidationPolicy.h"
 
@@ -67,13 +67,6 @@ struct DataCodecDecodeConfigurationSource {
     DataCodecRuntimeProfile runtimeProfile{DataCodecRuntimeProfile::Native};
 };
 
-enum class TopologyDecodeOutputMode : std::uint8_t { CommitToAdapter, ObserverOnly };
-
-struct DecodeExecutionOptions {
-    TopologyDecodeOutputMode topologyOutputMode{TopologyDecodeOutputMode::CommitToAdapter};
-    std::shared_ptr<IDecodeTopologyBlockObserver> topologyBlockObserver;
-};
-
 struct DataCodecEncodeConfigurationParams {
     EncodeCodecControlParams controlParams;
     EncodePipelineControlParams pipelineControl;
@@ -83,14 +76,12 @@ struct DataCodecEncodeConfigurationParams {
 
 struct DataCodecDecodePackageConfigurationParams {
     DecodeControlParams controlParams;
-    DecodeExecutionOptions execution;
     DataCodecDecodeConfigurationSource source;
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
 };
 
 struct DataCodecDecodeConfigurationParams {
     DecodeControlParams controlParams;
-    DecodeExecutionOptions execution;
     DecodedFrameCachePolicy decodedFrameCachePolicy;
     EncodedInputCachePolicy encodedInputCachePolicy;
     DataCodecDecodeConfigurationSource source;
@@ -98,7 +89,7 @@ struct DataCodecDecodeConfigurationParams {
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
 
     DataCodecDecodePackageConfigurationParams PackageConfiguration() const {
-        return {.controlParams = controlParams, .execution = execution, .source = source, .language = language};
+        return {.controlParams = controlParams, .source = source, .language = language};
     }
 };
 

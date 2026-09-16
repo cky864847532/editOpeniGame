@@ -96,6 +96,7 @@ public:
     TopoDecodeStage() = default;
     explicit TopoDecodeStage(FieldDecodeInput input) : m_input(input) {}
 
+    StageKind Kind() const noexcept override { return StageKind::Topology; }
     const char* Name() const override { return "TopoDecodeStage"; }
 
     // 把拓扑字节解入 decoded topology cache
@@ -163,11 +164,10 @@ public:
                 .cacheResources = workspace.CacheResourcesRef(),
                 .byteStoreSession = workspace.ByteStoreSessionRef(),
                 .topology = workspace.MutableTopology(),
-                .destination = context.topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly ? nullptr : context.adapter,
+                .destination = context.adapter,
             },
             .context = TopologyDecodeContext{
                 .timingCallback = std::move(topologyTiming),
-                .topologyBlockObserver = context.topologyBlockObserver,
                 .recordCapacitySamples = MakeCapacityRecordCallback(context.runRecords),
             },
         };

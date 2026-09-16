@@ -1,3 +1,4 @@
+#include "DataCodec/Workflow/Session/DecodeSession.h"
 #ifndef DATACODEC_TEST_FEATURE_DATACODECFEATUREPIPELINECONTRACTS_H
 #define DATACODEC_TEST_FEATURE_DATACODECFEATUREPIPELINECONTRACTS_H
 
@@ -10,14 +11,14 @@
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
 #include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
-#include "DataCodec/Workflow/Session/PlaybackSession.h"
+#include "DataCodec/API/Entry/PlaybackSession.h"
 #include "DataCodec/Workflow/Encode/EncodePipelineBinding.h"
 #include "DataCodec/Workflow/Encode/EncodePipeline.h"
 #include "DataCodec/Runtime/Context/EncodeContext.h"
 #include "DataCodec/Workflow/Leaf/LeafEncodeExecutor.h"
 #include "DataCodec/Workflow/Session/EncodeSessionWorkspace.h"
 #include "DataCodec/Workflow/Temporal/TemporalBuilder.h"
-#include "DataCodec/Workflow/FrameSequence/FrameSequenceEncodeExecutor.h"
+#include "DataCodec/API/Entry/DataCodecFrameSequenceEncode.h"
 #include "DataCodec/Workflow/FrameSequence/FrameSequenceDependencyPlanner.h"
 #include "DataCodec/Test/Adapter/DataCodecTestAdapter.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
@@ -480,50 +481,13 @@ inline bool CheckTemporalPipelineExecution(
         std::array<const TestDataset*, 2u> m_frames;
     };
 
-    class TemporalSequenceOutput final : public IFrameSequenceOutputSink {
-    public:
-        [[nodiscard]] std::unique_ptr<IByteRangeOutput> OpenFrame(
-            std::size_t,
-            std::uint32_t,
-            std::string*) override {
-            return std::make_unique<MemoryByteRangeOutput>(m_outputRoot);
-        }
-
-        bool CommitFrame(
-            std::size_t,
-            std::uint32_t,
-            const std::uint64_t encodedByteCount,
-            std::string* error) override {
-            if (encodedByteCount == 0u) {
-                return validation::AssignError(error, "temporal test frame output is empty");
-            }
-            m_encodedBytes += encodedByteCount;
-            return true;
-        }
-
-        void AbortSequence() noexcept override {
-            m_encodedBytes = 0u;
-        }
-
-        [[nodiscard]] std::uint64_t EncodedBytes() const noexcept {
-            return m_encodedBytes;
-        }
-
-    private:
-        DataCodecExecutionResources m_outputRoot{ResolvedResourceConfiguration{
-            {8u * 1024u * 1024u, 1u, 1u}, 8u * 1024u * 1024u, 1u, false, true}};
-        std::uint64_t m_encodedBytes{0u};
-    };
-
-    TemporalSequenceSource source(keyFrameDataset, predictedDataset);
-    TemporalSequenceOutput output;
-    const auto encoded = FrameSequenceEncodeExecutor::Execute(FrameSequenceEncodeRequest{
-        .source = &source,
-        .outputSink = &output,
-        .controlParams = &params,
+    auto source = std::make_shared<TemporalSequenceSource>(keyFrameDataset, predictedDataset);
+    const auto encoded = EncodeFrameSequence(FrameSequenceEncodeRequest{
+        .source = source,
+        .configuration = {.controlParams = params},
         .resources = {.mode = CodecResourceMode::Fixed, .maxComputeThreads = 1u},
     });
-    if (!encoded.success || encoded.encodedFrameCount != 2u || output.EncodedBytes() == 0u) {
+    if (!encoded.success || encoded.encodedFrameCount != 2u || encoded.encodedByteCount == 0u || encoded.frames.size() != 2u) {
         if (encoded.failure) {
             return validation::AssignError(error, FormatCodecFailure(*encoded.failure));
         }

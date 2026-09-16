@@ -72,12 +72,24 @@ public:
     // 连续数组快速路径
     const void* TryGetRawPtr() const override { return TryGetArrayRawPointer(m_array); }
 
-    // 逐 tuple 读取路径
-    void GetTuple(const std::size_t index, double* output) const override {
-        if (m_array == nullptr || output == nullptr || index >= m_elementCount) {
-            return;
-        }
-        m_array->GetElement(index, output);
+    ::datacodec::InputMemoryView InputMemory() const override { return DescribeArrayMemory(m_array); }
+
+    static ::datacodec::InputMemoryView DescribeArrayMemory(const ArrayObject::Pointer& array) {
+        ::datacodec::InputMemoryView view;
+        if (!array) { view.capacityBytes = 0u; return view; }
+        const auto describe = [&]<class T>(const SmartPointer<T>& typed) {
+            if (!typed) { return false; }
+            const auto width = sizeof(*typed->RawPointer());
+            view = {typed->RawPointer(), 0u, typed->GetNumberOfValues() * width, typed->GetCapacity() * width};
+            return true;
+        };
+        const bool known = describe(DynamicCast<FloatArray>(array)) || describe(DynamicCast<DoubleArray>(array)) ||
+            describe(DynamicCast<IntArray>(array)) || describe(DynamicCast<UnsignedIntArray>(array)) ||
+            describe(DynamicCast<CharArray>(array)) || describe(DynamicCast<UnsignedCharArray>(array)) ||
+            describe(DynamicCast<ShortArray>(array)) || describe(DynamicCast<UnsignedShortArray>(array)) ||
+            describe(DynamicCast<LongLongArray>(array)) || describe(DynamicCast<UnsignedLongLongArray>(array));
+        (void)known;
+        return view;
     }
 
 private:
@@ -227,8 +239,6 @@ public:
     using CellTypeMappingMode = ::datacodec::CellTypeMappingMode;
     using CellTypeFamilyCode = ::datacodec::CellTypeFamilyCode;
     using CellTypeLocalCode = ::datacodec::CellTypeLocalCode;
-    using EncodeAdapterStatusInfo = ::datacodec::EncodeAdapterStatusInfo;
-    using EncodeAdapterStatusKind = ::datacodec::EncodeAdapterStatusKind;
 
     explicit iGameEncodeAdapter(const DataObject::Pointer& dataObject) : m_dataObject(dataObject) {
         static_assert(sizeof(igIndex) == sizeof(IndexType));
@@ -283,6 +293,35 @@ public:
 
     // 当前 iGame adapter 没有提供 double 点坐标快速路径
     const double* TryGetPointsF64() const override { return nullptr; }
+
+    std::vector<::datacodec::InputMemoryView> InputMemoryViews() const override {
+        std::vector<::datacodec::InputMemoryView> views;
+        const auto pointSet = DynamicCast<PointSet>(m_dataObject);
+        if (pointSet && pointSet->GetPoints()) {
+            views.push_back(iGameEncodeAttrView::DescribeArrayMemory(pointSet->GetPoints()->ConvertToArray()));
+        }
+        const auto appendCells = [&](CellArray* cells) {
+            if (!cells) { return; }
+            const auto ids = cells->GetCellIdArray();
+            if (ids) {
+                views.push_back({ids->RawPointer(), 0u, ids->Size() * sizeof(igIndex), ids->GetCapacity() * sizeof(igIndex)});
+            }
+            if (cells->IsUseOffSet()) { views.push_back(iGameEncodeAttrView::DescribeArrayMemory(cells->GetOffset())); }
+        };
+        appendCells(GetCellArray());
+        if (const auto volume = DynamicCast<VolumeMesh>(m_dataObject); volume && volume->GetIsPolyhedronType()) {
+            appendCells(volume->GetFaces());
+        }
+        if (const auto mesh = DynamicCast<UnstructuredMesh>(m_dataObject); mesh && mesh->GetCellTypes()) {
+            views.push_back(iGameEncodeAttrView::DescribeArrayMemory(mesh->GetCellTypes()));
+        }
+        if (DynamicCast<LagrangeUnstructuredMesh>(m_dataObject)) {
+            views.push_back({nullptr, 0u, GetNumberOfCells() * sizeof(int), {}});
+        }
+        for (const auto& attribute : m_pointAttrs) { views.push_back(attribute.InputMemory()); }
+        for (const auto& attribute : m_cellAttrs) { views.push_back(attribute.InputMemory()); }
+        return views;
+    }
 
     // 返回 cell 个数；structured mesh 走轴尺寸推导
     std::size_t GetNumberOfCells() const override {
@@ -567,23 +606,6 @@ public:
             return {};
         }
         return m_dataObject->GetMetadata()->GetString(FILE_PATH);
-    }
-
-    EncodeAdapterStatusInfo GetEncodeStatusInfo(const std::string_view stageName) const override {
-        if (stageName.find("SpatialPartition") != std::string_view::npos ||
-            stageName.find("Remap") != std::string_view::npos) {
-            return {EncodeAdapterStatusKind::Sorting};
-        }
-        if (stageName.find("Topo") != std::string_view::npos) {
-            return {EncodeAdapterStatusKind::TopologyCompression};
-        }
-        if (stageName.find("Geometry") != std::string_view::npos) {
-            return {EncodeAdapterStatusKind::GeometryCompression};
-        }
-        if (stageName.find("Attribute") != std::string_view::npos) {
-            return {EncodeAdapterStatusKind::AttributeCompression};
-        }
-        return {};
     }
 
     // 释放 iGame adapter 为多面体输入构建的临时面表

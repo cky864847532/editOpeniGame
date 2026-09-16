@@ -1,4 +1,5 @@
 #include "DataCodec/Localization/DataCodecMessageCatalog.h"
+#include "DataCodec/Common/DataCodecError.h"
 
 #include <utility>
 
@@ -50,6 +51,9 @@ const char* DataCodecMessageIdName(const DataCodecMessageId id) noexcept {
         case DataCodecMessageId::PackageDecodeCompleted: return "PackageDecodeCompleted";
         case DataCodecMessageId::PackageDecodeFailed: return "PackageDecodeFailed";
         case DataCodecMessageId::FrameCounter: return "FrameCounter";
+        case DataCodecMessageId::UnsupportedVersion: return "UnsupportedVersion";
+        case DataCodecMessageId::IncompleteInput: return "IncompleteInput";
+        case DataCodecMessageId::InvalidFormat: return "InvalidFormat";
         case DataCodecMessageId::None:
         default: return "None";
     }
@@ -81,6 +85,21 @@ std::string FormatDataCodecMessage(
         }
     }
     return result;
+}
+
+std::string FormatCodecFailureMessage(DataCodecLanguage language, const CodecFailureRecord& failure) {
+    auto id = DataCodecMessageId::DecodeFailed;
+    switch (failure.code) {
+        case CodecErrorCode::UnsupportedVersion: id = DataCodecMessageId::UnsupportedVersion; break;
+        case CodecErrorCode::IncompleteInput: id = DataCodecMessageId::IncompleteInput; break;
+        case CodecErrorCode::InvalidFormat: id = DataCodecMessageId::InvalidFormat; break;
+        default: break;
+    }
+    const std::vector<DataCodecMessageArgument> arguments{
+        {"version", failure.actualVersion ? std::to_string(*failure.actualVersion) : "?"},
+        {"supported", failure.supportedVersion ? std::to_string(*failure.supportedVersion) : "?"},
+    };
+    return FormatDataCodecMessage(language, id, arguments);
 }
 
 DataCodecLocalizedMessage LocalizeDataCodecMessage(

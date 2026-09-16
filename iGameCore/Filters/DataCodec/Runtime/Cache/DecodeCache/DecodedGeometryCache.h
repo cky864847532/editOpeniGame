@@ -2,7 +2,7 @@
 #define DATACODEC_RUNTIME_CACHE_DECODECACHE_DECODEDGEOMETRYCACHE_H
 
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
@@ -36,6 +36,7 @@ struct DecodedGeometryCache {
 
     std::size_t pointCount{0u};
     std::size_t dimension{0u};
+    DataType dataType{DataType::Float32};
     std::shared_ptr<bytestore::IRandomAccessByteStore> bytes;
     bool complete{false};
     std::weak_ptr<const void> nativeOutputIdentity;
@@ -43,15 +44,16 @@ struct DecodedGeometryCache {
     bool Initialize(
         const std::size_t count,
         const std::size_t pointDimension,
+        const DataType type,
         bytestore::ByteStoreSession& byteStoreSession,
         std::string* error = nullptr,
         IDecodeAdapter* destination = nullptr) {
         Release();
         std::uint64_t byteCount = 0u;
-        if (!CalculateGeometryCacheBytes(count, pointDimension, byteCount, error)) {
+        if (!CalculateGeometryCacheBytes(count, pointDimension, type, byteCount, error)) {
             return false;
         }
-        if (destination && destination->SupportsGeometryDecodeStore()) {
+        if (destination && destination->SupportsGeometryDecodeStore(type)) {
             bytes = destination->CreateGeometryDecodeStore(count, pointDimension, error);
             nativeOutputIdentity = destination->DecodeStorageIdentity();
             if (nativeOutputIdentity.expired() || !bytes || bytes->ByteSizeHint() != byteCount) {
@@ -66,6 +68,7 @@ struct DecodedGeometryCache {
         }
         pointCount = count;
         dimension = pointDimension;
+        dataType = type;
         return true;
     }
 
@@ -81,6 +84,7 @@ private:
     void MoveFrom(DecodedGeometryCache&& other) noexcept {
         pointCount = other.pointCount;
         dimension = other.dimension;
+        dataType = other.dataType;
         bytes = std::move(other.bytes);
         nativeOutputIdentity = std::move(other.nativeOutputIdentity);
         complete = other.complete;

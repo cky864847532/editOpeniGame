@@ -90,6 +90,7 @@ inline bool EncodeGeometryTransferCache(
 
 class GeometryStage final : public EncodeStage {
 public:
+    StageKind Kind() const noexcept override { return StageKind::Geometry; }
     static constexpr std::string_view kTypeName = "GeometryStage";
 
     // 把该 stage 绑定到 pipeline 预先准备好的 geometry transfer cache

@@ -113,7 +113,6 @@ inline EncodeCodecControlParams MakeDefaultEncodeControlParams() {
     return MakeDefaultCodecControlParams();
 }
 inline DecodeControlParams MakeDefaultDecodeControlParams() { return {}; }
-inline DecodeExecutionOptions MakeDefaultDecodeExecutionOptions() { return {}; }
 
 } // namespace datacodec
 

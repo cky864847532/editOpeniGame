@@ -1,7 +1,7 @@
 #ifndef DATACODEC_WORKFLOW_SESSION_DECODESESSION_H
 #define DATACODEC_WORKFLOW_SESSION_DECODESESSION_H
 
-#include "DataCodec/API/Adapter/IFramePackageDecodeAssembly.h"
+#include "DataCodec/Workflow/Decode/IFramePackageDecodeAssembly.h"
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
 #include "DataCodec/Workflow/Leaf/LeafDecodeExecutor.h"

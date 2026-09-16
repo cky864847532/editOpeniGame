@@ -1,6 +1,7 @@
 #include "DataCodec/Filter/Adapter/iGameDecodedFrameAttributeDataSource.h"
 
 #include "DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h"
+#include "DataCodec/Filter/Adapter/iGameDecodeAdapter.h"
 #include "DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h"
 #include "DataCodec/Filter/Adapter/iGameFramePresentationBridge.h"
 
@@ -41,45 +42,29 @@ std::string FirstError(const ::datacodec::DecodedFrameAttributeResult& result) {
 }
 
 DecodedFrameAttributeDataSource::DecodedFrameAttributeDataSource(
-    ::datacodec::IDecodedFrameAttributeAccess::Pointer attributeAccess)
-    : DecodedFrameAttributeDataSource(
-          std::move(attributeAccess),
-          std::make_shared<SharedState>()) {}
-
-DecodedFrameAttributeDataSource::DecodedFrameAttributeDataSource(
-    ::datacodec::IDecodedFrameAttributeAccess::Pointer attributeAccess,
-    std::shared_ptr<SharedState> sharedState)
+    ::datacodec::IDecodedFrameAttributeAccess::Pointer attributeAccess, DataObject::Pointer output)
     : m_attributeAccess(std::move(attributeAccess)),
-      m_rootObject(DataObjectFromDecodedFrame(Frame())),
-      m_sharedState(std::move(sharedState)) {}
+      m_rootObject(std::move(output)) {}
 
 std::shared_ptr<DecodedFrameAttributeDataSource>
 DecodedFrameAttributeDataSource::ForFrame(
-    ::datacodec::DecodedFrameLease::Pointer frame) const {
+    ::datacodec::DecodedFrame::Pointer frame) const {
     if (m_attributeAccess == nullptr || frame == nullptr) { return {}; }
+    auto output = frame == Frame() ? m_rootObject : DataObjectFromDecodedFrame(frame);
     auto attributeAccess = m_attributeAccess->ForFrame(std::move(frame));
     return attributeAccess != nullptr
         ? std::shared_ptr<DecodedFrameAttributeDataSource>(
-            new DecodedFrameAttributeDataSource(std::move(attributeAccess), m_sharedState))
-        : std::shared_ptr<DecodedFrameAttributeDataSource>{};
-}
-
-std::shared_ptr<DecodedFrameAttributeDataSource>
-DecodedFrameAttributeDataSource::ForFrameIndex(const std::uint32_t frameIndex) const {
-    if (m_attributeAccess == nullptr) { return {}; }
-    const auto lookup = m_attributeAccess->FindCachedFrame(frameIndex);
-    return lookup.IsHit()
-        ? ForFrame(lookup.value)
+            new DecodedFrameAttributeDataSource(std::move(attributeAccess), std::move(output)))
         : std::shared_ptr<DecodedFrameAttributeDataSource>{};
 }
 
 std::shared_ptr<IAttributeDataSource>
 DecodedFrameAttributeDataSource::ForFrameObject(
     const DataObject::Pointer& frameObject) const {
-    const auto frameIndex = DataCodecFrameIndex(frameObject.get());
-    return frameIndex.has_value()
-        ? std::static_pointer_cast<IAttributeDataSource>(ForFrameIndex(*frameIndex))
-        : std::shared_ptr<IAttributeDataSource>{};
+    if (frameObject == nullptr || m_rootObject == nullptr) { return {}; }
+    if (frameObject == m_rootObject) { return ForFrame(Frame()); }
+    const auto frames = m_rootObject->PeekTimeFrames();
+    return frames != nullptr ? frames->AttributeSourceForFrame(frameObject) : nullptr;
 }
 
 DataObject::Pointer DecodedFrameAttributeDataSource::RootObject() const {
@@ -112,10 +97,10 @@ std::vector<AttributeDataDescriptor> DecodedFrameAttributeDataSource::Attributes
             .role = ToNativeRole(descriptor.metadata.type),
             .attachment = ToNativeAttachment(descriptor.metadata.attachmentType),
             .componentCount = descriptor.metadata.dimension,
-            .state = descriptor.committed
+            .state = nativeIndex >= 0
                 ? AttributeDataLoadState::Loaded
                 : AttributeDataLoadState::Unloaded,
-            .nativeIndex = descriptor.committed ? nativeIndex : -1,
+            .nativeIndex = nativeIndex,
         });
     }
     return descriptors;
@@ -168,20 +153,15 @@ AttributeDataLoadResult DecodedFrameAttributeDataSource::CommitAttribute(
     if (m_attributeAccess == nullptr || Frame() == nullptr || loadResult.object == nullptr) {
         return loadResult;
     }
-    const auto previousCount = loadResult.object->GetAttributeSet() != nullptr
-        ? loadResult.object->GetAttributeSet()->GetNumberOfAttributes()
-        : 0;
     auto result = m_attributeAccess->RequestAttributes({
         .attributeTargets = {ToDataCodecTarget(target)},
         .mode = ::datacodec::AttributeDecodeRequestMode::CommitCached,
     });
-    const auto currentCount = loadResult.object->GetAttributeSet() != nullptr
-        ? loadResult.object->GetAttributeSet()->GetNumberOfAttributes()
-        : 0;
-    if (result.success && currentCount > previousCount) {
-        loadResult.nativeIndex = currentCount - 1;
-        SetNativeAttributeIndex(target, loadResult.nativeIndex);
-    } else if (result.success) {
+    if (result.success) {
+        for (const auto& leaf : result.output.leaves) {
+            iGameDecodeAdapter consumer(loadResult.object);
+            if (!consumer.Import(leaf, true, &loadResult.error)) { return loadResult; }
+        }
         loadResult.nativeIndex = NativeAttributeIndex(target);
     }
     loadResult.success = result.success && loadResult.nativeIndex >= 0;
@@ -214,26 +194,7 @@ AttributeDataTarget DecodedFrameAttributeDataSource::ToAttributeDataTarget(
 
 int DecodedFrameAttributeDataSource::NativeAttributeIndex(
     const AttributeDataTarget& target) const {
-    if (m_sharedState == nullptr) { return -1; }
-    std::lock_guard<std::mutex> lock(m_sharedState->mutex);
-    const auto iterator = m_sharedState->nativeAttributeIndices.find({
-        target.frameIndex,
-        target.blockPath,
-        target.sourceIndex,
-    });
-    return iterator == m_sharedState->nativeAttributeIndices.end() ? -1 : iterator->second;
-}
-
-void DecodedFrameAttributeDataSource::SetNativeAttributeIndex(
-    const AttributeDataTarget& target,
-    const int nativeIndex) {
-    if (m_sharedState == nullptr) { return; }
-    std::lock_guard<std::mutex> lock(m_sharedState->mutex);
-    m_sharedState->nativeAttributeIndices[{
-        target.frameIndex,
-        target.blockPath,
-        target.sourceIndex,
-    }] = nativeIndex;
+    return iGameDecodeAdapter::NativeAttributeIndex(TargetObject(target), target.sourceIndex);
 }
 
 IGAME_NAMESPACE_END

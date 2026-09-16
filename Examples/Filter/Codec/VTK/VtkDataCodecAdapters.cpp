@@ -4,6 +4,11 @@
 #include <DataCodec/Common/DataCodecTypes.h>
 
 #include <vtkAbstractArray.h>
+#include <vtkCallbackCommand.h>
+#include <vtkCommand.h>
+#include <vtkVariant.h>
+
+
 #include <vtkCellArray.h>
 #include <vtkCellData.h>
 #include <vtkCellType.h>
@@ -152,6 +157,7 @@ AttrRole ResolveAttributeRole(vtkDataSetAttributes* attributes, const int arrayI
     }
 }
 
+
 class VtkEncodeAttributeView final : public ::datacodec::IEncodeAttrView {
 public:
     VtkEncodeAttributeView(
@@ -189,11 +195,25 @@ public:
         return m_array->GetVoidPointer(0);
     }
 
-    void GetTuple(const std::size_t index, double* output) const override {
+    bool GetTupleBytes(const std::size_t index, void* output, std::string* error = nullptr) const override {
         if (m_array == nullptr || output == nullptr || index >= GetElementCount()) {
-            return;
+            return Fail(error, "VTK attribute tuple byte range is invalid");
         }
-        m_array->GetTuple(static_cast<vtkIdType>(index), output);
+        if (TryGetRawPtr() != nullptr) {
+            return IEncodeAttrView::GetTupleBytes(index, output, error);
+        }
+        auto* bytes = static_cast<std::uint8_t*>(output);
+        for (int component = 0; component < GetComponentCount(); ++component) {
+            const auto value = m_array->GetVariantValue(static_cast<vtkIdType>(index) * GetComponentCount() + component);
+            if (m_dataType == DataType::Float32) {
+                const auto typed = value.ToFloat();
+                std::memcpy(bytes + static_cast<std::size_t>(component) * sizeof(typed), &typed, sizeof(typed));
+            } else if (m_dataType == DataType::Float64) {
+                const auto typed = value.ToDouble();
+                std::memcpy(bytes + static_cast<std::size_t>(component) * sizeof(typed), &typed, sizeof(typed));
+            } else { return Fail(error, "VTK array does not support exact tuple access"); }
+        }
+        return true;
     }
 
 private:
@@ -203,38 +223,6 @@ private:
     DataType m_dataType{DataType::Float32};
     bool m_supported{false};
 };
-
-template<typename TValue>
-bool CopyRange(
-    std::vector<TValue>& target,
-    const std::size_t offset,
-    const TValue* data,
-    const std::size_t count,
-    const char* label,
-    std::string* error) {
-    if (count == 0u) {
-        return true;
-    }
-    if (data == nullptr) {
-        return Fail(error, std::string(label) + " range has null input");
-    }
-    if (offset > target.size() || count > target.size() - offset) {
-        return Fail(error, std::string(label) + " range is outside the target buffer");
-    }
-    std::copy(data, data + count, target.begin() + static_cast<std::ptrdiff_t>(offset));
-    return true;
-}
-
-vtkSmartPointer<vtkDataArray> CreateVtkArray(const DataType type) {
-    switch (type) {
-        case DataType::Float32:
-            return vtkSmartPointer<vtkFloatArray>::New();
-        case DataType::Float64:
-            return vtkSmartPointer<vtkDoubleArray>::New();
-        default:
-            return nullptr;
-    }
-}
 
 int ToVtkAttributeRole(const AttrRole role) {
     switch (role) {
@@ -578,406 +566,133 @@ void VtkDataCodecEncodeAdapter::ResetInput() {
 
 void VtkDataCodecEncodeAdapter::Abort() { ResetInput(); }
 
-class VtkDataCodecDecodeAdapter::Impl {
-public:
-    struct PendingAttribute {
-        AttrStorageParams meta;
-        vtkSmartPointer<vtkDataArray> array;
-    };
-
-    vtkSmartPointer<vtkUnstructuredGrid> output;
-    vtkSmartPointer<vtkPoints> points;
-    std::size_t pointCount{0u};
-    std::size_t cellCount{0u};
-    bool hasOffsets{false};
-    std::vector<IndexType> connectivity;
-    std::vector<IndexType> offsets;
-    std::vector<IndexType> cellTypes;
-    std::vector<PendingAttribute> attributes;
-    VtkCellTypeMapping cellTypeMapping;
-};
-
-VtkDataCodecDecodeAdapter::VtkDataCodecDecodeAdapter()
-    : m_impl(std::make_unique<Impl>()) {}
-
-VtkDataCodecDecodeAdapter::~VtkDataCodecDecodeAdapter() = default;
-
-bool VtkDataCodecDecodeAdapter::SetMeshType(
-    const MeshType type,
-    std::string* error) {
-    ResetOutput();
-    if (type != MeshType::UnstructuredMesh) {
-        return Fail(error, "VTK decode adapter only supports UnstructuredMesh");
+namespace {
+vtkSmartPointer<vtkDataArray> AdoptArray(
+    const ::datacodec::DecodedBuffer& buffer, DataType type, int components,
+    std::size_t tuples) {
+    const auto width = ::datacodec::DataTypeSize(type);
+    if (components <= 0 || width == 0 ||
+        tuples > static_cast<std::size_t>(std::numeric_limits<vtkIdType>::max()) /
+            static_cast<std::size_t>(components) ||
+        tuples > std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(components) / width ||
+        buffer.size() != tuples * static_cast<std::size_t>(components) * width) {
+        return nullptr;
     }
-    m_impl->output = vtkSmartPointer<vtkUnstructuredGrid>::New();
-    return true;
+    const auto vtkType = type == DataType::Float32 ? VTK_FLOAT : type == DataType::Float64 ? VTK_DOUBLE : VTK_VOID;
+    if (vtkType == VTK_VOID) { return nullptr; }
+    vtkSmartPointer<vtkDataArray> array;
+    array.TakeReference(vtkDataArray::CreateDataArray(vtkType));
+    if (!array) { return nullptr; }
+    auto lifetime = vtkSmartPointer<vtkCallbackCommand>::New();
+    lifetime->SetClientData(new std::shared_ptr<const void>(buffer.Owner()));
+    lifetime->SetClientDataDeleteCallback([](void* state) {
+        delete static_cast<std::shared_ptr<const void>*>(state);
+    });
+    lifetime->SetCallback([](vtkObject*, unsigned long, void*, void*) {});
+    array->AddObserver(vtkCommand::DeleteEvent, lifetime);
+    array->SetNumberOfComponents(components);
+    array->SetVoidArray(const_cast<std::uint8_t*>(buffer.data()),
+        static_cast<vtkIdType>(buffer.size() / width), 1);
+    return array;
+}
+} // 匿名命名空间
+
+std::shared_ptr<const ::datacodec::ICellTypeMapping> MakeVtkCellTypeMapping() {
+    return std::make_shared<VtkCellTypeMapping>();
 }
 
-bool VtkDataCodecDecodeAdapter::BeginPoints(
-    const std::size_t count,
-    const std::size_t dimension,
-    std::string* error) {
-    if (m_impl->output == nullptr) {
-        return Fail(error, "VTK point decode requires an initialized output grid");
+bool VtkDataCodecDecodeAdapter::Import(
+    const ::datacodec::DecodedLeaf& leaf, std::string* error) {
+    using ::datacodec::IndexType;
+    using Kind = ::datacodec::DecodedTopology::Kind;
+    m_output = nullptr;
+    if (leaf.meshType != ::datacodec::MeshType::UnstructuredMesh ||
+        leaf.geometry.dimension != 3u) {
+        return Fail(error, "VTK import requires an unstructured mesh with three point components");
     }
-    if (dimension != 3u || count > static_cast<std::size_t>(std::numeric_limits<vtkIdType>::max())) {
-        return Fail(error, "VTK point decode requires three components and a valid tuple count");
+    auto pointValues = AdoptArray(leaf.geometry.values, leaf.geometry.dataType, 3,
+                                  leaf.geometry.pointCount);
+    if (!pointValues) { return Fail(error, "VTK geometry storage or scalar type is invalid"); }
+    auto output = vtkSmartPointer<vtkUnstructuredGrid>::New();
+    auto points = vtkSmartPointer<vtkPoints>::New();
+    points->SetData(pointValues);
+    output->SetPoints(points);
+    const auto& topology = leaf.topology;
+    if (topology.kind != Kind::Connectivity || !topology.polynomialOrders.empty()) {
+        return Fail(error, "VTK import requires ordinary connectivity topology");
     }
-    m_impl->points = vtkSmartPointer<vtkPoints>::New();
-    m_impl->points->SetDataTypeToFloat();
-    m_impl->points->SetNumberOfPoints(static_cast<vtkIdType>(count));
-    m_impl->output->SetPoints(m_impl->points);
-    m_impl->pointCount = count;
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::WritePointsRange(
-    const std::size_t offset,
-    const std::size_t count,
-    const float* data,
-    std::string* error) {
-    if (count == 0u) {
-        return true;
+    const auto count = topology.cellCount;
+    const auto ids = topology.connectivity.size() / sizeof(IndexType);
+    const auto limit = static_cast<std::size_t>(std::numeric_limits<vtkIdType>::max());
+    if (count >= limit || ids > limit ||
+        count > std::numeric_limits<std::size_t>::max() / sizeof(IndexType) - 1u ||
+        topology.connectivity.size() % sizeof(IndexType) != 0u ||
+        topology.cellTypes.size() != count * sizeof(IndexType) ||
+        (!topology.offsets.empty() && topology.offsets.size() != (count + 1u) * sizeof(IndexType)) ||
+        (topology.offsets.empty() && ((count == 0u && ids != 0u) ||
+                                     (count != 0u && ids % count != 0u)))) {
+        return Fail(error, "VTK topology array lengths are invalid");
     }
-    if (m_impl->points == nullptr || data == nullptr ||
-        offset > m_impl->pointCount || count > m_impl->pointCount - offset) {
-        return Fail(error, "VTK point range is outside the target array");
-    }
-    auto* target = static_cast<float*>(m_impl->points->GetData()->GetVoidPointer(0));
-    if (target == nullptr) {
-        return Fail(error, "VTK point array has no writable storage");
-    }
-    std::memcpy(
-        target + offset * 3u,
-        data,
-        count * 3u * sizeof(float));
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::EndPoints(std::string*) {
-    m_impl->points = nullptr;
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::BeginTopology(
-    const std::size_t cellCount,
-    const std::size_t connectivityCount,
-    const bool hasOffsets,
-    std::string* error) {
-    if (m_impl->output == nullptr ||
-        cellCount > static_cast<std::size_t>(std::numeric_limits<vtkIdType>::max()) ||
-        connectivityCount > static_cast<std::size_t>(std::numeric_limits<vtkIdType>::max())) {
-        return Fail(error, "VTK topology dimensions are invalid");
-    }
-    m_impl->cellCount = cellCount;
-    m_impl->hasOffsets = hasOffsets;
-    m_impl->connectivity.assign(connectivityCount, 0u);
-    m_impl->offsets.assign(hasOffsets ? cellCount + 1u : 0u, 0u);
-    m_impl->cellTypes.assign(cellCount, 0u);
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::WriteConnectivityRange(
-    const std::size_t offset,
-    const IndexType* data,
-    const std::size_t count,
-    std::string* error) {
-    return CopyRange(m_impl->connectivity, offset, data, count, "connectivity", error);
-}
-
-bool VtkDataCodecDecodeAdapter::WriteOffsetsRange(
-    const std::size_t offset,
-    const IndexType* data,
-    const std::size_t count,
-    std::string* error) {
-    return CopyRange(m_impl->offsets, offset, data, count, "offset", error);
-}
-
-bool VtkDataCodecDecodeAdapter::WriteCellTypesRange(
-    const std::size_t offset,
-    const IndexType* data,
-    const std::size_t count,
-    std::string* error) {
-    return CopyRange(m_impl->cellTypes, offset, data, count, "cell type", error);
-}
-
-bool VtkDataCodecDecodeAdapter::WriteCellPolynomialOrdersRange(
-    std::size_t,
-    const std::uint16_t*,
-    const std::size_t count,
-    std::string* error) {
-    return count == 0u
-        ? true
-        : Fail(error, "VTK decode adapter does not support polynomial-order cells");
-}
-
-bool VtkDataCodecDecodeAdapter::EndTopology(std::string* error) {
-    if (m_impl->output == nullptr || m_impl->cellTypes.size() != m_impl->cellCount) {
-        return Fail(error, "VTK topology commit has incomplete state");
-    }
-
-    if (!m_impl->hasOffsets) {
-        m_impl->offsets.assign(m_impl->cellCount + 1u, 0u);
-        if (m_impl->cellCount != 0u) {
-            if (m_impl->connectivity.empty() ||
-                m_impl->connectivity.size() % m_impl->cellCount != 0u) {
-                return Fail(error, "VTK fixed-size topology has an invalid connectivity length");
-            }
-            const auto fixedSize = m_impl->connectivity.size() / m_impl->cellCount;
-            for (std::size_t index = 0; index <= m_impl->cellCount; ++index) {
-                m_impl->offsets[index] = static_cast<IndexType>(index * fixedSize);
-            }
-        }
-    }
-
-    if (m_impl->offsets.size() != m_impl->cellCount + 1u ||
-        m_impl->offsets.front() != 0u ||
-        m_impl->offsets.back() != m_impl->connectivity.size()) {
-        return Fail(error, "VTK topology offsets do not match connectivity");
-    }
-
-    auto cells = vtkSmartPointer<vtkCellArray>::New();
+    const auto* connectivity = reinterpret_cast<const IndexType*>(topology.connectivity.data());
+    const auto* offsets = reinterpret_cast<const IndexType*>(topology.offsets.data());
+    const auto* cellTypes = reinterpret_cast<const IndexType*>(topology.cellTypes.data());
     auto vtkOffsets = vtkSmartPointer<vtkIdTypeArray>::New();
-    auto vtkConnectivity = vtkSmartPointer<vtkIdTypeArray>::New();
-    auto types = vtkSmartPointer<vtkUnsignedCharArray>::New();
-    vtkOffsets->SetNumberOfValues(static_cast<vtkIdType>(m_impl->offsets.size()));
-    vtkConnectivity->SetNumberOfValues(static_cast<vtkIdType>(m_impl->connectivity.size()));
-    types->SetNumberOfValues(static_cast<vtkIdType>(m_impl->cellCount));
-    auto* vtkOffsetValues = static_cast<vtkIdType*>(vtkOffsets->GetVoidPointer(0));
-    auto* vtkConnectivityValues = static_cast<vtkIdType*>(vtkConnectivity->GetVoidPointer(0));
-    auto* vtkTypeValues = static_cast<unsigned char*>(types->GetVoidPointer(0));
-    if (vtkOffsetValues == nullptr ||
-        (!m_impl->connectivity.empty() && vtkConnectivityValues == nullptr) ||
-        (m_impl->cellCount != 0u && vtkTypeValues == nullptr)) {
-        return Fail(error, "failed to allocate VTK topology arrays");
-    }
-    for (std::size_t offsetIndex = 0; offsetIndex < m_impl->offsets.size(); ++offsetIndex) {
-        vtkOffsetValues[offsetIndex] = static_cast<vtkIdType>(m_impl->offsets[offsetIndex]);
-    }
-    for (std::size_t connectivityIndex = 0;
-         connectivityIndex < m_impl->connectivity.size();
-         ++connectivityIndex) {
-        const auto pointId = m_impl->connectivity[connectivityIndex];
-        if (pointId >= m_impl->pointCount) {
-            return Fail(error, "decoded VTK topology references an invalid point id");
+    auto vtkIds = vtkSmartPointer<vtkIdTypeArray>::New();
+    auto vtkTypes = vtkSmartPointer<vtkUnsignedCharArray>::New();
+    vtkOffsets->SetNumberOfValues(static_cast<vtkIdType>(count + 1u));
+    vtkIds->SetNumberOfValues(static_cast<vtkIdType>(ids));
+    vtkTypes->SetNumberOfValues(static_cast<vtkIdType>(count));
+    std::size_t previous = 0u;
+    for (std::size_t index = 0u; index <= count; ++index) {
+        const auto value = offsets ? static_cast<std::size_t>(offsets[index])
+                                  : (count ? index * (ids / count) : 0u);
+        if (value < previous || value > ids || (index == 0u && value != 0u) ||
+            (index == count && value != ids)) {
+            return Fail(error, "VTK topology offsets do not match connectivity");
         }
-        vtkConnectivityValues[connectivityIndex] = static_cast<vtkIdType>(pointId);
+        static_cast<vtkIdType*>(vtkOffsets->GetVoidPointer(0))[index] = static_cast<vtkIdType>(value);
+        previous = value;
     }
-
-    for (std::size_t cellIndex = 0; cellIndex < m_impl->cellCount; ++cellIndex) {
-        const auto begin = static_cast<std::size_t>(m_impl->offsets[cellIndex]);
-        const auto end = static_cast<std::size_t>(m_impl->offsets[cellIndex + 1u]);
-        if (begin > end || end > m_impl->connectivity.size()) {
-            return Fail(error, "VTK topology contains a non-monotonic offset");
+    for (std::size_t index = 0u; index < ids; ++index) {
+        if (connectivity[index] >= leaf.geometry.pointCount) {
+            return Fail(error, "VTK topology references an invalid point");
         }
-
+        static_cast<vtkIdType*>(vtkIds->GetVoidPointer(0))[index] = static_cast<vtkIdType>(connectivity[index]);
+    }
+    VtkCellTypeMapping mapping;
+    for (std::size_t index = 0u; index < count; ++index) {
         CellTypeCodecEntry entry;
-        const auto rawCellType = m_impl->cellTypes[cellIndex];
-        if (!m_impl->cellTypeMapping.ResolveCellType(rawCellType, entry) ||
-            rawCellType > std::numeric_limits<unsigned char>::max()) {
-            return Fail(error, "decoded package contains an unsupported VTK cell type");
+        if (cellTypes[index] > std::numeric_limits<unsigned char>::max() ||
+            !mapping.ResolveCellType(cellTypes[index], entry)) {
+            return Fail(error, "VTK topology has an unsupported cell type");
         }
-
-        vtkTypeValues[cellIndex] = static_cast<unsigned char>(rawCellType);
+        static_cast<unsigned char*>(vtkTypes->GetVoidPointer(0))[index] = static_cast<unsigned char>(cellTypes[index]);
     }
-
-    cells->SetData(vtkOffsets, vtkConnectivity);
-    m_impl->output->SetCells(types, cells);
-    m_impl->connectivity.clear();
-    m_impl->offsets.clear();
-    m_impl->cellTypes.clear();
-    m_impl->cellCount = 0u;
-    m_impl->hasOffsets = false;
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::SetStructuredAxisSize(
-    const int[3],
-    std::string* error) {
-    return Fail(error, "VTK decode adapter does not support structured topology");
-}
-
-bool VtkDataCodecDecodeAdapter::SupportsPolyhedronTopology() const { return false; }
-
-bool VtkDataCodecDecodeAdapter::BeginPolyhedronTopology(
-    std::size_t,
-    std::string* error) {
-    return Fail(error, "VTK decode adapter does not support polyhedron topology");
-}
-
-bool VtkDataCodecDecodeAdapter::WritePolyhedronCellBatch(
-    std::size_t,
-    const PolyhedronTopologyView&,
-    std::string* error) {
-    return Fail(error, "VTK decode adapter does not support polyhedron topology");
-}
-
-bool VtkDataCodecDecodeAdapter::EndPolyhedronTopology(std::string* error) {
-    return Fail(error, "VTK decode adapter does not support polyhedron topology");
-}
-
-bool VtkDataCodecDecodeAdapter::BeginAttribute(
-    const std::size_t attrIndex,
-    const AttrStorageParams& meta,
-    std::string* error) {
-    if (m_impl->output == nullptr || meta.dimension <= 0 ||
-        meta.elementCount > static_cast<::datacodec::ParamSize>(std::numeric_limits<vtkIdType>::max())) {
-        return Fail(error, "VTK attribute metadata is invalid");
-    }
-    auto array = CreateVtkArray(meta.dataType);
-    if (array == nullptr) {
-        return Fail(error, "VTK decode adapter only supports float and double attributes");
-    }
-    array->SetName(meta.name.c_str());
-    array->SetNumberOfComponents(meta.dimension);
-    array->SetNumberOfTuples(static_cast<vtkIdType>(meta.elementCount));
-
-    if (attrIndex >= m_impl->attributes.size()) {
-        m_impl->attributes.resize(attrIndex + 1u);
-    }
-    m_impl->attributes[attrIndex].meta = meta;
-    m_impl->attributes[attrIndex].array = array;
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::WriteAttributeRange(
-    const std::size_t attrIndex,
-    const std::size_t offset,
-    const std::size_t count,
-    const void* data,
-    const std::size_t byteSize,
-    std::string* error) {
-    if (count == 0u) {
-        return true;
-    }
-    if (attrIndex >= m_impl->attributes.size() || data == nullptr) {
-        return Fail(error, "VTK attribute range uses an unknown attribute");
-    }
-    auto& pending = m_impl->attributes[attrIndex];
-    if (pending.array == nullptr ||
-        pending.meta.elementCount > std::numeric_limits<std::size_t>::max()) {
-        return Fail(error, "VTK attribute range has no writable array");
-    }
-    const auto elementCount = static_cast<std::size_t>(pending.meta.elementCount);
-    if (offset > elementCount || count > elementCount - offset) {
-        return Fail(error, "VTK attribute range is outside the target array");
-    }
-    const auto componentCount = static_cast<std::size_t>(pending.meta.dimension);
-    const auto valueSize = ::datacodec::DataTypeSize(pending.meta.dataType);
-    if (componentCount == 0u || valueSize == 0u ||
-        componentCount > std::numeric_limits<std::size_t>::max() / valueSize) {
-        return Fail(error, "VTK attribute tuple byte size is invalid");
-    }
-    const auto tupleByteSize = componentCount * valueSize;
-    if (count > std::numeric_limits<std::size_t>::max() / tupleByteSize ||
-        byteSize != count * tupleByteSize) {
-        return Fail(error, "VTK attribute range byte size does not match metadata");
-    }
-    auto* target = static_cast<std::uint8_t*>(pending.array->GetVoidPointer(0));
-    if (target == nullptr) {
-        return Fail(error, "VTK attribute array has no writable storage");
-    }
-    std::memcpy(target + offset * tupleByteSize, data, byteSize);
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::SupportsAttributeDecodeStore() const noexcept {
-    return false;
-}
-
-bool VtkDataCodecDecodeAdapter::EndAttribute(
-    const std::size_t attrIndex,
-    std::string* error) {
-    if (m_impl->output == nullptr || attrIndex >= m_impl->attributes.size() ||
-        m_impl->attributes[attrIndex].array == nullptr) {
-        return Fail(error, "VTK attribute commit uses an unknown attribute");
-    }
-    auto& pending = m_impl->attributes[attrIndex];
-    vtkDataSetAttributes* target = pending.meta.attachmentType == AttrAttachment::Point
-        ? static_cast<vtkDataSetAttributes*>(m_impl->output->GetPointData())
-        : static_cast<vtkDataSetAttributes*>(m_impl->output->GetCellData());
-    if (target == nullptr) {
-        return Fail(error, "VTK output has no attribute container");
-    }
-    const auto nativeIndex = target->AddArray(pending.array);
-    const auto nativeRole = ToVtkAttributeRole(pending.meta.type);
-    if (nativeIndex < 0 ||
-        (nativeRole >= 0 && target->SetActiveAttribute(nativeIndex, nativeRole) < 0)) {
-        return Fail(error, "failed to attach decoded VTK attribute");
-    }
-    pending.array = nullptr;
-    return true;
-}
-
-bool VtkDataCodecDecodeAdapter::ResolveCellType(
-    const CellTypeRaw rawType,
-    CellTypeCodecEntry& entry) const {
-    return m_impl->cellTypeMapping.ResolveCellType(rawType, entry);
-}
-
-VtkDataCodecDecodeAdapter::CellTypeMappingMode
-VtkDataCodecDecodeAdapter::GetCellTypeMappingMode() const {
-    return m_impl->cellTypeMapping.GetCellTypeMappingMode();
-}
-
-bool VtkDataCodecDecodeAdapter::ResolveCellSizeFromPolynomialOrder(
-    const CellTypeRaw rawType,
-    const std::uint16_t order,
-    int& size) const {
-    return m_impl->cellTypeMapping.ResolveCellSizeFromPolynomialOrder(rawType, order, size);
-}
-
-bool VtkDataCodecDecodeAdapter::EncodeCellTypeFamilyLocal(
-    const CellTypeRaw rawType,
-    CellTypeFamilyCode& familyCode,
-    CellTypeLocalCode& familyLocalCode) const {
-    return m_impl->cellTypeMapping.EncodeCellTypeFamilyLocal(
-        rawType,
-        familyCode,
-        familyLocalCode);
-}
-
-bool VtkDataCodecDecodeAdapter::DecodeCellTypeFamilyLocal(
-    const CellTypeFamilyCode familyCode,
-    const CellTypeLocalCode familyLocalCode,
-    CellTypeRaw& rawType) const {
-    return m_impl->cellTypeMapping.DecodeCellTypeFamilyLocal(
-        familyCode,
-        familyLocalCode,
-        rawType);
-}
-
-void VtkDataCodecDecodeAdapter::Abort() { ResetOutput(); }
-
-void VtkDataCodecDecodeAdapter::ResetOutput() {
-    m_impl->output = nullptr;
-    m_impl->points = nullptr;
-    m_impl->pointCount = 0u;
-    m_impl->cellCount = 0u;
-    m_impl->hasOffsets = false;
-    m_impl->connectivity.clear();
-    m_impl->offsets.clear();
-    m_impl->cellTypes.clear();
-    m_impl->attributes.clear();
-}
-
-bool VtkDataCodecDecodeAdapter::Commit(std::string* error) {
-    if (m_impl->output == nullptr) {
-        return Fail(error, "VTK decode adapter has no output grid");
-    }
-    for (const auto& attribute : m_impl->attributes) {
-        if (attribute.array != nullptr) {
-            return Fail(error, "VTK decode adapter has an uncommitted attribute");
+    auto cells = vtkSmartPointer<vtkCellArray>::New();
+    cells->SetData(vtkOffsets, vtkIds);
+    output->SetCells(vtkTypes, cells);
+    for (const auto& attribute : leaf.attributes) {
+        const auto& meta = attribute.metadata;
+        auto array = AdoptArray(attribute.values, meta.dataType, meta.dimension, meta.elementCount);
+        if (!array) { return Fail(error, "VTK attribute storage or scalar type is invalid"); }
+        array->SetName(meta.name.c_str());
+        vtkDataSetAttributes* target = meta.attachmentType == AttrAttachment::Point
+            ? static_cast<vtkDataSetAttributes*>(output->GetPointData())
+            : static_cast<vtkDataSetAttributes*>(output->GetCellData());
+        const auto index = target->AddArray(array);
+        const auto role = ToVtkAttributeRole(meta.type);
+        if (index < 0 || (role >= 0 && target->SetActiveAttribute(index, role) < 0)) {
+            return Fail(error, "failed to attach decoded VTK attribute");
         }
     }
+    m_output = output;
     return true;
 }
 
 vtkSmartPointer<vtkUnstructuredGrid> VtkDataCodecDecodeAdapter::TakeOutput() {
-    auto output = m_impl->output;
-    m_impl->output = nullptr;
-    m_impl->attributes.clear();
+    auto output = m_output;
+    m_output = nullptr;
     return output;
 }
 
-} // namespace vtk_datacodec_example
+} // 命名空间 vtk_datacodec_example

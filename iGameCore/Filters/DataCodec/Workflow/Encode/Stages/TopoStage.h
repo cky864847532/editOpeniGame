@@ -185,6 +185,7 @@ inline void RunPolyhedronTopologyEncode(
 
 class TopoStage final : public EncodeStage {
 public:
+    StageKind Kind() const noexcept override { return StageKind::Topology; }
     static constexpr std::string_view kTypeName = "TopoStage";
 
     // 绑定 pipeline 预先准备好的 topology transfer cache

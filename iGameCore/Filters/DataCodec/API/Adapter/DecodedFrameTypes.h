@@ -4,6 +4,7 @@
 #include "DataCodec/API/Adapter/CacheAccessResult.h"
 #include "DataCodec/API/Params/CodecStorageParams.h"
 #include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
+#include "DataCodec/API/Output/DecodedData.h"
 
 #include <cstdint>
 #include <memory>
@@ -18,25 +19,17 @@ struct DecodeAttributeDescriptor {
     bool committed{false};
 };
 
-class IDecodedFramePayload {
+class DecodedFrame final {
 public:
-    using Pointer = std::shared_ptr<IDecodedFramePayload>;
-
-    virtual ~IDecodedFramePayload() = default;
-    [[nodiscard]] virtual std::uint64_t ResidentSizeHint() const noexcept = 0;
+    using Pointer = std::shared_ptr<DecodedFrame>;
+    explicit DecodedFrame(DecodedData data) : m_data(std::move(data)) {}
+    [[nodiscard]] std::uint32_t FrameIndex() const noexcept { return m_data.frameIndex; }
+    [[nodiscard]] const DecodedData& Data() const noexcept { return m_data; }
+private:
+    DecodedData m_data;
 };
 
-class DecodedFrameLease {
-public:
-    using Pointer = std::shared_ptr<DecodedFrameLease>;
-
-    virtual ~DecodedFrameLease() = default;
-    [[nodiscard]] virtual std::uint32_t FrameIndex() const noexcept = 0;
-    [[nodiscard]] virtual IDecodedFramePayload::Pointer Payload() const noexcept = 0;
-    [[nodiscard]] virtual std::uint64_t ResidentSizeHint() const noexcept = 0;
-};
-
-using DecodedFrameCacheLookupResult = CacheLookupResult<DecodedFrameLease::Pointer>;
+using DecodedFrameCacheLookupResult = CacheLookupResult<DecodedFrame::Pointer>;
 
 enum class DecodedFrameAccessKind : std::uint8_t {
     UserRequest = 0u,

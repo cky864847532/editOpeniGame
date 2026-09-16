@@ -1,5 +1,5 @@
-#ifndef DATACODEC_API_ADAPTER_IDECODEADAPTER_H
-#define DATACODEC_API_ADAPTER_IDECODEADAPTER_H
+#ifndef DATACODEC_WORKFLOW_DECODE_IDECODEADAPTER_H
+#define DATACODEC_WORKFLOW_DECODE_IDECODEADAPTER_H
 
 #include "DataCodec/Common/Views/TopologyViews.h"
 #include "DataCodec/Common/Views/BufferCapacitySample.h"
@@ -37,19 +37,19 @@ struct IDecodeAdapter : public ICellTypeMapping {
     // 返回的 store 必须保持原生数组存活，满足 ByteStoreInterface 的并发写入和 Seal 契约
     // 核心完成写入后调用 EndPoints/EndTopology/EndAttribute 发布已有数组
     // Commit 发布对象，Abort 丢弃未提交状态，共享存储在最后一个持有者释放时销毁
-    [[nodiscard]] virtual bool SupportsGeometryDecodeStore() const noexcept { return false; }
+    [[nodiscard]] virtual bool SupportsGeometryDecodeStore(DataType type) const noexcept { return false; }
     virtual std::shared_ptr<bytestore::IRandomAccessByteStore> CreateGeometryDecodeStore(
         std::size_t count, std::size_t dimension, std::string* error) { return {}; }
     [[nodiscard]] virtual bool SupportsConnectivityDecodeStores(bool polynomialOrders) const noexcept { return false; }
     virtual bool CreateConnectivityDecodeStores(std::size_t cells, std::size_t values, bool hasOffsets, bool hasTypes,
         NativeConnectivityDecodeStores& stores, std::string* error) { return false; }
     // 开始按 range 写入点坐标
-    virtual bool BeginPoints(std::size_t count, std::size_t dimension, std::string* error = nullptr) = 0;
+    virtual bool BeginPoints(std::size_t count, std::size_t dimension, DataType type, std::string* error = nullptr) = 0;
     // 写入一段点坐标
     virtual bool WritePointsRange(
         std::size_t offset,
         std::size_t count,
-        const float* data,
+        const void* data,
         std::string* error = nullptr) = 0;
     // 结束点坐标写入
     virtual bool EndPoints(std::string* error = nullptr) = 0;

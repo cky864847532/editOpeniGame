@@ -17,7 +17,7 @@
 IGAME_NAMESPACE_BEGIN
 
 struct ExtractCellBoundaries;
-class ModelGeometryDecodedSurfaceBuilder;
+
 class ModelGeometryFilter : public Filter {
 public:
     I_OBJECT(ModelGeometryFilter);
@@ -85,7 +85,6 @@ public:
     FlatArray<igIndex>::Pointer GetPointMap() { return m_PointMap; }
 
 private:
-    friend class ModelGeometryDecodedSurfaceBuilder;
 
     char* ComputeCellVisibleArray(CharArray::Pointer& CellVisibleArray, Points::Pointer inPoints,
                                   CellArray::Pointer Cells, UnsignedIntArray::Pointer Types = nullptr);
@@ -129,35 +128,6 @@ public:
     FlatArray<igIndex>::Pointer m_PointMap = nullptr;
 
 private:
-};
-
-class ModelGeometryDecodedSurfaceBuilder {
-public:
-    // workerCount 为零时按实际 worker 索引延迟创建独立存储
-    ModelGeometryDecodedSurfaceBuilder(IGsize pointCount, std::size_t workerCount);
-    ~ModelGeometryDecodedSurfaceBuilder();
-
-    ModelGeometryDecodedSurfaceBuilder(const ModelGeometryDecodedSurfaceBuilder&) = delete;
-    ModelGeometryDecodedSurfaceBuilder& operator=(const ModelGeometryDecodedSurfaceBuilder&) = delete;
-
-    bool AccumulateBlock(
-        std::size_t workerIndex,
-        std::size_t cellOffset,
-        int fixedCellSize,
-        std::span<const std::uint32_t> connectivity,
-        std::span<const std::uint32_t> offsets,
-        std::span<const std::uint32_t> cellTypes,
-        std::string* error = nullptr);
-    bool Finalize(
-        UnstructuredMesh::Pointer input,
-        SurfaceMesh::Pointer& output,
-        FlatArray<igIndex>::Pointer& pointMap,
-        std::shared_ptr<std::vector<igIndex>>& faceToCellMap,
-        std::string* error = nullptr);
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> m_impl;
 };
 
 IGAME_NAMESPACE_END

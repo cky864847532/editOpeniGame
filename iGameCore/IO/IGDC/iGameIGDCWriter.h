@@ -20,7 +20,7 @@ public:
     static Pointer New() { return new IGDCWriter; }
 
     bool Execute() override;
-    bool GenerateBuffers() override;
+    [[nodiscard]] bool SupportsBufferedOutput() const noexcept override { return false; }
 
     // 复用写入时的属性选择和参数，未载入的时序帧只记录未知项
     [[nodiscard]] ::datacodec::EncodeStorageAnalysisResult AnalyzeStorage(const DataObject::Pointer& data) const;

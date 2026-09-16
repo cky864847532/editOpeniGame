@@ -6,9 +6,10 @@
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
 
 namespace datacodec {
+struct FramePackage;
 
 EncodeResult EncodeInRun(const EncodeRequest&, DataCodecExecutionResources&);
-DecodePackageResult DecodePackageInRun(const DecodePackageRequest&, DataCodecExecutionResources&, DecodeSession*);
+DecodePackageResult DecodePackageInRun(const DecodePackageRequest&, DataCodecExecutionResources&, DecodeSession*, const FramePackage* metadata = nullptr);
 
 }
 

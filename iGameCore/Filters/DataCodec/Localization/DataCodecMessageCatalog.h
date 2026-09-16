@@ -12,6 +12,9 @@
 
 namespace datacodec {
 
+struct CodecFailureRecord;
+[[nodiscard]] std::string FormatCodecFailureMessage(DataCodecLanguage language, const CodecFailureRecord& failure);
+
 struct DataCodecMessageArgument {
     std::string name;
     std::string value;

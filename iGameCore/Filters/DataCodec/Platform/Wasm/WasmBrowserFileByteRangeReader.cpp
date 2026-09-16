@@ -141,6 +141,17 @@ std::shared_ptr<IByteRangeReader> CreateWasmBrowserFileByteRangeReader(
 #endif
 }
 
+bool RetainWasmBrowserFile(const std::uint32_t fileId) noexcept {
+#if defined(__EMSCRIPTEN__)
+    return fileId != 0u && MAIN_THREAD_EM_ASM_INT({
+        return Module.dataCodecBrowserFiles && Module.dataCodecBrowserFiles.retain(Number($0)) ? 1 : 0;
+    }, fileId) != 0;
+#else
+    (void)fileId;
+    return false;
+#endif
+}
+
 void ReleaseWasmBrowserFile(const std::uint32_t fileId) noexcept {
 #if defined(__EMSCRIPTEN__)
     if (fileId != 0u) {

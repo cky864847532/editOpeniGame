@@ -17,6 +17,7 @@ struct iGameWasmDecodedModelEntry {
     ::datacodec::DecodeSourceIdentity sourceIdentity;
     std::string ownedInputPath;
     std::uint32_t browserFileId{0u};
+    ::datacodec::EncodedInput deferredInput;
 };
 
 class iGameWasmDecodedModelRegistry final {
@@ -25,9 +26,12 @@ public:
 
     [[nodiscard]] bool Contains(std::uint32_t modelId) const;
     [[nodiscard]] int FindBySource(
-        const ::datacodec::DecodeSourceIdentity& sourceIdentity) const;
+        const ::datacodec::DecodeSourceIdentity& sourceIdentity, bool requireRawData = false) const;
     [[nodiscard]] iGameWasmDecodedModelEntry* Find(std::uint32_t modelId);
     [[nodiscard]] const iGameWasmDecodedModelEntry* Find(std::uint32_t modelId) const;
+    [[nodiscard]] DataObject::Pointer RestoreRawData(std::uint32_t modelId,
+        const ::datacodec::CodecResourceParams& resources, std::string* error = nullptr,
+        std::optional<::datacodec::CodecFailureRecord>* failure = nullptr);
     void Store(std::uint32_t modelId, iGameWasmDecodedModelEntry entry);
     void Erase(std::uint32_t modelId);
     void Clear();
@@ -37,6 +41,7 @@ private:
     static void ReleaseInput(iGameWasmDecodedModelEntry& entry);
 
     std::map<std::uint32_t, iGameWasmDecodedModelEntry> m_entries;
+    std::uint64_t m_revision{0u};
 };
 
 IGAME_NAMESPACE_END

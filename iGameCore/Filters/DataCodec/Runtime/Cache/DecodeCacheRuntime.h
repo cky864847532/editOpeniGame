@@ -7,6 +7,7 @@
 #include "DataCodec/Runtime/Cache/EncodedInputLruCache.h"
 
 #include <memory>
+#include <functional>
 
 namespace datacodec {
 
@@ -22,8 +23,14 @@ public:
 
     // 顺序逐项解除可选引用，实际容量由最后 owner 的 lease 归还
     bool TrimOne() {
+        if (m_retiredFrameStates && m_retiredFrameStates()) { return true; }
         return m_defaultEncodedInputCache->TrimOne() ||
             m_defaultFrameCache->TrimOne() || m_referenceCache->TrimOne();
+    }
+
+    // 播放会话通过现有回收链清理已无结果消费者的属性状态
+    void SetRetiredFrameStateReclaimer(std::function<bool()> reclaimer) {
+        m_retiredFrameStates = std::move(reclaimer);
     }
 
     void TrimAll() { while (TrimOne()) {} }
@@ -53,6 +60,7 @@ public:
     }
 
 private:
+    std::function<bool()> m_retiredFrameStates;
     std::shared_ptr<DecodeReferenceCache> m_referenceCache;
     std::shared_ptr<DecodedFrameLruCache> m_defaultFrameCache;
     std::shared_ptr<EncodedInputLruCache> m_defaultEncodedInputCache;

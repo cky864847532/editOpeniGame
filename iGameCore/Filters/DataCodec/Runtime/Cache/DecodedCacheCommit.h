@@ -1,7 +1,7 @@
 #ifndef DATACODEC_RUNTIME_CACHE_DECODEDCACHECOMMIT_H
 #define DATACODEC_RUNTIME_CACHE_DECODEDCACHECOMMIT_H
 
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedAttributeCacheSet.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedGeometryCache.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
@@ -11,6 +11,7 @@
 #include "DataCodec/Codec/Topology/Polyhedron/PolyhedronTopologyEmit.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
+#include "DataCodec/Workflow/Decode/DecodedResultBuilder.h"
 
 #include <atomic>
 #include <cstddef>
@@ -61,6 +62,16 @@ inline bool CommitGeometryCache(
     if (!geometry.complete || geometry.bytes == nullptr) {
         return true;
     }
+    if (auto* result = dynamic_cast<DecodedLeafBuilder*>(&adapter)) {
+        if (!runtime.Run().IsDriverThread() || runtime.Run().Stopped()) {
+            return validation::AssignError(error, "result publication requires an active driver");
+        }
+        bytestore::ByteStoreSession stores;
+        stores.BindRun(runtime.Run());
+        if (!result->AcceptGeometry(geometry, stores, error)) { return false; }
+        geometry.Release();
+        return true;
+    }
     if (const auto identity = geometry.nativeOutputIdentity.lock();
         identity && identity == adapter.DecodeStorageIdentity()) {
         if (!runtime.Run().IsDriverThread() || runtime.Run().Stopped()) {
@@ -70,15 +81,15 @@ inline bool CommitGeometryCache(
         geometry.Release();
         return true;
     }
-    if (!adapter.BeginPoints(geometry.pointCount, geometry.dimension, error)) {
+    if (!adapter.BeginPoints(geometry.pointCount, geometry.dimension, geometry.dataType, error)) {
         return false;
     }
-    if (!ReplayTypedDecodedCache<float>(
+    if (!ReplayTypedDecodedCache<std::uint8_t>(
             runtime,
             *geometry.bytes,
             geometry.pointCount,
-            geometry.dimension,
-            [&](const std::size_t offset, const std::size_t count, const float* values) {
+            geometry.dimension * ScalarTypeSize(ToScalarType(geometry.dataType)),
+            [&](const std::size_t offset, const std::size_t count, const std::uint8_t* values) {
                 return adapter.WritePointsRange(offset, count, values, error);
             },
             error)) {
@@ -258,6 +269,14 @@ inline bool CommitTopologyCache(
     const DecodedTopologyCache& topology,
     std::string* error = nullptr,
     const callback::CapacityCallback& recordCapacitySamples = {}) {
+    if (auto* result = dynamic_cast<DecodedLeafBuilder*>(&adapter)) {
+        if (!runtime.Run().IsDriverThread() || runtime.Run().Stopped()) {
+            return validation::AssignError(error, "result publication requires an active driver");
+        }
+        bytestore::ByteStoreSession stores;
+        stores.BindRun(runtime.Run());
+        return result->AcceptTopology(topology, stores, error);
+    }
     switch (topology.kind) {
         case DecodedTopologyCache::Kind::Structured:
             return adapter.SetStructuredAxisSize(topology.structuredAxisSize.data(), error);
@@ -278,6 +297,11 @@ inline bool CommitTopologyCacheAndRelease(
     DecodedTopologyCache& topology,
     std::string* error = nullptr,
     const callback::CapacityCallback& recordCapacitySamples = {}) {
+    if (dynamic_cast<DecodedLeafBuilder*>(&adapter)) {
+        if (!CommitTopologyCache(adapter, runtime, topology, error, recordCapacitySamples)) { return false; }
+        topology.Release();
+        return true;
+    }
     switch (topology.kind) {
         case DecodedTopologyCache::Kind::Structured:
             return adapter.SetStructuredAxisSize(topology.structuredAxisSize.data(), error);
@@ -363,6 +387,12 @@ inline bool CommitAttributeCacheFields(
         auto bytes = attributes.Bytes(attrIndex);
         if (meta == nullptr || bytes == nullptr) {
             return validation::AssignError(error, "decoded attribute cache field is missing");
+        }
+        if (auto* result = dynamic_cast<DecodedLeafBuilder*>(&adapter)) {
+            bytestore::ByteStoreSession stores;
+            stores.BindRun(root);
+            if (!result->AcceptAttribute(attrIndex, *meta, *bytes, stores, error)) { return false; }
+            continue;
         }
         const auto tupleBytes = DecodeAttributeTupleBytes(*meta);
         std::size_t elementCount = 0u, totalBytes = 0u;

@@ -19,10 +19,10 @@ public:
         }
         if (reader->ByteSize() < sizeof(std::uint32_t) + sizeof(std::uint16_t)) {
             return ValidationResult::Failure(
-                CodecErrorCode::InvalidInput,
+                CodecErrorCode::IncompleteInput,
                 ValidationDomain::Storage,
                 "package.preamble",
-                "版本不符合");
+                "package header is incomplete");
         }
         return ValidationResult::Success(
             ValidationDomain::Storage,

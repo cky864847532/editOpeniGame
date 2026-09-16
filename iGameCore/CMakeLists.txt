@@ -116,10 +116,17 @@ if (IGAME_DATACODEC_BUILD_TESTS)
     endif ()
     add_executable(iGameDataCodecTests ${IGAME_DATACODEC_TEST_RUNNER_SOURCE})
     target_link_libraries(iGameDataCodecTests PRIVATE ${MODULE_NAME})
+    target_include_directories(iGameDataCodecTests PRIVATE "${CMAKE_SOURCE_DIR}/Examples/Wasm")
+    target_sources(iGameDataCodecTests PRIVATE
+        "${CMAKE_SOURCE_DIR}/Examples/Wasm/Codec/iGameWasmDataCodecBridge.cpp"
+        "${CMAKE_SOURCE_DIR}/Examples/Wasm/Codec/iGameWasmDataCodecTiming.cpp"
+        "${CMAKE_SOURCE_DIR}/Examples/Wasm/Codec/iGameWasmDecodedModelRegistry.cpp")
     add_test(NAME DataCodec.All COMMAND iGameDataCodecTests)
     add_test(NAME DataCodec.Budget COMMAND iGameDataCodecTests --budget)
     add_test(NAME DataCodec.Robustness COMMAND iGameDataCodecTests --robustness)
     add_test(NAME DataCodec.NativeDecodeStorage COMMAND iGameDataCodecTests --native-decode-storage)
+    add_test(NAME DataCodec.BridgeAudit COMMAND iGameDataCodecTests --bridge-audit)
+    set_tests_properties(DataCodec.BridgeAudit PROPERTIES TIMEOUT 120)
     set_tests_properties(DataCodec.Budget DataCodec.Robustness DataCodec.NativeDecodeStorage PROPERTIES TIMEOUT 60)
     add_test(NAME DataCodec.StorageAnalysis COMMAND iGameDataCodecTests --storage-analysis)
     add_test(NAME DataCodec.EncodeStorageAnalysis COMMAND iGameDataCodecTests --encode-storage-analysis)

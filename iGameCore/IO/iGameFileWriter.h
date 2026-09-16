@@ -27,8 +27,9 @@ public:
 	I_OBJECT(FileWriter);
 	// static Pointer New() { return new FileWriter; }
 
-	// Pure virtual function to generate buffers. Subclasses must implement this.
-	virtual bool GenerateBuffers() = 0;
+	// 缓冲型写入器生成数据，直接写出型通过 Execute 完成
+	virtual bool GenerateBuffers() { return false; }
+	[[nodiscard]] virtual bool SupportsBufferedOutput() const noexcept { return true; }
 
 	// Write the current data object to a file at the path specified by m_FilePath.
 	bool Execute();

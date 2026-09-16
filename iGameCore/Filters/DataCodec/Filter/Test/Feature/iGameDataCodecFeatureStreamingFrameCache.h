@@ -12,31 +12,12 @@
 
 namespace datacodec::test {
 
-class iGameStreamingCacheTestFrame final : public DecodedFrameLease {
-public:
-    iGameStreamingCacheTestFrame(
-        const std::uint32_t frameIndex,
-        iGame::DataObject::Pointer output)
-        : m_frameIndex(frameIndex),
-          m_payload(std::make_shared<iGame::iGameDecodedFramePayload>(std::move(output))) {}
-
-    [[nodiscard]] std::uint32_t FrameIndex() const noexcept override {
-        return m_frameIndex;
-    }
-
-    [[nodiscard]] IDecodedFramePayload::Pointer Payload() const noexcept override {
-        return m_payload;
-    }
-
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-        return m_payload != nullptr ? m_payload->ResidentSizeHint() : 0u;
-    }
-
-private:
-    std::uint32_t m_frameIndex{0u};
-    IDecodedFramePayload::Pointer m_payload;
-};
-
+inline auto MakeStreamingCacheTestFrame(std::uint32_t index, iGame::DataObject::Pointer) {
+    DecodedData data;
+    data.frameIndex = index;
+    data.leaves.emplace_back();
+    return std::make_shared<DecodedFrame>(std::move(data));
+}
 [[nodiscard]] inline bool RuniGameDataCodecFeatureStreamingFrameCache() {
     auto streamingData = iGame::StreamingData::New();
     auto metadata0 = iGame::StringArray::New();
@@ -51,7 +32,7 @@ private:
     cache.Configure(1u);
     const DecodedFrameKey key0{.source = source0, .frameIndex = 10u};
     const DecodedFrameKey key1{.source = source1, .frameIndex = 20u};
-    auto frame0 = std::make_shared<iGameStreamingCacheTestFrame>(
+    auto frame0 = MakeStreamingCacheTestFrame(
         10u,
         iGame::DrawObject::New());
     const auto stored0 = cache.Store(key0, frame0, DecodedFrameAccessKind::UserRequest);
@@ -60,7 +41,7 @@ private:
         return false;
     }
 
-    auto frame1 = std::make_shared<iGameStreamingCacheTestFrame>(
+    auto frame1 = MakeStreamingCacheTestFrame(
         20u,
         iGame::DrawObject::New());
     const auto stored1 = cache.Store(key1, frame1, DecodedFrameAccessKind::Prefetch);
@@ -75,11 +56,11 @@ private:
         return false;
     }
 
-    const auto retainedPayload = frame1->Payload();
+    const auto* retainedData = &frame1->Data();
     cache.InvalidateSource(source1);
     if (!cache.ResidentFrameIndices(source1).empty() ||
         cache.Statistics().residentFrames != 0u ||
-        frame1->Payload() != retainedPayload) {
+        &frame1->Data() != retainedData) {
         return false;
     }
     const DecodedFrameKey wrongRevision{

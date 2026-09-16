@@ -4,6 +4,8 @@
 #include "iGameDrawObject.h"
 
 #include <unordered_map>
+#include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -35,17 +37,19 @@ struct LeafPresentationInfo {
     auto drawObject = DynamicCast<DrawObject>(object);
     auto* metadata = object != nullptr ? object->GetMetadata() : nullptr;
     int marker = 0;
-    int frameIndex = 0;
+    double frameIndex = 0;
     int topologyMode = 0;
-    int ownerFrameIndex = 0;
+    double ownerFrameIndex = 0;
     int drawablePrepared = 0;
     std::string path;
     if (drawObject == nullptr || metadata == nullptr ||
         !metadata->GetInt(kFrameMarker, marker) || marker != 1 ||
-        !metadata->GetInt(kFrameIndex, frameIndex) || frameIndex < 0 ||
+        !metadata->GetDouble(kFrameIndex, frameIndex) || !std::isfinite(frameIndex) || frameIndex < 0 ||
+        frameIndex > std::numeric_limits<std::uint32_t>::max() || std::floor(frameIndex) != frameIndex ||
         !metadata->GetString(kBlockPath, path) ||
         !metadata->GetInt(kTopologyMode, topologyMode) ||
-        !metadata->GetInt(kTopologyOwnerFrameIndex, ownerFrameIndex) || ownerFrameIndex < 0 ||
+        !metadata->GetDouble(kTopologyOwnerFrameIndex, ownerFrameIndex) || !std::isfinite(ownerFrameIndex) || ownerFrameIndex < 0 ||
+        ownerFrameIndex > std::numeric_limits<std::uint32_t>::max() || std::floor(ownerFrameIndex) != ownerFrameIndex ||
         !metadata->GetInt(kDrawablePrepared, drawablePrepared)) {
         return false;
     }
@@ -93,7 +97,7 @@ void CollectLeafPresentationInfo(
 
 bool PrepareDataCodecDecodedLeaf(
     const DataObject::Pointer& output,
-    const ::datacodec::FramePackageLeafRecord& leaf,
+    const ::datacodec::DecodedLeaf& leaf,
     const std::uint32_t frameIndex,
     std::string* error) {
     auto drawObject = DynamicCast<DrawObject>(output);
@@ -104,13 +108,13 @@ bool PrepareDataCodecDecodedLeaf(
     }
     const auto ownerFrameIndex = leaf.topologyMode == ::datacodec::TopologyOwnershipMode::Owned
         ? frameIndex
-        : leaf.ownerFrameIndex;
+        : leaf.topologyOwnerFrameIndex;
     auto* metadata = output->GetMetadata();
     metadata->AddInt(kFrameMarker, 1);
-    metadata->AddInt(kFrameIndex, static_cast<int>(frameIndex));
+    metadata->AddDouble(kFrameIndex, static_cast<double>(frameIndex));
     metadata->AddString(kBlockPath, leaf.path);
     metadata->AddInt(kTopologyMode, static_cast<int>(leaf.topologyMode));
-    metadata->AddInt(kTopologyOwnerFrameIndex, static_cast<int>(ownerFrameIndex));
+    metadata->AddDouble(kTopologyOwnerFrameIndex, static_cast<double>(ownerFrameIndex));
 
     drawObject->SetShellRenderingOption(false);
     if (leaf.topologyMode == ::datacodec::TopologyOwnershipMode::Owned) {

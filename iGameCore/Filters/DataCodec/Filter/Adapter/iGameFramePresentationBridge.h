@@ -1,7 +1,7 @@
 #ifndef iGameFramePresentationBridge_h
 #define iGameFramePresentationBridge_h
 
-#include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
+#include "DataCodec/API/Output/DecodedData.h"
 #include "iGameDataObject.h"
 
 #include <cstddef>
@@ -19,7 +19,7 @@ struct DataCodecFramePresentationResult {
 
 [[nodiscard]] bool PrepareDataCodecDecodedLeaf(
     const DataObject::Pointer& output,
-    const ::datacodec::FramePackageLeafRecord& leaf,
+    const ::datacodec::DecodedLeaf& leaf,
     std::uint32_t frameIndex,
     std::string* error = nullptr);
 

@@ -163,22 +163,22 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
                         .geometry = geometry, .referenceCache = &reference},
                 };
                 const auto decoded = DecodeGeometryBlocks(runtime, stream);
-                bool matches = decoded && stream.valid && geometry.complete && reference.IsComplete();
-                std::vector<float> points(source.size());
+                bool matches = decoded && stream.valid && geometry.complete && geometry.dataType == DataType::Float64 && reference.IsComplete();
+                std::vector<double> points(source.size());
                 std::vector<double> original(source.size());
                 matches = matches && geometry.bytes->Read(0u,
-                    {reinterpret_cast<std::uint8_t*>(points.data()), points.size() * sizeof(float)}, &error) &&
+                    {reinterpret_cast<std::uint8_t*>(points.data()), points.size() * sizeof(double)}, &error) &&
                     reference.ReadRange(0u, count, original.data(), original.size() * sizeof(double), &error);
                 for (std::size_t i = 0u; matches && i < source.size(); ++i) {
                     matches = std::abs(original[i] - source[i]) <= 0.00101 &&
-                        points[i] == static_cast<float>(original[i]);
+                        points[i] == original[i];
                 }
                 ResourceDebugSnapshot snapshot;
                 Require(result, matches && scope.Finish(decoded.success) && CopyExecutionSnapshot(root, snapshot) &&
                     snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u &&
                     snapshot.lastRetired == 2u && snapshot.limits.slotLimit == slots,
                     "numericDecode.geometryFlow", decoded.message.empty() ?
-                        "numeric decode must preserve conversion, raw reference and bounded block admission" : decoded.message);
+                        "numeric decode must preserve scalar precision, raw reference and bounded block admission" : decoded.message);
                 geometry.Release();
                 reference.Reset();
                 Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u &&

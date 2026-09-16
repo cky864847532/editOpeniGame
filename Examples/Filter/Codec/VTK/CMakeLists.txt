@@ -35,3 +35,10 @@ vtk_module_autoinit(
         TARGETS dataCodecVtkAdapter
         MODULES ${IGAME_DATACODEC_VTK_MODULES}
 )
+
+if(IGAME_DATACODEC_BUILD_TESTS)
+    add_executable(DataCodecVtkOwnershipTests TestVtkOwnedDecode.cpp)
+    target_link_libraries(DataCodecVtkOwnershipTests PRIVATE dataCodecVtkAdapter)
+    add_test(NAME DataCodec.VtkOwnership COMMAND DataCodecVtkOwnershipTests)
+    set_tests_properties(DataCodec.VtkOwnership PROPERTIES TIMEOUT 120)
+endif()

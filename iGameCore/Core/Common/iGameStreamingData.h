@@ -23,12 +23,17 @@
 
 IGAME_NAMESPACE_BEGIN
 
+class IAttributeDataSource;
+
 class IStreamingFrameProvider {
 public:
     using Pointer = std::shared_ptr<IStreamingFrameProvider>;
 
     virtual ~IStreamingFrameProvider() = default;
     [[nodiscard]] virtual std::vector<Object::Pointer> RequestFrame(unsigned int ordinal) = 0;
+    [[nodiscard]] virtual std::shared_ptr<IAttributeDataSource> AttributeSourceForFrame(const Object::Pointer&) const { return {}; }
+    [[nodiscard]] virtual bool SupportsCacheCountLimit() const noexcept { return true; }
+    [[nodiscard]] virtual bool CacheEnabled() const { return true; }
     virtual void NotifyFramePresented(unsigned int ordinal) = 0;
     virtual void ConfigureCacheCapacity(unsigned int) {}
     virtual void ClearCachedFrames() = 0;
@@ -126,6 +131,12 @@ public:
     unsigned int GetMaxCacheSize() const { return m_Cache_MAXSize; }
 
     void SetFrameProvider(IStreamingFrameProvider::Pointer provider);
+    [[nodiscard]] std::shared_ptr<IAttributeDataSource> AttributeSourceForFrame(const Object::Pointer& object) const {
+        return m_FrameProvider != nullptr ? m_FrameProvider->AttributeSourceForFrame(object) : nullptr;
+    }
+    [[nodiscard]] bool SupportsCacheCountLimit() const noexcept {
+        return m_FrameProvider == nullptr || m_FrameProvider->SupportsCacheCountLimit();
+    }
 
     [[nodiscard]] bool FindCachedFrame(unsigned int index, StreamingFrameCacheEntry& entry);
     [[nodiscard]] bool StoreCachedFrame(

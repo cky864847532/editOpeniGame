@@ -57,6 +57,7 @@ bool FileWriter::WriteToFile(DataObject::Pointer dataObject,const std::string fi
 
 bool FileWriter::SaveBufferDataToFile()
 {
+    if (!SupportsBufferedOutput()) { return false; }
 	IGAME_CORE_INFO("[FileWriter] SaveBufferDataToFile begin path={} buffers={}",
 	                m_FilePath, m_Buffers.size());
 	FILE* file = fopen(this->m_FilePath.c_str(), "wb");
@@ -98,6 +99,7 @@ bool FileWriter::SaveBufferDataToFile()
 }
 bool FileWriter::SaveBufferDataToFileWithWindows()
 {
+    if (!SupportsBufferedOutput()) { return false; }
 #if defined(PLATFORM_WINDOWS) || defined(_WIN32)
 	clock_t time_1 = clock();
 	// 打开文件
@@ -155,6 +157,7 @@ bool FileWriter::SaveBufferDataToFileWithWindows()
 
 bool FileWriter::SaveBufferDataToFileWithLinux()
 {
+    if (!SupportsBufferedOutput()) { return false; }
 #if defined(PLATFORM_LINUX) || defined(__linux__)
 
 	// 打开文件
@@ -209,6 +212,7 @@ bool FileWriter::SaveBufferDataToFileWithLinux()
 }
 bool FileWriter::SaveBufferDataToFileWithMac()
 {
+    if (!SupportsBufferedOutput()) { return false; }
 #if defined(PLATFORM_MAC) || defined(__APPLE__)
 	// 使用mmap在macOS实现文件映射
 	int fd = open(this->m_FilePath.c_str(), O_RDWR | O_CREAT, 0666);

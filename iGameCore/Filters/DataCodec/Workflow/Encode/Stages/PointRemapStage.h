@@ -12,6 +12,7 @@ namespace datacodec {
 
 class PointRemapStage final : public EncodeStage {
 public:
+    StageKind Kind() const noexcept override { return StageKind::PointRemap; }
     static constexpr std::string_view kTypeName = "PointSpatialPartition";
 
     const char* Name() const override {

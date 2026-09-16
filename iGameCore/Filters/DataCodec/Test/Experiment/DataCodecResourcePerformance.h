@@ -1,3 +1,4 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #ifndef DATACODEC_TEST_EXPERIMENT_DATACODECRESOURCEPERFORMANCE_H
 #define DATACODEC_TEST_EXPERIMENT_DATACODECRESOURCEPERFORMANCE_H
 
@@ -246,10 +247,11 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
             const auto& config = configs[index];
             auto encodeSink = audit ? std::make_shared<CapacitySink>() : nullptr;
             auto decodeSink = audit ? std::make_shared<CapacitySink>() : nullptr;
-            TestEncodeAdapter encodeAdapter(data);
+            auto encodeAdapterOwner = std::make_shared<TestEncodeAdapter>(data);
+            auto& encodeAdapter = *encodeAdapterOwner;
             TestDecodeAdapter decodeAdapter;
             EncodeRequest encodeRequest;
-            encodeRequest.input = EncodeInput::LeafAdapter(&encodeAdapter, {}, data.name,
+            encodeRequest.input = EncodeInput::LeafAdapter(encodeAdapterOwner, {}, data.name,
                 data.meshType == MeshType::PointSet ? "PointSet" : "UnstructuredMesh");
             encodeRequest.output = EncodeOutput::Memory(EncodePackageKind::LeafPackage);
             encodeRequest.resources = config.params;
@@ -269,14 +271,14 @@ inline TestResult RunDataCodecResourcePerformance(std::size_t tuples, std::size_
             if (encoded.success && encoded.hasEncodedOutput) {
                 auto owner = std::make_shared<const EncodedBuffer>(std::move(encoded.encodedBytes));
                 DecodePackageRequest decodeRequest;
-                decodeRequest.inputReader = std::make_shared<MemoryByteRangeReader>(owner);
-                decodeRequest.leafAdapter = &decodeAdapter;
+                decodeRequest.input = ::datacodec::EncodedInputAccess::Retain(std::make_shared<MemoryByteRangeReader>(owner));
                 decodeRequest.attributeSelection = AttributeSelectionMode::Explicit;
                 decodeRequest.attributeTargets = targets;
                 decodeRequest.resources = config.params;
                 decodeRequest.runRecordSink = decodeSink;
                 const auto begin = std::chrono::steady_clock::now();
                 decoded = DecodePackage(decodeRequest);
+                if (decoded.success && decoded.output.leaves.size() == 1u) { decodeAdapter.Import(decoded.output.leaves.front()); }
                 decodeMs = Milliseconds(std::chrono::steady_clock::now() - begin);
                 matches = decoded.success && Matches(data, decodeAdapter, profile == "morton");
             }

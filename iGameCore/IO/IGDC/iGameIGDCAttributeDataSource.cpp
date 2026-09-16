@@ -45,10 +45,9 @@ bool IGDCAttributeDataSource::Open(const std::string& filePath, std::string* err
     const auto definition = ::datacodec::MakeDecodeConfigurationParams(
         DataCodecIOSettings::GetDefaultDecodeOptions());
     auto result = m_session.Open({
-        .inputReader = std::make_shared<::datacodec::FileByteRangeReader>(
+        .input = ::datacodec::EncodedInput::File(
             std::filesystem::path(filePath)),
         .controlParams = &definition.controlParams,
-        .executionOptions = &definition.execution,
         .configurationSource = &definition.source,
         .resources = DataCodecIOSettings::GetDefaultDecodeResources(),
         .runRecordSink = MakeiGameDataCodecOutputRecordSink(

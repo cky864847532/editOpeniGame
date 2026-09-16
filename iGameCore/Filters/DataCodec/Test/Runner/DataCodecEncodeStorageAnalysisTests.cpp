@@ -29,7 +29,7 @@ public:
     AttrAttachment GetAttachType() const override { return attachment; }
     int GetComponentCount() const override { return dimension; }
     std::size_t GetElementCount() const override { return count; }
-    void GetTuple(std::size_t, double*) const override { throw std::runtime_error("unexpected attribute read"); }
+    bool GetTupleBytes(std::size_t, void*, std::string*) const override { throw std::runtime_error("unexpected attribute read"); }
 };
 
 class MetadataAdapter final : public IEncodeAdapter {
@@ -73,13 +73,6 @@ public:
     std::unique_ptr<IEncodeAdapter> GetLeaf(const BlockPath&) const override { return std::make_unique<MetadataAdapter>(data); }
 };
 
-class CountingOutput final : public IByteRangeOutput {
-public:
-    std::size_t writes{0u};
-    bool WriteAt(std::uint64_t, std::span<const std::uint8_t>, std::string*) override { ++writes; return true; }
-    bool Finalize(std::uint64_t, std::string*) override { ++writes; return true; }
-};
-
 std::uint64_t Bound(const EncodeStorageAnalysisResult& result) {
     if (!result.success || !result.provenLowerBoundBytes) {
         throw std::runtime_error(result.failure ? FormatCodecFailure(*result.failure) : "missing encode bound");
@@ -91,11 +84,12 @@ std::uint64_t Bound(const EncodeStorageAnalysisResult& result) {
 
 int RunDataCodecEncodeStorageAnalysisTests() {
     try {
-        MetadataAdapter adapter;
+        auto adapterOwner = std::make_shared<MetadataAdapter>();
+        auto& adapter = *adapterOwner;
         adapter.pointFields.resize(2u);
         adapter.pointFields[1].name = "second";
         EncodeRequest request;
-        request.input = EncodeInput::LeafAdapter(&adapter);
+        request.input = EncodeInput::LeafAdapter(adapterOwner);
         request.configuration.pipelineControl.pointOrder = EncodePointOrderMode::Original;
         const auto samples = AnalyzeEncodeStorage(request);
         const auto expected = 16u * sizeof(std::size_t) + 2u * 16u * sizeof(float);
@@ -106,20 +100,20 @@ int RunDataCodecEncodeStorageAnalysisTests() {
             !CheckEncodeStorageLowerBound(samples, expected + 1u) &&
             !CheckEncodeStorageLowerBound(samples, std::nullopt), "equal, higher and unrestricted allowed by preflight");
 
-        CountingOutput output;
-        request.output = EncodeOutput::ByteRange(output);
+        request.output = EncodeOutput::File({});
         request.resources = {CodecResourceMode::Fixed, 1u, expected - 1u};
         auto rejected = Encode(request);
-        Ensure(!rejected.success && rejected.failure && output.writes == 0u &&
+        Ensure(!rejected.success && rejected.failure &&
             std::string_view(rejected.failure->reason.data()) == "encode.storage-limit-too-small" &&
             rejected.failure->requestedBytes == expected, "core rejects before reading data or writing output");
 
-        MetadataTree tree;
+        auto treeOwner = std::make_shared<MetadataTree>();
+        auto& tree = *treeOwner;
         tree.data = adapter;
-        request.input = EncodeInput::BlockTreeAdapter(&tree);
+        request.input = EncodeInput::BlockTreeAdapter(treeOwner);
         const auto treeAnalysis = AnalyzeEncodeStorage(request);
         Ensure(Bound(treeAnalysis) == expected && treeAnalysis.inspectedLeafCount == 2u, "independent leaves use max");
-        request.input = EncodeInput::LeafAdapter(&adapter);
+        request.input = EncodeInput::LeafAdapter(adapterOwner);
         request.attributeSelection = AttributeSelectionMode::Explicit;
         request.attributeTargets = {{.attrIndex = 0u}};
         Ensure(Bound(AnalyzeEncodeStorage(request)) == 0u, "one selected field creates no sample group");

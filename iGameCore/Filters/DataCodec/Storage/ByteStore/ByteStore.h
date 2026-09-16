@@ -97,6 +97,7 @@ public:
     }
 
     bool Append(const std::span<const std::uint8_t> bytes, std::string* error = nullptr) override {
+        if (m_exported) { return validation::AssignError(error, "exported memory store is read-only"); }
         if (m_released) {
             return validation::AssignError(error, "memory store was already released");
         }
@@ -132,6 +133,7 @@ public:
     }
 
     bool Resize(const std::uint64_t byteSize, std::string* error = nullptr) override {
+        if (m_exported) { return validation::AssignError(error, "exported memory store is read-only"); }
         if (m_released) {
             return validation::AssignError(error, "memory store was already released");
         }
@@ -157,7 +159,7 @@ public:
         const std::uint64_t offset,
         const std::span<const std::uint8_t> bytes,
         std::string* error = nullptr) override {
-        if (m_released ||
+        if (m_released || m_exported ||
             (m_requireSealBeforeRead && m_sealed) ||
             offset > m_size ||
             bytes.size() > m_size - static_cast<std::size_t>(offset)) {
@@ -186,11 +188,11 @@ public:
     }
     [[nodiscard]] std::span<const std::uint8_t> ContiguousBytes() const noexcept override {
         return CanRead()
-            ? std::span<const std::uint8_t>(m_bytes.get(), m_size)
+            ? std::span<const std::uint8_t>(Data(), m_size)
             : std::span<const std::uint8_t>{};
     }
     [[nodiscard]] std::span<std::uint8_t> WritableBytes() noexcept {
-        return !m_released && !m_sealed
+        return !m_released && !m_sealed && !m_exported
             ? std::span<std::uint8_t>(m_bytes.get(), m_size) : std::span<std::uint8_t>{};
     }
     [[nodiscard]] bool CanRead() const noexcept override {
@@ -208,7 +210,7 @@ public:
             return validation::AssignError(error, "memory store read is outside the store range");
         }
         if (!output.empty()) {
-            std::memcpy(output.data(), m_bytes.get() + static_cast<std::size_t>(offset), output.size());
+            std::memcpy(output.data(), Data() + static_cast<std::size_t>(offset), output.size());
         }
         return true;
     }
@@ -220,7 +222,7 @@ public:
         std::size_t offset = 0u;
         while (offset < m_size) {
             const auto currentBytes = std::min<std::size_t>(m_size - offset, kIoWindowBytes);
-            if (!writer.Write(std::span<const std::uint8_t>(m_bytes.get() + offset, currentBytes), error)) {
+            if (!writer.Write(std::span<const std::uint8_t>(Data() + offset, currentBytes), error)) {
                 return false;
             }
             offset += currentBytes;
@@ -231,6 +233,7 @@ public:
     bool PrepareCapacity(const std::uint64_t requiredBytes, DataCodecExecutionResources& run, MemoryDemandKind kind,
                          std::string* error = nullptr,
                          std::span<const resource::StorageOwnerDescription> coexist = {}) {
+        if (m_exported) { return validation::AssignError(error, "exported memory store is read-only"); }
         std::size_t required = 0u;
         if (!validation::CheckedCastSizeT(requiredBytes, required, "memory store capacity", error)) { return false; }
         if (required <= m_capacity) { return true; }
@@ -242,7 +245,34 @@ public:
         return ReserveCapacity(required, error, &run, coexist, kind);
     }
 
+    // 结果交接独立转出底层分配，同时归还执行期容量
+    [[nodiscard]] std::unique_ptr<std::uint8_t[]> TakeOwnedBytes() noexcept {
+        if (!m_sealed || m_released || m_exported) { return {}; }
+        auto bytes = m_bytes.Transfer();
+        m_capacityLease.Reset();
+        m_residentBudget.reset();
+        m_size = m_capacity = 0u;
+        m_released = true;
+        return bytes;
+    }
+
+    // 发布后的缓存保留只读视图，结果和缓存共同持有独立分配
+    [[nodiscard]] std::shared_ptr<std::uint8_t[]> ShareOwnedBytes() {
+        if (!m_sealed || m_released) { return {}; }
+        if (!m_exported) {
+            m_exportedBytes = std::shared_ptr<std::uint8_t[]>(m_bytes.Transfer());
+            // 内部参考仍持有数组时保留其额度，结果本身不持有预算状态
+            m_exported = true;
+        }
+        return m_exportedBytes;
+    }
+
 private:
+    [[nodiscard]] const std::uint8_t* Data() const noexcept {
+        return m_exported ? m_exportedBytes.get() : m_bytes.get();
+    }
+    std::shared_ptr<std::uint8_t[]> m_exportedBytes;
+    bool m_exported{false};
     friend class ByteStoreSession;
     bool InitializeReserved(const std::size_t byteSize,
                             resource::ResidentByteBudget::Lease lease,
@@ -671,6 +701,11 @@ public:
     void UnbindRun() noexcept {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_run = nullptr;
+    }
+
+    [[nodiscard]] bool Stopped() const noexcept {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_run != nullptr && m_run->Stopped();
     }
 
     void BindStorage(std::shared_ptr<resource::ResidentByteBudget> capacity,

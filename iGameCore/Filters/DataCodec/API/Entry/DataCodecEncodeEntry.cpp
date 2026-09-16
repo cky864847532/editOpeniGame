@@ -1,4 +1,5 @@
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
+#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
 #include "DataCodec/API/Entry/EncodeStorageAnalysis.h"
 #include "DataCodec/Workflow/Encode/EncodeStoragePlan.h"
 #include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
@@ -14,13 +15,13 @@
 namespace datacodec {
 
 EncodeInput EncodeInput::LeafAdapter(
-    IEncodeAdapter* inputAdapter,
+    std::shared_ptr<IEncodeAdapter> inputAdapter,
     BlockPath path,
     std::string name,
     std::string type,
     const std::uint32_t inputFrameIndex) {
     EncodeInput input;
-    input.adapter = inputAdapter;
+    input.adapter = std::move(inputAdapter);
     input.leafPath = std::move(path);
     input.objectName = std::move(name);
     input.meshType = std::move(type);
@@ -29,13 +30,13 @@ EncodeInput EncodeInput::LeafAdapter(
 }
 
 EncodeInput EncodeInput::BlockTreeAdapter(
-    IBlockTreeAdapter* inputAdapter,
+    std::shared_ptr<IBlockTreeAdapter> inputAdapter,
     std::string name,
     const std::uint32_t inputFrameIndex,
     const std::uint32_t inputFrameCount,
     const float inputTimeValue) {
     EncodeInput input;
-    input.adapter = inputAdapter;
+    input.adapter = std::move(inputAdapter);
     input.rootName = std::move(name);
     input.frameIndex = inputFrameIndex;
     input.frameCount = inputFrameCount;
@@ -47,10 +48,10 @@ EncodeOutput EncodeOutput::Memory(const EncodePackageKind kind) {
     return EncodeOutput{.packageKind = kind};
 }
 
-EncodeOutput EncodeOutput::ByteRange(
-    IByteRangeOutput& sink,
+EncodeOutput EncodeOutput::File(
+    std::filesystem::path path,
     const EncodePackageKind kind) {
-    return EncodeOutput{.packageKind = kind, .target = &sink};
+    return EncodeOutput{.packageKind = kind, .target = std::move(path)};
 }
 
 namespace {
@@ -188,10 +189,10 @@ EncodeStorageAnalysisResult AnalyzeEncodeStorage(const EncodeRequest& request, c
     };
     try {
         if (stop.stop_requested()) { return fail({}); }
-        const auto leafEntry = std::get_if<IEncodeAdapter*>(&request.input.adapter);
-        const auto treeEntry = std::get_if<IBlockTreeAdapter*>(&request.input.adapter);
-        auto* leaf = leafEntry ? *leafEntry : nullptr;
-        auto* tree = treeEntry ? *treeEntry : nullptr;
+        const auto leafEntry = std::get_if<std::shared_ptr<IEncodeAdapter>>(&request.input.adapter);
+        const auto treeEntry = std::get_if<std::shared_ptr<IBlockTreeAdapter>>(&request.input.adapter);
+        auto* leaf = leafEntry ? leafEntry->get() : nullptr;
+        auto* tree = treeEntry ? treeEntry->get() : nullptr;
         if ((!leaf && !tree) || (request.output.packageKind == EncodePackageKind::LeafPackage && !leaf) ||
             (request.output.packageKind == EncodePackageKind::FramePackage && !tree)) {
             return fail("encode storage analysis requires a compatible input adapter and package kind");
@@ -224,18 +225,20 @@ EncodeStorageAnalysisResult AnalyzeEncodeStorage(const EncodeRequest& request, c
 
 EncodeResult EncodeInRun(const EncodeRequest& request, DataCodecExecutionResources& resources) try {
     const auto packageKind = request.output.packageKind;
-    const auto outputSinkEntry = std::get_if<IByteRangeOutput*>(&request.output.target);
-    const auto leafAdapterEntry = std::get_if<IEncodeAdapter*>(&request.input.adapter);
-    const auto blockTreeAdapterEntry = std::get_if<IBlockTreeAdapter*>(&request.input.adapter);
-    auto* outputSink = outputSinkEntry != nullptr ? *outputSinkEntry : nullptr;
-    auto* leafAdapter = leafAdapterEntry != nullptr ? *leafAdapterEntry : nullptr;
-    auto* blockTreeAdapter = blockTreeAdapterEntry != nullptr ? *blockTreeAdapterEntry : nullptr;
+    const auto outputPath = std::get_if<std::filesystem::path>(&request.output.target);
+    std::unique_ptr<FileByteRangeOutput> fileOutput;
+    if (outputPath != nullptr && !outputPath->empty()) { fileOutput = std::make_unique<FileByteRangeOutput>(*outputPath); }
+    const auto leafAdapterEntry = std::get_if<std::shared_ptr<IEncodeAdapter>>(&request.input.adapter);
+    const auto blockTreeAdapterEntry = std::get_if<std::shared_ptr<IBlockTreeAdapter>>(&request.input.adapter);
+    auto* outputSink = fileOutput.get();
+    auto* leafAdapter = leafAdapterEntry != nullptr ? leafAdapterEntry->get() : nullptr;
+    auto* blockTreeAdapter = blockTreeAdapterEntry != nullptr ? blockTreeAdapterEntry->get() : nullptr;
     const bool hasLeafAdapter = leafAdapter != nullptr;
     const bool hasBlockTreeAdapter = blockTreeAdapter != nullptr;
     if ((!hasLeafAdapter && !hasBlockTreeAdapter) ||
         (packageKind == EncodePackageKind::LeafPackage && !hasLeafAdapter) ||
         (packageKind == EncodePackageKind::FramePackage && !hasBlockTreeAdapter) ||
-        (outputSinkEntry != nullptr && outputSink == nullptr)) {
+        (outputPath != nullptr && outputPath->empty())) {
         return MakeEncodeEntryFailure(
             CodecErrorCode::InvalidInput,
             "encode.request.contract",
@@ -317,14 +320,20 @@ EncodeResult EncodeInRun(const EncodeRequest& request, DataCodecExecutionResourc
 }
 
 EncodeResult Encode(const EncodeRequest& request) try {
-    const auto leaf = std::get_if<IEncodeAdapter*>(&request.input.adapter);
-    const auto tree = std::get_if<IBlockTreeAdapter*>(&request.input.adapter);
+    if (request.stopToken.stop_requested()) {
+        auto result = MakeEncodeEntryFailure(CodecErrorCode::EncodeFailure, "cancelled", "encode cancelled");
+        result.failure->cancelled = true;
+        return result;
+    }
+    const auto leaf = std::get_if<std::shared_ptr<IEncodeAdapter>>(&request.input.adapter);
+    const auto tree = std::get_if<std::shared_ptr<IBlockTreeAdapter>>(&request.input.adapter);
     if ((leaf == nullptr || *leaf == nullptr) && (tree == nullptr || *tree == nullptr)) {
         return MakeEncodeEntryFailure(CodecErrorCode::InvalidInput, "encode.request.contract", "encode input is unavailable");
     }
+    const auto inputMemory = ObserveInputMemory(leaf && *leaf ? (*leaf)->InputMemoryViews() : (*tree)->InputMemoryViews());
     const auto configuration = ResolveResourceConfiguration(request.resources, ProbeResources());
     if (request.resources.mode == CodecResourceMode::Fixed) {
-        const auto analysis = AnalyzeEncodeStorage(request);
+        const auto analysis = AnalyzeEncodeStorage(request, request.stopToken);
         if (auto failure = CheckEncodeStorageLowerBound(analysis, configuration.initialLimits.ownedStorageLimitBytes)) {
             EncodeResult result;
             result.failure = std::move(failure);
@@ -337,12 +346,18 @@ EncodeResult Encode(const EncodeRequest& request) try {
         result.failure = resources.FirstFailure();
         return result;
     }
+    std::stop_callback stop(request.stopToken, [&resources] { resources.RequestStop(); });
     auto result = EncodeInRun(request, resources);
+    result.inputMemory = inputMemory;
     if (result.failure) { resources.RecordFailure(*result.failure); }
     if (!result.success || resources.Stopped()) { resources.CancelAndWaitRun(); }
     if (!resources.EndRun() || resources.FirstFailure()) {
         result.success = false;
         result.failure = resources.FirstFailure();
+    }
+    if (!result.success) {
+        result.encodedBytes = {};
+        result.hasEncodedOutput = false;
     }
     return result;
 } catch (const std::bad_alloc&) {

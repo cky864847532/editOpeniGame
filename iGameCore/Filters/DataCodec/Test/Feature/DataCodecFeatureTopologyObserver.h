@@ -1,7 +1,7 @@
 #ifndef DATACODEC_TEST_FEATURE_DATACODECFEATURETOPOLOGYOBSERVER_H
 #define DATACODEC_TEST_FEATURE_DATACODECFEATURETOPOLOGYOBSERVER_H
 
-#include "DataCodec/API/Adapter/IDecodeTopologyBlockObserver.h"
+#include "DataCodec/Codec/Topology/IDecodeTopologyBlockObserver.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "DataCodec/Test/Common/DataCodecTestResult.h"
 

@@ -77,6 +77,7 @@ inline bool ExecuteAttributeField(
 
 class PointAttributeStage final : public EncodeStage {
 public:
+    StageKind Kind() const noexcept override { return StageKind::PointAttribute; }
     static constexpr std::string_view kTypeName = "PointAttributeStage";
 
     PointAttributeStage(
@@ -112,6 +113,7 @@ private:
 
 class CellAttributeStage final : public EncodeStage {
 public:
+    StageKind Kind() const noexcept override { return StageKind::CellAttribute; }
     static constexpr std::string_view kTypeName = "CellAttributeStage";
 
     CellAttributeStage(

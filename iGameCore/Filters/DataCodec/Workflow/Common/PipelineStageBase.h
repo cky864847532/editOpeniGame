@@ -7,6 +7,8 @@
 #include <string_view>
 namespace datacodec {
 
+enum class StageKind { Other, PointRemap, CellRemap, Topology, Geometry, PointAttribute, CellAttribute, Parameters, Attribute, Commit, IntraAffine, IntraWavelet, IntraPredictor, AttributeTemporalWavelet, AttributeTemporalPredictor, GeometryTemporalWavelet, GeometryTemporalPredictor, Reference, PackageField, PackageAssembly };
+
 // Stage 的唯一标识和元数据
 struct StageId {
     // 可读的 stage 类型名
@@ -15,15 +17,16 @@ struct StageId {
     std::size_t index{0};
     // 字符串化时是否需要带上 repeat 索引
     bool indexedName{false};
+    StageKind kind{StageKind::Other};
 
     auto operator<=>(const StageId& other) const {
-        if (const auto nameCompare = name <=> other.name; nameCompare != 0) {
-            return nameCompare;
+        if (const auto kindCompare = kind <=> other.kind; kindCompare != 0) {
+            return kindCompare;
         }
         return index <=> other.index;
     }
 
-    bool operator==(const StageId& other) const { return name == other.name && index == other.index; }
+    bool operator==(const StageId& other) const { return kind == other.kind && index == other.index; }
 
     [[nodiscard]] std::string ToString() const {
         if (!indexedName) {
@@ -34,10 +37,11 @@ struct StageId {
 };
 
 inline StageId MakeStageId(
+    const StageKind kind,
     const std::string_view name,
     const std::size_t index = 0,
     const bool indexedName = false) {
-    return {name, index, indexedName};
+    return {name, index, indexedName, kind};
 }
 
 // 前置声明
@@ -54,8 +58,9 @@ struct IStage {
     virtual const char* Name() const = 0;
     virtual std::size_t StageIndex() const { return 0; }
     virtual bool UsesIndexedName() const { return false; }
+    virtual StageKind Kind() const noexcept { return StageKind::Other; }
 
-    [[nodiscard]] StageId Id() const { return MakeStageId(Name(), StageIndex(), UsesIndexedName()); }
+    [[nodiscard]] StageId Id() const { return {Name(), StageIndex(), UsesIndexedName(), Kind()}; }
     [[nodiscard]] std::string Describe() const { return Id().ToString(); }
 };
 
@@ -88,17 +93,19 @@ struct EncodeStageExecutionRecord {
 };
 
 inline EncodeStageId MakeEncodeStageId(
+    const StageKind kind,
     const std::string_view name,
     const std::size_t index = 0,
     const bool indexedName = false) {
-    return MakeStageId(name, index, indexedName);
+    return MakeStageId(kind, name, index, indexedName);
 }
 
 inline DecodeStageId MakeDecodeStageId(
+    const StageKind kind,
     const std::string_view name,
     const std::size_t index = 0,
     const bool indexedName = false) {
-    return MakeStageId(name, index, indexedName);
+    return MakeStageId(kind, name, index, indexedName);
 }
 
 // Encode Stage 接口（包含 EncodeContext 特化的 Execute）

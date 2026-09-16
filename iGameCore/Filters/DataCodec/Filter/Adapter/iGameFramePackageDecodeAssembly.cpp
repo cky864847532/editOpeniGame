@@ -19,8 +19,21 @@ namespace {
 
 } // 匿名命名空间
 
+bool iGameFramePackageDecodeAssembly::Import(const ::datacodec::DecodedData& data, std::string* error) {
+    if (!BeginFramePackage(data, error)) { return false; }
+    for (const auto& branch : data.branches) { if (!AddBranch(branch, error)) { return false; } }
+    for (std::size_t i = 0u; i < data.leaves.size(); ++i) {
+        iGameDecodeAdapter leaf;
+        if (!leaf.Import(data.leaves[i], false, error) || !CommitLeaf(data.leaves[i], leaf, error)) {
+            AbortFramePackage();
+            return false;
+        }
+    }
+    return EndFramePackage(error);
+}
+
 bool iGameFramePackageDecodeAssembly::BeginFramePackage(
-        const ::datacodec::FramePackage& framePackage,
+        const ::datacodec::DecodedData& framePackage,
         std::string*) {
     m_nodes.clear();
     m_output = nullptr;
@@ -39,28 +52,17 @@ bool iGameFramePackageDecodeAssembly::BeginFramePackage(
 }
 
 bool iGameFramePackageDecodeAssembly::AddBranch(
-        const ::datacodec::FramePackageBranchRecord& branch,
+        const ::datacodec::DecodedBranch& branch,
         std::string*) {
     return EnsureBranchNode(branch.path, branch.name) != nullptr;
 }
 
-std::unique_ptr<::datacodec::IDecodeAdapter>
-iGameFramePackageDecodeAssembly::CreateLeafAdapter(
-        const ::datacodec::FramePackageLeafRecord&,
-        const ::datacodec::LeafPackage&,
-        std::string*) {
-    return std::make_unique<iGameDecodeAdapter>();
-}
 
 bool iGameFramePackageDecodeAssembly::CommitLeaf(
-        const ::datacodec::FramePackageLeafRecord& leaf,
-        ::datacodec::IDecodeAdapter& adapter,
+        const ::datacodec::DecodedLeaf& leaf,
+        iGameDecodeAdapter& adapter,
         std::string* error) {
-    auto* decodeAdapter = dynamic_cast<iGameDecodeAdapter*>(&adapter);
-    if (decodeAdapter == nullptr) {
-        return ::datacodec::validation::AssignError(error, "frame leaf adapter type is invalid");
-    }
-    auto output = decodeAdapter->TakeDataObject();
+    auto output = adapter.TakeDataObject();
     if (output == nullptr) {
         return ::datacodec::validation::AssignError(error, "frame leaf adapter has no output");
     }
@@ -106,12 +108,6 @@ void iGameFramePackageDecodeAssembly::AbortFramePackage() {
     m_directLeafOutput = false;
 }
 
-std::unique_ptr<::datacodec::IDecodeAdapter>
-iGameFramePackageDecodeAssembly::CreateSupplementAdapter(
-        const ::datacodec::BlockPath& path,
-        std::string* error) const {
-    return CreateiGameSupplementAdapter(path, error);
-}
 
 std::unique_ptr<iGameDecodeAdapter>
 iGameFramePackageDecodeAssembly::CreateiGameSupplementAdapter(
@@ -126,12 +122,6 @@ iGameFramePackageDecodeAssembly::CreateiGameSupplementAdapter(
     return std::make_unique<iGameDecodeAdapter>(iterator->second);
 }
 
-::datacodec::IDecodedFramePayload::Pointer
-iGameFramePackageDecodeAssembly::Payload() const noexcept {
-    return m_output != nullptr
-        ? std::make_shared<iGameDecodedFramePayload>(m_output)
-        : ::datacodec::IDecodedFramePayload::Pointer{};
-}
 
 DataObject::Pointer iGameFramePackageDecodeAssembly::LeafOutput(
         const ::datacodec::BlockPath& path) const {
@@ -155,9 +145,10 @@ DataObject::Pointer iGameFramePackageDecodeAssembly::EnsureBranchNode(
     return branch;
 }
 
-std::shared_ptr<::datacodec::IDecodedFrameAssembly>
-iGameFramePackageDecodeAssemblyFactory::Create() const {
-    return std::make_shared<iGameFramePackageDecodeAssembly>();
+DataObject::Pointer DataObjectFromDecodedFrame(const ::datacodec::DecodedFrame::Pointer& frame) {
+    if (!frame) { return {}; }
+    iGameFramePackageDecodeAssembly assembly;
+    return assembly.Import(frame->Data()) ? assembly.Output() : DataObject::Pointer{};
 }
 
 IGAME_NAMESPACE_END

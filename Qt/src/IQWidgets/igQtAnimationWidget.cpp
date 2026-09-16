@@ -297,13 +297,11 @@ void igQtAnimationWidget::presentAnimationFrame(
             igQtAttributeDataSourceManager::Instance()->Source(currentObjectId);
         currentModel->SetDataObject(nextDrawObject);
         presentedDrawObject = nextDrawObject;
+        auto nextSource = timeFrames->AttributeSourceForFrame(nextDrawObject);
+        if (nextSource != nullptr) {
+            igQtAttributeDataSourceManager::Instance()->RegisterSource(nextDrawObject, std::move(nextSource));
+        }
         if (currentAttributeSource != nullptr) {
-            auto nextSource = currentAttributeSource->ForFrameObject(nextDrawObject);
-            if (nextSource != nullptr) {
-                igQtAttributeDataSourceManager::Instance()->RegisterSource(
-                    nextDrawObject,
-                    std::move(nextSource));
-            }
             igQtAttributeDataSourceManager::Instance()->ReleaseSource(currentObjectId);
         }
         if (selectedAttributeIndex >= 0 &&
@@ -627,21 +625,28 @@ void igQtAnimationWidget::initAnimationComponents() {
     ui->SliderAnimationTrack->setMinimum(0);
     ui->SliderAnimationTrack->setValue(0);
     
-    // 初始化缓存ComboBox: 选项 [0, 1, 2, ..., 时间帧数量]
+    // 核心自动管理容量时仅提供真实支持的缓存开关
+    auto currentDrawObject = iGame::DynamicCast<iGame::DrawObject>(
+            iGame::SceneManager::Instance()->GetCurrentScene()->GetCurrentModel()->GetDataObject());
+    auto frames = currentDrawObject != nullptr ? currentDrawObject->GetTimeFrames() : nullptr;
+    const bool automaticCapacity = frames != nullptr && !frames->SupportsCacheCountLimit();
     int frameCount = static_cast<int>(timeValues.size());
     const int defaultCacheNum = std::min(3, std::max(0, frameCount - 1));
     ui->comboBox_AnimationCacheNum->blockSignals(true);
     ui->comboBox_AnimationCacheNum->clear();
-    for (int i = 0; i < frameCount; i++) {
-        ui->comboBox_AnimationCacheNum->addItem(QString::number(i));
+    if (automaticCapacity) {
+        ui->comboBox_AnimationCacheNum->addItem(tr("关闭"));
+        ui->comboBox_AnimationCacheNum->addItem(tr("自动"));
+    } else {
+        for (int i = 0; i < frameCount; i++) {
+            ui->comboBox_AnimationCacheNum->addItem(QString::number(i));
+        }
     }
-    ui->comboBox_AnimationCacheNum->setCurrentIndex(defaultCacheNum);
+    ui->comboBox_AnimationCacheNum->setCurrentIndex(automaticCapacity ? (frames->IsCacheEnabled() ? 1 : 0) : defaultCacheNum);
     ui->comboBox_AnimationCacheNum->blockSignals(false);
     
     // 应用初始缓存设置
-    auto currentDrawObject = iGame::DynamicCast<iGame::DrawObject>(
-            iGame::SceneManager::Instance()->GetCurrentScene()->GetCurrentModel()->GetDataObject());
-    if (currentDrawObject && currentDrawObject->GetTimeFrames()) {
+    if (!automaticCapacity && currentDrawObject && currentDrawObject->GetTimeFrames()) {
         if (defaultCacheNum > 0) {
             currentDrawObject->GetTimeFrames()->EnableCache(defaultCacheNum);
         } else {

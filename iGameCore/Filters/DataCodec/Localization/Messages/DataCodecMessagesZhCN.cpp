@@ -48,6 +48,9 @@ std::string_view DataCodecSimplifiedChineseMessageTemplate(const DataCodecMessag
         case DataCodecMessageId::PackageDecodeCompleted: return "DataCodec 包解压完成";
         case DataCodecMessageId::PackageDecodeFailed: return "DataCodec 包解压失败";
         case DataCodecMessageId::FrameCounter: return "第 {index}/{count} 帧";
+        case DataCodecMessageId::UnsupportedVersion: return "当前文件版本 {version} 不受支持，支持版本为 {supported}";
+        case DataCodecMessageId::IncompleteInput: return "输入数据不完整";
+        case DataCodecMessageId::InvalidFormat: return "输入格式错误";
         case DataCodecMessageId::None:
         default: return {};
     }

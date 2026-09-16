@@ -1,7 +1,8 @@
 #ifndef DATACODEC_TEST_ADAPTER_DATACODECTESTADAPTER_H
 #define DATACODEC_TEST_ADAPTER_DATACODECTESTADAPTER_H
 
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
+#include "DataCodec/API/Output/DecodedData.h"
 #include "DataCodec/API/Adapter/IEncodeAdapter.h"
 #include "DataCodec/API/Adapter/IBlockTreeAdapter.h"
 #include "DataCodec/Test/Data/DataCodecTestDataset.h"
@@ -34,18 +35,12 @@ public:
     [[nodiscard]] const void* TryGetRawPtr() const override {
         return m_field->values.empty() ? nullptr : m_field->values.data();
     }
-    void GetTuple(const std::size_t index, double* output) const override {
-        const auto begin = index * m_field->componentCount;
-        for (std::size_t component = 0u; component < m_field->componentCount; ++component) {
-            output[component] = static_cast<double>(m_field->values[begin + component]);
-        }
-    }
 
 private:
     const TestNumericField* m_field{nullptr};
 };
 
-class TestEncodeAdapter final : public IEncodeAdapter {
+class TestEncodeAdapter : public IEncodeAdapter {
 public:
     explicit TestEncodeAdapter(const TestDataset& dataset)
         : m_dataset(&dataset) {
@@ -179,6 +174,32 @@ struct DecodedTestAttribute {
 
 class TestDecodeAdapter final : public IDecodeAdapter {
 public:
+    bool Import(const DecodedLeaf& leaf, std::string* error = nullptr) {
+        if (!SetMeshType(leaf.meshType, error) ||
+            !BeginPoints(leaf.geometry.pointCount, leaf.geometry.dimension, leaf.geometry.dataType, error) ||
+            !WritePointsRange(0u, leaf.geometry.pointCount, leaf.geometry.values.data(), error) || !EndPoints(error)) { return false; }
+        const auto& topology = leaf.topology;
+        if (topology.kind == DecodedTopology::Kind::Structured) {
+            if (!SetStructuredAxisSize(topology.structuredAxisSize.data(), error)) { return false; }
+        } else if (topology.kind == DecodedTopology::Kind::Connectivity) {
+            const auto count = topology.connectivity.size() / sizeof(IndexType);
+            if (!BeginTopology(topology.cellCount, count, !topology.offsets.empty(), error) ||
+                !WriteConnectivityRange(0u, reinterpret_cast<const IndexType*>(topology.connectivity.data()), count, error)) { return false; }
+            if (!topology.offsets.empty() && !WriteOffsetsRange(0u,
+                reinterpret_cast<const IndexType*>(topology.offsets.data()), topology.offsets.size() / sizeof(IndexType), error)) { return false; }
+            if (!topology.cellTypes.empty() && !WriteCellTypesRange(0u,
+                reinterpret_cast<const IndexType*>(topology.cellTypes.data()), topology.cellCount, error)) { return false; }
+            if (!topology.polynomialOrders.empty() && !WriteCellPolynomialOrdersRange(0u,
+                reinterpret_cast<const std::uint16_t*>(topology.polynomialOrders.data()), topology.cellCount, error)) { return false; }
+            if (!EndTopology(error)) { return false; }
+        }
+        for (const auto& attribute : leaf.attributes) {
+            if (!BeginAttribute(attribute.sourceIndex, attribute.metadata, error) ||
+                !WriteAttributeRange(attribute.sourceIndex, 0u, attribute.metadata.elementCount,
+                    attribute.values.data(), attribute.values.size(), error) || !EndAttribute(attribute.sourceIndex, error)) { return false; }
+        }
+        return Commit(error);
+    }
     bool SetMeshType(const MeshType type, std::string* error = nullptr) override {
         if (type != MeshType::PointSet && type != MeshType::UnstructuredMesh) {
             return AssignError(error, "test decode adapter expects a point set or unstructured mesh");
@@ -190,27 +211,35 @@ public:
     bool BeginPoints(
         const std::size_t count,
         const std::size_t dimension,
+        const DataType type,
         std::string* error = nullptr) override {
         if (dimension != 3u) {
             return AssignError(error, "test decode adapter expects three-dimensional points");
         }
         m_pointDimension = dimension;
-        m_points.assign(count * dimension, 0.0f);
+        m_pointType = type;
+        m_points.clear();
+        m_doublePoints.clear();
+        if (type == DataType::Float32) { m_points.assign(count * dimension, 0.0f); }
+        else if (type == DataType::Float64) { m_doublePoints.assign(count * dimension, 0.0); }
+        else { return AssignError(error, "test geometry scalar type is unsupported"); }
         return true;
     }
 
     bool WritePointsRange(
         const std::size_t offset,
         const std::size_t count,
-        const float* data,
+        const void* data,
         std::string* error = nullptr) override {
-        if (data == nullptr || (offset + count) * m_pointDimension > m_points.size()) {
+        const auto values = m_pointType == DataType::Float32 ? m_points.size() : m_doublePoints.size();
+        if (data == nullptr || offset > values / m_pointDimension || count > values / m_pointDimension - offset) {
             return AssignError(error, "point range exceeds the test decode buffer");
         }
-        std::copy_n(
-            data,
-            count * m_pointDimension,
-            m_points.begin() + static_cast<std::ptrdiff_t>(offset * m_pointDimension));
+        if (m_pointType == DataType::Float32) {
+            std::memcpy(m_points.data() + offset * m_pointDimension, data, count * m_pointDimension * sizeof(float));
+        } else {
+            std::memcpy(m_doublePoints.data() + offset * m_pointDimension, data, count * m_pointDimension * sizeof(double));
+        }
         return true;
     }
 
@@ -341,7 +370,7 @@ public:
     }
 
     [[nodiscard]] std::uint64_t NativeResidentBytesHint() const override {
-        std::uint64_t bytes = static_cast<std::uint64_t>(m_points.size() * sizeof(float));
+        std::uint64_t bytes = static_cast<std::uint64_t>(m_points.size() * sizeof(float) + m_doublePoints.size() * sizeof(double));
         for (const auto& attribute : m_attributes) {
             bytes += static_cast<std::uint64_t>(attribute.bytes.size());
         }
@@ -352,6 +381,8 @@ public:
         m_meshType = MeshType::PointSet;
         m_pointDimension = 0u;
         m_points.clear();
+        m_doublePoints.clear();
+        m_pointType = DataType::Float32;
         m_connectivity.clear();
         m_offsets.clear();
         m_cellTypes.clear();
@@ -367,6 +398,8 @@ public:
 
     [[nodiscard]] MeshType Mesh() const noexcept { return m_meshType; }
     [[nodiscard]] const std::vector<float>& Points() const noexcept { return m_points; }
+    [[nodiscard]] const std::vector<double>& DoublePoints() const noexcept { return m_doublePoints; }
+    [[nodiscard]] DataType PointType() const noexcept { return m_pointType; }
     [[nodiscard]] const std::vector<IndexType>& Connectivity() const noexcept { return m_connectivity; }
     [[nodiscard]] const std::vector<IndexType>& Offsets() const noexcept { return m_offsets; }
     [[nodiscard]] const std::vector<DecodedTestAttribute>& Attributes() const noexcept {
@@ -403,6 +436,8 @@ private:
     MeshType m_meshType{MeshType::PointSet};
     std::size_t m_pointDimension{0u};
     std::vector<float> m_points;
+    std::vector<double> m_doublePoints;
+    DataType m_pointType{DataType::Float32};
     std::vector<IndexType> m_connectivity;
     std::vector<IndexType> m_offsets;
     std::vector<IndexType> m_cellTypes;

@@ -1,3 +1,5 @@
+#include "DataCodec/Filter/Adapter/iGameCellTypeMapping.h"
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #ifndef iGameDataCodecFeaturePlaybackSession_h
 #define iGameDataCodecFeaturePlaybackSession_h
 
@@ -5,7 +7,7 @@
 #include <DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h>
 #include <DataCodec/Filter/Adapter/iGameDataCodecAttributeCatalog.h>
 #include <DataCodec/Filter/Adapter/iGameFramePresentationBridge.h>
-#include <DataCodec/Workflow/Session/PlaybackSession.h>
+#include <DataCodec/API/Entry/PlaybackSession.h>
 #include <DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h>
 #include <DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h>
 #include <DataCodec/API/Adapter/DecodedFrameTypes.h>
@@ -67,79 +69,26 @@ struct BlockingPlaybackAssemblyState {
     bool released{false};
 };
 
-class BlockingPlaybackAssembly final : public ::datacodec::IDecodedFrameAssembly {
+class BlockingPlaybackReader final : public ::datacodec::IByteRangeReader {
 public:
-    explicit BlockingPlaybackAssembly(std::shared_ptr<BlockingPlaybackAssemblyState> state)
-        : m_state(std::move(state)) {}
-
-    bool BeginFramePackage(
-            const ::datacodec::FramePackage& framePackage,
-            std::string* error) override {
-        if (framePackage.frameIndex == 3u) {
-            std::unique_lock<std::mutex> lock(m_state->mutex);
+    BlockingPlaybackReader(std::shared_ptr<::datacodec::IByteRangeReader> reader,
+                           std::shared_ptr<BlockingPlaybackAssemblyState> state)
+        : m_reader(std::move(reader)), m_state(std::move(state)) {}
+    std::uint64_t ByteSize() const noexcept override { return m_reader->ByteSize(); }
+    bool ReadAt(std::uint64_t offset, std::span<std::uint8_t> output, std::string* error) override {
+        if (armed.load()) {
+            std::unique_lock lock(m_state->mutex);
             m_state->started = true;
             m_state->condition.notify_all();
-            m_state->condition.wait(lock, [this]() { return m_state->released; });
+            m_state->condition.wait(lock, [this] { return m_state->released; });
         }
-        return m_delegate.BeginFramePackage(framePackage, error);
+        return m_reader->ReadAt(offset, output, error);
     }
-
-    bool AddBranch(const ::datacodec::FramePackageBranchRecord& branch, std::string* error) override {
-        return m_delegate.AddBranch(branch, error);
-    }
-
-    std::unique_ptr<::datacodec::IDecodeAdapter> CreateLeafAdapter(
-            const ::datacodec::FramePackageLeafRecord& leaf,
-            const ::datacodec::LeafPackage& leafPackage,
-            std::string* error) override {
-        return m_delegate.CreateLeafAdapter(leaf, leafPackage, error);
-    }
-
-    bool CommitLeaf(
-            const ::datacodec::FramePackageLeafRecord& leaf,
-            ::datacodec::IDecodeAdapter& adapter,
-            std::string* error) override {
-        return m_delegate.CommitLeaf(leaf, adapter, error);
-    }
-
-    bool EndFramePackage(std::string* error) override {
-        return m_delegate.EndFramePackage(error);
-    }
-
-    void AbortFramePackage() override { m_delegate.AbortFramePackage(); }
-
-    std::unique_ptr<::datacodec::IDecodeAdapter> CreateSupplementAdapter(
-            const ::datacodec::BlockPath& path,
-            std::string* error) const override {
-        return m_delegate.CreateSupplementAdapter(path, error);
-    }
-
-    ::datacodec::IDecodedFramePayload::Pointer Payload() const noexcept override {
-        return m_delegate.Payload();
-    }
-
+    std::atomic<bool> armed{false};
 private:
-    std::shared_ptr<BlockingPlaybackAssemblyState> m_state;
-    iGame::iGameFramePackageDecodeAssembly m_delegate;
-};
-
-class BlockingPlaybackAssemblyFactory final
-    : public ::datacodec::IDecodedFrameAssemblyFactory {
-public:
-    [[nodiscard]] std::string CacheIdentity() const override {
-        return "igame.test.blocking-frame-package.v1";
-    }
-    explicit BlockingPlaybackAssemblyFactory(std::shared_ptr<BlockingPlaybackAssemblyState> state)
-        : m_state(std::move(state)) {}
-
-    std::shared_ptr<::datacodec::IDecodedFrameAssembly> Create() const override {
-        return std::make_shared<BlockingPlaybackAssembly>(m_state);
-    }
-
-private:
+    std::shared_ptr<::datacodec::IByteRangeReader> m_reader;
     std::shared_ptr<BlockingPlaybackAssemblyState> m_state;
 };
-
 bool HasOnlyDrawableSubObjects(const iGame::DataObject::Pointer& object) {
     if (object == nullptr) { return false; }
     if (!object->HasSubDataObject()) { return true; }
@@ -508,7 +457,7 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     }
     for (const auto& frameSource: sequence.decodeSources) {
         ::datacodec::FramePackage framePackage;
-        if (!::datacodec::FramePackageIO::ReadMetadata(*frameSource.frameReader, framePackage, &error) ||
+        if (!::datacodec::FramePackageIO::ReadMetadata(*::datacodec::EncodedInputAccess::Open(frameSource.input), framePackage, &error) ||
             framePackage.leaves.size() != 2u) {
             std::cerr << "multi-leaf frame package layout is invalid\n";
             return 1;
@@ -520,7 +469,7 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
                 {
                         .decodeSources = selectedSequence.decodeSources,
                         .playbackFrameOrder = selectedSequence.selectedFrameIndices,
-                        .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
+                        .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
                         .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
                         .decodedFrameCachePolicy = ::datacodec::DecodedFrameCachePolicy{
                                 .prefetchEnabled = true,
@@ -552,11 +501,19 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     sparseSession.ClearDecodedFrameCache();
 
     auto blockingState = std::make_shared<BlockingPlaybackAssemblyState>();
+    auto blockingSources = sequence.decodeSources;
+    std::shared_ptr<BlockingPlaybackReader> blockedInput;
+    for (auto& source : blockingSources) {
+        if (source.frameIndex != 3u) { continue; }
+        blockedInput = std::make_shared<BlockingPlaybackReader>(
+            ::datacodec::EncodedInputAccess::Open(source.input), blockingState);
+        source.input = ::datacodec::EncodedInputAccess::Retain(blockedInput);
+    }
     ::datacodec::PlaybackSession prioritySession;
     if (!prioritySession.OpenSequence({
-            .decodeSources = sequence.decodeSources,
+            .decodeSources = blockingSources,
             .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
-            .assemblyFactory = std::make_shared<BlockingPlaybackAssemblyFactory>(blockingState),
+            .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
             .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
             .decodedFrameCachePolicy = ::datacodec::DecodedFrameCachePolicy{
                     .prefetchEnabled = true,
@@ -566,6 +523,7 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
         return 1;
     }
     if (!prioritySession.RequestFrame({.frameIndex = 2u}).success) { return 1; }
+    blockedInput->armed = true;
     prioritySession.NotifyFramePresented(2u);
     {
         std::unique_lock<std::mutex> lock(blockingState->mutex);
@@ -609,7 +567,7 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
                 {
                         .decodeSources = sequence.decodeSources,
                         .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
-                        .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
+                        .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
                         .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
                         .decodedFrameCachePolicy =
                                 ::datacodec::DecodedFrameCachePolicy{
@@ -668,7 +626,7 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
                 {
                         .decodeSources = sequence.decodeSources,
                         .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
-                        .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
+                        .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
                         .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
                         .decodedFrameCachePolicy =
                                 ::datacodec::DecodedFrameCachePolicy{
@@ -712,18 +670,18 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
     if (!session.OpenSequence({
             .decodeSources = sequence.decodeSources,
             .playbackFrameOrder = {0u, 1u, 2u, 3u, 4u},
-            .assemblyFactory = std::make_shared<iGame::iGameFramePackageDecodeAssemblyFactory>(),
+            .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
             .resources = {.mode = ::datacodec::CodecResourceMode::Fixed},
         }, &error)) { return 1; }
     auto retained = session.RequestFrame({.frameIndex = 2u});
     if (!retained.success || !retained.frame) { return 1; }
-    const auto payload = retained.frame->Payload();
+    const auto* retainedData = &retained.frame->Data();
     for (const auto index : {3u, 4u, 1u, 0u}) {
         if (!session.RequestFrame({.frameIndex = index}).success ||
             session.CachedDecodedFrameIndices().size() > 2u) { return 1; }
     }
     session.ClearDecodedFrameCache();
-    if (!session.CachedDecodedFrameIndices().empty() || retained.frame->Payload() != payload) {
+    if (!session.CachedDecodedFrameIndices().empty() || &retained.frame->Data() != retainedData) {
         return 1;
     }
 
@@ -812,8 +770,9 @@ inline int RunDataCodecFeaturePlaybackSession(const int argc = 0, char** argv = 
         return 1;
     }
     const auto replayedFrame = selectedTimeFrames->GetTargetTimeFrameData(1u);
-    if (replayedFrame != delegatedFrame || !selectedTimeFrames->CachedFrameIndices().empty()) {
-        std::cerr << "host cache clearing must preserve the independently retained DataCodec frame\n";
+    if (replayedFrame.empty() || replayedFrame == delegatedFrame ||
+        !selectedTimeFrames->CachedFrameIndices().empty() || delegatedFrame.empty()) {
+        std::cerr << "cache clearing must rebuild the frame and preserve previously delivered objects\n";
         return 1;
     }
     std::error_code removeError;

@@ -1,7 +1,7 @@
 #ifndef IGAME_EXAMPLES_VTK_DATACODEC_ADAPTERS_H
 #define IGAME_EXAMPLES_VTK_DATACODEC_ADAPTERS_H
 
-#include <DataCodec/API/Adapter/IDecodeAdapter.h>
+#include <DataCodec/API/Output/DecodedData.h>
 #include <DataCodec/API/Adapter/IEncodeAdapter.h>
 
 #include <vtkSmartPointer.h>
@@ -90,114 +90,16 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-class VtkDataCodecDecodeAdapter final : public ::datacodec::IDecodeAdapter {
+std::shared_ptr<const ::datacodec::ICellTypeMapping> MakeVtkCellTypeMapping();
+
+class VtkDataCodecDecodeAdapter final {
 public:
-    using IndexType = ::datacodec::IndexType;
-    using MeshType = ::datacodec::MeshType;
-    using PolyhedronTopologyView = ::datacodec::PolyhedronTopologyView;
-    using AttrStorageParams = ::datacodec::AttrStorageParams;
-    using CellTypeRaw = ::datacodec::CellTypeRaw;
-    using CellTypeCodecEntry = ::datacodec::CellTypeCodecEntry;
-    using CellTypeMappingMode = ::datacodec::CellTypeMappingMode;
-    using CellTypeFamilyCode = ::datacodec::CellTypeFamilyCode;
-    using CellTypeLocalCode = ::datacodec::CellTypeLocalCode;
-
-    VtkDataCodecDecodeAdapter();
-    ~VtkDataCodecDecodeAdapter() override;
-
-    VtkDataCodecDecodeAdapter(const VtkDataCodecDecodeAdapter&) = delete;
-    VtkDataCodecDecodeAdapter& operator=(const VtkDataCodecDecodeAdapter&) = delete;
-
-    bool SetMeshType(MeshType type, std::string* error = nullptr) override;
-    bool BeginPoints(
-        std::size_t count,
-        std::size_t dimension,
-        std::string* error = nullptr) override;
-    bool WritePointsRange(
-        std::size_t offset,
-        std::size_t count,
-        const float* data,
-        std::string* error = nullptr) override;
-    bool EndPoints(std::string* error = nullptr) override;
-
-    bool BeginTopology(
-        std::size_t cellCount,
-        std::size_t connectivityCount,
-        bool hasOffsets,
-        std::string* error = nullptr) override;
-    bool WriteConnectivityRange(
-        std::size_t offset,
-        const IndexType* data,
-        std::size_t count,
-        std::string* error = nullptr) override;
-    bool WriteOffsetsRange(
-        std::size_t offset,
-        const IndexType* data,
-        std::size_t count,
-        std::string* error = nullptr) override;
-    bool WriteCellTypesRange(
-        std::size_t offset,
-        const IndexType* data,
-        std::size_t count,
-        std::string* error = nullptr) override;
-    bool WriteCellPolynomialOrdersRange(
-        std::size_t offset,
-        const std::uint16_t* data,
-        std::size_t count,
-        std::string* error = nullptr) override;
-    bool EndTopology(std::string* error = nullptr) override;
-    bool SetStructuredAxisSize(const int size[3], std::string* error = nullptr) override;
-
-    bool SupportsPolyhedronTopology() const override;
-    bool BeginPolyhedronTopology(
-        std::size_t cellCount,
-        std::string* error = nullptr) override;
-    bool WritePolyhedronCellBatch(
-        std::size_t firstCell,
-        const PolyhedronTopologyView& batch,
-        std::string* error = nullptr) override;
-    bool EndPolyhedronTopology(std::string* error = nullptr) override;
-
-    bool BeginAttribute(
-        std::size_t attrIndex,
-        const AttrStorageParams& meta,
-        std::string* error = nullptr) override;
-    bool WriteAttributeRange(
-        std::size_t attrIndex,
-        std::size_t offset,
-        std::size_t count,
-        const void* data,
-        std::size_t byteSize,
-        std::string* error = nullptr) override;
-    bool SupportsAttributeDecodeStore() const noexcept override;
-    bool EndAttribute(std::size_t attrIndex, std::string* error = nullptr) override;
-
-    bool ResolveCellType(CellTypeRaw rawType, CellTypeCodecEntry& entry) const override;
-    CellTypeMappingMode GetCellTypeMappingMode() const override;
-    bool ResolveCellSizeFromPolynomialOrder(
-        CellTypeRaw rawType,
-        std::uint16_t order,
-        int& size) const override;
-    bool EncodeCellTypeFamilyLocal(
-        CellTypeRaw rawType,
-        CellTypeFamilyCode& familyCode,
-        CellTypeLocalCode& familyLocalCode) const override;
-    bool DecodeCellTypeFamilyLocal(
-        CellTypeFamilyCode familyCode,
-        CellTypeLocalCode familyLocalCode,
-        CellTypeRaw& rawType) const override;
-
-    void Abort() override;
-    void ResetOutput() override;
-    bool Commit(std::string* error = nullptr) override;
-
+    bool Import(const ::datacodec::DecodedLeaf& leaf, std::string* error = nullptr);
     vtkSmartPointer<vtkUnstructuredGrid> TakeOutput();
-
 private:
-    class Impl;
-    std::unique_ptr<Impl> m_impl;
+    vtkSmartPointer<vtkUnstructuredGrid> m_output;
 };
 
-} // namespace vtk_datacodec_example
+} // 命名空间 vtk_datacodec_example
 
 #endif

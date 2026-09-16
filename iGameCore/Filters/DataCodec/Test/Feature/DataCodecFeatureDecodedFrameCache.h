@@ -13,32 +13,13 @@
 namespace datacodec::test::feature_decoded_frame_cache
 {
 
-class TestPayload final : public IDecodedFramePayload {
-public:
-    explicit TestPayload(const std::uint64_t residentBytes) : m_residentBytes(residentBytes) {}
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override { return m_residentBytes; }
-
-private:
-    std::uint64_t m_residentBytes{0u};
-};
-
-class TestFrame final : public DecodedFrameLease {
-public:
-    TestFrame(const std::uint32_t frameIndex, const std::uint64_t residentBytes)
-        : m_frameIndex(frameIndex),
-          m_payload(std::make_shared<TestPayload>(residentBytes)) {}
-
-    [[nodiscard]] std::uint32_t FrameIndex() const noexcept override { return m_frameIndex; }
-    [[nodiscard]] IDecodedFramePayload::Pointer Payload() const noexcept override { return m_payload; }
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-        return m_payload->ResidentSizeHint();
-    }
-
-private:
-    std::uint32_t m_frameIndex{0u};
-    IDecodedFramePayload::Pointer m_payload;
-};
-
+using TestFrame = DecodedFrame;
+inline auto MakeTestFrame(std::uint32_t index, std::uint64_t) {
+    DecodedData data;
+    data.frameIndex = index;
+    data.leaves.emplace_back();
+    return std::make_shared<DecodedFrame>(std::move(data));
+}
 inline DecodeSourceIdentity Source(const std::string& revision = "r1") {
     return DecodeSourceIdentity{.stableId = "synthetic-series", .revision = revision};
 }
@@ -50,13 +31,13 @@ inline DecodedFrameKey Key(const std::uint32_t frameIndex, const std::string& re
 inline bool TestLeastRecentlyUsedFrameIsEvicted() {
     DecodedFrameLruCache cache;
     cache.Configure(2u);
-    (void)cache.Store(Key(0u), std::make_shared<TestFrame>(0u, 8u), DecodedFrameAccessKind::UserRequest);
-    (void)cache.Store(Key(1u), std::make_shared<TestFrame>(1u, 8u), DecodedFrameAccessKind::Prefetch);
+    (void)cache.Store(Key(0u), MakeTestFrame(0u, 8u), DecodedFrameAccessKind::UserRequest);
+    (void)cache.Store(Key(1u), MakeTestFrame(1u, 8u), DecodedFrameAccessKind::Prefetch);
     {
         const auto touched = cache.Find(Key(0u), DecodedFrameAccessKind::UserRequest);
         if (!touched.IsHit()) { return false; }
     }
-    (void)cache.Store(Key(2u), std::make_shared<TestFrame>(2u, 8u), DecodedFrameAccessKind::UserRequest);
+    (void)cache.Store(Key(2u), MakeTestFrame(2u, 8u), DecodedFrameAccessKind::UserRequest);
     return cache.Find(Key(0u), DecodedFrameAccessKind::UserRequest).IsHit() &&
         cache.Find(Key(1u), DecodedFrameAccessKind::UserRequest).IsMiss() &&
         cache.Find(Key(2u), DecodedFrameAccessKind::UserRequest).IsHit();
@@ -65,7 +46,7 @@ inline bool TestLeastRecentlyUsedFrameIsEvicted() {
 inline bool TestTrimPreservesConsumerAndIgnoresSizeHint() {
     DecodedFrameLruCache cache;
     cache.Configure(1u);
-    auto consumer = std::make_shared<TestFrame>(0u, UINT64_MAX);
+    auto consumer = MakeTestFrame(0u, UINT64_MAX);
     std::weak_ptr<TestFrame> lifetime = consumer;
     if (!cache.Store(Key(0u), consumer, DecodedFrameAccessKind::UserRequest).IsStored() ||
         !cache.TrimOne() || cache.TrimOne() || lifetime.expired() ||
@@ -76,14 +57,14 @@ inline bool TestTrimPreservesConsumerAndIgnoresSizeHint() {
     consumer.reset();
     cache.Configure(0u);
     return lifetime.expired() && cache.Store(
-        Key(1u), std::make_shared<TestFrame>(1u, 1u),
+        Key(1u), MakeTestFrame(1u, 1u),
         DecodedFrameAccessKind::UserRequest).IsRejectedByPolicy();
 }
 
 inline bool TestSourceRevisionSeparatesEntries() {
     DecodedFrameLruCache cache;
     cache.Configure(4u);
-    (void)cache.Store(Key(0u, "r1"), std::make_shared<TestFrame>(0u, 4u), DecodedFrameAccessKind::UserRequest);
+    (void)cache.Store(Key(0u, "r1"), MakeTestFrame(0u, 4u), DecodedFrameAccessKind::UserRequest);
     return cache.Find(Key(0u, "r1"), DecodedFrameAccessKind::UserRequest).IsHit() &&
         cache.Find(Key(0u, "r2"), DecodedFrameAccessKind::UserRequest).IsMiss();
 }
@@ -91,14 +72,14 @@ inline bool TestSourceRevisionSeparatesEntries() {
 inline bool TestDisableClearsAndBlocksFrameCaching() {
     DecodedFrameLruCache cache;
     cache.Configure(4u);
-    (void)cache.Store(Key(0u), std::make_shared<TestFrame>(0u, 8u), DecodedFrameAccessKind::UserRequest);
+    (void)cache.Store(Key(0u), MakeTestFrame(0u, 8u), DecodedFrameAccessKind::UserRequest);
     cache.SetEnabled(false);
     const auto disabledStats = cache.Statistics();
     if (cache.IsEnabled() || disabledStats.residentFrames != 0u ||
         !cache.Find(Key(0u), DecodedFrameAccessKind::UserRequest).IsMiss() ||
         !cache.Store(
             Key(1u),
-            std::make_shared<TestFrame>(1u, 8u),
+            MakeTestFrame(1u, 8u),
             DecodedFrameAccessKind::UserRequest).IsRejectedByPolicy()) {
         return false;
     }
@@ -106,7 +87,7 @@ inline bool TestDisableClearsAndBlocksFrameCaching() {
     return cache.IsEnabled() &&
         cache.Store(
             Key(1u),
-            std::make_shared<TestFrame>(1u, 8u),
+            MakeTestFrame(1u, 8u),
             DecodedFrameAccessKind::UserRequest).IsStored() &&
         cache.Find(Key(1u), DecodedFrameAccessKind::UserRequest).IsHit();
 }
@@ -130,7 +111,7 @@ inline bool TestInvalidCacheAccessIsReportedAsError() {
         DecodedFrameAccessKind::UserRequest);
     const auto store = cache.Store(
         Key(0u),
-        std::make_shared<TestFrame>(1u, 8u),
+        MakeTestFrame(1u, 8u),
         DecodedFrameAccessKind::UserRequest);
     const auto stats = cache.Statistics();
     return lookup.IsError() && !lookup.error.empty() &&

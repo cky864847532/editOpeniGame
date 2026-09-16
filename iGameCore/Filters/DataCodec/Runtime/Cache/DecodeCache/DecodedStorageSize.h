@@ -2,16 +2,17 @@
 #define DATACODEC_RUNTIME_CACHE_DECODECACHE_DECODEDSTORAGESIZE_H
 
 #include "DataCodec/API/Params/CodecStorageParams.h"
+#include "DataCodec/Common/Views/ArrayViews.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
 
 namespace datacodec {
 
 // 预检和真实分配共用确定容量公式，所有乘加均检查溢出
 inline bool CalculateGeometryCacheBytes(const std::size_t count, const std::size_t dimension,
-    std::uint64_t& bytes, std::string* error = nullptr) {
+    DataType type, std::uint64_t& bytes, std::string* error = nullptr) {
     std::uint64_t values = 0u;
     return validation::CheckedMulU64(count, dimension, values, "decoded geometry value count", error) &&
-        validation::CheckedMulU64(values, sizeof(float), bytes, "decoded geometry cache bytes", error);
+        validation::CheckedMulU64(values, ScalarTypeSize(ToScalarType(type)), bytes, "decoded geometry cache bytes", error);
 }
 
 inline bool CalculateDecodedNumericStorageBytes(const NumericArrayStorageParams& meta,

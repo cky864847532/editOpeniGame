@@ -1,9 +1,11 @@
 #ifndef iGameDataCodeciGameDecodeAdapter_h
 #define iGameDataCodeciGameDecodeAdapter_h
 
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
-#include "DataCodec/Storage/ByteStore/ByteStoreInterface.h"
-#include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
+
+#include "DataCodec/API/Output/DecodedData.h"
+#include "DataCodec/Common/Views/BufferCapacitySample.h"
+
+
 #include "DataCodec/Filter/Adapter/iGameCellTypeMapping.h"
 #include "DataCodec/Common/Views/TopologyViews.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
@@ -28,7 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <mutex>
+
 #include <span>
 #include <string>
 #include <utility>
@@ -36,7 +38,7 @@
 
 IGAME_NAMESPACE_BEGIN
 
-class iGameDecodeAdapter final : public ::datacodec::IDecodeAdapter {
+class iGameDecodeAdapter final {
 public:
     using IndexType = ::datacodec::IndexType;
     using MeshType = ::datacodec::MeshType;
@@ -54,10 +56,64 @@ public:
     iGameDecodeAdapter() = default;
     explicit iGameDecodeAdapter(DataObject::Pointer output) : m_output(std::move(output)) {}
 
+    // 在核心完成之后接管结果，原生封装不参与解码执行
+    bool Import(const ::datacodec::DecodedLeaf& leaf, bool attributesOnly = false,
+                std::string* error = nullptr) {
+        if (!attributesOnly) {
+            if (!SetMeshType(leaf.meshType, error)) { return false; }
+            if (leaf.geometry.dataType != DataType::Float32 || leaf.geometry.dimension != 3u) {
+                return Fail(error, "iGame Points requires Float32 geometry with three components");
+            }
+            auto points = Points::New();
+            if (!AdoptTyped(points->ConvertToArray(), leaf.geometry.values, 3, error)) { return false; }
+            auto pointSet = DynamicCast<PointSet>(m_output);
+            if (!pointSet) { return Fail(error, "decoded geometry requires a point set"); }
+            pointSet->SetPoints(points);
+            const auto& topology = leaf.topology;
+            using Kind = ::datacodec::DecodedTopology::Kind;
+            if (topology.kind == Kind::Connectivity) {
+                m_pendingCellCount = topology.cellCount;
+                m_pendingConnectivityCount = topology.connectivity.size() / sizeof(IndexType);
+                m_pendingConnectivityIds = IdArray::New();
+                if (!AdoptTyped(m_pendingConnectivityIds, topology.connectivity, 1, error)) { return false; }
+                if (!topology.offsets.empty()) {
+                    m_pendingOffsets = UnsignedIntArray::New();
+                    if (!AdoptTyped(m_pendingOffsets, topology.offsets, 1, error)) { return false; }
+                }
+                if (!topology.cellTypes.empty()) {
+                    m_cellTypes = UnsignedIntArray::New();
+                    if (!AdoptTyped(m_cellTypes, topology.cellTypes, 1, error)) { return false; }
+                }
+                if (!topology.polynomialOrders.empty() && !WriteCellPolynomialOrdersRange(0u,
+                    reinterpret_cast<const std::uint16_t*>(topology.polynomialOrders.data()),
+                    topology.polynomialOrders.size() / sizeof(std::uint16_t), error)) { return false; }
+                if (!EndTopology(error)) { return false; }
+            } else if (topology.kind == Kind::Structured) {
+                if (!SetStructuredAxisSize(topology.structuredAxisSize.data(), error)) { return false; }
+            } else if (topology.kind == Kind::Polyhedron) {
+                if (!ImportPolyhedron(topology, error)) { return false; }
+            }
+        }
+        for (const auto& attribute : leaf.attributes) {
+            const auto index = attribute.sourceIndex;
+            if (NativeAttributeIndex(m_output, index) >= 0) { continue; }
+            auto array = CreateArray(attribute.metadata.dataType);
+            if (!array || !AdoptAttribute(array, attribute, error)) { return false; }
+            array->SetName(attribute.metadata.name);
+            if (index >= m_pendingAttributes.size()) {
+                m_pendingAttributes.resize(index + 1u);
+                m_pendingAttributeMeta.resize(index + 1u);
+            }
+            m_pendingAttributes[index] = array;
+            m_pendingAttributeMeta[index] = attribute.metadata;
+            if (!EndAttribute(index, error)) { return false; }
+        }
+        return Commit(error);
+    }
+
     // 为解码后的 mesh type 创建目标原生网格对象
-    bool SetMeshType(MeshType type, std::string* error = nullptr) override {
+    bool SetMeshType(MeshType type, std::string* error = nullptr) {
         ReleaseOutputState();
-        m_decodeStorageIdentity = std::make_shared<unsigned char>(0u);
         m_meshType = type;
         m_output = DataObject::CreateDataObject(ToNativeMeshType(type));
         if (m_output == nullptr) {
@@ -66,129 +122,12 @@ public:
         return true;
     }
 
-    std::shared_ptr<const void> DecodeStorageIdentity() const noexcept override { return m_decodeStorageIdentity; }
-    bool SupportsGeometryDecodeStore() const noexcept override { return true; }
-    std::shared_ptr<::datacodec::bytestore::IRandomAccessByteStore> CreateGeometryDecodeStore(
-        std::size_t count, std::size_t dimension, std::string* error) override {
-        std::size_t values{}, bytes{};
-        if (!::datacodec::validation::CheckedMulSizeT(count, dimension, values, "native points", error) ||
-            !::datacodec::validation::CheckedMulSizeT(values, sizeof(float), bytes, "native point bytes", error) ||
-            !BeginPoints(count, dimension, error)) { return {}; }
-        return std::make_shared<NativeArrayByteStore>(m_pendingPoints,
-            std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(m_pendingPoints->RawPointer()), bytes));
-    }
-    bool SupportsConnectivityDecodeStores(bool polynomialOrders) const noexcept override { return !polynomialOrders; }
-    bool CreateConnectivityDecodeStores(std::size_t cells, std::size_t values, bool hasOffsets, bool hasTypes,
-        ::datacodec::NativeConnectivityDecodeStores& stores, std::string* error) override {
-        static_assert(sizeof(igIndex) == sizeof(IndexType));
-        ::datacodec::DecodedConnectivityStorageSize sizes;
-        if (!::datacodec::CalculateDecodedConnectivityStorageSize(cells, values, hasOffsets, hasTypes, false, sizes, error) ||
-            !BeginTopology(cells, values, hasOffsets, error)) { return false; }
-        stores.connectivity = std::make_shared<NativeArrayByteStore>(m_pendingConnectivityIds,
-            std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(m_pendingConnectivityIds->RawPointer()), sizes.connectivity));
-        // 固定单元尺寸路径保留零长 offsets 视图，满足缓存读取契约
-        stores.offsets = std::make_shared<NativeArrayByteStore>(m_pendingOffsets,
-            std::span<std::uint8_t>(hasOffsets ? reinterpret_cast<std::uint8_t*>(m_pendingOffsets->RawPointer()) : nullptr,
-                sizes.offsets));
-        if (hasTypes) {
-            m_cellTypes = UnsignedIntArray::New();
-            m_cellTypes->Resize(cells);
-            stores.cellTypes = std::make_shared<NativeArrayByteStore>(m_cellTypes,
-                std::span<std::uint8_t>(reinterpret_cast<std::uint8_t*>(m_cellTypes->RawPointer()), sizes.cellTypes));
-            m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(m_nativeResidentBytes, sizes.cellTypes);
-        }
-        return true;
-    }
-
-    // 开始写入点坐标 range
-    bool BeginPoints(
-        const std::size_t count,
-        const std::size_t dimension,
-        std::string* error = nullptr) override {
-        const auto pointSet = DynamicCast<PointSet>(m_output);
-        if (pointSet == nullptr) {
-            return Fail(error, "points can only be written to point-set compatible output");
-        }
-        if (dimension != 3u) {
-            return Fail(error, "iGame point output requires 3 components");
-        }
-
-        m_pointDimension = dimension;
-        m_pendingPointCount = count;
-        m_pendingPoints = Points::New();
-        if (m_pendingPoints == nullptr) {
-            return Fail(error, "failed to allocate iGame points");
-        }
-        m_pendingPoints->Resize(count);
-        pointSet->SetPoints(m_pendingPoints);
-        m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-            m_nativeResidentBytes,
-            ::datacodec::validation::SaturatingMulU64(
-                static_cast<std::uint64_t>(count),
-                ::datacodec::validation::SaturatingMulU64(static_cast<std::uint64_t>(dimension), sizeof(float))));
-        return true;
-    }
-
-    // 写入点坐标 range
-    bool WritePointsRange(
-        const std::size_t offset,
-        const std::size_t count,
-        const float* data,
-        std::string* error = nullptr) override {
-        if (count == 0u) {
-            return true;
-        }
-        if (m_pendingPoints == nullptr || data == nullptr) {
-            return Fail(error, "point range write requires initialized points and input data");
-        }
-        if (offset > m_pendingPointCount || count > m_pendingPointCount - offset) {
-            return Fail(error, "point range write is outside the target points");
-        }
-        constexpr std::size_t componentCount = 3u;
-        std::size_t pointOffset = 0u;
-        std::size_t tupleBytes = 0u;
-        std::size_t byteCount = 0u;
-        if (!::datacodec::validation::CheckedMulSizeT(
-                offset,
-                componentCount,
-                pointOffset,
-                "point range write offset",
-                error) ||
-            !::datacodec::validation::CheckedMulSizeT(
-                componentCount,
-                sizeof(float),
-                tupleBytes,
-                "point range write tuple bytes",
-                error) ||
-            !::datacodec::validation::CheckedMulSizeT(
-                count,
-                tupleBytes,
-                byteCount,
-                "point range write byte count",
-                error)) {
-            return false;
-        }
-        std::memcpy(
-            m_pendingPoints->RawPointer() + pointOffset,
-            data,
-            byteCount);
-        return true;
-    }
-
-    // 结束点坐标 range 写入
-    bool EndPoints(std::string* = nullptr) override {
-        m_pendingPoints = nullptr;
-        m_pendingPointCount = 0u;
-        m_pointDimension = 3u;
-        return true;
-    }
-
     // 开始写入普通拓扑 range
     bool BeginTopology(
         const std::size_t cellCount,
         const std::size_t connectivityCount,
         const bool hasOffsets,
-        std::string* error = nullptr) override {
+        std::string* error = nullptr) {
         m_pendingCellCount = cellCount;
         m_pendingConnectivityCount = connectivityCount;
         m_pendingConnectivityIds = IdArray::New();
@@ -204,101 +143,10 @@ public:
             }
             m_pendingOffsets->Resize(cellCount + 1u);
         }
-        m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-            m_nativeResidentBytes,
-            ::datacodec::validation::SaturatingMulU64(static_cast<std::uint64_t>(connectivityCount), sizeof(IndexType)));
-        if (hasOffsets) {
-            m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-                m_nativeResidentBytes,
-                ::datacodec::validation::SaturatingMulU64(
-                    ::datacodec::validation::SaturatingAddU64(static_cast<std::uint64_t>(cellCount), 1u),
-                    sizeof(IndexType)));
-        }
+
         m_cellArray = nullptr;
         m_cellTypes = nullptr;
         ReleasePolynomialOrders();
-        return true;
-    }
-
-    // 写入 connectivity range
-    bool WriteConnectivityRange(
-        const std::size_t offset,
-        const IndexType* data,
-        const std::size_t count,
-        std::string* error = nullptr) override {
-        if (count == 0u) {
-            return true;
-        }
-        if (data == nullptr) {
-            return Fail(error, "connectivity range write requires input data");
-        }
-        if (m_pendingConnectivityIds == nullptr ||
-            offset > m_pendingConnectivityCount ||
-            count > m_pendingConnectivityCount - offset) {
-            return Fail(error, "connectivity range write is outside the target buffer");
-        }
-        auto* target = m_pendingConnectivityIds->RawPointer() + offset;
-        std::copy(data, data + count, target);
-        return true;
-    }
-
-    // 写入 offsets range
-    bool WriteOffsetsRange(
-        const std::size_t offset,
-        const IndexType* data,
-        const std::size_t count,
-        std::string* error = nullptr) override {
-        if (count == 0u) {
-            return true;
-        }
-        if (data == nullptr) {
-            return Fail(error, "offset range write requires input data");
-        }
-        if (m_pendingOffsets == nullptr ||
-            offset > m_pendingOffsets->GetNumberOfValues() ||
-            count > m_pendingOffsets->GetNumberOfValues() - offset) {
-            return Fail(error, "offset range write is outside the target buffer");
-        }
-        std::copy(data, data + count, m_pendingOffsets->RawPointer() + offset);
-        return true;
-    }
-
-    // 写入 cell type range
-    bool WriteCellTypesRange(
-        const std::size_t offset,
-        const IndexType* data,
-        const std::size_t count,
-        std::string* error = nullptr) override {
-        if (count == 0u) {
-            return true;
-        }
-        if (data == nullptr) {
-            return Fail(error, "cell type range write requires input data");
-        }
-        if (offset > m_pendingCellCount || count > m_pendingCellCount - offset) {
-            return Fail(error, "cell type range write is outside the target cells");
-        }
-        if (m_cellTypes == nullptr) {
-            m_cellTypes = UnsignedIntArray::New();
-            if (m_cellTypes == nullptr) {
-                return Fail(error, "failed to allocate cell type array");
-            }
-            m_cellTypes->Resize(m_pendingCellCount);
-            std::fill(m_cellTypes->RawPointer(), m_cellTypes->RawPointer() + m_cellTypes->GetNumberOfValues(), 0u);
-            m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-                m_nativeResidentBytes,
-                ::datacodec::validation::SaturatingMulU64(
-                    static_cast<std::uint64_t>(m_cellTypes->GetNumberOfValues()),
-                    sizeof(unsigned int)));
-        }
-        const auto targetCount = m_cellTypes->GetNumberOfValues();
-        if (offset >= targetCount) {
-            return Fail(error, "cell type range offset is outside the target array");
-        }
-        auto* target = m_cellTypes->RawPointer() + offset;
-        for (std::size_t index = 0; index < count; ++index) {
-            target[index] = static_cast<unsigned int>(data[index]);
-        }
         return true;
     }
 
@@ -307,7 +155,7 @@ public:
         const std::size_t offset,
         const std::uint16_t* data,
         const std::size_t count,
-        std::string* error = nullptr) override {
+        std::string* error = nullptr) {
         if (count == 0u) {
             return true;
         }
@@ -326,7 +174,7 @@ public:
     }
 
     // 结束普通拓扑 range 写入
-    bool EndTopology(std::string* error = nullptr) override {
+    bool EndTopology(std::string* error = nullptr) {
         if (m_pendingCellCount != 0u &&
             (m_pendingConnectivityIds == nullptr || m_pendingConnectivityCount == 0u)) {
             return Fail(error, "topology commit requires connectivity data");
@@ -357,7 +205,7 @@ public:
     }
 
     // 写入 structured mesh 的轴尺寸
-    bool SetStructuredAxisSize(const int size[3], std::string* error = nullptr) override {
+    bool SetStructuredAxisSize(const int size[3], std::string* error = nullptr) {
         const auto structuredMesh = DynamicCast<StructuredMesh>(m_output);
         if (structuredMesh == nullptr || size == nullptr) {
             return Fail(error, "structured axis size requires structured output and input size");
@@ -373,61 +221,14 @@ public:
         return true;
     }
 
-    // 解析原生 raw type 的编码信息
-    bool ResolveCellType(const CellTypeRaw rawType, CellTypeCodecEntry& entry) const override {
-        return m_cellTypeMapping.ResolveCellType(rawType, entry);
-    }
-
-    // 返回 cell type 映射模式
-    CellTypeMappingMode GetCellTypeMappingMode() const override {
-        return m_cellTypeMapping.GetCellTypeMappingMode();
-    }
-
-    // 解析 polynomial-order-dependent cell 的精确 size
-    bool ResolveCellSizeFromPolynomialOrder(const CellTypeRaw rawType, const std::uint16_t order, int& size) const override {
-        return m_cellTypeMapping.ResolveCellSizeFromPolynomialOrder(rawType, order, size);
-    }
-
-    // 编码 family-local cell type token
-    bool EncodeCellTypeFamilyLocal(
-        const CellTypeRaw rawType,
-        CellTypeFamilyCode& familyCode,
-        CellTypeLocalCode& familyLocalCode) const override {
-        return m_cellTypeMapping.EncodeCellTypeFamilyLocal(rawType, familyCode, familyLocalCode);
-    }
-
-    // 反解 family-local cell type token
-    bool DecodeCellTypeFamilyLocal(
-        const CellTypeFamilyCode familyCode,
-        const CellTypeLocalCode familyLocalCode,
-        CellTypeRaw& rawType) const override {
-        return m_cellTypeMapping.DecodeCellTypeFamilyLocal(familyCode, familyLocalCode, rawType);
-    }
-
-    // 编码 polynomial-order-dependent cell 的局部 order token
-    bool EncodeCellPolynomialOrderLocal(
-        const CellTypeRaw rawType,
-        const std::uint16_t order,
-        CellTypeLocalCode& localOrder) const override {
-        return m_cellTypeMapping.EncodeCellPolynomialOrderLocal(rawType, order, localOrder);
-    }
-
-    // 反解 polynomial-order-dependent cell 的局部 order token
-    bool DecodeCellPolynomialOrderLocal(
-        const CellTypeRaw rawType,
-        const CellTypeLocalCode localOrder,
-        std::uint16_t& order) const override {
-        return m_cellTypeMapping.DecodeCellPolynomialOrderLocal(rawType, localOrder, order);
-    }
-
     // 判断当前目标 mesh 是否支持 polyhedron 组装
-    bool SupportsPolyhedronTopology() const override {
+    bool SupportsPolyhedronTopology() const {
         return m_meshType == MeshType::VolumeMesh || m_meshType == MeshType::UnstructuredMesh ||
             m_meshType == MeshType::PolyhedronMesh;
     }
 
     // 开始按 chunk 写入 polyhedron 拓扑
-    bool BeginPolyhedronTopology(const std::size_t cellCount, std::string* error = nullptr) override {
+    bool BeginPolyhedronTopology(const std::size_t cellCount, std::string* error = nullptr) {
         if (!SupportsPolyhedronTopology()) {
             return Fail(error, "target mesh does not support polyhedron topology");
         }
@@ -454,9 +255,6 @@ public:
             m_polyCellTypes->RawPointer(),
             m_polyCellTypes->RawPointer() + cellCount,
             static_cast<unsigned int>(IG_POLYHEDRON));
-        m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-            m_nativeResidentBytes,
-            ::datacodec::validation::SaturatingMulU64(static_cast<std::uint64_t>(cellCount), sizeof(unsigned int)));
         return true;
     }
 
@@ -464,7 +262,7 @@ public:
     bool WritePolyhedronCellBatch(
         const std::size_t firstCell,
         const PolyhedronTopologyView& batch,
-        std::string* error = nullptr) override {
+        std::string* error = nullptr) {
         if (!SupportsPolyhedronTopology() || !HasPolyhedronData(batch)) {
             return Fail(error, "polyhedron batch requires supported target and valid batch data");
         }
@@ -480,7 +278,7 @@ public:
     }
 
     // 结束 polyhedron chunk 写入
-    bool EndPolyhedronTopology(std::string* error = nullptr) override {
+    bool EndPolyhedronTopology(std::string* error = nullptr) {
         if (!SupportsPolyhedronTopology()) {
             return Fail(error, "target mesh does not support polyhedron topology");
         }
@@ -510,93 +308,8 @@ public:
         return true;
     }
 
-    // 开始写入属性 range
-    bool BeginAttribute(
-        const std::size_t attrIndex,
-        const AttrStorageParams& meta,
-        std::string* error = nullptr) override {
-        if (m_output == nullptr || m_output->GetAttributeSet() == nullptr) {
-            return Fail(error, "attribute write requires an output object with attribute set");
-        }
-
-        const auto array = CreateArray(meta.dataType);
-        if (array == nullptr) {
-            return Fail(error, "failed to create attribute array");
-        }
-
-        array->SetDimension(std::max(meta.dimension, 1));
-        array->SetName(meta.name);
-        std::size_t localElementCount = 0u;
-        if (!::datacodec::TryParamSizeToSizeT(meta.elementCount, localElementCount)) {
-            return Fail(error, "attribute element count exceeds this platform size limit");
-        }
-        array->Resize(localElementCount);
-        m_nativeResidentBytes = ::datacodec::validation::SaturatingAddU64(
-            m_nativeResidentBytes,
-            ::datacodec::validation::SaturatingMulU64(
-                static_cast<std::uint64_t>(localElementCount),
-                ::datacodec::validation::SaturatingMulU64(
-                    static_cast<std::uint64_t>(std::max(meta.dimension, 1)),
-                    ::datacodec::DataTypeSize(meta.dataType))));
-        if (attrIndex >= m_pendingAttributes.size()) {
-            m_pendingAttributes.resize(attrIndex + 1u);
-            m_pendingAttributeMeta.resize(attrIndex + 1u);
-        }
-        m_pendingAttributes[attrIndex] = array;
-        m_pendingAttributeMeta[attrIndex] = meta;
-        return true;
-    }
-
-    // 写入属性 range
-    bool WriteAttributeRange(
-        const std::size_t attrIndex,
-        const std::size_t offset,
-        const std::size_t count,
-        const void* data,
-        const std::size_t byteSize,
-        std::string* error = nullptr) override {
-        if (attrIndex >= m_pendingAttributes.size() || attrIndex >= m_pendingAttributeMeta.size()) {
-            std::lock_guard<std::mutex> lock(m_attributeWriteErrorMutex);
-            return Fail(error, "attribute range write uses an unknown attribute index");
-        }
-        std::string copyError;
-        if (!CopyBytesToArrayRange(
-                m_pendingAttributes[attrIndex],
-                m_pendingAttributeMeta[attrIndex],
-                offset,
-                count,
-                data,
-                byteSize,
-                &copyError)) {
-            std::lock_guard<std::mutex> lock(m_attributeWriteErrorMutex);
-            return Fail(error, copyError.empty() ? "attribute range write failed" : copyError);
-        }
-        return true;
-    }
-
-    [[nodiscard]] bool SupportsAttributeDecodeStore() const noexcept override {
-        return true;
-    }
-
-    std::shared_ptr<::datacodec::bytestore::IRandomAccessByteStore> CreateAttributeDecodeStore(
-        const std::size_t attrIndex,
-        const AttrStorageParams& meta,
-        std::string* error = nullptr) override {
-        if (!BeginAttribute(attrIndex, meta, error)) {
-            return nullptr;
-        }
-        std::span<std::uint8_t> bytes;
-        if (attrIndex >= m_pendingAttributes.size() ||
-            !ResolveMutableArrayBytes(m_pendingAttributes[attrIndex], bytes, error)) {
-            return nullptr;
-        }
-        return std::make_shared<NativeArrayByteStore>(
-            m_pendingAttributes[attrIndex],
-            bytes);
-    }
-
     // 结束属性 range 写入并挂接到属性集
-    bool EndAttribute(const std::size_t attrIndex, std::string* error = nullptr) override {
+    bool EndAttribute(const std::size_t attrIndex, std::string* error = nullptr) {
         if (m_output == nullptr ||
             m_output->GetAttributeSet() == nullptr ||
             attrIndex >= m_pendingAttributes.size() ||
@@ -617,12 +330,14 @@ public:
             m_nativeAttributeIndices.resize(attrIndex + 1u, -1);
         }
         m_nativeAttributeIndices[attrIndex] = static_cast<int>(nativeIndex);
+        m_output->GetMetadata()->AddInt("DataCodec.AttributeIndex." + std::to_string(attrIndex),
+            static_cast<int>(nativeIndex));
         m_pendingAttributes[attrIndex] = nullptr;
         return true;
     }
 
     // 提交组装后的 iGame 输出对象
-    bool Commit(std::string* error = nullptr) override {
+    bool Commit(std::string* error = nullptr) {
         if (m_failed) {
             return Fail(error, m_failureMessage.empty() ? "decode adapter is in failed state" : m_failureMessage);
         }
@@ -641,126 +356,93 @@ public:
             : -1;
     }
 
-    std::uint64_t NativeResidentBytesHint() const override { return m_nativeResidentBytes; }
+    // 映射归属于本次输出对象，初始属性与补充属性使用相同发布路径
+    [[nodiscard]] static int NativeAttributeIndex(const DataObject::Pointer& output, std::size_t sourceIndex) {
+        int index = -1;
+        if (output == nullptr || output->GetMetadata() == nullptr || output->GetAttributeSet() == nullptr ||
+            !output->GetMetadata()->GetInt("DataCodec.AttributeIndex." + std::to_string(sourceIndex), index) ||
+            index < 0 || static_cast<std::size_t>(index) >= output->GetAttributeSet()->GetNumberOfAttributes()) { return -1; }
+        return index;
+    }
 
-    [[nodiscard]] std::span<const ::datacodec::BufferCapacitySample> CapacitySamples() const noexcept override {
+
+    [[nodiscard]] std::span<const ::datacodec::BufferCapacitySample> CapacitySamples() const noexcept {
         return {&m_polynomialOrdersCapacity, 1u};
     }
 
-    void ResetOutput() override {
+    void ResetOutput() {
         ReleaseOutputState();
     }
 
-    void Abort() override {
+    void Abort() {
         ReleaseOutputState();
     }
 
 private:
-    class NativeArrayByteStore final : public ::datacodec::bytestore::IRandomAccessByteStore {
-    public:
-        template<class TOwner>
-        NativeArrayByteStore(
-            TOwner owner,
-            const std::span<std::uint8_t> bytes)
-            : m_owner(std::make_shared<TOwner>(std::move(owner))), m_bytes(bytes) {}
-
-        bool AppendBytes(
-            const std::span<const std::uint8_t> bytes,
-            std::string* error = nullptr) override {
-            if (m_released || m_appendOffset > m_bytes.size() ||
-                bytes.size() > m_bytes.size() - m_appendOffset) {
-                return ::datacodec::validation::AssignError(error, "native attribute store append is outside the array range");
-            }
-            if (!bytes.empty()) {
-                std::memcpy(m_bytes.data() + m_appendOffset, bytes.data(), bytes.size());
-            }
-            m_appendOffset += bytes.size();
+    template<class TArray>
+    static bool AdoptTyped(TArray array, const ::datacodec::DecodedBuffer& buffer, int dimension,
+                           std::string* error) {
+        using Value = std::remove_pointer_t<decltype(array->RawPointer())>;
+        if (buffer.size() % sizeof(Value) != 0u) {
+            return ::datacodec::validation::AssignError(error, "decoded array has a partial scalar");
+        }
+        if (buffer.empty() && !buffer.Owner()) {
+            if constexpr (requires { array->SetDimension(dimension); }) { array->SetDimension(dimension); }
             return true;
         }
+        return array->AdoptArray(buffer.Owner(), reinterpret_cast<Value*>(const_cast<std::uint8_t*>(buffer.data())),
+            dimension, buffer.size() / sizeof(Value), buffer.capacity() / sizeof(Value)) ||
+            ::datacodec::validation::AssignError(error, "decoded array ownership is invalid");
+    }
 
-        bool Seal(std::string* error = nullptr) override {
-            if (m_released) {
-                return ::datacodec::validation::AssignError(error, "native attribute store was already released");
+    static bool AdoptAttribute(ArrayObject::Pointer array, const ::datacodec::DecodedAttribute& attribute,
+                               std::string* error) {
+        const auto adopt = [&](auto typed) { return AdoptTyped(typed, attribute.values, attribute.metadata.dimension, error); };
+        switch (attribute.metadata.dataType) {
+            case DataType::Float32: return adopt(DynamicCast<FloatArray>(array));
+            case DataType::Float64: return adopt(DynamicCast<DoubleArray>(array));
+            case DataType::Int8: return adopt(DynamicCast<CharArray>(array));
+            case DataType::UInt8: return adopt(DynamicCast<UnsignedCharArray>(array));
+            case DataType::Int16: return adopt(DynamicCast<ShortArray>(array));
+            case DataType::UInt16: return adopt(DynamicCast<UnsignedShortArray>(array));
+            case DataType::Int32: return adopt(DynamicCast<IntArray>(array));
+            case DataType::UInt32: return adopt(DynamicCast<UnsignedIntArray>(array));
+            case DataType::Int64: return adopt(DynamicCast<LongLongArray>(array));
+            case DataType::UInt64: return adopt(DynamicCast<UnsignedLongLongArray>(array));
+            default: return ::datacodec::validation::AssignError(error, "unsupported decoded attribute type");
+        }
+    }
+
+    bool ImportPolyhedron(const ::datacodec::DecodedTopology& topology, std::string* error) {
+        if (!BeginPolyhedronTopology(topology.cellCount, error)) { return false; }
+        const auto offsets = [](const ::datacodec::DecodedBuffer& counts) {
+            const auto count = counts.size() / sizeof(IndexType);
+            const auto* values = reinterpret_cast<const IndexType*>(counts.data());
+            std::vector<IndexType> result(count + 1u, 0u);
+            for (std::size_t i = 0u; i < count; ++i) {
+                if (values[i] > std::numeric_limits<IndexType>::max() - result[i]) {
+                    throw std::overflow_error("polyhedron offsets exceed index capacity");
+                }
+                result[i + 1u] = result[i] + values[i];
             }
-            return true;
-        }
-
-        bool ResizeBytes(
-            const std::uint64_t byteSize,
-            std::string* error = nullptr) override {
-            if (m_released || byteSize != static_cast<std::uint64_t>(m_bytes.size())) {
-                return ::datacodec::validation::AssignError(error, "native attribute store size does not match the array range");
-            }
-            m_appendOffset = 0u;
-            return true;
-        }
-
-        bool WriteBytesAt(
-            const std::uint64_t offset,
-            const std::span<const std::uint8_t> bytes,
-            std::string* error = nullptr) override {
-            if (m_released || offset > m_bytes.size() ||
-                bytes.size() > m_bytes.size() - static_cast<std::size_t>(offset)) {
-                return ::datacodec::validation::AssignError(error, "native attribute store write is outside the array range");
-            }
-            if (!bytes.empty()) {
-                std::memcpy(m_bytes.data() + static_cast<std::size_t>(offset), bytes.data(), bytes.size());
-            }
-            return true;
-        }
-
-        [[nodiscard]] std::uint64_t ByteSizeHint() const noexcept override {
-            return static_cast<std::uint64_t>(m_bytes.size());
-        }
-
-        [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-            return static_cast<std::uint64_t>(m_bytes.size());
-        }
-
-        [[nodiscard]] std::span<const std::uint8_t> ContiguousBytes() const noexcept override {
-            return m_released
-                ? std::span<const std::uint8_t>{}
-                : std::span<const std::uint8_t>(m_bytes.data(), m_bytes.size());
-        }
-
-        [[nodiscard]] bool CanRead() const noexcept override {
-            return !m_released;
-        }
-
-        bool Read(
-            const std::uint64_t offset,
-            const std::span<std::uint8_t> output,
-            std::string* error = nullptr) const override {
-            if (m_released || offset > m_bytes.size() ||
-                output.size() > m_bytes.size() - static_cast<std::size_t>(offset)) {
-                return ::datacodec::validation::AssignError(error, "native attribute store read is outside the array range");
-            }
-            if (!output.empty()) {
-                std::memcpy(output.data(), m_bytes.data() + static_cast<std::size_t>(offset), output.size());
-            }
-            return true;
-        }
-
-        bool CopyTo(
-            ::datacodec::bytestore::IByteWriter& writer,
-            std::string* error = nullptr) override {
-            if (m_released) {
-                return ::datacodec::validation::AssignError(error, "native attribute store was already released");
-            }
-            return writer.Write(
-                std::span<const std::uint8_t>(m_bytes.data(), m_bytes.size()),
-                error);
-        }
-
-    private:
-        std::shared_ptr<void> m_owner;
-        std::span<std::uint8_t> m_bytes;
-        std::size_t m_appendOffset{0u};
-        bool m_released{false};
-    };
+            return result;
+        };
+        const auto vertices = offsets(topology.uniqueVertexCounts);
+        const auto faces = offsets(topology.cellFaceCounts);
+        const auto faceVertices = offsets(topology.faceVertexCounts);
+        const PolyhedronTopologyView view{
+            .cellVertexOffsets = vertices.data(), .cellVertexOffsetCount = vertices.size(),
+            .cellUniqueVertexIds = reinterpret_cast<const IndexType*>(topology.cellUniqueVertexIds.data()),
+            .cellUniqueVertexIdCount = topology.cellUniqueVertexIds.size() / sizeof(IndexType),
+            .cellFaceOffsets = faces.data(), .cellFaceOffsetCount = faces.size(),
+            .faceVertexOffsets = faceVertices.data(), .faceVertexOffsetCount = faceVertices.size(),
+            .localFaceVertexIds = reinterpret_cast<const IndexType*>(topology.localFaceVertexIds.data()),
+            .localFaceVertexIdCount = topology.localFaceVertexIds.size() / sizeof(IndexType),
+        };
+        return WritePolyhedronCellBatch(0u, view, error) && EndPolyhedronTopology(error);
+    }
 
     void ReleaseOutputState() {
-        m_decodeStorageIdentity.reset();
         ResetPartialState();
         m_output = nullptr;
     }
@@ -783,9 +465,6 @@ private:
         m_cellArray = nullptr;
         m_cellTypes = nullptr;
         ReleasePolynomialOrders();
-        m_pendingPoints = nullptr;
-        m_pendingPointCount = 0u;
-        m_pointDimension = 3u;
         m_pendingAttributes.clear();
         m_pendingAttributeMeta.clear();
         m_nativeAttributeIndices.clear();
@@ -798,7 +477,6 @@ private:
         m_polyCells = nullptr;
         m_polyCellTypes = nullptr;
         m_polyCellCount = 0u;
-        m_nativeResidentBytes = 0u;
     }
 
     // 仅供 decode adapter 使用的 codec 到 iGame 枚举桥接
@@ -869,133 +547,7 @@ private:
         }
     }
 
-    static bool ResolveMutableArrayBytes(
-        const ArrayObject::Pointer& array,
-        std::span<std::uint8_t>& bytes,
-        std::string* error = nullptr) {
-        bytes = {};
-        if (array == nullptr) {
-            return ::datacodec::validation::AssignError(error, "attribute byte store requires a target array");
-        }
-        const auto resolve = [&bytes](auto typed) {
-            if (typed == nullptr) {
-                return false;
-            }
-            bytes = std::span<std::uint8_t>(
-                reinterpret_cast<std::uint8_t*>(typed->RawPointer()),
-                typed->GetNumberOfValues() * sizeof(*typed->RawPointer()));
-            return true;
-        };
-        bool resolved = false;
-        switch (array->GetArrayType()) {
-            case IG_FloatArray: resolved = resolve(DynamicCast<FloatArray>(array)); break;
-            case IG_DoubleArray: resolved = resolve(DynamicCast<DoubleArray>(array)); break;
-            case IG_CharArray: resolved = resolve(DynamicCast<CharArray>(array)); break;
-            case IG_UnsignedCharArray: resolved = resolve(DynamicCast<UnsignedCharArray>(array)); break;
-            case IG_ShortArray: resolved = resolve(DynamicCast<ShortArray>(array)); break;
-            case IG_UnsignedShortArray: resolved = resolve(DynamicCast<UnsignedShortArray>(array)); break;
-            case IG_IntArray: resolved = resolve(DynamicCast<IntArray>(array)); break;
-            case IG_UnsignedIntArray: resolved = resolve(DynamicCast<UnsignedIntArray>(array)); break;
-            case IG_LongLongArray: resolved = resolve(DynamicCast<LongLongArray>(array)); break;
-            case IG_UnsignedLongLongArray: resolved = resolve(DynamicCast<UnsignedLongLongArray>(array)); break;
-            default: break;
-        }
-        return resolved || ::datacodec::validation::AssignError(error, "attribute array type cannot expose a writable byte store");
-    }
-
     // 把解码后的原始字节拷进带类型的原生数组 range
-    static bool CopyBytesToArrayRange(
-        const ArrayObject::Pointer& array,
-        const AttrStorageParams& meta,
-        const std::size_t offset,
-        const std::size_t count,
-        const void* data,
-        const std::size_t byteSize,
-        std::string* error = nullptr) {
-        const auto fail = [error](const char* message) {
-            return ::datacodec::validation::AssignError(error, message);
-        };
-
-        if (array == nullptr) {
-            return fail("attribute range write requires a target array");
-        }
-
-        const auto componentCount = static_cast<std::size_t>(std::max(meta.dimension, 1));
-        const auto valueSize = ::datacodec::DataTypeSize(meta.dataType);
-        std::size_t tupleBytes = 0u;
-        std::size_t byteOffset = 0u;
-        std::size_t expectedBytes = 0u;
-        if (!::datacodec::validation::CheckedMulSizeT(
-                componentCount,
-                valueSize,
-                tupleBytes,
-                "attribute range write tuple bytes",
-                error) ||
-            !::datacodec::validation::CheckedMulSizeT(
-                offset,
-                tupleBytes,
-                byteOffset,
-                "attribute range write byte offset",
-                error) ||
-            !::datacodec::validation::CheckedMulSizeT(
-                count,
-                tupleBytes,
-                expectedBytes,
-                "attribute range write byte size",
-                error)) {
-            return false;
-        }
-        if (byteSize != expectedBytes) {
-            return fail("attribute range write byte size does not match metadata");
-        }
-        if (byteSize == 0u) {
-            return true;
-        }
-        if (data == nullptr) {
-            return fail("attribute range write requires input data");
-        }
-        const auto* source = static_cast<const std::uint8_t*>(data);
-
-        const auto copyRange = [byteOffset, byteSize, source, fail](auto typed) -> bool {
-            if (typed == nullptr) {
-                return fail("attribute range write array type does not match metadata");
-            }
-            const auto totalBytes = typed->GetNumberOfValues() * sizeof(*typed->RawPointer());
-            if (byteOffset > totalBytes || byteSize > totalBytes - byteOffset) {
-                return fail("attribute range write is outside the target array");
-            }
-            auto* target = reinterpret_cast<std::uint8_t*>(typed->RawPointer()) + byteOffset;
-            std::memcpy(target, source, byteSize);
-            return true;
-        };
-
-        switch (array->GetArrayType()) {
-            case IG_FloatArray:
-                return copyRange(DynamicCast<FloatArray>(array));
-            case IG_DoubleArray:
-                return copyRange(DynamicCast<DoubleArray>(array));
-            case IG_CharArray:
-                return copyRange(DynamicCast<CharArray>(array));
-            case IG_UnsignedCharArray:
-                return copyRange(DynamicCast<UnsignedCharArray>(array));
-            case IG_ShortArray:
-                return copyRange(DynamicCast<ShortArray>(array));
-            case IG_UnsignedShortArray:
-                return copyRange(DynamicCast<UnsignedShortArray>(array));
-            case IG_IntArray:
-            case IG_INTARRAY:
-                return copyRange(DynamicCast<IntArray>(array));
-            case IG_UnsignedIntArray:
-                return copyRange(DynamicCast<UnsignedIntArray>(array));
-            case IG_LongLongArray:
-                return copyRange(DynamicCast<LongLongArray>(array));
-            case IG_UnsignedLongLongArray:
-                return copyRange(DynamicCast<UnsignedLongLongArray>(array));
-            default:
-                return fail("attribute range write uses an unsupported array type");
-        }
-    }
-
     // 在尝试重建 polyhedron 之前做基础形状校验
     static bool HasPolyhedronData(const PolyhedronTopologyView& topology) {
         return topology.cellVertexOffsets != nullptr &&
@@ -1176,7 +728,6 @@ private:
     UnsignedIntArray::Pointer m_cellTypes;
     // 暂存的逐 cell 阶数流
     std::vector<std::uint16_t> m_cellPolynomialOrders;
-    std::shared_ptr<const void> m_decodeStorageIdentity{std::make_shared<unsigned char>(0u)};
     ::datacodec::BufferCapacitySample m_polynomialOrdersCapacity{"adapter.decode.polynomial_orders"};
     // 正在写入的 cell 数
     std::size_t m_pendingCellCount{0u};
@@ -1186,18 +737,10 @@ private:
     std::size_t m_pendingConnectivityCount{0u};
     // 正在写入的原生 offsets
     UnsignedIntArray::Pointer m_pendingOffsets;
-    // 正在写入的点坐标对象
-    Points::Pointer m_pendingPoints;
-    // 正在写入的点数
-    std::size_t m_pendingPointCount{0u};
-    // 点坐标 tuple 的分量数
-    std::size_t m_pointDimension{3u};
     // 正在写入的属性对象
     std::vector<ArrayObject::Pointer> m_pendingAttributes;
     // 正在写入的属性元数据
     std::vector<AttrStorageParams> m_pendingAttributeMeta;
-    // 并发 range 写入失败时串行更新 Adapter 错误状态
-    std::mutex m_attributeWriteErrorMutex;
     // DataCodec 属性索引到原生 AttributeSet 索引的稳定映射
     std::vector<int> m_nativeAttributeIndices;
     // 正在分块组装的 polyhedron 面表
@@ -1210,10 +753,6 @@ private:
     UnsignedIntArray::Pointer m_polyCellTypes;
     // polyhedron 总 cell 数
     std::size_t m_polyCellCount{0u};
-    // iGame 原生 cell type 到 DataCodec cell type token 的映射
-    iGameCellTypeMapping m_cellTypeMapping;
-    // 原生输出对象已经接收的逻辑字节估计
-    std::uint64_t m_nativeResidentBytes{0u};
     bool m_failed{false};
     std::string m_failureMessage;
 };

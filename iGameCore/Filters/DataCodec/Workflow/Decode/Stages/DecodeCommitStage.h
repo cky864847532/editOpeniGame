@@ -105,12 +105,6 @@ inline bool CommitDecodedTopologyIfPresent(
     if (workspace.topology == nullptr || !workspace.topology->complete) {
         return true;
     }
-    if (context.topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly) {
-        if (!workspace.topologyBorrowed) {
-            workspace.topology->Release();
-        }
-        return true;
-    }
     const bool retainAsTopologyReference = !workspace.topologyBorrowed &&
         context.topologyReferenceStore != nullptr &&
         !context.topologyReferenceKey.empty();
@@ -158,7 +152,8 @@ inline void CommitOutput(DecodeContext& context, DecodeLeafWorkspace& workspace)
         context.leafPackage != nullptr ? context.leafPackage->path : BlockPath{},
         context.attributeSelection,
         workspace.StorageParams().attrParams.size());
-    const auto uncommittedAttrIndices = CollectUncommittedAttributeIndices(workspace, targetAttrIndices);
+    const auto uncommittedAttrIndices = dynamic_cast<DecodedLeafBuilder*>(context.adapter)
+        ? targetAttrIndices : CollectUncommittedAttributeIndices(workspace, targetAttrIndices);
     auto stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     SubmitCommitProgress(context, 0.905, DataCodecMessageId::DecodeValidateCommit);
     if (!ValidateDecodedCacheShapesIfStrict(workspace, targetAttrIndices, &error)) {
@@ -244,7 +239,8 @@ inline void CommitAttributeOutput(DecodeContext& context, DecodeLeafWorkspace& w
         context.leafPackage != nullptr ? context.leafPackage->path : BlockPath{},
         context.attributeSelection,
         workspace.StorageParams().attrParams.size());
-    const auto uncommittedAttrIndices = CollectUncommittedAttributeIndices(workspace, targetAttrIndices);
+    const auto uncommittedAttrIndices = dynamic_cast<DecodedLeafBuilder*>(context.adapter)
+        ? targetAttrIndices : CollectUncommittedAttributeIndices(workspace, targetAttrIndices);
     std::string error;
     auto stageStart = callback::StartTiming(context.runRecords.Wants(RunRecordKind::StageTiming));
     if (!ValidateDecodedAttributeTargetsIfStrict(workspace, uncommittedAttrIndices, &error)) {
@@ -285,6 +281,7 @@ class DecodeCommitStage final : public DecodeStage {
 public:
     static constexpr std::string_view kTypeName = "DecodeCommitStage";
 
+    StageKind Kind() const noexcept override { return StageKind::Commit; }
     const char* Name() const override { return "DecodeCommitStage"; }
     [[nodiscard]] bool UsesInternalParallelism() const noexcept override { return true; }
 

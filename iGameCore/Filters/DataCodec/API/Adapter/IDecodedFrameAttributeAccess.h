@@ -3,7 +3,7 @@
 
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
-#include "DataCodec/Workflow/Session/DecodeSession.h"
+#include "DataCodec/Common/DataCodecError.h"
 
 #include <memory>
 #include <stop_token>
@@ -23,6 +23,7 @@ struct DecodedFrameAttributeResult {
     bool cancelled{false};
     std::optional<CodecFailureRecord> failure;
     std::vector<TelemetryMessageRecord> messages;
+    DecodedData output;
 };
 
 // 将完整解码帧上的属性访问与会话实现隔离
@@ -33,10 +34,10 @@ public:
 
     virtual ~IDecodedFrameAttributeAccess() = default;
 
-    [[nodiscard]] virtual DecodedFrameLease::Pointer Frame() const noexcept = 0;
+    [[nodiscard]] virtual DecodedFrame::Pointer Frame() const noexcept = 0;
     [[nodiscard]] virtual DecodedFrameCacheLookupResult FindCachedFrame(
         std::uint32_t frameIndex) const = 0;
-    [[nodiscard]] virtual Pointer ForFrame(DecodedFrameLease::Pointer frame) const = 0;
+    [[nodiscard]] virtual Pointer ForFrame(DecodedFrame::Pointer frame) const = 0;
     [[nodiscard]] virtual std::vector<DecodeAttributeDescriptor> AvailableAttributes() const = 0;
     [[nodiscard]] virtual DecodedFrameAttributeResult RequestAttributes(
         const DecodedFrameAttributeRequest& request) = 0;

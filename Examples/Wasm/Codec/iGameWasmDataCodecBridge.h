@@ -4,7 +4,7 @@
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/API/Adapter/EncodedInputTypes.h"
 #include "DataCodec/Filter/Adapter/iGameDataCodecDataObjectBridge.h"
-#include "DataCodec/Filter/Adapter/iGamePreparedSurfaceDecodeAdapter.h"
+
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 
 #include <cstdint>
@@ -17,18 +17,11 @@
 
 IGAME_NAMESPACE_BEGIN
 
-enum class iGameWasmTopologyOutputMode : std::uint8_t {
-    CommitToAdapter = 0,
-    PreparedSurface = 1,
-};
-
 struct iGameWasmDataCodecDecodeRequest {
-    std::shared_ptr<::datacodec::IByteRangeReader> inputReader;
+    ::datacodec::EncodedInput input;
     ::datacodec::DecodeSourceIdentity sourceIdentity;
     bool enableReuseCache{true};
     std::optional<bool> enableEncodedInputCache;
-    iGameWasmTopologyOutputMode topologyOutputMode{
-        iGameWasmTopologyOutputMode::CommitToAdapter};
     ::datacodec::CodecResourceParams resources{.mode = ::datacodec::CodecResourceMode::Unlimited};
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink;
 };
@@ -39,15 +32,13 @@ struct iGameWasmDataCodecDecodeResult {
     std::shared_ptr<DataCodecDataObjectDecodeSession> session;
     ::datacodec::DecodeSourceIdentity sourceIdentity;
     DataCodecDataObjectDecodeResult decodeResult;
-    ::datacodec::DecodedFrameCacheStats cacheStatsBefore;
-    ::datacodec::DecodedFrameCacheStats cacheStatsAfter;
     ::datacodec::EncodedInputCacheStats encodedInputCacheStatsBefore;
     ::datacodec::EncodedInputCacheStats encodedInputCacheStatsAfter;
     bool cacheIdentityAvailable{false};
     bool encodedInputCacheEnabled{false};
     bool diagnosticsIncomplete{false};
     std::string timingDetail;
-    std::string surfaceSummary;
+
     std::string error;
 };
 
@@ -55,7 +46,7 @@ struct iGameWasmDataCodecDecodeResult {
     std::function<void()> task);
 
 [[nodiscard]] bool ResolveiGameWasmPackageSourceIdentity(
-    ::datacodec::IByteRangeReader& reader,
+    const ::datacodec::EncodedInput& input,
     ::datacodec::DecodeSourceIdentity& sourceIdentity,
     std::string* error = nullptr);
 
@@ -70,8 +61,6 @@ struct iGameWasmDataCodecDecodeResult {
 [[nodiscard]] iGameWasmDataCodecDecodeResult DecodeiGameWasmDataCodecFile(
     const std::string& filePath,
     bool enableReuseCache = true,
-    iGameWasmTopologyOutputMode topologyOutputMode =
-        iGameWasmTopologyOutputMode::CommitToAdapter,
     std::optional<bool> enableEncodedInputCache = {},
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
     ::datacodec::DecodeSourceIdentity sourceIdentity = {},
@@ -81,8 +70,6 @@ struct iGameWasmDataCodecDecodeResult {
     std::shared_ptr<const void> inputOwner,
     std::span<const std::uint8_t> bytes,
     bool enableReuseCache = true,
-    iGameWasmTopologyOutputMode topologyOutputMode =
-        iGameWasmTopologyOutputMode::CommitToAdapter,
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
     ::datacodec::CodecResourceParams resources = {.mode = ::datacodec::CodecResourceMode::Unlimited});
 
@@ -90,8 +77,6 @@ struct iGameWasmDataCodecDecodeResult {
     std::uint32_t browserFileId,
     std::uint64_t browserFileSize,
     bool enableReuseCache = true,
-    iGameWasmTopologyOutputMode topologyOutputMode =
-        iGameWasmTopologyOutputMode::CommitToAdapter,
     std::optional<bool> enableEncodedInputCache = {},
     std::shared_ptr<::datacodec::IRunRecordSink> runRecordSink = {},
     ::datacodec::CodecResourceParams resources = {.mode = ::datacodec::CodecResourceMode::Unlimited});

@@ -195,6 +195,7 @@ public:
     AttrDecodeStage() = default;
     explicit AttrDecodeStage(FieldDecodeInput input) : m_input(input) {}
 
+    StageKind Kind() const noexcept override { return StageKind::Attribute; }
     const char* Name() const override { return "AttrDecodeStage"; }
     [[nodiscard]] bool UsesInternalParallelism() const noexcept override { return true; }
 

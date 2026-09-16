@@ -48,6 +48,9 @@ std::string_view DataCodecEnglishMessageTemplate(const DataCodecMessageId id) no
         case DataCodecMessageId::PackageDecodeCompleted: return "DataCodec package decompression completed";
         case DataCodecMessageId::PackageDecodeFailed: return "DataCodec package decompression failed";
         case DataCodecMessageId::FrameCounter: return "Frame {index}/{count}";
+        case DataCodecMessageId::UnsupportedVersion: return "File version {version} is unsupported; supported version: {supported}";
+        case DataCodecMessageId::IncompleteInput: return "The input data is incomplete";
+        case DataCodecMessageId::InvalidFormat: return "The input format is invalid";
         case DataCodecMessageId::None:
         default: return {};
     }

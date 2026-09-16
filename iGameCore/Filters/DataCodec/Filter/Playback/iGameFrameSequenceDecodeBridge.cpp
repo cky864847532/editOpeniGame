@@ -1,3 +1,4 @@
+#include "DataCodec/Filter/Adapter/iGameCellTypeMapping.h"
 #include "DataCodec/Filter/Playback/iGameFrameSequenceDecodeBridge.h"
 
 #include "DataCodec/Filter/Adapter/iGameDecodedFrameAttributeDataSource.h"
@@ -28,6 +29,10 @@ void AddFrameSequenceDecodeMessage(
         .text = std::move(text),
     };
     ::datacodec::SubmitRunMessage(runRecordSink, message);
+    if (!result.failure) {
+        result.failure = ::datacodec::MakeCodecFailureRecord(::datacodec::CodecErrorCode::DecodeFailure,
+            "sequence-bridge", "iGameFrameSequenceDecodeBridge", message.text);
+    }
     AppendRetainedTelemetryMessage(result.messages, message);
 }
 
@@ -71,16 +76,15 @@ FrameSequenceDecodeResult DecodeFrameSequence(const FrameSequenceDecodeRequest& 
     if (!playback->OpenSequence({
             .decodeSources = request.decodeSources,
             .playbackFrameOrder = request.selectedFrameOrder,
-            .assemblyFactory = std::make_shared<iGameFramePackageDecodeAssemblyFactory>(),
+            .cellTypeMapping = std::make_shared<iGameCellTypeMapping>(),
             .controlParams = request.controlParams,
-            .executionOptions = request.executionOptions,
             .configurationSource = request.configurationSource,
             .language = request.language,
             .resources = request.resources,
             .decodedFrameCachePolicy = request.decodedFrameCachePolicy,
             .encodedInputCachePolicy = request.encodedInputCachePolicy,
             .loadAllAvailableAttributes = request.loadAllAvailableAttributes,
-        }, &openError)) {
+        }, &openError, &result.failure)) {
         AddFrameSequenceDecodeMessage(
             result,
             request.runRecordSink.get(),
@@ -108,6 +112,7 @@ FrameSequenceDecodeResult DecodeFrameSequence(const FrameSequenceDecodeRequest& 
         .runRecordSink = request.runRecordSink,
     });
     result.messages = std::move(decoded.messages);
+    result.failure = decoded.failure;
     const auto output = DataObjectFromDecodedFrame(decoded.frame);
     const auto root = DynamicCast<DrawObject>(output);
     if (!decoded.success || root == nullptr) {
@@ -136,7 +141,7 @@ FrameSequenceDecodeResult DecodeFrameSequence(const FrameSequenceDecodeRequest& 
     result.success = true;
     result.output = root;
     result.attributeDataSource = std::make_shared<DecodedFrameAttributeDataSource>(
-        std::move(attributeAccess));
+        std::move(attributeAccess), output);
     return result;
 }
 

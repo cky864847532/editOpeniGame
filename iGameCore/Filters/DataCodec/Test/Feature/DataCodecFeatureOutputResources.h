@@ -138,10 +138,12 @@ inline TestResult RunDataCodecFeatureOutputResources() {
         } else {
             Require(result, copied && !segmented.CanRead() && output.size() == input.size() &&
                 std::equal(input.begin(), input.end(), output.span().begin()) &&
-                root.StorageCapacity()->Snapshot().reservedBytes == 8u &&
+                root.StorageCapacity()->Snapshot().reservedBytes == 0u &&
+                root.StorageCapacity()->AllocatedStorage().liveBytes == 0u &&
+                root.StorageCapacity()->AllocatedStorage().transferredBytes == 8u &&
                 root.StorageCapacity()->Snapshot().peakReservedBytes == 16u,
                 "output.materialize-owner",
-                "materialization must consume segments only after full admission and return the same controlled owner");
+                "materialization must admit the full output before consuming segments and transfer result ownership out of the run");
         }
     }
     for (const auto compute : {1u, 2u, 4u}) {

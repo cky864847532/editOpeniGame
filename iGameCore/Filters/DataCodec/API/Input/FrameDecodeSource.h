@@ -1,9 +1,9 @@
-#ifndef DATACODEC_WORKFLOW_FRAMESEQUENCE_FRAMEDECODESOURCE_H
-#define DATACODEC_WORKFLOW_FRAMESEQUENCE_FRAMEDECODESOURCE_H
+#ifndef DATACODEC_API_INPUT_FRAMEDECODESOURCE_H
+#define DATACODEC_API_INPUT_FRAMEDECODESOURCE_H
 
-#include "DataCodec/Storage/ByteIO/ByteRange.h"
+#include "DataCodec/API/Input/EncodedInput.h"
 #include "DataCodec/API/Adapter/DecodeCacheIdentity.h"
-#include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
+
 
 #include <cstdint>
 #include <memory>
@@ -14,9 +14,9 @@ namespace datacodec {
 struct FrameDecodeSource {
     std::uint32_t frameIndex{0u};
     float timeValue{0.0f};
-    std::shared_ptr<IByteRangeReader> frameReader;
+    EncodedInput input;
     DecodeSourceIdentity sourceIdentity;
-    std::shared_ptr<const FramePackage> framePackage;
+
 };
 
 } // namespace datacodec

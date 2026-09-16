@@ -1,6 +1,7 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #include "DataCodec/Test/Experiment/DataCodecResourcePerformance.h"
-#include "DataCodec/Workflow/FrameSequence/FrameSequenceEncodeExecutor.h"
-#include "DataCodec/Workflow/Session/PlaybackSession.h"
+#include "DataCodec/API/Entry/DataCodecFrameSequenceEncode.h"
+#include "DataCodec/API/Entry/PlaybackSession.h"
 #include <iostream>
 #include <iomanip>
 
@@ -36,78 +37,6 @@ private:
     const std::vector<TestDataset>& m_frames;
 };
 
-// 测试宿主保存输出字节，不向编解码内部注入资源设施
-class VectorOutput final : public IByteRangeOutput {
-public:
-    explicit VectorOutput(std::shared_ptr<std::vector<std::uint8_t>> bytes) : m_bytes(std::move(bytes)) {}
-    bool WriteAt(std::uint64_t offset, std::span<const std::uint8_t> bytes, std::string*) override {
-        if (offset > m_bytes->max_size() || bytes.size() > m_bytes->max_size() - offset) { return false; }
-        if (offset + bytes.size() > m_bytes->size()) { m_bytes->resize(offset + bytes.size()); }
-        std::copy(bytes.begin(), bytes.end(), m_bytes->begin() + static_cast<std::size_t>(offset));
-        return true;
-    }
-    bool Finalize(std::uint64_t size, std::string*) override {
-        if (size > m_bytes->max_size()) { return false; }
-        m_bytes->resize(size);
-        return true;
-    }
-private:
-    std::shared_ptr<std::vector<std::uint8_t>> m_bytes;
-};
-
-class Output final : public IFrameSequenceOutputSink {
-public:
-    std::array<std::shared_ptr<std::vector<std::uint8_t>>, frameCount> frames;
-    std::size_t committed{};
-    std::unique_ptr<IByteRangeOutput> OpenFrame(std::size_t ordinal, std::uint32_t, std::string*) override {
-        if (ordinal >= frames.size()) { return {}; }
-        frames[ordinal] = std::make_shared<std::vector<std::uint8_t>>();
-        return std::make_unique<VectorOutput>(frames[ordinal]);
-    }
-    bool CommitFrame(std::size_t ordinal, std::uint32_t, std::uint64_t bytes, std::string*) override {
-        if (ordinal >= frames.size() || !frames[ordinal] || frames[ordinal]->size() != bytes || bytes == 0u) { return false; }
-        ++committed;
-        return true;
-    }
-    void AbortSequence() noexcept override { frames = {}; committed = 0u; }
-};
-
-struct Payload final : IDecodedFramePayload {
-    TestDecodeAdapter data;
-    std::uint64_t ResidentSizeHint() const noexcept override {
-        std::uint64_t bytes = data.Points().size() * sizeof(float);
-        for (const auto& field : data.Attributes()) { bytes += field.bytes.size(); }
-        return bytes;
-    }
-};
-
-class Assembly final : public IDecodedFrameAssembly {
-public:
-    bool BeginFramePackage(const FramePackage&, std::string*) override {
-        m_payload = std::make_shared<::Payload>();
-        return true;
-    }
-    bool AddBranch(const FramePackageBranchRecord&, std::string*) override { return true; }
-    std::unique_ptr<IDecodeAdapter> CreateLeafAdapter(const FramePackageLeafRecord&, const LeafPackage&, std::string*) override {
-        return std::make_unique<TestDecodeAdapter>();
-    }
-    bool CommitLeaf(const FramePackageLeafRecord&, IDecodeAdapter& adapter, std::string*) override {
-        m_payload->data = std::move(static_cast<TestDecodeAdapter&>(adapter));
-        return m_payload->data.Committed();
-    }
-    bool EndFramePackage(std::string*) override { return m_payload && m_payload->data.Committed(); }
-    void AbortFramePackage() override { m_payload.reset(); }
-    std::unique_ptr<IDecodeAdapter> CreateSupplementAdapter(const BlockPath&, std::string*) const override { return {}; }
-    IDecodedFramePayload::Pointer Payload() const noexcept override { return m_payload; }
-private:
-    std::shared_ptr<::Payload> m_payload;
-};
-
-class AssemblyFactory final : public IDecodedFrameAssemblyFactory {
-public:
-    std::string CacheIdentity() const override { return "sequence-benchmark-all-attributes"; }
-    std::shared_ptr<IDecodedFrameAssembly> Create() const override { return std::make_shared<Assembly>(); }
-};
 }
 
 int main() {
@@ -146,12 +75,11 @@ int main() {
             for (std::size_t offset = 0u; offset < configs.size(); ++offset) {
                 const auto index = (iteration + offset) % configs.size();
                 const auto& config = configs[index];
-                Source source(frames);
-                Output output;
+                auto source = std::make_shared<Source>(frames);
                 const auto encodeBegin = Clock::now();
-                const auto encoded = FrameSequenceEncodeExecutor::Execute({
-                    .source = &source, .outputSink = &output, .controlParams = &control,
-                    .pipelineControl = {.pointOrder = EncodePointOrderMode::Original, .cellOrder = EncodeCellOrderMode::Original},
+                auto encoded = EncodeFrameSequence({
+                    .source = source, .configuration = {.controlParams = control,
+                    .pipelineControl = {.pointOrder = EncodePointOrderMode::Original, .cellOrder = EncodeCellOrderMode::Original}},
                     .resources = config.resources,
                 });
                 const double encodeMs = Milliseconds(encodeBegin);
@@ -164,17 +92,16 @@ int main() {
                 bool matches = true;
                 std::string error;
                 bool success = encoded.success && encoded.encodedFrameCount == frameCount &&
-                    output.committed == frameCount && referenceStages > 0;
+                    encoded.frames.size() == frameCount && referenceStages > 0;
                 if (success) {
                     PlaybackSequenceOpenRequest request;
-                    request.assemblyFactory = std::make_shared<AssemblyFactory>();
                     request.resources = config.resources;
                     request.decodedFrameCachePolicy = {.enabled = false, .prefetchEnabled = false};
                     request.encodedInputCachePolicy.enabled = false;
                     request.loadAllAvailableAttributes = true;
                     for (std::size_t f = 0u; f < frameCount; ++f) {
                         request.decodeSources.push_back({.frameIndex = static_cast<std::uint32_t>(f),
-                            .timeValue = static_cast<float>(f), .frameReader = std::make_shared<MemoryByteRangeReader>(output.frames[f]),
+                            .timeValue = static_cast<float>(f), .input = ::datacodec::EncodedInputAccess::Retain(std::make_shared<MemoryByteRangeReader>(std::move(encoded.frames[f].bytes))),
                             .sourceIdentity = {.stableId = "sequence-benchmark/frame/" + std::to_string(f), .revision = "1"}});
                         request.playbackFrameOrder.push_back(static_cast<std::uint32_t>(f));
                     }
@@ -194,8 +121,8 @@ int main() {
                         ++decodedCount;
                         cacheHits += decoded.decodedFrameCacheHit;
                         {
-                            auto payload = std::dynamic_pointer_cast<::Payload>(decoded.frame->Payload());
-                            matches &= payload && resource_experiment::Matches(frames[f], payload->data);
+                            TestDecodeAdapter consumer;
+                            matches &= decoded.frame->Data().leaves.size() == 1u && consumer.Import(decoded.frame->Data().leaves[0]) && resource_experiment::Matches(frames[f], consumer);
                         }
                         begin = Clock::now();
                         decoded.frame.reset();

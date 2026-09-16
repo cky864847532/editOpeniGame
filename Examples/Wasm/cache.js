@@ -133,6 +133,29 @@ const handleMessage = (port, message) => {
         removePage(pageId);
         return;
     }
+    if (type === 'surface-cache-statistics' || type === 'clear-surface-cache') {
+        let clearedArtifacts = 0;
+        let clearedBytes = 0;
+        if (type === 'clear-surface-cache') {
+            for (const [key, entry] of entries) {
+                if (entry.artifact) {
+                    ++clearedArtifacts;
+                    clearedBytes += Number(entry.artifactBytes || 0);
+                    entries.delete(key);
+                }
+            }
+        }
+        let residentArtifacts = 0;
+        let residentBytes = 0;
+        let pendingJobs = 0;
+        for (const entry of entries.values()) {
+            if (entry.artifact) { ++residentArtifacts; residentBytes += Number(entry.artifactBytes || 0); }
+            else { ++pendingJobs; }
+        }
+        post(port, { type: 'surface-cache-state', requestId: message.requestId,
+            residentArtifacts, residentBytes, pendingJobs, clearedArtifacts, clearedBytes });
+        return;
+    }
     const contentKey = String(message && message.contentKey || '');
     if (type === 'acquire') {
         if (!contentKey) {

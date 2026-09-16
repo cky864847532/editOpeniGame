@@ -17,7 +17,7 @@ class DecodedFrameLruCache final {
 public:
     explicit DecodedFrameLruCache(DataCodecExecutionResources* run = nullptr) noexcept : m_run(run) {}
     void SetEnabled(const bool enabled) {
-        std::vector<DecodedFrameLease::Pointer> released;
+        std::vector<DecodedFrame::Pointer> released;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_enabled = enabled;
@@ -33,7 +33,7 @@ public:
     }
 
     void Clear() {
-        std::vector<DecodedFrameLease::Pointer> released;
+        std::vector<DecodedFrame::Pointer> released;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             ClearLocked(released);
@@ -41,7 +41,7 @@ public:
     }
 
     void Configure(const std::size_t frameLimit) {
-        std::vector<DecodedFrameLease::Pointer> evicted;
+        std::vector<DecodedFrame::Pointer> evicted;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_index.Configure(frameLimit);
@@ -53,8 +53,8 @@ public:
     [[nodiscard]] DecodedFrameCacheLookupResult Find(
         const DecodedFrameKey& key,
         const DecodedFrameAccessKind accessKind) {
-        std::vector<DecodedFrameLease::Pointer> evicted;
-        DecodedFrameLease::Pointer frame;
+        std::vector<DecodedFrame::Pointer> evicted;
+        DecodedFrame::Pointer frame;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!key.source.IsStable()) {
@@ -72,7 +72,7 @@ public:
             } else {
                 if (iterator->second == nullptr ||
                     iterator->second->FrameIndex() != key.frameIndex ||
-                    iterator->second->Payload() == nullptr) {
+                    iterator->second->Data().leaves.empty()) {
                     ++m_stats.lookupErrors;
                     return DecodedFrameCacheLookupResult::Error(
                         "decoded frame cache contains an invalid frame lease");
@@ -93,15 +93,15 @@ public:
 
     [[nodiscard]] CacheStoreResult Store(
         const DecodedFrameKey& key,
-        DecodedFrameLease::Pointer frame,
+        DecodedFrame::Pointer frame,
         const DecodedFrameAccessKind accessKind) {
         if (frame == nullptr || !key.source.IsStable() ||
-            frame->FrameIndex() != key.frameIndex || frame->Payload() == nullptr) {
+            frame->FrameIndex() != key.frameIndex || frame->Data().leaves.empty()) {
             std::lock_guard<std::mutex> lock(m_mutex);
             ++m_stats.storeErrors;
             return CacheStoreResult::Error("decoded frame cache store input is invalid");
         }
-        std::vector<DecodedFrameLease::Pointer> evicted;
+        std::vector<DecodedFrame::Pointer> evicted;
         bool stored = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -145,7 +145,7 @@ public:
     }
 
     void InvalidateSource(const DecodeSourceIdentity& source) {
-        std::vector<DecodedFrameLease::Pointer> released;
+        std::vector<DecodedFrame::Pointer> released;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (auto iterator = m_frames.begin(); iterator != m_frames.end();) {
@@ -182,7 +182,7 @@ public:
 
     // 仅解除一个可选缓存引用，数据仍可由活跃消费者持有
     bool TrimOne() {
-        DecodedFrameLease::Pointer released;
+        DecodedFrame::Pointer released;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             const auto* key = m_index.LeastRecentlyUsedKey();
@@ -201,7 +201,7 @@ public:
 
 private:
     DataCodecExecutionResources* m_run{nullptr};
-    void ClearLocked(std::vector<DecodedFrameLease::Pointer>& released) {
+    void ClearLocked(std::vector<DecodedFrame::Pointer>& released) {
         released.reserve(released.size() + m_frames.size());
         for (auto& [key, frame] : m_frames) {
             (void)key;
@@ -214,7 +214,7 @@ private:
 
     void PruneLocked(
         const std::optional<DecodedFrameKey>& protectedKey,
-        std::vector<DecodedFrameLease::Pointer>& evicted) {
+        std::vector<DecodedFrame::Pointer>& evicted) {
         for (const auto& candidate : m_index.LeastRecentlyUsedOrder()) {
             if (!m_index.OverBudget()) { break; }
             if (protectedKey.has_value() && candidate == *protectedKey) { continue; }
@@ -235,7 +235,7 @@ private:
     }
 
     mutable std::mutex m_mutex;
-    std::unordered_map<DecodedFrameKey, DecodedFrameLease::Pointer, DecodedFrameKeyHash> m_frames;
+    std::unordered_map<DecodedFrameKey, DecodedFrame::Pointer, DecodedFrameKeyHash> m_frames;
     LruCacheIndex<DecodedFrameKey, DecodedFrameKeyHash> m_index;
     DecodedFrameCacheStats m_stats;
     bool m_enabled{true};

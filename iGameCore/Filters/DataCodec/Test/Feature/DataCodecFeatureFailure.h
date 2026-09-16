@@ -111,8 +111,8 @@ public:
     // 属性目标数组申请失败后继续拒绝全部申请，验证固定结果交付
     TestDataset dataset;
     dataset.pointFields.resize(1u);
-    TestEncodeAdapter adapter(dataset);
-    encode.input.adapter = &adapter;
+    auto adapter = std::make_shared<TestEncodeAdapter>(dataset);
+    encode.input.adapter = adapter;
     bool encodeReturned = false;
     {
         RejectAllocationsScope reject;

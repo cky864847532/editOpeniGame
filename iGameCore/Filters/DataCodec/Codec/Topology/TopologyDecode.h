@@ -1,7 +1,7 @@
 #ifndef DATACODEC_CODEC_TOPOLOGY_TOPOLOGYDECODE_H
 #define DATACODEC_CODEC_TOPOLOGY_TOPOLOGYDECODE_H
 
-#include "DataCodec/API/Adapter/IDecodeTopologyBlockObserver.h"
+#include "DataCodec/Codec/Topology/IDecodeTopologyBlockObserver.h"
 #include "DataCodec/Storage/ByteStore/ByteStore.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedTopologyCache.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"

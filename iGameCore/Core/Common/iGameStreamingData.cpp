@@ -210,6 +210,7 @@ void StreamingData::DisableCache() {
 
 void StreamingData::SetFrameProvider(IStreamingFrameProvider::Pointer provider) {
     m_FrameProvider = std::move(provider);
+    if (m_FrameProvider != nullptr) { m_Enable_Cache = m_FrameProvider->CacheEnabled(); }
     m_Cache_AllocatedNum.store(m_FrameProvider != nullptr
         ? static_cast<unsigned int>(m_FrameProvider->CachedFrameCount())
         : 0u);

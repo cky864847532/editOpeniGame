@@ -1,10 +1,10 @@
 #ifndef iGameIGDCFrameSequence_h
 #define iGameIGDCFrameSequence_h
 
-#include "DataCodec/Workflow/FrameSequence/FrameDecodeSource.h"
-#include "DataCodec/Storage/FramePackage/FramePackageIO.h"
+#include "DataCodec/API/Input/FrameDecodeSource.h"
+#include "DataCodec/API/Entry/InspectEncodedInput.h"
 #include "DataCodec/Storage/FramePackage/FramePackageSeries.h"
-#include "DataCodec/Storage/ByteIO/FileByteRangeIO.h"
+
 
 #include <algorithm>
 #include <cstdint>
@@ -62,28 +62,26 @@ inline bool ResolveIGDCFrameSelection(const std::vector<std::filesystem::path>& 
     sequence.framePaths.reserve(discovered.frames.size());
     sequence.decodeSources.reserve(discovered.frames.size());
     for (const auto& frame: discovered.frames) {
-        auto reader = std::make_shared<::datacodec::FileByteRangeReader>(frame.framePackagePath);
-        auto metadata = std::make_shared<::datacodec::FramePackage>();
-        if (!::datacodec::FramePackageIO::ReadMetadata(*reader, *metadata, error)) {
+        const auto input = ::datacodec::EncodedInput::File(frame.framePackagePath);
+        const auto metadata = ::datacodec::InspectEncodedInput(input);
+        if (!metadata.success || metadata.kind != ::datacodec::EncodedPackageKind::Frame) {
+            if (error) { *error = metadata.failure ? ::datacodec::FormatCodecFailure(*metadata.failure) : "expected frame package"; }
             sequence = {};
             return false;
         }
-        if (metadata->frameIndex != frame.frameIndex) {
+        if (metadata.frameIndex != frame.frameIndex) {
             if (error != nullptr) { *error = "frame package file name index does not match its metadata"; }
             sequence = {};
             return false;
         }
-        const auto sourceIdentity = ::datacodec::MakePackageDecodeSourceIdentity(
-            metadata->identity,
-            ::datacodec::framepackagewire::kFramePackageVersion,
-            reader->ByteSize());
+        const auto sourceIdentity = metadata.sourceIdentity;
         sequence.framePaths.push_back(frame.framePackagePath);
         sequence.decodeSources.push_back(::datacodec::FrameDecodeSource{
-                .frameIndex = metadata->frameIndex,
-                .timeValue = metadata->timeValue,
-                .frameReader = std::move(reader),
+                .frameIndex = metadata.frameIndex,
+                .timeValue = metadata.timeValue,
+                .input = input,
                 .sourceIdentity = sourceIdentity,
-                .framePackage = std::move(metadata),
+
         });
     }
     if (sequence.decodeSources.empty()) {

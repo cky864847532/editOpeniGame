@@ -6,6 +6,7 @@
 #include "DataCodec/Storage/FramePackage/FramePackageWireLayout.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackageWireLayout.h"
 #include "DataCodec/Storage/Package/PackageIdentity.h"
+#include "DataCodec/Common/DataCodecError.h"
 
 #include <array>
 #include <cstdint>
@@ -27,6 +28,7 @@ struct PackageInspection {
     PackageIdentity identity;
     std::uint64_t byteSize{0u};
     DecodeSourceIdentity sourceIdentity;
+    std::optional<CodecFailureRecord> failure;
 };
 
 inline bool InspectPackage(
@@ -38,11 +40,13 @@ inline bool InspectPackage(
         sizeof(std::uint32_t) + sizeof(std::uint16_t) + sizeof(std::uint64_t) * 2u;
     inspection = {};
     inspection.byteSize = reader.ByteSize();
-    if (inspection.byteSize < kFixedHeaderByteCount) {
-        if (error != nullptr) {
-            *error = "文件头不完整";
-        }
+    const auto fail = [&](CodecErrorCode code, const char* message) {
+        inspection.failure = MakeCodecFailureRecord(code, "package.header", "InspectPackage", message);
+        if (error != nullptr) { *error = message; }
         return false;
+    };
+    if (inspection.byteSize < kFixedHeaderByteCount) {
+        return fail(CodecErrorCode::IncompleteInput, "package header is incomplete");
     }
 
     std::array<std::uint8_t, kFixedHeaderByteCount> bytes{};
@@ -51,6 +55,8 @@ inline bool InspectPackage(
             std::span<std::uint8_t>(bytes),
             stop,
             error)) {
+        inspection.failure = MakeCodecFailureRecord(CodecErrorCode::IncompleteInput,
+            "package.read", "InspectPackage", error ? *error : "package header read failed", stop.stop_requested());
         return false;
     }
     std::size_t cursor = 0u;
@@ -74,11 +80,7 @@ inline bool InspectPackage(
             cursor,
             inspection.identity.low,
             error)) {
-        inspection = {};
-        if (error != nullptr) {
-            *error = "文件头不完整";
-        }
-        return false;
+        return fail(CodecErrorCode::IncompleteInput, "package header is incomplete");
     }
 
     if (inspection.magic == leafpackagewire::kLeafPackageMagic) {
@@ -86,35 +88,26 @@ inline bool InspectPackage(
     } else if (inspection.magic == framepackagewire::kFramePackageMagic) {
         inspection.format = PackageBinaryFormat::FramePackage;
     } else {
-        if (error != nullptr) {
-            *error = "格式错误";
-        }
-        return false;
+        return fail(CodecErrorCode::InvalidFormat, "package magic is invalid");
     }
     const auto expectedVersion = inspection.format == PackageBinaryFormat::LeafPackage
         ? leafpackagewire::kLeafPackageVersion
         : framepackagewire::kFramePackageVersion;
     if (inspection.version != expectedVersion) {
-        if (error != nullptr) {
-            *error = "版本不符合";
-        }
+        fail(CodecErrorCode::UnsupportedVersion, "package version is unsupported");
+        inspection.failure->actualVersion = inspection.version;
+        inspection.failure->supportedVersion = expectedVersion;
         return false;
     }
     if (!inspection.identity.IsValid()) {
-        if (error != nullptr) {
-            *error = "package identity 错误";
-        }
-        return false;
+        return fail(CodecErrorCode::InvalidFormat, "package identity is invalid");
     }
     inspection.sourceIdentity = MakePackageDecodeSourceIdentity(
         inspection.identity,
         inspection.version,
         inspection.byteSize);
     if (!inspection.sourceIdentity.IsStable()) {
-        if (error != nullptr) {
-            *error = "package identity 错误";
-        }
-        return false;
+        return fail(CodecErrorCode::InvalidFormat, "package identity is invalid");
     }
     if (error != nullptr) {
         error->clear();

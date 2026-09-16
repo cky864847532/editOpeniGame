@@ -1,7 +1,7 @@
-#ifndef DATACODEC_API_ADAPTER_IFRAMEPACKAGEDECODEASSEMBLY_H
-#define DATACODEC_API_ADAPTER_IFRAMEPACKAGEDECODEASSEMBLY_H
+#ifndef DATACODEC_WORKFLOW_DECODE_IFRAMEPACKAGEDECODEASSEMBLY_H
+#define DATACODEC_WORKFLOW_DECODE_IFRAMEPACKAGEDECODEASSEMBLY_H
 
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
 #include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
 #include "DataCodec/Storage/LeafPackage/LeafPackage.h"
 

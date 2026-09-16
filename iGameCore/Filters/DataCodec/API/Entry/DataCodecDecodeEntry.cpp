@@ -19,7 +19,7 @@ DecodePackageResult MakeDecodeEntryFailure(
 } // 匿名命名空间
 
 DecodePackageResult DecodePackageInRun(const DecodePackageRequest& request,
-    DataCodecExecutionResources& resources, DecodeSession* session) try {
+    DataCodecExecutionResources& resources, DecodeSession* session, const FramePackage* metadata) try {
     if (request.attributeSelection != AttributeSelectionMode::Explicit &&
         !request.attributeTargets.empty()) {
         return MakeDecodeEntryFailure(
@@ -35,7 +35,9 @@ DecodePackageResult DecodePackageInRun(const DecodePackageRequest& request,
             "decode.attribute-selection",
             "decode request contains an unknown attribute selection mode");
     }
-    return ExecutePackageDecodeWorkflow(request, resources, session);
+    auto result = ExecutePackageDecodeWorkflow(request, resources, session, metadata);
+    result.inputMemory = request.input.ObserveMemory();
+    return result;
 } catch (const std::bad_alloc&) {
     return MakeDecodeEntryFailure(
         CodecErrorCode::DecodeFailure, "allocation-failed", "memory allocation failed");
@@ -58,12 +60,19 @@ DecodePackageResult DecodePackage(const DecodePackageRequest& request) try {
         return MakeDecodeEntryFailure(CodecErrorCode::InvalidInput, "decode.attribute-selection",
             "decode request contains an unknown attribute selection mode");
     }
+    if (request.stopToken.stop_requested()) {
+        auto result = MakeDecodeEntryFailure(CodecErrorCode::DecodeFailure, "cancelled", "decode cancelled");
+        result.cancelled = true;
+        result.failure->cancelled = true;
+        return result;
+    }
     DataCodecExecutionResources resources(request.resources);
     if (!resources.BeginRun()) {
         DecodePackageResult result;
         result.failure = resources.FirstFailure();
         return result;
     }
+    std::stop_callback stop(request.stopToken, [&resources] { resources.RequestStop(); });
     auto result = DecodePackageInRun(request, resources, nullptr);
     if (result.failure) { resources.RecordFailure(*result.failure); }
     if (!result.success || resources.Stopped()) { resources.CancelAndWaitRun(); }
@@ -71,6 +80,8 @@ DecodePackageResult DecodePackage(const DecodePackageRequest& request) try {
         result.success = false;
         result.failure = resources.FirstFailure();
     }
+    if (!result.success) { result.output = {}; }
+    result.cancelled = result.cancelled || (result.failure && result.failure->cancelled);
     return result;
 } catch (const std::bad_alloc&) {
     return MakeDecodeEntryFailure(CodecErrorCode::DecodeFailure, "allocation-failed", "memory allocation failed");

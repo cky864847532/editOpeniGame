@@ -1,7 +1,8 @@
 #ifndef DATACODEC_WORKFLOW_FRAMESEQUENCE_FRAMESEQUENCEENCODEEXECUTOR_H
 #define DATACODEC_WORKFLOW_FRAMESEQUENCE_FRAMESEQUENCEENCODEEXECUTOR_H
 
-#include "DataCodec/API/Adapter/IBlockTreeAdapter.h"
+#include "DataCodec/API/Entry/DataCodecFrameSequenceEncode.h"
+#include "DataCodec/Storage/FramePackage/FrameSequenceFileOutput.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Storage/ByteIO/ByteRange.h"
 #include "DataCodec/Runtime/Record/RunRecordEmitter.h"
@@ -17,7 +18,9 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <limits>
 #include <new>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -25,80 +28,46 @@
 
 namespace datacodec {
 
-struct FrameSequenceEncodeFrame {
-    std::unique_ptr<IBlockTreeAdapter> blockTreeAdapter;
-    std::string rootName;
-    std::uint32_t frameIndex{0u};
-    float timeValue{0.0f};
-    std::vector<AttributeTarget> attributeTargets;
-};
-
-class IFrameSequenceEncodeSource {
-public:
-    virtual ~IFrameSequenceEncodeSource() = default;
-    [[nodiscard]] virtual std::size_t FrameCount() const noexcept = 0;
-    virtual bool LoadFrame(
-        std::size_t frameOrdinal,
-        FrameSequenceEncodeFrame& frame,
-        std::string* error = nullptr) = 0;
-};
-
-class IFrameSequenceOutputSink {
-public:
-    virtual ~IFrameSequenceOutputSink() = default;
-    [[nodiscard]] virtual std::unique_ptr<IByteRangeOutput> OpenFrame(
-        std::size_t frameOrdinal,
-        std::uint32_t frameIndex,
-        std::string* error = nullptr) = 0;
-    virtual bool CommitFrame(
-        std::size_t frameOrdinal,
-        std::uint32_t frameIndex,
-        std::uint64_t encodedByteCount,
-        std::string* error = nullptr) = 0;
-    virtual void AbortSequence() noexcept = 0;
-};
-
-struct FrameSequenceEncodeRequest {
-    IFrameSequenceEncodeSource* source{nullptr};
-    IFrameSequenceOutputSink* outputSink{nullptr};
-    const CodecControlParams* controlParams{nullptr};
-    EncodePipelineControlParams pipelineControl;
-    DataCodecEncodeConfigurationSource configurationSource;
-    DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
-    IRunRecordSink* runRecordSink{nullptr};
-    CodecResourceParams resources;
-};
-
-struct FrameSequenceEncodeResult {
-    bool success{false};
-    std::optional<CodecFailureRecord> failure;
-    std::size_t encodedFrameCount{0u};
-    std::uint64_t encodedByteCount{0u};
-    std::vector<TelemetryMessageRecord> messages;
-};
-
 class FrameSequenceEncodeExecutor final {
 public:
     [[nodiscard]] static FrameSequenceEncodeResult Execute(
         const FrameSequenceEncodeRequest& request) noexcept {
         FrameSequenceEncodeResult result;
-        if (!request.source || !request.outputSink || request.source->FrameCount() == 0u) {
+        if (!request.source || request.source->FrameCount() == 0u || request.source->FrameCount() > std::numeric_limits<std::uint32_t>::max()) {
             result.failure = MakeCodecFailureRecord(CodecErrorCode::InvalidInput,
-                "invalid-sequence-input", "FrameSequenceEncodeExecutor", "frame sequence requires a source, output sink and frames");
+                "invalid-sequence-input", "FrameSequenceEncodeExecutor", "frame sequence requires a shared source with a supported frame count");
             return result;
         }
+        std::unique_ptr<FrameSequenceFileOutput> files;
         try {
+            if (request.files) { files = std::make_unique<FrameSequenceFileOutput>(*request.files); }
+            {
             DataCodecExecutionResources resources(request.resources);
             CodecRunScope run(resources);
             if (!run) { result.failure = resources.FirstFailure(); return result; }
+            std::stop_callback stop(request.stopToken, [&resources] { resources.RequestStop(); });
             try {
-                result = ExecuteInRun(request, resources);
+                result = ExecuteInRun(request, resources, files.get());
                 if (result.failure) { resources.RecordFailure(*result.failure); }
             } catch (...) {
                 RecordExecutionException(resources, "FrameSequenceEncodeExecutor");
             }
             result.success = run.Finish(result.success);
             if (auto failure = resources.FirstFailure()) { result.failure = failure; }
+            }
+            if (request.stopToken.stop_requested()) {
+                result.success = false;
+                result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                    "sequence-cancelled", "FrameSequenceEncodeExecutor", "frame sequence cancelled before publication", true);
+            }
+            if (result.success && files) {
+                std::string error;
+                if (!files->Commit(&error)) {
+                    result.success = false;
+                    result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                        "sequence-publication", "FrameSequenceEncodeExecutor", error);
+                }
+            }
         } catch (const std::bad_alloc&) {
             result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
                 "allocation-failed", "FrameSequenceEncodeExecutor", "memory allocation failed");
@@ -109,16 +78,21 @@ public:
             result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
                 "entry-exception", "FrameSequenceEncodeExecutor", "unknown exception");
         }
-        if (!result.success && request.outputSink) { request.outputSink->AbortSequence(); }
+        if (result.failure) { result.success = false; }
+        if (!result.success) {
+            result.frames.clear();
+            result.encodedFrameCount = 0u;
+            result.encodedByteCount = 0u;
+        }
         return result;
     }
 
 private:
     static FrameSequenceEncodeResult ExecuteInRun(
-        const FrameSequenceEncodeRequest& request, DataCodecExecutionResources& resources) {
+        const FrameSequenceEncodeRequest& request, DataCodecExecutionResources& resources, FrameSequenceFileOutput* files) {
         FrameSequenceEncodeResult result;
         RunRecordDispatcher recordDispatcher;
-        recordDispatcher.AddSink(request.runRecordSink);
+        recordDispatcher.AddSink(request.runRecordSink.get());
         RunRecordEmitter runRecords;
         runRecords.Reset(
             RunRecordInfo{
@@ -126,7 +100,7 @@ private:
                 .runKind = TelemetryRunKind::Encode,
                 .objectName = "FrameSequence",
                 .meshType = "FrameSequence",
-                .language = request.language,
+                .language = request.configuration.language,
             },
             &recordDispatcher);
         runRecords.BeginRun();
@@ -150,27 +124,24 @@ private:
             AddError(result, runRecords, "frame sequence encode requires a frame source");
             return result;
         }
-        if (request.outputSink == nullptr) {
-            AddError(result, runRecords, "frame sequence encode requires an output sink");
-            return result;
-        }
         const auto frameCount = request.source->FrameCount();
         if (frameCount == 0u) {
             AddError(result, runRecords, "frame sequence encode requires at least one frame");
             return result;
         }
 
-        std::optional<CodecControlParams> defaultControlParams;
-        const auto* controlParams = request.controlParams;
-        if (!controlParams) {
-            defaultControlParams.emplace(MakeDefaultEncodeControlParams());
-            controlParams = &*defaultControlParams;
-        }
+        const auto* controlParams = &request.configuration.controlParams;
         SubmitProgress(runRecords, RunProgressPhase::Begin, 0.0, false);
         EncodeSessionWorkspace workspace;
+        std::set<std::uint32_t> frameIndices;
 
         try {
             for (std::size_t frameOrdinal = 0u; frameOrdinal < frameCount; ++frameOrdinal) {
+                if (resources.Stopped()) {
+                    result.failure = MakeCodecFailureRecord(CodecErrorCode::EncodeFailure,
+                        "sequence-cancelled", "FrameSequenceEncodeExecutor", "frame sequence cancelled", true);
+                    return result;
+                }
                 const auto frameBegin = static_cast<double>(frameOrdinal) /
                     static_cast<double>(frameCount);
                 const auto frameEnd = static_cast<double>(frameOrdinal + 1u) /
@@ -180,7 +151,7 @@ private:
                 FrameSequenceEncodeFrame frame;
                 std::string error;
                 if (!request.source->LoadFrame(frameOrdinal, frame, &error) ||
-                    frame.blockTreeAdapter == nullptr) {
+                    frame.blockTreeAdapter == nullptr || !frameIndices.insert(frame.frameIndex).second) {
                     AddError(
                         result,
                         runRecords,
@@ -189,20 +160,17 @@ private:
                     return result;
                 }
                 SubmitProgress(runRecords, RunProgressPhase::Update, loadEnd, true);
+                const auto inputMemory = ObserveInputMemory(frame.blockTreeAdapter->InputMemoryViews());
 
-                auto output = request.outputSink->OpenFrame(
-                    frameOrdinal,
-                    frame.frameIndex,
-                    &error);
-                if (output == nullptr) {
-                    AddError(
-                        result,
-                        runRecords,
-                        error.empty() ? "failed to open frame sequence output" : std::move(error));
-                    SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
-                    return result;
+                std::filesystem::path finalPath;
+                std::unique_ptr<FileByteRangeOutput> output;
+                if (files) {
+                    output = files->OpenFrame(frame.frameIndex, finalPath, &error);
+                    if (!output) {
+                        AddError(result, runRecords, error);
+                        return result;
+                    }
                 }
-
                 ProgressRangeRunRecordSink frameRecords(
                     &recordDispatcher,
                     loadEnd,
@@ -218,9 +186,9 @@ private:
                     .frameCount = static_cast<std::uint32_t>(frameCount),
                     .timeValue = frame.timeValue,
                     .controlParams = controlParams,
-                    .pipelineControl = request.pipelineControl,
-                    .configurationSource = request.configurationSource,
-                    .language = request.language,
+                    .pipelineControl = request.configuration.pipelineControl,
+                    .configurationSource = request.configuration.source,
+                    .language = request.configuration.language,
                     .runRecordSink = &frameRecords,
                     .outputSink = output.get(),
                     .attributeTargets = std::span<const AttributeTarget>(frame.attributeTargets),
@@ -245,18 +213,8 @@ private:
                     SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
                     return result;
                 }
-                if (!request.outputSink->CommitFrame(
-                        frameOrdinal,
-                        frame.frameIndex,
-                        frameResult.encodedByteCount,
-                        &error)) {
-                    AddError(
-                        result,
-                        runRecords,
-                        error.empty() ? "failed to commit frame sequence output" : std::move(error));
-                    SubmitProgress(runRecords, RunProgressPhase::Finish, 1.0, false);
-                    return result;
-                }
+                result.frames.push_back({frame.frameIndex, frame.timeValue,
+                    std::move(frameResult.encodedBytes), std::move(finalPath), inputMemory});
                 result.encodedByteCount += frameResult.encodedByteCount;
                 ++result.encodedFrameCount;
             }

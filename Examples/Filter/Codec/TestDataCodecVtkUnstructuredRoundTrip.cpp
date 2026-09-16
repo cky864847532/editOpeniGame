@@ -262,11 +262,10 @@ bool VerifyIgameDecode(
     vtkUnstructuredGrid* source,
     const ::datacodec::DataCodecDecodePackageConfigurationParams& configuration,
     std::string* error) {
-    auto inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(encodedBytes);
     iGame::iGameDecodeAdapter adapter;
     auto result = ::datacodec::DecodePackage({
-        .inputReader = inputReader,
-        .leafAdapter = &adapter,
+        .input = ::datacodec::EncodedInput::Memory(encodedBytes),
+        .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = configuration,
     });
@@ -279,6 +278,9 @@ bool VerifyIgameDecode(
         return Fail(error, message.str());
     }
 
+    if (result.output.leaves.size() != 1u || !adapter.Import(result.output.leaves.front(), false, error)) {
+        return false;
+    }
     const auto object = adapter.TakeDataObject();
     const auto mesh = iGame::DynamicCast<iGame::UnstructuredMesh>(object);
     if (mesh == nullptr || source == nullptr ||
@@ -349,7 +351,7 @@ int main(const int argc, char** argv) {
     }
 
     // Encode adapter把VTK对象桥接为DataCodec借用视图
-    auto encodeAdapter = vtk_datacodec_example::VtkDataCodecEncodeAdapter::Create(
+    std::shared_ptr<vtk_datacodec_example::VtkDataCodecEncodeAdapter> encodeAdapter = vtk_datacodec_example::VtkDataCodecEncodeAdapter::Create(
         source,
         &error);
     if (encodeAdapter == nullptr) {
@@ -358,7 +360,7 @@ int main(const int argc, char** argv) {
     }
 
     auto encodeResult = ::datacodec::Encode({
-        .input = ::datacodec::EncodeInput::LeafAdapter(encodeAdapter.get()),
+        .input = ::datacodec::EncodeInput::LeafAdapter(encodeAdapter),
         .output = ::datacodec::EncodeOutput::Memory(
             ::datacodec::EncodePackageKind::LeafPackage),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
@@ -379,15 +381,14 @@ int main(const int argc, char** argv) {
         return 1;
     }
 
-    // DecodePackage直接把同一份编码字节写入VTK decode adapter
-    auto inputReader = std::make_shared<::datacodec::MemoryByteRangeReader>(encodedBytes);
+    // 核心交付完成数组，VTK 自行接管并组装原生对象
     vtk_datacodec_example::VtkDataCodecDecodeAdapter decodeAdapter;
     const auto decodeConfiguration = ::datacodec::MakeDecodeConfigurationParams({
         .validationProfile = ::datacodec::DataCodecDecodeValidationProfile::Required,
     });
     auto decodeResult = ::datacodec::DecodePackage({
-        .inputReader = inputReader,
-        .leafAdapter = &decodeAdapter,
+        .input = ::datacodec::EncodedInput::Memory(encodedBytes),
+        .cellTypeMapping = vtk_datacodec_example::MakeVtkCellTypeMapping(),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = decodeConfiguration.PackageConfiguration(),
     });
@@ -397,6 +398,11 @@ int main(const int argc, char** argv) {
         return 1;
     }
 
+    if (decodeResult.output.leaves.size() != 1u ||
+        !decodeAdapter.Import(decodeResult.output.leaves.front(), &error)) {
+        std::cerr << error << '\n';
+        return 1;
+    }
     auto decoded = decodeAdapter.TakeOutput();
     if (decoded == nullptr || !VerifyRoundTrip(source, decoded, &error)) {
         std::cerr << (error.empty() ? "VTK round-trip verification failed" : error) << '\n';

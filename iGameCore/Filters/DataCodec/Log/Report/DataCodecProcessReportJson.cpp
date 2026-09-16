@@ -120,12 +120,6 @@ void WriteReportConfigurationJson(
     return mode == DecodeValidationMode::Strict ? "Strict" : "Required";
 }
 
-[[nodiscard]] const char* TopologyDecodeOutputModeReportName(
-        const TopologyDecodeOutputMode mode) noexcept {
-    return mode == TopologyDecodeOutputMode::ObserverOnly
-        ? "ObserverOnly"
-        : "CommitToAdapter";
-}
 
 [[nodiscard]] const char* TemporalPredictorSearchStrategyReportName(
         const TemporalPredictorSearchStrategy strategy) noexcept {
@@ -331,8 +325,6 @@ DataCodecReportConfiguration MakeDataCodecDecodeReportConfiguration(
             DataCodecReportConfigurationSection{
                 .name = "execution",
                 .values = {
-                    {"topologyOutputMode", TopologyDecodeOutputModeReportName(
-                        configuration.execution.topologyOutputMode)},
                     {"loadAllAvailableAttributes", loadAllAvailableAttributes},
                 },
             },

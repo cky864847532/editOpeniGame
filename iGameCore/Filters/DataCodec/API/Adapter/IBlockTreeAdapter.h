@@ -29,6 +29,18 @@ struct IBlockTreeAdapter {
 
     [[nodiscard]] virtual std::string GetRootName() const { return {}; }
 
+    [[nodiscard]] virtual std::vector<InputMemoryView> InputMemoryViews() const {
+        std::vector<InputMemoryView> views;
+        EnumerateLeafPaths([&](const BlockPath& path) {
+            const auto leaf = GetLeaf(path);
+            if (leaf) {
+                auto ranges = leaf->InputMemoryViews();
+                views.insert(views.end(), ranges.begin(), ranges.end());
+            }
+        });
+        return views;
+    }
+
     [[nodiscard]] virtual std::vector<BlockTreeLeafRecord> GetLeafRecords() const {
         std::vector<BlockTreeLeafRecord> leaves;
         EnumerateLeafPaths([&leaves](const BlockPath& path) {

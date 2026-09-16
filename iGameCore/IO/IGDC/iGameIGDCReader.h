@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace datacodec { class MemoryByteRangeReader; }
+
 
 IGAME_NAMESPACE_BEGIN
 
@@ -59,6 +59,7 @@ public:
 
     const std::vector<::datacodec::TelemetryMessageRecord>& GetMessages() const;
     [[nodiscard]] bool DiagnosticsIncomplete() const noexcept;
+    [[nodiscard]] std::optional<::datacodec::CodecFailureRecord> GetFailure() const;
 
 protected:
     IGDCReader();
@@ -71,7 +72,8 @@ private:
     DataObject::Pointer m_DecodedOutput;
     std::optional<std::uint32_t> m_requestedFrameIndex;
     std::unique_ptr<State> m_state;
-    std::shared_ptr<::datacodec::MemoryByteRangeReader> m_memoryInput;
+    ::datacodec::EncodedInput m_memoryInput;
+    std::span<const std::uint8_t> m_memoryBytes;
 
     bool DecodeInput();
     void RecordMessage(

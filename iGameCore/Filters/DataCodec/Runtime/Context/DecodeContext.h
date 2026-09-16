@@ -2,8 +2,7 @@
 #define DATACODEC_RUNTIME_CONTEXT_DECODECONTEXT_H
 
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
-#include "DataCodec/API/Adapter/IDecodeTopologyBlockObserver.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Runtime/Failure/FailureCleanable.h"
@@ -54,8 +53,6 @@ struct DecodeContext : IFailureCleanable {
     RunRecordEmitter runRecords;
     RunEndRecord runSummary;
     TelemetryMemoryTraceRecorder* memoryTrace{nullptr};
-    TopologyDecodeOutputMode topologyOutputMode{TopologyDecodeOutputMode::CommitToAdapter};
-    std::shared_ptr<IDecodeTopologyBlockObserver> topologyBlockObserver;
 
     // 校验必要字段并初始化运行记录，调用前需先设置各字段
     DecodeContextInitializeResult Initialize(IRunRecordSink* recordSink) {
@@ -79,10 +76,6 @@ struct DecodeContext : IFailureCleanable {
         }
         if (leafPackage == nullptr) {
             return {false, "DataCodec decode context requires an leaf package"};
-        }
-        if (topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly &&
-            topologyBlockObserver == nullptr) {
-            return {false, "observer-only topology decode requires a topology observer"};
         }
         return {};
     }

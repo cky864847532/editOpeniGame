@@ -51,6 +51,9 @@ enum class DataCodecMessageId : std::uint16_t {
     PackageDecodeCompleted,
     PackageDecodeFailed,
     FrameCounter,
+    UnsupportedVersion,
+    IncompleteInput,
+    InvalidFormat,
 };
 
 [[nodiscard]] const char* DataCodecMessageIdName(DataCodecMessageId id) noexcept;

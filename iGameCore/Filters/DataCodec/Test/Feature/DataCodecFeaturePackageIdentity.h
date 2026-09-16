@@ -118,13 +118,14 @@ inline void RunMultiLeafOwnerCase(TestResult& result) {
             root.StorageCapacity()->Snapshot().reservedBytes == payloadBytes + frameBytes,
             "packageIdentity.multi-leaf-output-overlap", "exact complete output and all retained leaf inputs must coexist at their measured capacities");
         auto owner = std::make_shared<const EncodedBuffer>(output.TakeBytes());
+        const std::weak_ptr<const EncodedBuffer> outputLifetime = owner;
         writers.clear();
         std::uint64_t remaining = payloadBytes;
         for (std::size_t i = 0u; i < leaves.size(); ++i) {
             leaves[i].reset();
             if (i != 2u) { remaining -= sizes[i]; }
             Require(result, weak[i].expired() == (i != 2u) &&
-                root.StorageCapacity()->Snapshot().reservedBytes == remaining + frameBytes,
+                root.StorageCapacity()->Snapshot().reservedBytes == remaining,
                 "packageIdentity.multi-leaf-retire-" + std::to_string(i),
                 "each final leaf reference must release its own capacity while an external consumer remains valid");
         }
@@ -147,10 +148,10 @@ inline void RunMultiLeafOwnerCase(TestResult& result) {
         owner.reset();
         reader.reset();
         Require(result, replayed && scope.Finish(written) &&
-            root.StorageCapacity()->Snapshot().reservedBytes == frameBytes,
-            "packageIdentity.parsed-ranges-share-output", "parsed field ranges must retain exactly one complete output after the request and original reader retire");
+            root.StorageCapacity()->Snapshot().reservedBytes == 0u && !outputLifetime.expired(),
+            "packageIdentity.parsed-ranges-share-output", "parsed field ranges must retain the transferred output without retaining execution capacity");
         parsed.clear();
-        Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+        Require(result, root.StorageCapacity()->Snapshot().reservedBytes == 0u && outputLifetime.expired(),
             "packageIdentity.parsed-ranges-final-release", "the final parsed range must release the complete encoded buffer");
     }
 }
@@ -279,9 +280,11 @@ inline void RunMultiLeafOwnerCase(TestResult& result) {
         "mismatched package version was accepted");
     Require(
         result,
-        versionMismatchError == "版本不符合",
+        versionMismatchInspection.failure && versionMismatchInspection.failure->code == CodecErrorCode::UnsupportedVersion &&
+        versionMismatchInspection.failure->actualVersion == 2u &&
+        versionMismatchInspection.failure->supportedVersion == leafpackagewire::kLeafPackageVersion,
         "packageIdentity.versionMismatchError",
-        "package version rejection did not use the unified version message");
+        "package version rejection did not report structured version details");
 
     const auto sourceIdentity = MakePackageDecodeSourceIdentity(
         first,

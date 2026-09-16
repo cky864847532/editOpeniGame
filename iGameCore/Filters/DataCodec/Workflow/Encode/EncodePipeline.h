@@ -160,19 +160,19 @@ private:
         std::vector<EncodeStageId>& stageIds) {
         switch (control.codec) {
             case IntraFieldReferenceCodec::Affine:
-                stageIds.push_back(MakeEncodeStageId(
+                stageIds.push_back(MakeEncodeStageId(StageKind::IntraAffine,
                     control.selectionMode == ReferenceSelectionMode::Forced
                         ? "ReferenceEncode.AttributeIntra.AffineSpatialBlock.Forced"
                         : "ReferenceEncode.AttributeIntra.AffineSpatialBlock.Auto"));
                 return;
             case IntraFieldReferenceCodec::Wavelet:
-                stageIds.push_back(MakeEncodeStageId(
+                stageIds.push_back(MakeEncodeStageId(StageKind::IntraWavelet,
                     control.selectionMode == ReferenceSelectionMode::Forced
                         ? "ReferenceEncode.AttributeIntra.WaveletSpatialBlock.Forced"
                         : "ReferenceEncode.AttributeIntra.WaveletSpatialBlock.Auto"));
                 return;
             case IntraFieldReferenceCodec::Predictor:
-                stageIds.push_back(MakeEncodeStageId(
+                stageIds.push_back(MakeEncodeStageId(StageKind::IntraPredictor,
                     control.selectionMode == ReferenceSelectionMode::Forced
                         ? "ReferenceEncode.AttributeIntra.PredictorSpatialBlock.Forced"
                         : "ReferenceEncode.AttributeIntra.PredictorSpatialBlock.Auto"));
@@ -190,13 +190,13 @@ private:
         if (domain == "Attribute") {
             switch (control.codec) {
                 case TemporalFieldReferenceCodec::Wavelet:
-                    stageIds.push_back(MakeEncodeStageId(
+                    stageIds.push_back(MakeEncodeStageId(StageKind::AttributeTemporalWavelet,
                         control.selectionMode == ReferenceSelectionMode::Forced
                             ? "ReferenceEncode.AttributeTemporal.WaveletSpatialBlock.Forced"
                             : "ReferenceEncode.AttributeTemporal.WaveletSpatialBlock.Auto"));
                     return;
                 case TemporalFieldReferenceCodec::Predictor:
-                    stageIds.push_back(MakeEncodeStageId(
+                    stageIds.push_back(MakeEncodeStageId(StageKind::AttributeTemporalPredictor,
                         control.selectionMode == ReferenceSelectionMode::Forced
                             ? "ReferenceEncode.AttributeTemporal.PredictorSpatialBlock.Forced"
                             : "ReferenceEncode.AttributeTemporal.PredictorSpatialBlock.Auto"));
@@ -208,13 +208,13 @@ private:
         }
         switch (control.codec) {
             case TemporalFieldReferenceCodec::Wavelet:
-                stageIds.push_back(MakeEncodeStageId(
+                stageIds.push_back(MakeEncodeStageId(StageKind::GeometryTemporalWavelet,
                     control.selectionMode == ReferenceSelectionMode::Forced
                         ? "ReferenceEncode.GeometryTemporal.WaveletSpatialBlock.Forced"
                         : "ReferenceEncode.GeometryTemporal.WaveletSpatialBlock.Auto"));
                 return;
             case TemporalFieldReferenceCodec::Predictor:
-                stageIds.push_back(MakeEncodeStageId(
+                stageIds.push_back(MakeEncodeStageId(StageKind::GeometryTemporalPredictor,
                     control.selectionMode == ReferenceSelectionMode::Forced
                         ? "ReferenceEncode.GeometryTemporal.PredictorSpatialBlock.Forced"
                         : "ReferenceEncode.GeometryTemporal.PredictorSpatialBlock.Auto"));
@@ -255,11 +255,11 @@ private:
     static void AppendResolvedPackageStageIds(
         const EncodePipelineDescriptor& descriptor,
         std::vector<EncodeStageId>& stageIds) {
-        stageIds.push_back(MakeEncodeStageId(
+        stageIds.push_back(MakeEncodeStageId(StageKind::PackageField,
             descriptor.packageFields.mode == PackageFieldEncodingMode::Zstd
                 ? "PackageFieldZstd.Streaming"
                 : "PackageFieldRaw.Streaming"));
-        stageIds.push_back(MakeEncodeStageId(
+        stageIds.push_back(MakeEncodeStageId(StageKind::PackageAssembly,
             descriptor.outputKind == EncodePipelineOutputKind::EncodedLeafFieldBundle
                 ? "PackageAssembly.EncodedLeafFieldBundle"
                 : "PackageAssembly.LeafPackage"));
@@ -314,7 +314,7 @@ private:
                 }
                 *recorded = true;
                 stageExecutions.push_back(EncodeStageExecutionRecord{
-                    .stageId = MakeEncodeStageId(stageName),
+                    .stageId = MakeEncodeStageId(StageKind::Reference, stageName),
                     .status = EncodeStageExecutionStatus::Completed,
                 });
                 context.AddInfo(stageName, "stage result=Completed");
@@ -407,7 +407,7 @@ private:
                         ? "PackageFieldZstd.Streaming"
                         : "PackageFieldRaw.Streaming";
                 result.stageExecutions.push_back(EncodeStageExecutionRecord{
-                    .stageId = MakeEncodeStageId(packageFieldStage),
+                    .stageId = MakeEncodeStageId(StageKind::PackageField, packageFieldStage),
                     .status = EncodeStageExecutionStatus::Completed,
                 });
                 context.AddInfo(packageFieldStage, "stage result=Completed");
@@ -416,7 +416,7 @@ private:
                 ? "PackageAssembly.EncodedLeafFieldBundle"
                 : "PackageAssembly.LeafPackage";
             result.stageExecutions.push_back(EncodeStageExecutionRecord{
-                .stageId = MakeEncodeStageId(assemblyName),
+                .stageId = MakeEncodeStageId(StageKind::PackageAssembly, assemblyName),
                 .status = EncodeStageExecutionStatus::Completed,
             });
             context.AddInfo(assemblyName, "stage result=Completed");
@@ -663,26 +663,28 @@ private:
             return;
         }
         DataCodecMessageId messageId{DataCodecMessageId::None};
-        if (context.adapter != nullptr) {
-            switch (context.adapter->GetEncodeStatusInfo(stageId.name).kind) {
-                case EncodeAdapterStatusKind::Sorting:
+        {
+            switch (stageId.kind) {
+                case StageKind::PointRemap:
+                case StageKind::CellRemap:
                     messageId = DataCodecMessageId::EncodeSorting;
                     break;
-                case EncodeAdapterStatusKind::TopologyCompression:
+                case StageKind::Topology:
                     messageId = DataCodecMessageId::EncodeTopology;
                     break;
-                case EncodeAdapterStatusKind::GeometryCompression:
+                case StageKind::Geometry:
                     messageId = DataCodecMessageId::EncodeGeometry;
                     break;
-                case EncodeAdapterStatusKind::AttributeCompression:
+                case StageKind::PointAttribute:
+                case StageKind::CellAttribute:
                     messageId = DataCodecMessageId::EncodeAttribute;
                     break;
-                case EncodeAdapterStatusKind::None:
+                case StageKind::Other:
                 default:
                     break;
             }
         }
-        if ((stageId.name == "PointAttributeStage" || stageId.name == "CellAttributeStage") &&
+        if ((stageId.kind == StageKind::PointAttribute || stageId.kind == StageKind::CellAttribute) &&
             stageId.index < workspace.StorageParams().attrParams.size()) {
             const auto& attributeName = workspace.StorageParams().attrParams[stageId.index].name;
             if (attributeName.empty()) {
@@ -974,24 +976,13 @@ private:
         std::size_t cellRemapConsumers{0};
     };
 
-    static bool IsPointSpatialPartitionStage(const std::string_view stageName) {
-        return stageName.starts_with(PointRemapStage::kTypeName);
+    static bool IsPointRemapConsumer(const StageKind kind) {
+        return kind == StageKind::Geometry || kind == StageKind::CellRemap ||
+            kind == StageKind::Topology || kind == StageKind::PointAttribute;
     }
 
-    static bool IsCellSpatialPartitionStage(const std::string_view stageName) {
-        return stageName.starts_with(CellRemapStage::kTypeName);
-    }
-
-    static bool IsPointRemapConsumer(const std::string_view stageName) {
-        return stageName == "GeometryStage" ||
-            IsCellSpatialPartitionStage(stageName) ||
-            stageName == "TopoStage" ||
-            stageName == "PointAttributeStage";
-    }
-
-    static bool IsCellRemapConsumer(const std::string_view stageName) {
-        return stageName == "TopoStage" ||
-            stageName == "CellAttributeStage";
+    static bool IsCellRemapConsumer(const StageKind kind) {
+        return kind == StageKind::Topology || kind == StageKind::CellAttribute;
     }
 
     static void RecordAttributeEncodeTiming(
@@ -1028,11 +1019,11 @@ private:
         const std::vector<EncodeStageNode>& stageNodes) {
         EncodeResourceReleaseTracker tracker;
         for (const auto& stageNode : stageNodes) {
-            const auto stageName = stageNode.stage->Id().name;
-            if (IsPointRemapConsumer(stageName)) {
+            const auto kind = stageNode.stage->Kind();
+            if (IsPointRemapConsumer(kind)) {
                 ++tracker.pointRemapConsumers;
             }
-            if (IsCellRemapConsumer(stageName)) {
+            if (IsCellRemapConsumer(kind)) {
                 ++tracker.cellRemapConsumers;
             }
         }
@@ -1044,7 +1035,7 @@ private:
         EncodeLeafWorkspace& workspace,
         EncodeResourceReleaseTracker& tracker,
         const EncodeStageId& stageId) {
-        if (IsPointRemapConsumer(stageId.name) && tracker.pointRemapConsumers > 0u) {
+        if (IsPointRemapConsumer(stageId.kind) && tracker.pointRemapConsumers > 0u) {
             --tracker.pointRemapConsumers;
             if (tracker.pointRemapConsumers == 0u) {
                 RecordPointRemapLog(context, workspace);
@@ -1052,12 +1043,12 @@ private:
             }
         }
 
-        if (IsPointSpatialPartitionStage(stageId.name) && tracker.pointRemapConsumers == 0u) {
+        if (stageId.kind == StageKind::PointRemap && tracker.pointRemapConsumers == 0u) {
             RecordPointRemapLog(context, workspace);
             (void)workspace.ReleasePointRemap();
         }
 
-        if (IsCellRemapConsumer(stageId.name) && tracker.cellRemapConsumers > 0u) {
+        if (IsCellRemapConsumer(stageId.kind) && tracker.cellRemapConsumers > 0u) {
             --tracker.cellRemapConsumers;
             if (tracker.cellRemapConsumers == 0u) {
                 RecordCellRemapLog(context, workspace);
@@ -1065,7 +1056,7 @@ private:
             }
         }
 
-        if (stageId.name == "GeometryStage") {
+        if (stageId.kind == StageKind::Geometry) {
             (void)workspace.ReleaseGeometrySource();
         }
     }

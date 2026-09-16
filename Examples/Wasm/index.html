@@ -425,11 +425,15 @@
             };
             if (singleFrameBenchmarkMode) {
                 log('[Benchmark] cross-page and persistent reuse disabled');
-                return { acquire: async () => localLease };
+                return { acquire: async () => localLease,
+                    clear: async () => ({ available: false }),
+                    statistics: async () => ({ available: false }) };
             }
             if (typeof SharedWorker !== 'function') {
                 log('[Cross-page cache] SharedWorker unavailable');
-                return { acquire: async () => localLease };
+                return { acquire: async () => localLease,
+                    clear: async () => ({ available: false }),
+                    statistics: async () => ({ available: false }) };
             }
             const pageId = typeof crypto.randomUUID === 'function'
                 ? crypto.randomUUID()
@@ -499,6 +503,14 @@
             window.addEventListener('beforeunload', disconnect, { once: true });
 
             return {
+                async statistics() {
+                    await ready;
+                    return request('surface-cache-statistics');
+                },
+                async clear() {
+                    await ready;
+                    return request('clear-surface-cache');
+                },
                 async acquire(contentKey) {
                     try {
                         await ready;
@@ -796,6 +808,26 @@
                     }
                 },
 
+                async statistics() {
+                    const state = { supported, residentArtifacts: 0, residentBytes: 0 };
+                    if (!supported) return state;
+                    let directory;
+                    try { directory = await openCacheDirectory(false); }
+                    catch (error) { if (error && error.name === 'NotFoundError') return state; throw error; }
+                    if (!directory) return state;
+                    for await (const [, entry] of directory.entries()) {
+                        if (entry.kind !== 'directory') continue;
+                        try {
+                            const metadata = await readMetadata(entry);
+                            const bytes = Number(metadata.residentBytes);
+                            if (Number.isSafeInteger(bytes) && bytes >= 0) {
+                                ++state.residentArtifacts;
+                                state.residentBytes += bytes;
+                            }
+                        } catch (_) {}
+                    }
+                    return state;
+                },
                 async remove(contentKey) {
                     await removeEntry(contentKey);
                 },
@@ -822,6 +854,16 @@
 
         const persistentSurfaceCache = createPersistentSurfaceCache();
         window.igamePersistentSurfaceCache = persistentSurfaceCache;
+        window.igameSurfaceCaches = Object.freeze({
+            clearShared: () => crossPageDecodeCoordinator
+                ? crossPageDecodeCoordinator.clear() : Promise.resolve({ available: false }),
+            clearPersistent: () => persistentSurfaceCache.clear(),
+            statistics: async () => ({
+                shared: crossPageDecodeCoordinator
+                    ? await crossPageDecodeCoordinator.statistics() : { available: false },
+                persistent: await persistentSurfaceCache.statistics(),
+            }),
+        });
 
         const armPostLoadRenderTiming = (modelId, requestStartedAt = null) => {
             postLoadRenderTiming = {
@@ -1982,7 +2024,23 @@
                     log('viewer cleared');
                 });
 
-                document.getElementById('btnRefreshScalarList').addEventListener('click', refreshScalarList);
+                document.getElementById('btnRefreshScalarList').addEventListener('click', async () => {
+                    const modelId = Number(document.getElementById('modelList').value);
+                    if (!modelId || wasmAsyncCallActive) { return; }
+                    try {
+                        const capabilities = JSON.parse(api.getModelCapabilitiesJson(modelId));
+                        if (!capabilities.rawData && capabilities.canRestoreRawData) {
+                            wasmAsyncCallActive = true;
+                            applyCodecStartupResources();
+                            const restored = await Module.ccall('igameRestoreIgcRawData', 'number',
+                                ['number'], [modelId], { async: true });
+                            if (!restored) { throw new Error(api.getLastErrorJson()); }
+                        }
+                        refreshScalarList();
+                        startRenderLoop();
+                    } catch (error) { log(`original data restoration failed: ${errorText(error)}`); }
+                    finally { wasmAsyncCallActive = false; }
+                });
                 document.getElementById('autoRangeMode').addEventListener('change', (event) => {
                     const label = autoRangeModeLabel(Number(event.target.value));
                     document.getElementById('autoRangeStatus').textContent = `${label} · Apply Scalar`;
@@ -2489,6 +2547,15 @@
                         if (!modelId) {
                             throw new Error(`${cacheLabel} surface import failed: ${api.getLastErrorJson()}`);
                         }
+                        const originalFileId = browserFiles.register(file);
+                        try {
+                            if (!Module.ccall('igameAttachIgcSource', 'number',
+                                ['number', 'number', 'number'], [modelId, originalFileId, file.size])) {
+                                const sourceError = api.getLastErrorJson();
+                                api.removeModel(modelId);
+                                throw new Error(sourceError);
+                            }
+                        } finally { browserFiles.release(originalFileId); }
                         const artifactBytes = artifact.positions.byteLength +
                             artifact.triangles.byteLength + artifact.edgeMasks.byteLength;
                         log(`[${cacheLabel} surface cache] loaded modelId=${modelId} elapsed=${importElapsed.toFixed(2)} ms bytes=${artifactBytes}`);

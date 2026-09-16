@@ -10,6 +10,9 @@ IGAME_NAMESPACE_BEGIN
 
 class IGDCAttributeDataSource final : public IAttributeDataSource {
 public:
+    IGDCAttributeDataSource() = default;
+    explicit IGDCAttributeDataSource(DataCodecDataObjectDecodeSession session)
+        : m_session(std::move(session)) {}
     bool Open(const std::string& filePath, std::string* error = nullptr);
 
     [[nodiscard]] DataObject::Pointer RootObject() const override;

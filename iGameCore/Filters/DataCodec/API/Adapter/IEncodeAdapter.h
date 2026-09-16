@@ -3,34 +3,23 @@
 
 #include "DataCodec/Common/Views/ArrayViews.h"
 #include "DataCodec/Common/Views/BufferCapacitySample.h"
+#include "DataCodec/Common/Views/InputMemoryView.h"
 #include "DataCodec/Common/Views/AttributeViews.h"
 #include "DataCodec/Common/Views/TopologyViews.h"
 #include "DataCodec/API/Adapter/ICellTypeMapping.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Validation/Common/DataCodecValidation.h"
-#include "DataCodec/Codec/Topology/Common/CellTypeCodec.h"
 
 #include <cstddef>
 #include <cstring>
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 namespace datacodec {
-
-enum class EncodeAdapterStatusKind : std::uint8_t {
-    None = 0,
-    Sorting,
-    TopologyCompression,
-    GeometryCompression,
-    AttributeCompression,
-};
-
-struct EncodeAdapterStatusInfo {
-    EncodeAdapterStatusKind kind{EncodeAdapterStatusKind::None};
-};
 
 struct IEncodeAttrView {
     virtual ~IEncodeAttrView() = default;
@@ -51,25 +40,40 @@ struct IEncodeAttrView {
     virtual std::size_t GetElementCount() const = 0;
     // 连续紧凑数组的快速路径；返回空表示走逐 tuple 回退路径
     virtual const void* TryGetRawPtr() const { return nullptr; }
-    // 当拿不到连续原始内存时使用的通用逐 tuple 读取路径
-    virtual void GetTuple(std::size_t index, double* output) const = 0;
-    // 按属性自身标量类型写出 tuple 字节
+    // 默认只描述可读取字节，完整分配容量由了解宿主数组的适配器补充
+    virtual InputMemoryView InputMemory() const {
+        const auto components = GetComponentCount();
+        if (components <= 0) { return {}; }
+        const auto width = static_cast<std::uint64_t>(components) * ScalarTypeSize(ToScalarType(GetDataType()));
+        if (width && GetElementCount() > std::numeric_limits<std::uint64_t>::max() / width) {
+            throw std::overflow_error("attribute input byte range overflows");
+        }
+        return {TryGetRawPtr(), 0u, GetElementCount() * width, {}};
+    }
+    // 按属性自身标量类型读取，非连续输入必须实现精确的字节 getter
     virtual bool GetTupleBytes(std::size_t index, void* output, std::string* error = nullptr) const {
         if (!IsDataTypeSupported()) {
             return validation::AssignError(error, "attribute scalar type is unsupported");
         }
         const auto componentCount = GetComponentCount();
-        if (componentCount <= 0) {
-            return true;
+        if (componentCount <= 0 || index >= GetElementCount() || output == nullptr) {
+            return validation::AssignError(error, "attribute tuple byte getter received an invalid range");
         }
-        std::vector<double> tuple(static_cast<std::size_t>(componentCount), 0.0);
-        GetTuple(index, tuple.data());
-        return WriteDoubleTupleAsScalarBytes(
-            ToScalarType(GetDataType()),
-            tuple.data(),
-            static_cast<std::size_t>(componentCount),
-            output,
-            error);
+        const auto* raw = static_cast<const std::uint8_t*>(TryGetRawPtr());
+        if (raw == nullptr) {
+            return validation::AssignError(error, "non-contiguous attributes require a typed byte getter");
+        }
+        const auto scalarBytes = ScalarTypeSize(ToScalarType(GetDataType()));
+        const auto maximum = std::numeric_limits<std::size_t>::max();
+        if (scalarBytes == 0u || static_cast<std::size_t>(componentCount) > maximum / scalarBytes) {
+            return validation::AssignError(error, "attribute tuple byte size overflows");
+        }
+        const auto tupleBytes = static_cast<std::size_t>(componentCount) * scalarBytes;
+        if (GetElementCount() > maximum / tupleBytes) {
+            return validation::AssignError(error, "attribute byte range overflows");
+        }
+        std::memcpy(output, raw + index * tupleBytes, tupleBytes);
+        return true;
     }
 
     // 构建 DataCodec 属性输入视图，优先借用连续内存
@@ -495,9 +499,6 @@ struct IEncodeAdapter
     }
     // 当前网格名称，主要用于报告和调试
     virtual std::string GetName() const = 0;
-    // 根据 DataCodec 阶段名返回 adapter 可展示的状态信息
-    virtual EncodeAdapterStatusInfo GetEncodeStatusInfo(std::string_view) const { return {}; }
-
     // 由第三方 adapter 指定 raw type 的编码信息
     bool ResolveCellType(CellTypeRaw, CellTypeCodecEntry& entry) const override {
         entry = {};
@@ -574,6 +575,46 @@ struct IEncodeAdapter
     // 供报告使用的可选源数据元数据
     virtual std::int64_t GetSourceByteSizeHint() const { return -1; }
     virtual std::string GetSourceLocationHint() const { return {}; }
+
+    // 只读取元数据与现有数组地址，getter 的宿主分配容量保持未知
+    [[nodiscard]] virtual std::vector<InputMemoryView> InputMemoryViews() const {
+        std::vector<InputMemoryView> views;
+        const auto append = [&views](const void* identity, std::uint64_t count, std::uint64_t width) {
+            if (width && count > std::numeric_limits<std::uint64_t>::max() / width) {
+                throw std::overflow_error("input byte range overflows");
+            }
+            if (count != 0u) { views.push_back({identity, 0u, count * width, {}}); }
+        };
+        const auto* f32 = TryGetPointsF32();
+        const auto* f64 = f32 ? nullptr : TryGetPointsF64();
+        append(f32 ? static_cast<const void*>(f32) : f64, GetNumberOfPoints(),
+            3u * ScalarTypeSize(f32 ? ScalarType::Float32 : f64 ? ScalarType::Float64 : GetPointScalarType()));
+        TopologyInputDescriptor topology;
+        if (DescribeTopology(topology)) {
+            if (topology.polyhedron) {
+                // 多面体 getter 可能构建转换数组，观察过程不调用这些 getter
+                views.push_back({nullptr, 0u, 0u, {}});
+            } else if (!topology.structured) {
+                append(topology.connectivity == TopologyValueSource::CompactArray ? GetCellIdBufferPtr() : nullptr,
+                    topology.connectivityCount, sizeof(IndexType));
+                if (topology.cellSize == TopologyCellSizeSource::Offsets && topology.cellCount) {
+                    append(topology.offsets == TopologyValueSource::CompactArray ? GetCellIdOffsetPtr() : nullptr,
+                        topology.cellCount + 1u, sizeof(IndexType));
+                }
+                if (TopologyValueSourceProvidesStream(topology.cellTypes)) {
+                    append(topology.cellTypes == TopologyValueSource::CompactArray ? GetCellTypesPtr() : nullptr,
+                        topology.cellCount, sizeof(IndexType));
+                }
+                if (TopologyValueSourceProvidesStream(topology.cellPolynomialOrders)) {
+                    append(topology.cellPolynomialOrders == TopologyValueSource::CompactArray ? GetCellPolynomialOrdersPtr() : nullptr,
+                        topology.cellCount, sizeof(std::uint16_t));
+                }
+            }
+        }
+        for (std::size_t i = 0u; i < GetNumberOfPointAttrs(); ++i) { views.push_back(GetPointAttr(i).InputMemory()); }
+        for (std::size_t i = 0u; i < GetNumberOfCellAttrs(); ++i) { views.push_back(GetCellAttr(i).InputMemory()); }
+        return views;
+    }
 
     // 仅返回显式接入数组的确定容量取样，未知宿主存储不纳入
     [[nodiscard]] virtual std::span<const BufferCapacitySample> CapacitySamples() const noexcept { return {}; }

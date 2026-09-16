@@ -2,6 +2,7 @@
 #define DATACODEC_WORKFLOW_DECODE_PACKAGEDECODEWORKFLOW_H
 
 #include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/Common/DataCodecCallback.h"
 #include "DataCodec/Runtime/Execution/DataCodecExecutionResources.h"
@@ -32,6 +33,13 @@
 #include <vector>
 
 namespace datacodec {
+
+struct ResolvedDecodeRequest : DecodePackageRequest {
+    IDecodeAdapter* leafAdapter{nullptr};
+    IFramePackageDecodeAssembly* frameAssembly{nullptr};
+    std::shared_ptr<IByteRangeReader> inputReader;
+    const FramePackage* framePackageMetadata{nullptr};
+};
 
 inline constexpr const char* kPackageDecodeWorkflowOrigin = "PackageDecodeWorkflow";
 
@@ -90,7 +98,7 @@ inline void SubmitDecodePackageProgress(
 
 [[nodiscard]] inline DecodePackageResult DecodeLeafPackage(
     const LeafPackage& leafPackage,
-    const DecodePackageRequest& request,
+    const ResolvedDecodeRequest& request,
     IRunRecordSink* runRecordSink,
     RunRecordEmitter& packageRecords,
     DecodeSession& session,
@@ -120,7 +128,6 @@ inline void SubmitDecodePackageProgress(
         .attributeSelection = request.attributeSelection,
         .attributeTargets = std::span<const AttributeTarget>(request.attributeTargets),
         .controlParams = request.configuration.controlParams,
-        .execution = request.configuration.execution,
         .configurationSource = request.configuration.source,
         .language = request.configuration.language,
         .runRecordSink = runRecordSink,
@@ -138,7 +145,7 @@ inline void SubmitDecodePackageProgress(
 }
 
 [[nodiscard]] inline DecodePackageResult DecodeLeafByteRange(
-    const DecodePackageRequest& request,
+    const ResolvedDecodeRequest& request,
     RunRecordEmitter& packageRecords,
     IRunRecordSink* leafRunRecordSink,
     DataCodecExecutionResources& resources,
@@ -178,7 +185,7 @@ inline void SubmitDecodePackageProgress(
 
 [[nodiscard]] inline DecodePackageResult DecodeFramePackage(
     const FramePackage& framePackage,
-    const DecodePackageRequest& request,
+    const ResolvedDecodeRequest& request,
     RunRecordEmitter& packageRecords,
     IRunRecordSink* leafRunRecordSink,
     DataCodecExecutionResources& resources,
@@ -381,7 +388,7 @@ inline void SubmitDecodePackageProgress(
 }
 
 [[nodiscard]] inline DecodePackageResult ExecutePackageDecodeWorkflowUnchecked(
-    const DecodePackageRequest& request,
+    const ResolvedDecodeRequest& request,
     RunRecordEmitter& packageRecords,
     IRunRecordSink* leafRunRecordSink,
     DataCodecExecutionResources& resources,
@@ -395,6 +402,7 @@ inline void SubmitDecodePackageProgress(
         request.inputReader.get());
     if (!inputValidation) {
         DecodePackageResult result;
+        result.failure = MakeCodecFailureRecord(inputValidation.code, "input.validation", "DecodePackage", inputValidation.message);
         AddDecodePackageMessage(
             result,
             packageRecords,
@@ -422,6 +430,7 @@ inline void SubmitDecodePackageProgress(
     }();
     if (!inspected) {
         DecodePackageResult result;
+        result.failure = packageInspection.failure;
         result.inputBytes = request.inputReader->ByteSize();
         AddDecodePackageMessage(
             result,
@@ -478,7 +487,7 @@ inline void SubmitDecodePackageProgress(
 [[nodiscard]] inline DecodePackageResult ExecutePackageDecodeWorkflow(
     const DecodePackageRequest& request,
     DataCodecExecutionResources& resources,
-    DecodeSession* runSession) {
+    DecodeSession* runSession, const FramePackage* metadata) {
     RunRecordDispatcher recordDispatcher;
     recordDispatcher.AddSink(request.runRecordSink);
     if (!request.outputSinks.Empty()) {
@@ -520,12 +529,28 @@ inline void SubmitDecodePackageProgress(
     };
     DecodePackageResult result;
     try {
+        ResolvedDecodeRequest resolved;
+        static_cast<DecodePackageRequest&>(resolved) = request;
+        resolved.inputReader = EncodedInputAccess::Open(request.input);
+        resolved.framePackageMetadata = metadata;
+        DecodedLeafBuilder leaf(request.cellTypeMapping);
+        DecodedDataBuilder frame(request.cellTypeMapping);
+        resolved.leafAdapter = &leaf;
+        resolved.frameAssembly = &frame;
         result = ExecutePackageDecodeWorkflowUnchecked(
-            request,
+            resolved,
             packageRecords,
             &leafRunRecords,
             resources,
             runSession);
+        if (result.success) {
+            if (result.decodedFramePackage) {
+                result.output = std::move(frame.output);
+            } else {
+                result.output.frameIndex = request.requestedFrameIndex.value_or(0u);
+                result.output.leaves.push_back(std::move(leaf.output));
+            }
+        }
     } catch (const std::bad_alloc&) {
         if (!result.failure) {
             result.failure = MakeCodecFailureRecord(

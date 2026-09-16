@@ -1,3 +1,4 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #include "DataCodec/Runtime/Execution/DataCodecCpuController.h"
 #include "DataCodec/Runtime/Execution/DataCodecResourceController.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"
@@ -117,9 +118,10 @@ TestResult RunDataCodecCpuControlTests() {
             if (threads == CodecThreadMode::Fixed) { resources.maxComputeThreads = 1u; }
             else { resources.targetCpuIdleRatio = 0.0; }
             if (memory == CodecResourceMode::Fixed) { resources.ownedStorageLimitBytes = 128u * 1024u * 1024u; }
-            TestEncodeAdapter encoder(data);
+            auto encoderOwner = std::make_shared<TestEncodeAdapter>(data);
+            auto& encoder = *encoderOwner;
             EncodeRequest request;
-            request.input = EncodeInput::LeafAdapter(&encoder, {}, data.name, "PointSet");
+            request.input = EncodeInput::LeafAdapter(encoderOwner, {}, data.name, "PointSet");
             request.output = EncodeOutput::Memory(EncodePackageKind::LeafPackage);
             request.attributeSelection = AttributeSelectionMode::AllAvailable;
             request.resources = resources;
@@ -128,12 +130,12 @@ TestResult RunDataCodecCpuControlTests() {
             if (!Require(result, encoded.success, "cpu.mode-matrix.encode", "thread/memory mode encode failed")) { continue; }
             TestDecodeAdapter decoder;
             DecodePackageRequest decode;
-            decode.inputReader = std::make_shared<MemoryByteRangeReader>(
-                std::make_shared<const EncodedBuffer>(std::move(encoded.encodedBytes)));
-            decode.leafAdapter = &decoder;
+            decode.input = ::datacodec::EncodedInputAccess::Retain(std::make_shared<MemoryByteRangeReader>(
+                std::make_shared<const EncodedBuffer>(std::move(encoded.encodedBytes))));
             decode.attributeSelection = AttributeSelectionMode::AllAvailable;
             decode.resources = resources;
             const auto decoded = DecodePackage(decode);
+            if (decoded.success && decoded.output.leaves.size() == 1u) { decoder.Import(decoded.output.leaves.front()); }
             AppendCodecMessages(result, decoded.messages);
             check(decoded.success && decoder.Committed() && decoder.Points() == data.points &&
                 decoder.Attributes().size() == data.pointFields.size(), "cpu.mode-matrix.roundtrip");

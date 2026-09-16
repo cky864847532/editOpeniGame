@@ -1,16 +1,16 @@
 #ifndef DATACODEC_API_ENTRY_DATACODECDECODEENTRY_H
 #define DATACODEC_API_ENTRY_DATACODECDECODEENTRY_H
 
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
-#include "DataCodec/API/Adapter/IFramePackageDecodeAssembly.h"
+#include "DataCodec/API/Adapter/ICellTypeMapping.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
 #include "DataCodec/API/Output/DataCodecOutputSinks.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/Common/DataCodecTypes.h"
 #include "DataCodec/Common/DataCodecError.h"
 #include "DataCodec/API/Params/CodecResourceParams.h"
-#include "DataCodec/Storage/ByteIO/ByteRange.h"
-#include "DataCodec/Storage/FramePackage/FramePackageFormat.h"
+#include "DataCodec/API/Input/EncodedInput.h"
+#include "DataCodec/API/Output/DecodedData.h"
+
 
 #include <cstdint>
 #include <memory>
@@ -24,10 +24,9 @@ namespace datacodec {
 class DecodeSession;
 
 struct DecodePackageRequest {
-    std::shared_ptr<IByteRangeReader> inputReader;
-    const FramePackage* framePackageMetadata{nullptr};
-    IDecodeAdapter* leafAdapter{nullptr};
-    IFramePackageDecodeAssembly* frameAssembly{nullptr};
+    EncodedInput input;
+
+    std::shared_ptr<const ICellTypeMapping> cellTypeMapping;
     std::optional<std::uint32_t> requestedFrameIndex;
     AttributeSelectionMode attributeSelection{AttributeSelectionMode::AllAvailable};
     std::vector<AttributeTarget> attributeTargets;
@@ -48,6 +47,8 @@ struct DecodePackageResult {
     std::uint64_t inputBytes{0u};
     std::vector<TelemetryMessageRecord> messages;
     std::optional<CodecFailureRecord> failure;
+    DecodedData output;
+    InputMemoryObservation inputMemory;
 };
 
 [[nodiscard]] DecodePackageResult DecodePackage(const DecodePackageRequest& request);

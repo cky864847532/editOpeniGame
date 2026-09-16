@@ -1,3 +1,4 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #include <CGNS/iGameCGNSReader.h>
 #include "DataCodec/API/Entry/DataCodecEncodeEntry.h"
 #include "DataCodec/API/Entry/DecodeStorageAnalysis.h"
@@ -124,7 +125,7 @@ int main(int argc, char** argv) {
             }
             auto reader = std::make_shared<::datacodec::FileByteRangeReader>(argv[2]);
             const auto start = Clock::now();
-            const auto analysis = datacodec::AnalyzeDecodeStorage({.inputReader = reader, .adapterBackedAttributes = true, .adapterBackedGeometry = true, .adapterBackedConnectivity = true});
+            const auto analysis = datacodec::AnalyzeDecodeStorage({.input = ::datacodec::EncodedInputAccess::Retain(reader),});
             if (!analysis.success) {
                 std::cerr << (analysis.failure ? datacodec::FormatCodecFailure(*analysis.failure) : "analysis cancelled") << '\n';
                 return 5;
@@ -136,7 +137,6 @@ int main(int argc, char** argv) {
             std::cout << "STORAGE_ANALYSIS bytes=" << floor << " seconds=" << Seconds(start)
                 << " stage=" << analysis.peakStage << " frame=" << analysis.peakFrameIndex
                 << " leaf=" << analysis.peakLeafPath << " leaves=" << analysis.inspectedLeafCount << std::endl;
-            std::cout << "COUNT_SCAN milliseconds=" << analysis.polyhedronCountScanMilliseconds << std::endl;
             for (std::size_t i = 0; i < analysis.peakBytesByKind.size(); ++i) {
                 std::cout << "STORAGE_PART kind=" << i << " bytes=" << analysis.peakBytesByKind[i] << std::endl;
             }
@@ -148,8 +148,8 @@ int main(int argc, char** argv) {
             iGame::iGameFramePackageDecodeAssembly assembly;
             Memory("before_bounded_decode");
             const auto decodeStart = Clock::now();
-            const auto decoded = datacodec::DecodePackageInRun({.inputReader = reader,
-                .leafAdapter = &adapter, .frameAssembly = &assembly,
+            const auto decoded = datacodec::DecodePackageInRun({.input = ::datacodec::EncodedInputAccess::Retain(reader),
+                .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
                 .runRecordSink = std::make_shared<Records>()}, root, &session);
             const auto decodeSeconds = Seconds(decodeStart);
             const auto storage = root.StorageCapacity()->Snapshot();
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
                 if (decoded.failure) { std::cerr << datacodec::FormatCodecFailure(*decoded.failure) << '\n'; }
                 return 5;
             }
-            Describe(decoded.decodedFramePackage ? assembly.Output() : adapter.TakeDataObject(), "bounded_decoded");
+            Describe(decoded.success && assembly.Import(decoded.output) ? assembly.Output() : iGame::DataObject::Pointer{}, "bounded_decoded");
             return storage.peakReservedBytes <= limit ? 0 : 6;
         }
         if (argc == 3 && (std::string_view(argv[1]) == "--decode" || std::string_view(argv[1]) == "--surface")) {
@@ -187,14 +187,14 @@ int main(int argc, char** argv) {
             Memory("before_decode");
             const auto start = Clock::now();
             iGame::DataCodecDataObjectDecodeRequest request;
-            request.inputReader = std::make_shared<::datacodec::FileByteRangeReader>(argv[2]);
+            request.input = ::datacodec::EncodedInput::File(argv[2]);
             request.loadAllAvailableAttributes = true;
             request.runRecordSink = std::make_shared<Records>();
             if (surface) { request.resources.mode = datacodec::CodecResourceMode::Unlimited; }
             const auto decoded = iGame::DecodeDataCodecDataObject(request);
             const auto decodeSeconds = Seconds(start);
             std::cout << "RESULT decode_success=" << decoded.success << " decode_seconds=" << decodeSeconds
-                      << " decoded_cache_hit=" << decoded.decodedFrameCacheHit << std::endl;
+                      << std::endl;
             Memory("after_decode");
             if (!decoded.success || decoded.output == nullptr) {
                 for (const auto& m : decoded.messages) { std::cerr << m.code << ' ' << m.text << ' ' << m.technicalDetail << '\n'; }
@@ -293,19 +293,18 @@ int main(int argc, char** argv) {
         start = Clock::now();
         std::cout << "BEGIN encode" << std::endl;
         {
-            ::datacodec::FileByteRangeOutput sink(output);
             datacodec::EncodeRequest request;
-            std::unique_ptr<iGame::iGameBlockTreeAdapter> tree;
-            std::unique_ptr<iGame::iGameEncodeAdapter> leaf;
+            std::shared_ptr<iGame::iGameBlockTreeAdapter> tree;
+            std::shared_ptr<iGame::iGameEncodeAdapter> leaf;
             const auto kind = iGame::ResolveDataCodecEncodePackageKind(source);
             if (kind == datacodec::EncodePackageKind::FramePackage) {
-                tree = std::make_unique<iGame::iGameBlockTreeAdapter>(source);
-                request.input = datacodec::EncodeInput::BlockTreeAdapter(tree.get(), source->GetName());
+                tree = std::make_shared<iGame::iGameBlockTreeAdapter>(source);
+                request.input = datacodec::EncodeInput::BlockTreeAdapter(tree, source->GetName());
             } else {
-                leaf = std::make_unique<iGame::iGameEncodeAdapter>(source);
-                request.input = datacodec::EncodeInput::LeafAdapter(leaf.get());
+                leaf = std::make_shared<iGame::iGameEncodeAdapter>(source);
+                request.input = datacodec::EncodeInput::LeafAdapter(leaf);
             }
-            request.output = datacodec::EncodeOutput::ByteRange(sink, kind);
+            request.output = datacodec::EncodeOutput::File(output, kind);
             request.runRecordSink = records;
             request.resources = resources;
             encoded = datacodec::Encode(request);
@@ -330,14 +329,14 @@ int main(int argc, char** argv) {
         start = Clock::now();
         std::cout << "BEGIN decode" << std::endl;
         iGame::DataCodecDataObjectDecodeRequest request;
-        request.inputReader = std::make_shared<::datacodec::FileByteRangeReader>(output);
+        request.input = ::datacodec::EncodedInput::File(output);
         request.loadAllAvailableAttributes = true;
         request.runRecordSink = records;
         request.resources = resources;
         const auto decoded = iGame::DecodeDataCodecDataObject(request);
         const auto decodeSeconds = Seconds(start);
         std::cout << "RESULT decode_success=" << decoded.success << " decode_seconds=" << decodeSeconds
-                  << " decoded_cache_hit=" << decoded.decodedFrameCacheHit << std::endl;
+                  << std::endl;
         Memory("after_decode");
         if (!decoded.success || decoded.output == nullptr) {
             for (const auto& m : decoded.messages) { std::cerr << m.code << ' ' << m.text << ' ' << m.technicalDetail << '\n'; }

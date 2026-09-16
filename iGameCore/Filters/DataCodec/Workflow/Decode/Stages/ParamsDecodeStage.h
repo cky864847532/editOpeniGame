@@ -23,6 +23,7 @@ public:
     ParamsDecodeStage() = default;
     explicit ParamsDecodeStage(FieldDecodeInput input) : m_input(input) {}
 
+    StageKind Kind() const noexcept override { return StageKind::Parameters; }
     const char* Name() const override { return "ParamsDecodeStage"; }
 
     // 先解析 params field，后续 stage 才知道缓冲区尺寸和 codec 类型

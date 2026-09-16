@@ -58,45 +58,9 @@ inline GeometryDecodeResult MakeGeometryDecodeFailure(
     return CodecStatus::Failure(code, std::move(message));
 }
 
-template<typename TValue>
-inline bool ConvertGeometryPointValues(
-    const std::span<const std::uint8_t> raw,
-    FixedScratchBuffer& converted, std::string* error) {
-    if (raw.size() % sizeof(TValue) != 0u) {
-        return validation::AssignError(error, "geometry source has an incomplete numeric value");
-    }
-    const auto count = raw.size() / sizeof(TValue);
-    std::size_t bytes = 0u;
-    if (!validation::CheckedMulSizeT(count, sizeof(float), bytes, "converted geometry values", error)) { return false; }
-    converted.Bytes().resize(bytes);
-    const auto* source = reinterpret_cast<const TValue*>(raw.data());
-    auto* target = reinterpret_cast<float*>(converted.Bytes().data());
-    for (std::size_t i = 0u; i < count; ++i) { target[i] = static_cast<float>(source[i]); }
-    return true;
-}
-
-inline bool ConvertGeometryPointBlock(
-    const DataType type, const std::span<const std::uint8_t> raw,
-    FixedScratchBuffer& converted, std::string* error) {
-    switch (type) {
-        case DataType::Float32: return true;
-        case DataType::Float64: return ConvertGeometryPointValues<double>(raw, converted, error);
-        case DataType::Int8: return ConvertGeometryPointValues<std::int8_t>(raw, converted, error);
-        case DataType::UInt8: return ConvertGeometryPointValues<std::uint8_t>(raw, converted, error);
-        case DataType::Int16: return ConvertGeometryPointValues<std::int16_t>(raw, converted, error);
-        case DataType::UInt16: return ConvertGeometryPointValues<std::uint16_t>(raw, converted, error);
-        case DataType::Int32: return ConvertGeometryPointValues<std::int32_t>(raw, converted, error);
-        case DataType::UInt32: return ConvertGeometryPointValues<std::uint32_t>(raw, converted, error);
-        case DataType::Int64: return ConvertGeometryPointValues<std::int64_t>(raw, converted, error);
-        case DataType::UInt64: return ConvertGeometryPointValues<std::uint64_t>(raw, converted, error);
-        default: return validation::AssignError(error, "geometry value type is unsupported");
-    }
-}
-
 struct GeometryDecodedBlock {
     NumericArrayBlockHeader header;
     FixedScratchBuffer raw;
-    FixedScratchBuffer converted;
     std::optional<numericarray::NumericArrayBlockCapacitySamples> capacitySamples;
 };
 
@@ -115,7 +79,6 @@ inline bool ComputeGeometryDecodedBlock(
     }
     output.header = input.header;
     output.raw = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.raw));
-    output.converted = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.converted));
     auto& decoded = output.raw.Bytes();
     if (input.header.codecId == NumericArrayReferenceCodecId::NonReference) {
         if (input.header.referenceKind != NumericArrayReferenceKind::None ||
@@ -154,16 +117,9 @@ inline bool ComputeGeometryDecodedBlock(
         decoded.size() != expected) {
         return validation::AssignError(error, "geometry decoded block does not match its logical shape");
     }
-    if (!ConvertGeometryPointBlock(params.dataType, output.raw.Span(), output.converted, error)) {
-        return false;
-    }
     if (params.capacitySamples != nullptr) {
         params.capacitySamples->Observe(numericarray::NumericBufferSample::Output, output.raw.Bytes());
-        if (params.dataType != DataType::Float32) {
-            params.capacitySamples->Observe(numericarray::NumericBufferSample::Converted, output.converted.Bytes());
-        }
     }
-    if (params.dataType != DataType::Float32 && runtime.cache.referenceCache == nullptr) { output.raw.Release(); }
     return true;
 }
 
@@ -206,7 +162,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
     auto phase = WaitForHeavyPhase(root);
     if (!phase) { return detail::MakeGeometryDecodeFailure(CodecErrorCode::PipelineFailure, "geometry preparation was stopped"); }
     // 完整目标在块流前取得容量，两个真实数组分别持有 owner
-    if (!geometry.Initialize(params.elementCount, params.componentCount, runtime.cache.byteStoreSession, &error, runtime.cache.destination) ||
+    if (!geometry.Initialize(params.elementCount, params.componentCount, params.dataType, runtime.cache.byteStoreSession, &error, runtime.cache.destination) ||
         (referenceCache != nullptr &&
             !referenceCache->BeginGeometry(meta, runtime.cache.byteStoreSession, &error))) {
         geometry.Release();
@@ -234,7 +190,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
     std::size_t sourceTupleBytes = 0u, targetTupleBytes = 0u;
     if (!validation::CheckedMulSizeT(params.componentCount, params.valueSize, sourceTupleBytes,
             "geometry source tuple", &error) ||
-        !validation::CheckedMulSizeT(params.componentCount, sizeof(float), targetTupleBytes,
+        !validation::CheckedMulSizeT(params.componentCount, params.valueSize, targetTupleBytes,
             "geometry output tuple", &error)) {
         geometry.Release();
         if (referenceCache != nullptr) { referenceCache->Reset(); }
@@ -274,7 +230,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
                     offset += count;
                 }
             }
-            const auto points = params.dataType == DataType::Float32 ? output.raw.Span() : output.converted.Span();
+            const auto points = output.raw.Span();
             std::uint64_t byteOffset = 0u;
             if (!validation::CheckedMulU64(committedElements, targetTupleBytes, byteOffset,
                     "geometry output offset", &error)) { return false; }
@@ -293,7 +249,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
             const auto* referenceMeta = runtime.data.keyFrameReference && runtime.data.keyFrameReference->store
                 ? &runtime.data.keyFrameReference->store->StorageParams() : nullptr;
             nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, meta.blockLayouts[cursor.nextBlock],
-                referenceMeta, true);
+                referenceMeta, false);
             return nextMemory;
         });
     if (!success) {

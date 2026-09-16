@@ -1,7 +1,7 @@
 #ifndef DATACODEC_CODEC_TOPOLOGY_POLYHEDRON_POLYHEDRONTOPOLOGYEMIT_H
 #define DATACODEC_CODEC_TOPOLOGY_POLYHEDRON_POLYHEDRONTOPOLOGYEMIT_H
 
-#include "DataCodec/API/Adapter/IDecodeAdapter.h"
+#include "DataCodec/Workflow/Decode/IDecodeAdapter.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedIndexCache.h"
 #include "DataCodec/Runtime/Cache/CacheResources.h"
 #include "DataCodec/Runtime/Execution/ParallelExecution.h"

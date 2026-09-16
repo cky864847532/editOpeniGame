@@ -1,4 +1,6 @@
+#include "DataCodec/API/Entry/InspectEncodedInput.h"
 #include "iGameIGDCReader.h"
+#include "iGameIGDCAttributeDataSource.h"
 
 #include "DataCodec/Filter/Output/iGameDataCodecOutputBinding.h"
 #include "DataCodec/Filter/Telemetry/iGameDataCodecTelemetryCapture.h"
@@ -236,7 +238,6 @@ std::string WriteDecodeReports(
 struct IGDCReader::State {
     bool hasCodecParams{false};
     ::datacodec::DecodeControlParams codecParams;
-    ::datacodec::DecodeExecutionOptions executionOptions;
     ::datacodec::DataCodecDecodeConfigurationSource configurationSource;
     ::datacodec::CodecResourceParams resources;
     std::vector<::datacodec::TelemetryMessageRecord> messages;
@@ -251,6 +252,7 @@ struct IGDCReader::State {
     AttributeDataSourcePointer attributeDataSource;
     bool loadAllAvailableAttributes{true};
     bool diagnosticsIncomplete{false};
+    std::optional<::datacodec::CodecFailureRecord> failure;
 };
 
 IGDCReader::Pointer IGDCReader::New() {
@@ -262,20 +264,19 @@ IGDCReader::Pointer IGDCReader::New() {
     using namespace ::datacodec;
     try {
         DecodeStorageAnalysisRequest request{
-            .inputReader = std::make_shared<::datacodec::FileByteRangeReader>(path),
+            .input = EncodedInput::File(path),
             .attributeSelection = loadAllAttributes ? AttributeSelectionMode::AllAvailable : AttributeSelectionMode::None,
-            .adapterBackedAttributes = true, .adapterBackedGeometry = true, .adapterBackedConnectivity = true,
             .stopToken = stop,
         };
-        PackageInspection inspection;
+        const auto inspection = InspectEncodedInput(request.input, stop);
         std::string error;
-        if (!InspectPackage(*request.inputReader, inspection, &error, stop)) { throw std::runtime_error(error); }
-        if (inspection.format == PackageBinaryFormat::FramePackage) {
+        if (!inspection.success) { return {.failure = inspection.failure}; }
+        if (inspection.kind == EncodedPackageKind::Frame) {
             IGDCFrameSequence sequence;
             if (!ResolveIGDCFrameSequence(path, sequence, &error)) { throw std::runtime_error(error); }
             request.frameIndex = sequence.entryFrameIndex;
             for (const auto& source : sequence.decodeSources) {
-                if (source.frameIndex != sequence.entryFrameIndex) { request.referenceReaders.push_back(source.frameReader); }
+                if (source.frameIndex != sequence.entryFrameIndex) { request.referenceInputs.push_back(source.input); }
             }
         }
         return AnalyzeDecodeStorage(request);
@@ -308,7 +309,6 @@ void IGDCReader::SetDecodeControls(
     auto& state = *m_state;
     state.hasCodecParams = true;
     state.codecParams = definition.controlParams;
-    state.executionOptions = definition.execution;
     state.decodedFrameCachePolicy = definition.decodedFrameCachePolicy;
     state.encodedInputCachePolicy = definition.encodedInputCachePolicy;
     state.configurationSource = definition.source;
@@ -365,16 +365,19 @@ const std::vector<::datacodec::TelemetryMessageRecord>& IGDCReader::GetMessages(
     return m_state != nullptr ? m_state->messages : empty;
 }
 
+std::optional<::datacodec::CodecFailureRecord> IGDCReader::GetFailure() const { return m_state->failure; }
+
 bool IGDCReader::DiagnosticsIncomplete() const noexcept {
     return m_state->diagnosticsIncomplete;
 }
 
 void IGDCReader::SetMemoryInput(
     std::shared_ptr<const void> owner, const std::span<const std::uint8_t> bytes) {
-    auto input = std::make_shared<::datacodec::MemoryByteRangeReader>(std::move(owner), bytes);
+    auto input = ::datacodec::EncodedInput::Memory(std::move(owner), bytes);
     FileReader::SetMemoryBuffer(bytes.data(), bytes.size());
     m_UseMemoryBuffer = true;
     m_memoryInput = std::move(input);
+    m_memoryBytes = bytes;
 }
 
 bool IGDCReader::Execute() {
@@ -419,6 +422,7 @@ bool IGDCReader::DecodeInput() {
     m_DecodedOutput = nullptr;
     m_FileSize = 0u;
     state.messages.clear();
+    state.failure.reset();
     state.attributeDataSource.reset();
     state.diagnosticsIncomplete = false;
 
@@ -469,7 +473,6 @@ bool IGDCReader::DecodeInput() {
         .controlParams = state.hasCodecParams
             ? state.codecParams
             : ::datacodec::MakeDefaultDecodeControlParams(),
-        .execution = state.executionOptions,
         .decodedFrameCachePolicy = state.decodedFrameCachePolicy,
         .encodedInputCachePolicy = state.encodedInputCachePolicy,
         .source = state.configurationSource,
@@ -528,8 +531,8 @@ bool IGDCReader::DecodeInput() {
     };
     const auto loggingStart = std::chrono::steady_clock::now();
     const bool success = [&]() -> bool {
-        std::shared_ptr<::datacodec::IByteRangeReader> inputReader;
-        ::datacodec::PackageInspection packageInspection;
+        ::datacodec::EncodedInput input;
+        ::datacodec::EncodedInputInspection packageInspection;
         if (!m_UseMemoryBuffer) {
             std::vector<std::filesystem::path> selectedPaths;
             if (state.selectedFramePaths.empty()) {
@@ -540,18 +543,17 @@ bool IGDCReader::DecodeInput() {
                     selectedPaths.emplace_back(path);
                 }
             }
-            inputReader = std::make_shared<::datacodec::FileByteRangeReader>(
-                selectedPaths.front());
+            input = ::datacodec::EncodedInput::File(selectedPaths.front());
             std::string inspectionError;
-            if (!::datacodec::InspectPackage(
-                    *inputReader,
-                    packageInspection,
-                    &inspectionError)) {
+            packageInspection = ::datacodec::InspectEncodedInput(input);
+            if (!packageInspection.success) {
+                inspectionError = packageInspection.failure ? ::datacodec::FormatCodecFailure(*packageInspection.failure) : std::string{};
+                state.failure = packageInspection.failure;
                 addCodecError(std::move(inspectionError));
                 return false;
             }
-            if (packageInspection.format ==
-                ::datacodec::PackageBinaryFormat::FramePackage) {
+            if (packageInspection.kind ==
+                ::datacodec::EncodedPackageKind::Frame) {
                 IGDCFrameSequence sequence;
                 std::string sequenceError;
                 if (!ResolveIGDCFrameSelection(
@@ -574,7 +576,6 @@ bool IGDCReader::DecodeInput() {
                     .controlParams = state.hasCodecParams
                         ? &state.codecParams
                         : nullptr,
-                    .executionOptions = &state.executionOptions,
                     .configurationSource = &state.configurationSource,
                     .language = state.language,
                     .decodedFrameCachePolicy = state.decodedFrameCachePolicy,
@@ -585,6 +586,7 @@ bool IGDCReader::DecodeInput() {
                     .runRecordSink = runRecordSink,
                 });
                 state.messages = std::move(sequenceResult.messages);
+                state.failure = sequenceResult.failure;
                 if (!sequenceResult.success || sequenceResult.output == nullptr) {
                     return false;
                 }
@@ -613,18 +615,18 @@ bool IGDCReader::DecodeInput() {
                 addHostError(iGameDataCodecHostMessageId::MemoryInputEmpty, {});
                 return false;
             }
-            if (m_memoryInput == nullptr ||
-                m_memoryInput->Bytes().data() != reinterpret_cast<const std::uint8_t*>(m_MemoryBuffer) ||
-                m_memoryInput->ByteSize() != m_MemoryBufferSize) {
+            if (!m_memoryInput ||
+                m_memoryBytes.data() != reinterpret_cast<const std::uint8_t*>(m_MemoryBuffer) ||
+                m_memoryBytes.size() != m_MemoryBufferSize) {
                 addCodecError("IGC memory input must retain its original shared owner");
                 return false;
             }
-            inputReader = m_memoryInput;
+            input = m_memoryInput;
             std::string headerError;
-            if (!::datacodec::InspectPackage(
-                    *inputReader,
-                    packageInspection,
-                    &headerError)) {
+            packageInspection = ::datacodec::InspectEncodedInput(input);
+            if (!packageInspection.success) {
+                headerError = packageInspection.failure ? ::datacodec::FormatCodecFailure(*packageInspection.failure) : std::string{};
+                state.failure = packageInspection.failure;
                 addCodecError(headerError.empty()
                     ? "package header validation failed"
                     : std::move(headerError));
@@ -632,14 +634,13 @@ bool IGDCReader::DecodeInput() {
             }
         }
         auto inputSourceIdentity = packageInspection.sourceIdentity;
-        const auto decodeResult = DecodeDataCodecDataObject({
-            .inputReader = std::move(inputReader),
+        DataCodecDataObjectDecodeSession decodeSession;
+        const auto decodeResult = decodeSession.Open({
+            .input = std::move(input),
             .inputSourceIdentity = inputSourceIdentity,
             .controlParams = state.hasCodecParams ? &state.codecParams : nullptr,
-            .executionOptions = &state.executionOptions,
             .configurationSource = &state.configurationSource,
             .language = state.language,
-            .decodedFrameCachePolicy = state.decodedFrameCachePolicy,
             .encodedInputCachePolicy = state.encodedInputCachePolicy,
             .resources = state.resources,
             .requestedFrameIndex = m_requestedFrameIndex,
@@ -647,6 +648,7 @@ bool IGDCReader::DecodeInput() {
             .runRecordSink = runRecordSink,
         });
         state.messages = decodeResult.messages;
+        state.failure = decodeResult.failure;
         m_FileSize = static_cast<std::size_t>(decodeResult.inputBytes);
         if (!decodeResult.success || decodeResult.output == nullptr) {
             if (state.messages.empty()) {
@@ -655,6 +657,9 @@ bool IGDCReader::DecodeInput() {
             return false;
         }
         m_DecodedOutput = decodeResult.output;
+        if (!state.loadAllAvailableAttributes) {
+            state.attributeDataSource = std::make_shared<IGDCAttributeDataSource>(std::move(decodeSession));
+        }
         return true;
     }();
     const auto loggingEnd = std::chrono::steady_clock::now();

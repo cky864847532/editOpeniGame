@@ -1,3 +1,4 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #include "DataCodec/Workflow/Decode/DecodeStoragePlan.h"
 #include "DataCodec/Codec/Attributes/AttributeDecodePlan.h"
 #include "DataCodec/Runtime/Cache/DecodeCache/DecodedStorageSize.h"
@@ -84,17 +85,17 @@ public:
           parserScope(parserRun) { parserResources.BindRun(parserRun); }
 
     DecodeStorageAnalysisResult Execute() {
-        Check(request.inputReader != nullptr, "storage analysis requires an input reader");
+        Cancel();
+        const auto inputReader = EncodedInputAccess::Open(request.input);
+        Check(inputReader != nullptr, "storage analysis requires an input reader");
         Check(request.attributeSelection == AttributeSelectionMode::None ||
             request.attributeSelection == AttributeSelectionMode::AllAvailable ||
             request.attributeSelection == AttributeSelectionMode::Explicit, "invalid attribute selection mode");
         Check(request.attributeSelection == AttributeSelectionMode::Explicit || request.attributeTargets.empty(),
             "explicit attribute targets require explicit selection mode");
-        Check(request.topologyOutputMode == TopologyDecodeOutputMode::CommitToAdapter ||
-            request.topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly, "invalid topology output mode");
         Cancel();
         PackageInspection inspection;
-        Check(InspectPackage(*request.inputReader, inspection, &error, request.stopToken));
+        Check(InspectPackage(*inputReader, inspection, &error, request.stopToken));
         std::vector<std::uint32_t> order;
         if (inspection.format == PackageBinaryFormat::LeafPackage) {
             targetFrame = request.frameIndex.value_or(0u);
@@ -102,7 +103,7 @@ public:
             frame.standalone = true;
             frame.metadata.frameIndex = targetFrame;
             Leaf leaf;
-            Check(LeafPackageIO::ReadFromByteRange(request.inputReader, 0u, request.inputReader->ByteSize(),
+            Check(LeafPackageIO::ReadFromByteRange(inputReader, 0u, inputReader->ByteSize(),
                 leaf.package, &error, request.stopToken));
             leaf.record.path = leaf.package.path;
             ReadParams(leaf, targetFrame);
@@ -123,9 +124,9 @@ public:
                 metadata.emplace(index, std::move(frame));
                 return index;
             };
-            targetFrame = addSource(request.inputReader);
+            targetFrame = addSource(inputReader);
             Check(!request.frameIndex || *request.frameIndex == targetFrame, "requested frame does not match input");
-            for (const auto& reader : request.referenceReaders) { addSource(reader); }
+            for (const auto& input : request.referenceInputs) { addSource(EncodedInputAccess::Open(input)); }
             FrameSequenceDependencyPlanner dependencies(readers, metadata);
             FrameSequenceDependencyPlan plan;
             Check(dependencies.BuildPlan(targetFrame, plan, &error));
@@ -262,8 +263,6 @@ private:
             "topology exceeds local address space");
         const bool orders = std::any_of(topo.connectivityLayout.blockLayouts.begin(),
             topo.connectivityLayout.blockLayouts.end(), [](const auto& b) { return b.cellPolynomialOrderByteCount != 0u; });
-        if (request.adapterBackedConnectivity && !orders &&
-            request.topologyOutputMode == TopologyDecodeOutputMode::CommitToAdapter) { return 0u; }
         DecodedConnectivityStorageSize size;
         Check(CalculateDecodedConnectivityStorageSize(cells, indices, topo.fixedCellSize <= 0,
             topo.hasCellTypes != 0u, orders, size, &error));
@@ -334,52 +333,11 @@ private:
         }
         Remove(DecodeStorageKind::StageWork, windows);
     }
-    void PolyhedronCommit(std::uint32_t frame, Leaf& leaf) {
-        const auto& topo = leaf.params.topoParams;
-        if (!topo.isPolyhedron || request.topologyOutputMode != TopologyDecodeOutputMode::CommitToAdapter || topo.cellCount == 0u) { return; }
-        const auto start = ResourceClock::now();
-        auto* sourceLeaf = &leaf;
-        std::size_t ownerHops = 0u;
-        while (sourceLeaf->record.topologyMode == TopologyOwnershipMode::Reused) {
-            Check(++ownerHops <= frames.size(), "polyhedron topology owner cycle");
-            sourceLeaf = &FindLeaf(sourceLeaf->record.ownerFrameIndex, sourceLeaf->package.path);
-        }
-        const auto* field = Field(*sourceLeaf, FieldType::Topology);
-        Check(field != nullptr, "polyhedron count source is missing");
-        Check(topo.polyhedronStreamLayouts.size() == 5u, "polyhedron stream count mismatch");
-        CountCursor unique(*field, topo, 0u, parserResources, error), faces(*field, topo, 1u, parserResources, error),
-            vertices(*field, topo, 2u, parserResources, error);
-        const auto windowBytes = polyhedron::PolyhedronDescriptionWindowBytes(topo);
-        std::vector<IndexType> window(windowBytes / sizeof(IndexType));
-        Add(DecodeStorageKind::StageWork, windowBytes, "polyhedron-description", frame, leaf.package.path);
-        polyhedron::PolyhedronBatchRange range;
-        while (range.firstCell < topo.cellCount) {
-            Cancel();
-            const auto read = [](CountCursor& cursor) {
-                return [&cursor](std::size_t first, std::span<IndexType> values, std::string* error) { return cursor.Read(first, values, error); };
-            };
-            Check(polyhedron::DescribePolyhedronBatch(range, topo.cellCount, read(unique), read(faces), read(vertices), window, &error));
-            Work(DecodeStorageKind::BlockWork, polyhedron::MakePolyhedronBatchMemoryLayout(range).TotalBytes(),
-                "polyhedron-commit", frame, leaf, range.firstCell);
-            range.firstCell = DecodeBlockMemoryPlan::Add(range.firstCell, range.cellCount);
-            range.firstFace = DecodeBlockMemoryPlan::Add(range.firstFace, range.faceCount);
-            range.firstUnique = DecodeBlockMemoryPlan::Add(range.firstUnique, range.uniqueCount);
-            range.firstLocal = DecodeBlockMemoryPlan::Add(range.firstLocal, range.localCount);
-        }
-        Check(range.firstFace == topo.polyhedronFaceVertexCount && range.firstUnique == topo.polyhedronVertexCount &&
-            range.firstLocal == topo.cellBufferSize, "polyhedron count totals disagree with metadata");
-        Remove(DecodeStorageKind::StageWork, windowBytes);
-        result.polyhedronCountScanMilliseconds += std::chrono::duration<double, std::milli>(ResourceClock::now() - start).count();
-    }
     void PlanAttributes(Frame& frame, Leaf& leaf, const std::vector<std::size_t>& targets, bool referenceHelper = false) {
         if (targets.empty()) { return; }
         std::vector<std::size_t> order;
         Check(decodeimpl::detail::ResolveAttributeExecutionOrder(leaf.params, targets, order, &error));
         if (std::all_of(targets.begin(), targets.end(), [&](auto index) { return leaf.completed[index]; })) { return; }
-        // 仅目标字段绑定宿主存储，额外前驱保留 DataCodec 自有存储
-        if (!referenceHelper && request.adapterBackedAttributes) {
-            for (const auto index : targets) { if (!leaf.completed[index]) { leaf.host[index] = true; } }
-        }
         const auto payload = PayloadBytes(leaf);
         const auto frameIndex = frame.metadata.frameIndex;
         Add(DecodeStorageKind::FieldPayload, payload, referenceHelper ? "reference-payload" : "attribute-payload",
@@ -429,8 +387,7 @@ private:
             Check(!supplement || leaf.existing, "attribute supplement requires an existing leaf workspace");
             if (!supplement) {
                 const auto& meta = leaf.params.geomParams;
-                Check(CalculateGeometryCacheBytes(meta.elementCount, static_cast<std::size_t>(meta.dimension), leaf.geometry, &error));
-                if (request.adapterBackedGeometry) { leaf.geometry = 0u; }
+                Check(CalculateGeometryCacheBytes(meta.elementCount, static_cast<std::size_t>(meta.dimension), meta.dataType, leaf.geometry, &error));
                 Add(DecodeStorageKind::Geometry, leaf.geometry, "geometry", index, leaf.package.path);
                 if (frame.metadata.geometryTemporalRole != TemporalFieldRole::SingleFrame &&
                     frame.metadata.geometryKeyFrameIndex == index && meta.elementCount != 0u && meta.dimension != 0) {
@@ -470,11 +427,10 @@ private:
             if (!supplement) {
                 Remove(DecodeStorageKind::Geometry, leaf.geometry);
                 leaf.geometry = 0u;
-                PolyhedronCommit(index, leaf);
-                if (frame.standalone || request.topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly) {
+
+                if (frame.standalone) {
                     Remove(DecodeStorageKind::Topology, leaf.topology);
                     leaf.topology = 0u;
-                    if (request.topologyOutputMode == TopologyDecodeOutputMode::ObserverOnly) { leaf.topologyReady = false; }
                 }
             }
         }
@@ -485,8 +441,7 @@ private:
             const bool retainsWorkspace = leaf.geometryReferenceReady ||
                 (frame.metadata.attributeTemporalRole != TemporalFieldRole::SingleFrame &&
                     frame.metadata.attributeKeyFrameIndex == index) ||
-                (leaf.record.topologyMode == TopologyOwnershipMode::Owned &&
-                    request.topologyOutputMode == TopologyDecodeOutputMode::CommitToAdapter);
+                leaf.record.topologyMode == TopologyOwnershipMode::Owned;
             if (!retainsWorkspace) {
                 for (auto& bytes : leaf.newAttributeBytes) { Remove(DecodeStorageKind::Attributes, bytes); bytes = 0u; }
             }

@@ -3,6 +3,7 @@
 
 #include <DataCodec/Filter/Adapter/iGameBlockTreeAdapter.h>
 #include <DataCodec/Filter/Adapter/iGameDecodeAdapter.h>
+#include <DataCodec/Workflow/Decode/DecodedResultBuilder.h>
 #include <DataCodec/Common/Views/ArrayViews.h>
 #include <DataCodec/Test/Common/DataCodecTestResult.h>
 #include <DataCodec/Filter/Test/Common/iGameIGDCFileRoundTrip.h>
@@ -288,36 +289,25 @@ inline bool TestNativePolyhedronResourceBoundary() {
         const bool decoded = polyhedron::DecodePolyhedronTopologyStreamsToCache(runtime, session, cache, encoded.topo, stream, &error);
         Require(result, decoded && stream.bounded, "polyhedron.native-complete-indices", error);
         if (!decoded) { continue; }
-        const auto& p = cache.polyhedron;
-        polyhedron::PolyhedronTopologyStreamHeader header{.cellCount = p.cellCount, .faceCount = p.faceCount,
-            .uniqueVertexIdCount = p.uniqueVertexIdCount, .localFaceVertexIdCount = p.localFaceVertexIdCount};
+        DecodedLeafBuilder builder(std::make_shared<iGameCellTypeMapping>());
+        builder.output.meshType = MeshType::PolyhedronMesh;
+        builder.output.geometry.pointCount = 3u;
+        auto geometry = session.CreateSizedStore(bytestore::ByteStorePurpose::Contiguous,
+            9u * sizeof(float), MemoryDemandKind::RequiredContinuation, "test.geometry", &error);
+        const std::array<float, 9u> coordinates{0, 0, 0, 1, 0, 0, 0, 1, 0};
+        bool emitted = geometry && geometry->WriteBytesAt(0u,
+            {reinterpret_cast<const std::uint8_t*>(coordinates.data()), sizeof(coordinates)}, &error) &&
+            geometry->Seal(&error) &&
+            DecodedBufferAccess::Export(*geometry, session, builder.output.geometry.values, &error) &&
+            builder.AcceptTopology(cache, session, &error);
         iGameDecodeAdapter output;
-        bool emitted = output.SetMeshType(MeshType::PolyhedronMesh, &error) && output.BeginPoints(3u, 3u, &error);
-        const auto controlledBeforeEmit = root.StorageCapacity()->Snapshot().reservedBytes - root.Scratch().RetainedFixedBytes();
-        std::uint64_t batches = 0u;
-        std::size_t sampleGroups = 0u;
-        bool windows = true;
-        emitted = emitted && polyhedron::EmitPolyhedronCacheToAdapter(runtime, output, header,
-            p.uniqueVertexCounts, p.cellFaceCounts, p.faceVertexCounts, p.cellUniqueVertexIds, p.localFaceVertexIds,
-            batches, &error, [&](std::span<const BufferCapacitySample> samples) {
-                using Sample = polyhedron::PolyhedronBufferSample;
-                const auto count = sampleGroups++ == 0u ? numericarray::kSpatialBlockElementCount : 1u;
-                const auto faceCount = count * 9u;
-                ResourceDebugSnapshot current;
-                windows &= root.TryCopyResourceDebugSnapshot(current) && current.admittedBlocks != 0u &&
-                    samples[static_cast<std::size_t>(Sample::FaceCountWindow)].capacityBytes ==
-                        std::min<std::size_t>(faceCount * sizeof(IndexType), kIoWindowBytes) &&
-                    samples[static_cast<std::size_t>(Sample::FaceVertexOffsets)].capacityBytes == (faceCount + 1u) * sizeof(IndexType) &&
-                    samples[static_cast<std::size_t>(Sample::LocalIds)].capacityBytes == count * 27u * sizeof(IndexType);
-            });
-        Require(result, emitted && windows && batches == 2u && sampleGroups == 2u &&
-            root.StorageCapacity()->Snapshot().reservedBytes == controlledBeforeEmit + root.Scratch().RetainedFixedBytes(),
-            "polyhedron.native-emit-windows", error.empty() ?
-                "native emission must cross the fixed cell boundary with a 1 MiB face scan and exempt host output" : error);
+        emitted = emitted && output.Import(builder.output, false, &error);
+        Require(result, emitted, "polyhedron.native-owned-import", error);
         iGameEncodeAdapter replay(output.TakeDataObject());
         Require(result, emitted && replay.GetNumberOfCells() == cellCount && replay.GetNumberOfPoints() == 3u &&
             replay.GetCellFaceOffsetPtr()[cellCount] == cellCount * 9u,
             "polyhedron.native-emit-counts", "the native output must contain every cell and its nine faces including the tail batch");
+        geometry.reset();
         cache.Release();
         encoded = {};
         output.Abort();
@@ -360,8 +350,8 @@ inline bool ReadIdentityValue(
         return false;
     }
 
-    double value = 0.0;
-    attr.GetTuple(tupleIndex, &value);
+    float value = 0.0f;
+    if (attr.GetDataType() != DataType::Float32 || !attr.GetTupleBytes(tupleIndex, &value)) { return false; }
     if (!std::isfinite(value) ||
         value < 0.0 ||
         value > static_cast<double>(std::numeric_limits<IndexType>::max())) {

@@ -1,6 +1,6 @@
 #include <DataCodec/API/Entry/DataCodecDecodeEntry.h>
 #include <DataCodec/Filter/Adapter/iGameDecodeAdapter.h>
-#include <DataCodec/Storage/ByteIO/FileByteRangeIO.h>
+
 #include <DataCodec/Filter/Adapter/iGameFramePackageDecodeAssembly.h>
 #include <iGameInteractor.h>
 #include <iGameRenderWindow.h>
@@ -28,15 +28,12 @@ int main(const int argc, char** argv) {
         return 1;
     }
 
-    // ByteRangeReader向DataCodec提供文件随机访问能力
-    auto inputReader = std::make_shared<::datacodec::FileByteRangeReader>(encodedFile);
-    if (inputReader->ByteSize() == 0u) {
+    if (std::filesystem::file_size(encodedFile) == 0u) {
         std::cerr << "encoded DataCodec file is empty\n";
         return 1;
     }
 
-    // leaf adapter和frame assembly分别接收两种package的解码结果
-    iGame::iGameDecodeAdapter leafAdapter;
+    // 原生层级在核心解码完成后组装
     iGame::iGameFramePackageDecodeAssembly frameAssembly;
 
     // 完整配置包含session缓存策略 package入口只提取实际消费的配置
@@ -46,9 +43,8 @@ int main(const int argc, char** argv) {
 
     // DecodePackage是DataCodec的直接解码入口
     auto result = ::datacodec::DecodePackage({
-        .inputReader = inputReader,
-        .leafAdapter = &leafAdapter,
-        .frameAssembly = &frameAssembly,
+        .input = ::datacodec::EncodedInput::File(encodedFile),
+        .cellTypeMapping = std::make_shared<iGame::iGameCellTypeMapping>(),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = configuration.PackageConfiguration(),
     });
@@ -60,9 +56,7 @@ int main(const int argc, char** argv) {
         return 1;
     }
 
-    auto object = result.decodedFramePackage
-        ? frameAssembly.Output()
-        : leafAdapter.TakeDataObject();
+    auto object = frameAssembly.Import(result.output) ? frameAssembly.Output() : iGame::DataObject::Pointer{};
     if (object == nullptr) {
         std::cerr << "DataCodec decode produced no iGame DataObject\n";
         return 1;

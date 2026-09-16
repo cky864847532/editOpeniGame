@@ -1,4 +1,4 @@
-#include "DataCodec/Filter/Wasm/iGameWasmDataCodecTiming.h"
+#include "Codec/iGameWasmDataCodecTiming.h"
 
 #include <algorithm>
 #include <cstddef>

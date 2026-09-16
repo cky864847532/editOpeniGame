@@ -41,23 +41,23 @@ int main(const int argc, char** argv) {
     const auto packageKind = object->HasSubDataObject()
         ? ::datacodec::EncodePackageKind::FramePackage
         : ::datacodec::EncodePackageKind::LeafPackage;
-    std::unique_ptr<iGame::iGameEncodeAdapter> leafAdapter;
-    std::unique_ptr<iGame::iGameBlockTreeAdapter> blockTreeAdapter;
+    std::shared_ptr<iGame::iGameEncodeAdapter> leafAdapter;
+    std::shared_ptr<iGame::iGameBlockTreeAdapter> blockTreeAdapter;
     ::datacodec::EncodeInput encodeInput;
     if (packageKind == ::datacodec::EncodePackageKind::LeafPackage) {
         if (!iGame::CanCreateiGameEncodeAdapter(object)) {
             std::cerr << "source object is not supported by iGameEncodeAdapter\n";
             return 1;
         }
-        leafAdapter = std::make_unique<iGame::iGameEncodeAdapter>(object);
-        encodeInput = ::datacodec::EncodeInput::LeafAdapter(leafAdapter.get());
+        leafAdapter = std::make_shared<iGame::iGameEncodeAdapter>(object);
+        encodeInput = ::datacodec::EncodeInput::LeafAdapter(leafAdapter);
     } else {
-        blockTreeAdapter = std::make_unique<iGame::iGameBlockTreeAdapter>(object);
+        blockTreeAdapter = std::make_shared<iGame::iGameBlockTreeAdapter>(object);
         if (blockTreeAdapter->GetLeafRecords().empty()) {
             std::cerr << "source object has no encodable leaves\n";
             return 1;
         }
-        encodeInput = ::datacodec::EncodeInput::BlockTreeAdapter(blockTreeAdapter.get());
+        encodeInput = ::datacodec::EncodeInput::BlockTreeAdapter(blockTreeAdapter);
     }
 
     if (!encodedFile.parent_path().empty()) {
@@ -76,10 +76,9 @@ int main(const int argc, char** argv) {
     });
 
     // ByteRangeOutput和执行资源分别接入文件系统与iGame线程池
-    ::datacodec::FileByteRangeOutput output(encodedFile);
     auto result = ::datacodec::Encode({
         .input = std::move(encodeInput),
-        .output = ::datacodec::EncodeOutput::ByteRange(output, packageKind),
+        .output = ::datacodec::EncodeOutput::File(encodedFile, packageKind),
         .attributeSelection = ::datacodec::AttributeSelectionMode::AllAvailable,
         .configuration = std::move(configuration),
     });

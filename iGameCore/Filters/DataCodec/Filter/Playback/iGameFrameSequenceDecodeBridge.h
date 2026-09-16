@@ -4,11 +4,10 @@
 #include "Attribute/iGameAttributeDataSource.h"
 #include "DataCodec/API/Adapter/DecodedFrameTypes.h"
 #include "DataCodec/API/Adapter/IRunRecordSink.h"
-#include "DataCodec/Workflow/Session/PlaybackSession.h"
+#include "DataCodec/API/Entry/PlaybackSession.h"
 #include "DataCodec/API/Params/CodecParamDefaults.h"
 #include "DataCodec/API/Params/DecodedFrameCacheParams.h"
 #include "DataCodec/API/Params/EncodedInputCacheParams.h"
-#include "DataCodec/Runtime/Execution/ParallelExecution.h"
 #include "iGameDataObject.h"
 
 #include <cstdint>
@@ -26,7 +25,6 @@ struct FrameSequenceDecodeRequest {
     std::uint32_t targetFrameIndex{0u};
     std::string sourceLabel;
     const ::datacodec::DecodeControlParams* controlParams{nullptr};
-    const ::datacodec::DecodeExecutionOptions* executionOptions{nullptr};
     const ::datacodec::DataCodecDecodeConfigurationSource* configurationSource{nullptr};
     ::datacodec::DataCodecLanguage language{
         ::datacodec::DataCodecLanguage::SimplifiedChinese};
@@ -40,6 +38,7 @@ struct FrameSequenceDecodeRequest {
 
 struct FrameSequenceDecodeResult {
     bool success{false};
+    std::optional<::datacodec::CodecFailureRecord> failure;
     DataObject::Pointer output;
     AttributeDataSourcePointer attributeDataSource;
     std::vector<::datacodec::TelemetryMessageRecord> messages;

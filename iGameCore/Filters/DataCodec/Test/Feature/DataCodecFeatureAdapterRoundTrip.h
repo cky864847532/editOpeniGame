@@ -1,3 +1,4 @@
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
 #ifndef DATACODEC_TEST_FEATURE_DATACODECFEATUREADAPTERROUNDTRIP_H
 #define DATACODEC_TEST_FEATURE_DATACODECFEATUREADAPTERROUNDTRIP_H
 
@@ -31,7 +32,8 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
     TestResult result;
     try {
         const auto dataset = MakeAdapterRoundTripDataset();
-        TestEncodeAdapter encodeAdapter(dataset);
+        auto encodeAdapterOwner = std::make_shared<TestEncodeAdapter>(dataset);
+        auto& encodeAdapter = *encodeAdapterOwner;
 
         std::vector<AttributeTarget> targets;
         targets.reserve(dataset.pointFields.size());
@@ -45,7 +47,7 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
 
         auto encodeResult = Encode(EncodeRequest{
             .input = EncodeInput::LeafAdapter(
-                &encodeAdapter,
+                encodeAdapterOwner,
                 {},
                 dataset.name,
                 "PointSet"),
@@ -71,12 +73,14 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
         auto encodedOwner = std::make_shared<const EncodedBuffer>(std::move(encodeResult.encodedBytes));
         TestDecodeAdapter decodeAdapter;
         auto decodeResult = DecodePackage(DecodePackageRequest{
-            .inputReader = std::make_shared<MemoryByteRangeReader>(encodedOwner),
-            .leafAdapter = &decodeAdapter,
+            .input = ::datacodec::EncodedInputAccess::Retain(std::make_shared<MemoryByteRangeReader>(encodedOwner)),
             .attributeSelection = AttributeSelectionMode::Explicit,
             .attributeTargets = targets,
         });
         AppendCodecMessages(result, decodeResult.messages);
+        if (decodeResult.success && decodeResult.output.leaves.size() == 1u) {
+            decodeResult.success = decodeAdapter.Import(decodeResult.output.leaves.front());
+        }
         if (!Require(
                 result,
                 decodeResult.success && decodeAdapter.Committed(),
@@ -144,9 +148,8 @@ inline TestResult RunDataCodecFeatureAdapterRoundTrip() noexcept {
         }
         TestDecodeAdapter malformedAdapter;
         const auto malformedResult = DecodePackage(DecodePackageRequest{
-            .inputReader = std::make_shared<MemoryByteRangeReader>(
-                std::make_shared<const std::vector<std::uint8_t>>(std::move(malformedBytes))),
-            .leafAdapter = &malformedAdapter,
+            .input = ::datacodec::EncodedInputAccess::Retain(std::make_shared<MemoryByteRangeReader>(
+                std::make_shared<const std::vector<std::uint8_t>>(std::move(malformedBytes)))),
             .attributeSelection = AttributeSelectionMode::Explicit,
             .attributeTargets = targets,
         });

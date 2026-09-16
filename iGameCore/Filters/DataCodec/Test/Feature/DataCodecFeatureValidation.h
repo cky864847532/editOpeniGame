@@ -112,7 +112,7 @@ inline void CheckFiniteValidationWindows(TestResult& result) {
     const auto finiteGeometryReady = finiteGeometry.Initialize(
         2u,
         1u,
-        geometryStoreSession,
+        DataType::Float32, geometryStoreSession,
         &finiteError) &&
         finiteGeometry.bytes->WriteBytesAt(
             0u,
@@ -141,7 +141,7 @@ inline void CheckFiniteValidationWindows(TestResult& result) {
     const auto nonFiniteGeometryReady = nonFiniteGeometry.Initialize(
         2u,
         1u,
-        nonFiniteGeometryStoreSession,
+        DataType::Float32, nonFiniteGeometryStoreSession,
         &finiteError) &&
         nonFiniteGeometry.bytes->WriteBytesAt(
             0u,

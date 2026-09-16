@@ -9,7 +9,7 @@ namespace datacodec {
 const std::uint8_t* EncodedBuffer::data() const noexcept { return span().data(); }
 std::size_t EncodedBuffer::size() const noexcept { return span().size(); }
 std::span<const std::uint8_t> EncodedBuffer::span() const noexcept {
-    return m_owner ? m_owner->ContiguousBytes() : std::span<const std::uint8_t>{};
+    return {m_bytes.get(), m_size};
 }
 
 MemoryByteRangeOutput::MemoryByteRangeOutput(DataCodecExecutionResources& run)
@@ -87,7 +87,12 @@ std::span<const std::uint8_t> MemoryByteRangeOutput::Bytes() const noexcept {
 
 EncodedBuffer MemoryByteRangeOutput::TakeBytes() noexcept {
     if (!m_finalized || m_failed) { return {}; }
-    return EncodedBuffer(std::move(m_store));
+    if (!m_store) { return {}; }
+    const auto size = static_cast<std::size_t>(m_store->ByteSizeHint());
+    const auto capacity = static_cast<std::size_t>(m_store->ResidentSizeHint());
+    auto bytes = m_store->TakeOwnedBytes();
+    m_store.reset();
+    return EncodedBuffer(std::move(bytes), size, capacity);
 }
 
 }

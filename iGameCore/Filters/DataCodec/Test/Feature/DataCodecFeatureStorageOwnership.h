@@ -346,7 +346,7 @@ namespace datacodec::test {
                 bytestore::ByteStoreSession session;
                 session.BindStorage(capacity, externalSpill);
                 std::string error;
-                const bool ready = geometry.Initialize(2u, 3u, session, &error) &&
+                const bool ready = geometry.Initialize(2u, 3u, DataType::Float32, session, &error) &&
                     reference.BeginGeometry(meta, session, &error);
                 Require(result, ready && geometry.bytes->ByteSizeHint() == sizeof(points) &&
                     reference.Bytes()->ByteSizeHint() == sizeof(referenceValues) &&
@@ -381,14 +381,14 @@ namespace datacodec::test {
         zero.BindStorage(std::make_shared<resource::ResidentByteBudget>(0u), false);
         DecodedGeometryCache rejected;
         DecodedGeometryReferenceCache reference;
-        Require(result, !rejected.Initialize(2u, 3u, zero) && !rejected.bytes &&
+        Require(result, !rejected.Initialize(2u, 3u, DataType::Float32, zero) && !rejected.bytes &&
             !reference.BeginGeometry(meta, zero) && !reference.IsInitialized(),
             "geometry.no-capacity", "necessary geometry must reject unavailable memory without spill capability");
-        Require(result, rejected.Initialize(0u, 3u, zero) && rejected.bytes->ByteSizeHint() == 0u,
+        Require(result, rejected.Initialize(0u, 3u, DataType::Float32, zero) && rejected.bytes->ByteSizeHint() == 0u,
             "geometry.empty", "an empty geometry needs no positive memory reservation");
         rejected.Release();
         zero.BindStorage(std::make_shared<resource::ResidentByteBudget>(0u), true);
-        Require(result, !rejected.Initialize(std::numeric_limits<std::size_t>::max(), 3u, zero) && !rejected.bytes,
+        Require(result, !rejected.Initialize(std::numeric_limits<std::size_t>::max(), 3u, DataType::Float32, zero) && !rejected.bytes,
             "geometry.output-overflow", "output byte-count overflow must fail before choosing any backend");
         meta.elementCount = std::numeric_limits<decltype(meta.elementCount)>::max();
         Require(result, !reference.BeginGeometry(meta, zero) && !reference.Bytes(),
@@ -606,18 +606,20 @@ namespace datacodec::test {
         }
         Require(result, encodedOutput.data() == address && encodedOutput.size() == 8u &&
             encodedOutput.span()[0] == 0u && encodedOutput.span()[5] == 0u && encodedOutput.span()[6] == input[0] &&
-            rejectedAllocationCount == 0u && escapedCapacity->Snapshot().reservedBytes == 8u,
+            rejectedAllocationCount == 0u && escapedCapacity->Snapshot().reservedBytes == 0u &&
+            escapedCapacity->AllocatedStorage().liveBytes == 0u &&
+            escapedCapacity->AllocatedStorage().transferredBytes == 8u,
             "output.move-owner", "finalization must transfer the same allocation and initialize unwritten gaps");
     }
     const auto* encodedAddress = encodedOutput.data();
     {
         MemoryByteRangeReader reader(std::move(encodedOutput));
         Require(result, reader.ContiguousRange(0u, 8u).data() == encodedAddress &&
-            escapedCapacity->Snapshot().reservedBytes == 8u && encodedOutput.empty(),
+            escapedCapacity->Snapshot().reservedBytes == 0u && encodedOutput.empty(),
             "output.reader-owner", "the decoder reader must retain the original output allocation without copying");
     }
     Require(result, escapedCapacity->Snapshot().reservedBytes == 0u,
-        "output.reader-release", "the last reader must release the encoded allocation after the root is destroyed");
+        "output.reader-release", "reader ownership must remain independent from the completed run budget");
     {
         DataCodecExecutionResources root(ResolvedResourceConfiguration{{8u, 1u, 1u}, 8u, 1u, false, true});
         auto limited = root.StorageCapacity();

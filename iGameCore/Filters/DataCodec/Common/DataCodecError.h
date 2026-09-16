@@ -25,6 +25,9 @@ enum class CodecErrorCode {
     DecodeFailure,
     UnsupportedFormat,
     UnsupportedPlatform,
+    UnsupportedVersion,
+    IncompleteInput,
+    InvalidFormat,
 };
 
 struct CodecFailureRecord {
@@ -37,6 +40,8 @@ struct CodecFailureRecord {
     std::optional<std::uint64_t> requestedBytes;
     std::optional<std::uint64_t> reservedBytes;
     std::optional<std::uint64_t> limitBytes;
+    std::optional<std::uint32_t> actualVersion;
+    std::optional<std::uint32_t> supportedVersion;
 };
 
 static_assert(sizeof(CodecFailureRecord) <= 512u);
@@ -120,6 +125,9 @@ inline const char* CodecErrorCodeName(const CodecErrorCode code) noexcept {
             return "unsupported-format";
         case CodecErrorCode::UnsupportedPlatform:
             return "unsupported-platform";
+        case CodecErrorCode::UnsupportedVersion: return "unsupported-version";
+        case CodecErrorCode::IncompleteInput: return "incomplete-input";
+        case CodecErrorCode::InvalidFormat: return "invalid-format";
     }
     return "unknown";
 }

@@ -31,6 +31,7 @@ inline cellremap::BuildOptions MakeCellRemapOptions(
 
 class CellRemapStage final : public EncodeStage {
 public:
+    StageKind Kind() const noexcept override { return StageKind::CellRemap; }
     static constexpr std::string_view kTypeName = "CellSpatialPartition";
 
     const char* Name() const override {

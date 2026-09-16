@@ -97,6 +97,7 @@ public:
     GeometryDecodeStage() = default;
     explicit GeometryDecodeStage(FieldDecodeInput input) : m_input(input) {}
 
+    StageKind Kind() const noexcept override { return StageKind::Geometry; }
     const char* Name() const override { return "GeometryDecodeStage"; }
 
     // 把几何字段交给 Codec 解码并归档失败

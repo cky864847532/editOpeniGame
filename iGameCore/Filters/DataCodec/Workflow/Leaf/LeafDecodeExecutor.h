@@ -38,7 +38,6 @@ struct LeafDecodeRequest {
     bool supplementAttributesOnly{false};
     AttributeDecodeRequestMode attributeRequestMode{AttributeDecodeRequestMode::DecodeAndCommit};
     DecodeControlParams controlParams{MakeDefaultDecodeControlParams()};
-    DecodeExecutionOptions execution{MakeDefaultDecodeExecutionOptions()};
     DataCodecDecodeConfigurationSource configurationSource;
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
     IRunRecordSink* runRecordSink{nullptr};
@@ -128,8 +127,6 @@ public:
             context.attributeSelection = request.attributeSelection;
             context.attributeTargets = request.attributeTargets;
             context.attributeRequestMode = request.attributeRequestMode;
-            context.topologyOutputMode = request.execution.topologyOutputMode;
-            context.topologyBlockObserver = request.execution.topologyBlockObserver;
 
             const auto contextCreateResult = context.Initialize(request.runRecordSink);
             if (!contextCreateResult) {

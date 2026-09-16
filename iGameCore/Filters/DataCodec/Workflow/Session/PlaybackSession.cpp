@@ -1,5 +1,9 @@
-#include "DataCodec/Workflow/Session/PlaybackSession.h"
+#include "DataCodec/Workflow/Session/DecodeSession.h"
+#include "DataCodec/Storage/ByteIO/EncodedInputAccess.h"
+#include "DataCodec/Storage/Package/PackageBinaryHeader.h"
+#include "DataCodec/API/Entry/PlaybackSession.h"
 #include "DataCodec/Workflow/Session/CodecRunEntry.h"
+#include "DataCodec/Workflow/Decode/DecodedResultBuilder.h"
 
 #include "DataCodec/Workflow/FrameSequence/FrameSequenceDependencyPlanner.h"
 #include "DataCodec/API/Entry/DataCodecDecodeEntry.h"
@@ -100,7 +104,7 @@ public:
           m_frameOrdinal(frameOrdinal),
           m_frameCount(frameCount) {
         if (m_sink != nullptr && m_sink->Wants(RunRecordKind::Progress)) {
-            m_sink->Submit(RunRecord{RunProgressRecord{
+            m_sink->TrySubmit(RunRecord{RunProgressRecord{
                 .phase = RunProgressPhase::Begin,
                 .normalized = 0.0,
                 .frameOrdinal = m_frameOrdinal,
@@ -109,18 +113,19 @@ public:
         }
     }
 
-    ~PlaybackProgressScope() { Finish(false); }
+    ~PlaybackProgressScope() noexcept { Finish(false); }
 
-    void Finish(const bool success) {
-        if (m_sink == nullptr || m_finished || !m_sink->Wants(RunRecordKind::Progress)) { return; }
-        m_sink->Submit(RunRecord{RunProgressRecord{
+    void Finish(const bool success) noexcept {
+        if (m_finished) { return; }
+        m_finished = true;
+        if (m_sink == nullptr || !m_sink->Wants(RunRecordKind::Progress)) { return; }
+        m_sink->TrySubmit(RunRecord{RunProgressRecord{
             .phase = RunProgressPhase::Finish,
             .normalized = 1.0,
             .success = success,
             .frameOrdinal = m_frameOrdinal,
             .frameCount = m_frameCount,
         }});
-        m_finished = true;
     }
 
 private:
@@ -132,39 +137,22 @@ private:
 
 } // namespace
 
-class DecodedFrame final : public DecodedFrameLease {
+class FrameDecodeState final {
 public:
     using PreparedAttributeKey = std::pair<BlockPath, std::vector<std::size_t>>;
 
-    DecodedFrame(
-        const std::uint32_t frameIndex,
-        IDecodedFramePayload::Pointer payload,
-        std::shared_ptr<IDecodedFrameAssembly> assembly,
-        std::shared_ptr<DecodeSession> frameSession)
-        : m_frameIndex(frameIndex),
-          m_payload(std::move(payload)),
-          m_assembly(std::move(assembly)),
-          m_frameSession(std::move(frameSession)) {}
-
-    [[nodiscard]] std::uint32_t FrameIndex() const noexcept override { return m_frameIndex; }
-    [[nodiscard]] IDecodedFramePayload::Pointer Payload() const noexcept override { return m_payload; }
-    [[nodiscard]] std::uint64_t ResidentSizeHint() const noexcept override {
-        const auto payloadBytes = m_payload != nullptr ? m_payload->ResidentSizeHint() : 0u;
-        const auto sessionBytes = m_frameSession != nullptr ? m_frameSession->ResidentSizeHint() : 0u;
-        return validation::SaturatingAddU64(payloadBytes, sessionBytes);
-    }
-    [[nodiscard]] std::shared_ptr<IDecodedFrameAssembly> Assembly() const noexcept { return m_assembly; }
+    explicit FrameDecodeState(std::shared_ptr<DecodeSession> session) : m_frameSession(std::move(session)) {}
     [[nodiscard]] std::shared_ptr<DecodeSession> FrameSession() const noexcept { return m_frameSession; }
     [[nodiscard]] std::unique_lock<std::mutex> LockDecodeState() const {
         return std::unique_lock<std::mutex>(m_decodeStateMutex);
     }
-    [[nodiscard]] IDecodeAdapter* PreparedAdapter(const PreparedAttributeKey& key) const noexcept {
+    [[nodiscard]] DecodedLeafBuilder* PreparedAdapter(const PreparedAttributeKey& key) const noexcept {
         const auto iterator = m_preparedAttributeAdapters.find(key);
         return iterator == m_preparedAttributeAdapters.end() ? nullptr : iterator->second.get();
     }
-    IDecodeAdapter* StorePreparedAdapter(
+    DecodedLeafBuilder* StorePreparedAdapter(
         PreparedAttributeKey key,
-        std::unique_ptr<IDecodeAdapter> adapter) {
+        std::unique_ptr<DecodedLeafBuilder> adapter) {
         auto [iterator, inserted] = m_preparedAttributeAdapters.emplace(
             std::move(key),
             std::move(adapter));
@@ -175,12 +163,9 @@ public:
     }
 
 private:
-    std::uint32_t m_frameIndex{0u};
-    IDecodedFramePayload::Pointer m_payload;
-    std::shared_ptr<IDecodedFrameAssembly> m_assembly;
     std::shared_ptr<DecodeSession> m_frameSession;
     mutable std::mutex m_decodeStateMutex;
-    std::map<PreparedAttributeKey, std::unique_ptr<IDecodeAdapter>> m_preparedAttributeAdapters;
+    std::map<PreparedAttributeKey, std::unique_ptr<DecodedLeafBuilder>> m_preparedAttributeAdapters;
 };
 
 struct PlaybackSession::Impl {
@@ -200,7 +185,7 @@ struct PlaybackSession::Impl {
         bool success{false};
         std::optional<CodecFailureRecord> failure;
         bool cancelled{false};
-        std::shared_ptr<IDecodedFrameAssembly> assembly;
+        DecodedData output;
         std::shared_ptr<DecodeSession> session;
         std::vector<TelemetryMessageRecord> messages;
         std::vector<DecodeReferenceCache::RequiredFrameLease> requiredReferences;
@@ -229,9 +214,20 @@ struct PlaybackSession::Impl {
         return frameIdentities ? *frameIdentities : empty;
     }
     std::unique_ptr<FrameSequenceDependencyPlanner> dependencyPlanner;
-    IDecodedFrameAssemblyFactory::Pointer assemblyFactory;
+    std::shared_ptr<const ICellTypeMapping> cellTypeMapping;
+    std::map<std::weak_ptr<DecodedFrame>, std::shared_ptr<FrameDecodeState>, std::owner_less<>> frameStates;
+
+    std::shared_ptr<FrameDecodeState> FindFrameState(const DecodedFrame::Pointer& frame) const {
+        std::lock_guard lock(stateMutex);
+        const auto found = frameStates.find(frame);
+        return found == frameStates.end() ? nullptr : found->second;
+    }
+
+    bool PruneRetiredFrameStates() {
+        std::lock_guard lock(stateMutex);
+        return std::erase_if(frameStates, [](const auto& entry) { return entry.first.expired(); }) != 0u;
+    }
     DecodeControlParams controlParams{MakeDefaultDecodeControlParams()};
-    DecodeExecutionOptions execution{MakeDefaultDecodeExecutionOptions()};
     DataCodecDecodeConfigurationSource configurationSource;
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
     DecodedFrameCachePolicy decodedFrameCachePolicy;
@@ -382,7 +378,7 @@ struct PlaybackSession::Impl {
     }
 
     [[nodiscard]] CacheStoreResult StoreDecodedFrame(
-        const DecodedFrameLease::Pointer& frame,
+        const DecodedFrame::Pointer& frame,
         const DecodedFrameAccessKind accessKind) const {
         if (frame == nullptr) {
             return CacheStoreResult::Error("decoded frame cache store received a null frame");
@@ -468,16 +464,13 @@ struct PlaybackSession::Impl {
             result.cancelled = true;
             return result;
         }
-        auto assembly = assemblyFactory != nullptr ? assemblyFactory->Create() : nullptr;
         const auto reader = frameReaders.find(frameIndex);
-        if (assembly == nullptr || reader == frameReaders.end() || reader->second == nullptr) {
+        if (reader == frameReaders.end() || reader->second == nullptr) {
             AddPlaybackMessage(
                 result,
                 request.runRecordSink.get(),
                 TelemetryMessageSeverity::Error,
-                assembly == nullptr
-                    ? "failed to create playback frame assembly"
-                    : "playback frame reader is unavailable");
+                "playback frame reader is unavailable");
             return result;
         }
         const auto inputReader = ResolveInputReader(
@@ -501,28 +494,27 @@ struct PlaybackSession::Impl {
             ? metadata->second.get()
             : nullptr;
         auto frameResult = DecodePackageInRun({
-            .inputReader = inputReader,
-            .framePackageMetadata = framePackageMetadata,
-            .frameAssembly = assembly.get(),
+            .input = EncodedInputAccess::Retain(inputReader),
+
+            .cellTypeMapping = cellTypeMapping,
             .requestedFrameIndex = frameIndex,
             .attributeSelection = decodeAllAttributes
                 ? AttributeSelectionMode::AllAvailable
                 : AttributeSelectionMode::None,
             .configuration = DataCodecDecodePackageConfigurationParams{
                 .controlParams = controlParams,
-                .execution = execution,
                 .source = configurationSource,
                 .language = language,
             },
             .runRecordSink = request.runRecordSink != nullptr ? decodeRecords : nullptr,
             .stopToken = stopToken,
-        }, *resources, frameSession.get());
+        }, *resources, frameSession.get(), framePackageMetadata);
         result.failure = frameResult.failure;
         result.messages = std::move(frameResult.messages);
         result.cancelled = frameResult.cancelled || stopToken.stop_requested();
         result.success = frameResult.success && !result.cancelled;
         if (result.success) {
-            result.assembly = std::move(assembly);
+            result.output = std::move(frameResult.output);
             result.session = std::move(frameSession);
         }
         return result;
@@ -682,14 +674,12 @@ struct PlaybackSession::Impl {
             : static_cast<std::uint32_t>(playbackFrameOrder.size());
         PlaybackProgressScope progress(request.runRecordSink.get(), progressFrameOrdinal, progressFrameCount);
 
-        if (dependencyPlanner == nullptr || assemblyFactory == nullptr) {
+        if (dependencyPlanner == nullptr) {
             AddPlaybackMessage(
                 result,
                 request.runRecordSink.get(),
                 TelemetryMessageSeverity::Error,
-                dependencyPlanner == nullptr
-                    ? "playback dependency planner is unavailable"
-                    : "playback frame assembly factory is unavailable");
+                "playback dependency planner is unavailable");
             return result;
         }
 
@@ -705,7 +695,7 @@ struct PlaybackSession::Impl {
         }
 
         auto requiredReferences = RequireReferenceFrames(dependencyPlan.referenceFrames);
-        std::shared_ptr<IDecodedFrameAssembly> targetAssembly;
+        DecodedData targetOutput;
         std::shared_ptr<DecodeSession> targetSession;
         const auto decodeCount = std::max<std::size_t>(dependencyPlan.decodeOrder.size(), 1u);
         const auto referenceCount = dependencyPlan.decodeOrder.size() > 0u
@@ -767,13 +757,12 @@ struct PlaybackSession::Impl {
             }
             if (!frameResult.success) { return result; }
             if (isTarget) {
-                targetAssembly = std::move(frameResult.assembly);
+                targetOutput = std::move(frameResult.output);
                 targetSession = std::move(frameResult.session);
             }
         }
 
-        const auto payload = targetAssembly != nullptr ? targetAssembly->Payload() : nullptr;
-        if (payload == nullptr || targetSession == nullptr) {
+        if (targetOutput.leaves.empty() || targetSession == nullptr) {
             AddPlaybackMessage(
                 result,
                 request.runRecordSink.get(),
@@ -787,11 +776,12 @@ struct PlaybackSession::Impl {
         }
 
         result.success = true;
-        result.frame = std::make_shared<DecodedFrame>(
-            request.frameIndex,
-            payload,
-            std::move(targetAssembly),
-            std::move(targetSession));
+        result.frame = std::make_shared<DecodedFrame>(std::move(targetOutput));
+        {
+            std::lock_guard lock(stateMutex);
+            std::erase_if(frameStates, [](const auto& entry) { return entry.first.expired(); });
+            frameStates.emplace(result.frame, std::make_shared<FrameDecodeState>(std::move(targetSession)));
+        }
         progress.Finish(true);
         return result;
     }
@@ -839,11 +829,13 @@ struct PlaybackSession::Impl {
 
     void ClearState() {
         taskCoordinator.reset();
+        if (cacheRuntime) { cacheRuntime->SetRetiredFrameStateReclaimer({}); }
+        frameStates.clear();
         resources.reset();
         prefetchTasks.clear();
         queuedFrames.clear();
         dependencyPlanner.reset();
-        assemblyFactory.reset();
+        cellTypeMapping.reset();
         frameReaders.clear();
         framePackages.clear();
         frameIdentities.reset();
@@ -867,11 +859,11 @@ class DecodedFrameAttributeAccess final : public IDecodedFrameAttributeAccess {
 public:
     DecodedFrameAttributeAccess(
         std::weak_ptr<PlaybackSession> session,
-        DecodedFrameLease::Pointer frame)
+        DecodedFrame::Pointer frame)
         : m_session(std::move(session)),
           m_frame(std::move(frame)) {}
 
-    [[nodiscard]] DecodedFrameLease::Pointer Frame() const noexcept override {
+    [[nodiscard]] DecodedFrame::Pointer Frame() const noexcept override {
         return m_frame;
     }
 
@@ -884,7 +876,7 @@ public:
                 "decoded frame attribute access session is unavailable");
     }
 
-    [[nodiscard]] Pointer ForFrame(DecodedFrameLease::Pointer frame) const override {
+    [[nodiscard]] Pointer ForFrame(DecodedFrame::Pointer frame) const override {
         const auto session = m_session.lock();
         return session != nullptr ? session->CreateAttributeAccess(std::move(frame)) : nullptr;
     }
@@ -913,7 +905,7 @@ public:
 
 private:
     std::weak_ptr<PlaybackSession> m_session;
-    DecodedFrameLease::Pointer m_frame;
+    DecodedFrame::Pointer m_frame;
 };
 
 } // namespace
@@ -923,22 +915,28 @@ PlaybackSession::PlaybackSession() : m_impl(std::make_unique<Impl>()) {}
 PlaybackSession::~PlaybackSession() { Reset(); }
 
 IDecodedFrameAttributeAccess::Pointer PlaybackSession::CreateAttributeAccess(
-    DecodedFrameLease::Pointer frame) {
+    DecodedFrame::Pointer frame) {
     if (frame == nullptr) { return nullptr; }
     const auto self = weak_from_this();
     if (self.expired()) { return nullptr; }
     return std::make_shared<DecodedFrameAttributeAccess>(std::move(self), std::move(frame));
 }
 
-bool PlaybackSession::Open(const PlaybackOpenRequest& request, std::string* error) {
-    if (request.inputReader == nullptr) {
+bool PlaybackSession::Open(const PlaybackOpenRequest& request, std::string* error,
+    std::optional<CodecFailureRecord>* failure) try {
+    if (failure) { failure->reset(); }
+    Reset();
+    if (!request.input) {
         return validation::AssignError(error, "playback session requires an input reader");
     }
-    if (request.assemblyFactory == nullptr) {
-        return validation::AssignError(error, "playback session requires a frame assembly factory");
+    const auto reader = EncodedInputAccess::Open(request.input);
+    PackageInspection inspection;
+    if (!InspectPackage(*reader, inspection, error)) {
+        if (failure) { *failure = inspection.failure; }
+        return false;
     }
     auto framePackage = std::make_shared<FramePackage>();
-    if (!FramePackageIO::ReadMetadata(*request.inputReader, *framePackage, error)) {
+    if (!FramePackageIO::ReadMetadata(*reader, *framePackage, error)) {
         return validation::AssignError(error, "playback session requires one frame package per input");
     }
     return OpenSequence(PlaybackSequenceOpenRequest{
@@ -946,38 +944,36 @@ bool PlaybackSession::Open(const PlaybackOpenRequest& request, std::string* erro
             FrameDecodeSource{
                 .frameIndex = framePackage->frameIndex,
                 .timeValue = framePackage->timeValue,
-                .frameReader = request.inputReader,
+                .input = EncodedInputAccess::Retain(reader),
                 .sourceIdentity = request.sourceIdentity,
-                .framePackage = std::move(framePackage),
+
             },
         },
         .playbackFrameOrder = {},
-        .assemblyFactory = request.assemblyFactory,
+        .cellTypeMapping = request.cellTypeMapping,
         .controlParams = request.controlParams,
-        .executionOptions = request.executionOptions,
         .configurationSource = request.configurationSource,
         .language = request.language,
         .resources = request.resources,
         .decodedFrameCachePolicy = request.decodedFrameCachePolicy,
         .encodedInputCachePolicy = request.encodedInputCachePolicy,
         .loadAllAvailableAttributes = request.loadAllAvailableAttributes,
-    }, error);
+    }, error, failure);
+} catch (const std::exception& exception) {
+    Reset();
+    if (failure) { *failure = MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+        "playback-open", "PlaybackSession", exception.what()); }
+    return validation::AssignError(error, exception.what());
 }
 
-bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, std::string* error) {
+bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, std::string* error,
+    std::optional<CodecFailureRecord>* failure) try {
+    if (failure) { failure->reset(); }
     Reset();
     if (request.decodeSources.empty()) {
         return validation::AssignError(error, "playback sequence requires decode sources");
     }
-    if (request.assemblyFactory == nullptr) {
-        return validation::AssignError(error, "playback sequence requires a frame assembly factory");
-    }
-    const auto decodedFrameResultIdentity = request.assemblyFactory->CacheIdentity();
-    if (decodedFrameResultIdentity.empty()) {
-        return validation::AssignError(
-            error,
-            "playback sequence requires a stable frame assembly cache identity");
-    }
+    const std::string decodedFrameResultIdentity = "datacodec.owned-frame.v1";
 
     FrameSequenceDependencyPlanner::FrameReaderMap frameReaders;
     FrameSequenceDependencyPlanner::FramePackageMap framePackages;
@@ -987,23 +983,27 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
     frameReaders.reserve(request.decodeSources.size());
     frameIdentities.reserve(request.decodeSources.size());
     for (const auto& source : request.decodeSources) {
-        if (source.frameReader == nullptr || frameReaders.contains(source.frameIndex)) {
+        if (!source.input || frameReaders.contains(source.frameIndex)) {
             return validation::AssignError(error, "playback sequence contains a missing or duplicate decode source");
         }
         if (!source.sourceIdentity.IsStable()) {
             return validation::AssignError(error, "playback decode source requires a stable cache identity");
         }
         allFrameOrder.push_back(source.frameIndex);
-        frameReaders.emplace(source.frameIndex, source.frameReader);
-        frameIdentities.emplace(source.frameIndex, source.sourceIdentity);
-        if (source.framePackage != nullptr) {
-            if (source.framePackage->frameIndex != source.frameIndex) {
-                return validation::AssignError(
-                    error,
-                    "playback sequence frame metadata index does not match its decode source");
-            }
-            framePackages.emplace(source.frameIndex, source.framePackage);
+        const auto reader = EncodedInputAccess::Open(source.input);
+        PackageInspection inspection;
+        if (!InspectPackage(*reader, inspection, error)) {
+            if (failure) { *failure = inspection.failure; }
+            return false;
         }
+        frameReaders.emplace(source.frameIndex, reader);
+        frameIdentities.emplace(source.frameIndex, source.sourceIdentity);
+        auto metadata = std::make_shared<FramePackage>();
+        if (!FramePackageIO::ReadMetadata(*reader, *metadata, error)) { return false; }
+        if (metadata->frameIndex != source.frameIndex) {
+            return validation::AssignError(error, "playback sequence frame metadata index does not match its decode source");
+        }
+        framePackages.emplace(source.frameIndex, std::move(metadata));
     }
     auto sharedFrameIdentities = std::make_shared<const DecodeSession::FrameIdentityMap>(std::move(frameIdentities));
     std::sort(allFrameOrder.begin(), allFrameOrder.end());
@@ -1023,6 +1023,7 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
     auto resources = std::make_shared<DataCodecExecutionResources>(request.resources);
     auto taskCoordinator = std::make_unique<Impl::TargetTaskCoordinator>(*resources);
     auto* cacheRuntime = &resources->Caches();
+    cacheRuntime->SetRetiredFrameStateReclaimer([state = m_impl.get()] { return state->PruneRetiredFrameStates(); });
     auto referenceCache = cacheRuntime->ReferenceCache();
     referenceCache->Configure(1u);
     auto frameCache = cacheRuntime->DefaultFrameCache();
@@ -1038,13 +1039,10 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
         m_impl->dependencyPlanner = std::make_unique<FrameSequenceDependencyPlanner>(
             m_impl->frameReaders,
             m_impl->framePackages);
-        m_impl->assemblyFactory = request.assemblyFactory;
+        m_impl->cellTypeMapping = request.cellTypeMapping;
         m_impl->controlParams = request.controlParams != nullptr
             ? *request.controlParams
             : MakeDefaultDecodeControlParams();
-        m_impl->execution = request.executionOptions != nullptr
-            ? *request.executionOptions
-            : MakeDefaultDecodeExecutionOptions();
         m_impl->configurationSource = request.configurationSource != nullptr
             ? *request.configurationSource
             : DataCodecDecodeConfigurationSource{};
@@ -1064,6 +1062,11 @@ bool PlaybackSession::OpenSequence(const PlaybackSequenceOpenRequest& request, s
         m_impl->open = true;
     }
     return true;
+} catch (const std::exception& exception) {
+    Reset();
+    if (failure) { *failure = MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
+        "playback-open-sequence", "PlaybackSession", exception.what()); }
+    return validation::AssignError(error, exception.what());
 }
 
 PlaybackFrameResult PlaybackSession::RequestFrame(const PlaybackFrameRequest& request) {
@@ -1197,7 +1200,7 @@ PlaybackFrameResult PlaybackSession::RequestFrame(const PlaybackFrameRequest& re
 }
 
 DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
-    const DecodedFrameLease::Pointer& frame, const DecodedFrameAttributeRequest& request) {
+    const DecodedFrame::Pointer& frame, const DecodedFrameAttributeRequest& request) {
     DecodedFrameAttributeResult result;
     if (!m_impl->taskCoordinator || m_impl->taskCoordinator->IsDriverThread() || !frame) {
         result.failure = MakeCodecFailureRecord(CodecErrorCode::PipelineFailure,
@@ -1241,14 +1244,14 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributes(
 }
 
 DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
-    const DecodedFrameLease::Pointer& lease,
+    const DecodedFrame::Pointer& lease,
     const DecodedFrameAttributeRequest& request) {
     DecodedFrameAttributeResult result;
     if (request.stopToken.stop_requested()) {
         result.cancelled = true;
         return result;
     }
-    const auto frame = std::dynamic_pointer_cast<DecodedFrame>(lease);
+    const auto& frame = lease;
     if (frame == nullptr || request.attributeTargets.empty()) {
         AddPlaybackMessage(
             result,
@@ -1269,7 +1272,6 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
     }
 
     DecodeControlParams controlParams;
-    DecodeExecutionOptions execution;
     DataCodecDecodeConfigurationSource configurationSource;
     DataCodecLanguage language{DataCodecLanguage::SimplifiedChinese};
     std::shared_ptr<DataCodecExecutionResources> resources;
@@ -1284,7 +1286,6 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
             return result;
         }
         controlParams = m_impl->controlParams;
-        execution = m_impl->execution;
         configurationSource = m_impl->configurationSource;
         language = m_impl->language;
         resources = m_impl->resources;
@@ -1310,13 +1311,14 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
     }
     AppendRetainedTelemetryMessages(result.messages, referenceResult.messages);
     if (!referenceResult.success) {
+        result.failure = referenceResult.failure;
         result.cancelled = referenceResult.cancelled;
         return result;
     }
 
-    const auto assembly = frame->Assembly();
-    const auto frameSession = frame->FrameSession();
-    if (assembly == nullptr || frameSession == nullptr) {
+    const auto frameState = m_impl->FindFrameState(frame);
+    const auto frameSession = frameState ? frameState->FrameSession() : nullptr;
+    if (frameSession == nullptr) {
         AddPlaybackMessage(
             result,
             request.runRecordSink.get(),
@@ -1330,7 +1332,7 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
         groupedTargets[target.blockPath].push_back(target);
     }
 
-    auto decodeStateLock = frame->LockDecodeState();
+    auto decodeStateLock = frameState->LockDecodeState();
     result.success = true;
     for (const auto& [path, targets] : groupedTargets) {
         if (request.stopToken.stop_requested()) {
@@ -1343,9 +1345,9 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
         for (const auto& target : targets) { attrIndices.push_back(target.attrIndex); }
         std::sort(attrIndices.begin(), attrIndices.end());
         attrIndices.erase(std::unique(attrIndices.begin(), attrIndices.end()), attrIndices.end());
-        DecodedFrame::PreparedAttributeKey preparedKey{path, std::move(attrIndices)};
+        FrameDecodeState::PreparedAttributeKey preparedKey{path, std::move(attrIndices)};
 
-        auto* adapter = frame->PreparedAdapter(preparedKey);
+        auto* adapter = frameState->PreparedAdapter(preparedKey);
         std::string adapterError;
         if (adapter == nullptr) {
             if (request.mode == AttributeDecodeRequestMode::CommitCached) {
@@ -1357,9 +1359,10 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
                     "prepared playback attribute adapter is unavailable");
                 break;
             }
-            auto preparedAdapter = assembly->CreateSupplementAdapter(path, &adapterError);
+            auto preparedAdapter = std::make_unique<DecodedLeafBuilder>(m_impl->cellTypeMapping);
+            preparedAdapter->output.path = path;
             if (preparedAdapter != nullptr) {
-                adapter = frame->StorePreparedAdapter(preparedKey, std::move(preparedAdapter));
+                adapter = frameState->StorePreparedAdapter(preparedKey, std::move(preparedAdapter));
             }
         }
         if (adapter == nullptr) {
@@ -1383,7 +1386,6 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
             .supplementAttributesOnly = true,
             .attributeRequestMode = request.mode,
             .controlParams = controlParams,
-            .execution = execution,
             .configurationSource = configurationSource,
             .language = language,
             .runRecordSink = request.runRecordSink.get(),
@@ -1392,24 +1394,28 @@ DecodedFrameAttributeResult PlaybackSession::RequestDecodedFrameAttributesInRun(
         });
         AppendRetainedTelemetryMessages(result.messages, leafResult.messages);
         if (!leafResult.success) {
+            result.failure = leafResult.failure;
             result.success = false;
             result.cancelled = request.stopToken.stop_requested();
             break;
         }
         if (request.mode != AttributeDecodeRequestMode::DecodeToCache) {
-            frame->ErasePreparedAdapter(preparedKey);
+            result.output.frameIndex = frame->FrameIndex();
+            result.output.leaves.push_back(std::move(adapter->output));
+            frameState->ErasePreparedAdapter(preparedKey);
         }
     }
     return result;
 }
 
 std::vector<DecodeAttributeDescriptor> PlaybackSession::AvailableFrameAttributes(
-    const DecodedFrameLease::Pointer& lease) const {
-    const auto frame = std::dynamic_pointer_cast<DecodedFrame>(lease);
+    const DecodedFrame::Pointer& lease) const {
+    const auto& frame = lease;
     if (frame == nullptr) { return {}; }
-    const auto frameSession = frame->FrameSession();
+    const auto frameState = m_impl->FindFrameState(frame);
+    const auto frameSession = frameState ? frameState->FrameSession() : nullptr;
     if (frameSession == nullptr) { return {}; }
-    auto decodeStateLock = frame->LockDecodeState();
+    auto decodeStateLock = frameState->LockDecodeState();
     auto descriptors = frameSession->AvailableAttributes();
     descriptors.erase(
         std::remove_if(
