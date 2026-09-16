@@ -4,6 +4,9 @@
 
 #include <IQComponents/igQtProgressBarWidget.h>
 #include <QHBoxLayout>
+#include <QMetaObject>
+#include <QThread>
+#include <string>
 
 /**
  * @class   igQtProgressBarWidget
@@ -30,22 +33,52 @@ igQtProgressBarWidget::igQtProgressBarWidget(QWidget *parent) : QWidget(parent) 
 
     progressObserver = iGame::ProgressObserver::Instance();
 
-   progressObserver->AddObserver(iGame::Command::ProgressEvent,
-        [&](iGame::Object*, unsigned long, void* data)-> void {
-            double value = *static_cast<double*>(data);
-            this->updateProgressBar(value);
+    // 事件回调发生在“发事件的那个线程”：PVD 读第一帧、切帧读播放帧都是在
+    // ThreadPool 工作线程里读的（iGamePVDReader.cpp / iGameStreamingData.cpp），
+    // 而 FileReader::UpdateReadProgress() 会把进度直接发给全局 ProgressObserver。
+    // 在工作线程里直接 setValue()/setText() 属于跨线程操作 QWidget（UB），
+    // 外部 UIA 客户端查询状态栏无障碍树时会撞在 Qt 内部崩溃。
+    // 这里统一编组：GUI 线程直调，其它线程投递回本控件所在线程。
+    auto dispatch = [this](auto action) {
+        if (QThread::currentThread() == this->thread()) {
+            action();
+            return;
+        }
+        QMetaObject::invokeMethod(this, action, Qt::QueuedConnection);
+    };
+
+    m_ProgressObserverTag = progressObserver->AddObserver(iGame::Command::ProgressEvent,
+        [this, dispatch](iGame::Object*, unsigned long, void* data)-> void {
+            if (!data) { return; }
+            const double value = *static_cast<double*>(data);
+            dispatch([this, value]() { this->updateProgressBar(value); });
         });
 
-    progressObserver->AddObserver(iGame::Command::UpdateEvent,
-        [&](iGame::Object*, unsigned long, void* data)-> void {
+    m_TextObserverTag = progressObserver->AddObserver(iGame::Command::UpdateEvent,
+        [this, dispatch](iGame::Object*, unsigned long, void* data)-> void {
             const char* text = static_cast<const char*>(data);
-            if (!text || text[0] == '\0') {
-                resetTextMode();
-                return;
-            }
-            hasExternalText = true;
-            this->updateProgressBarLabel(text);
+            const std::string info = text ? std::string(text) : std::string();
+            dispatch([this, info]() {
+                if (info.empty()) {
+                    this->resetTextMode();
+                    return;
+                }
+                this->hasExternalText = true;
+                this->updateProgressBarLabel(info.c_str());
+            });
         });
+}
+
+igQtProgressBarWidget::~igQtProgressBarWidget() {
+    // ProgressObserver 是全局单例：不摘掉观察者，控件析构后它还会回调到悬空的 this。
+    if (progressObserver) {
+        if (m_ProgressObserverTag != kInvalidObserverTag) {
+            progressObserver->RemoveObserver(m_ProgressObserverTag);
+        }
+        if (m_TextObserverTag != kInvalidObserverTag) {
+            progressObserver->RemoveObserver(m_TextObserverTag);
+        }
+    }
 }
 
 void igQtProgressBarWidget::resetTextMode() {
