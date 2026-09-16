@@ -179,10 +179,12 @@ int main(int argc, char** argv) {
             Describe(decoded.success && assembly.Import(decoded.output) ? assembly.Output() : iGame::DataObject::Pointer{}, "bounded_decoded");
             return storage.peakReservedBytes <= limit ? 0 : 6;
         }
-        if (argc == 3 && (std::string_view(argv[1]) == "--decode" || std::string_view(argv[1]) == "--surface")) {
+        if (argc == 3 && (std::string_view(argv[1]) == "--decode" ||
+                std::string_view(argv[1]) == "--decode-unlimited" || std::string_view(argv[1]) == "--surface")) {
             const bool surface = std::string_view(argv[1]) == "--surface";
+            const bool unlimited = surface || std::string_view(argv[1]) == "--decode-unlimited";
             std::cout << std::fixed << std::setprecision(3);
-            std::cout << "CONFIG decode_only=true mode=" << (surface ? "Unlimited" : "Adaptive")
+            std::cout << "CONFIG decode_only=true mode=" << (unlimited ? "Unlimited" : "Adaptive")
                       << " threads=unlimited storage=automatic all_attributes=true surface=" << surface << std::endl;
             Memory("before_decode");
             const auto start = Clock::now();
@@ -190,7 +192,7 @@ int main(int argc, char** argv) {
             request.input = ::datacodec::EncodedInput::File(argv[2]);
             request.loadAllAvailableAttributes = true;
             request.runRecordSink = std::make_shared<Records>();
-            if (surface) { request.resources.mode = datacodec::CodecResourceMode::Unlimited; }
+            if (unlimited) { request.resources.mode = datacodec::CodecResourceMode::Unlimited; }
             const auto decoded = iGame::DecodeDataCodecDataObject(request);
             const auto decodeSeconds = Seconds(start);
             std::cout << "RESULT decode_success=" << decoded.success << " decode_seconds=" << decodeSeconds
@@ -226,7 +228,7 @@ int main(int argc, char** argv) {
         if (argc < 3 || (argc - 3) % 2 != 0) {
             std::cerr << "Usage: iGameDataCodecFileBenchmark input.cgns new-output.igc "
                 "[--memory unlimited|fixed|adaptive] [--threads N | --cpu-idle percent] [--memory-reserve percent]\n"
-                "       iGameDataCodecFileBenchmark --decode|--surface input.igc\n";
+                "       iGameDataCodecFileBenchmark --decode|--decode-unlimited|--surface input.igc\n";
             return 2;
         }
         datacodec::CodecResourceParams resources;

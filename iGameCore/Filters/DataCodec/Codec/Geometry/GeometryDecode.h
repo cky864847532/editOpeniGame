@@ -67,7 +67,8 @@ struct GeometryDecodedBlock {
 inline bool ComputeGeometryDecodedBlock(
     const GeometryDecodeRuntime& runtime, const numericarray::NumericArrayBlockParams& sourceParams,
     const numericarray::NumericArrayBlockPayload& input, GeometryDecodedBlock& output,
-    WorkerContext& worker, DecodeBlockWorkspace& workspace, std::string* error) {
+    WorkerContext& worker, DecodeBlockWorkspace& workspace, std::string* error,
+    std::span<std::uint8_t> target = {}) {
     auto scratchBytes = workspace.View<std::uint8_t>(input.memory.scratch);
     scratchBytes.resize(scratchBytes.capacity());
     ArrayWorkspace scratch(scratchBytes.Span());
@@ -78,7 +79,8 @@ inline bool ComputeGeometryDecodedBlock(
         params.capacitySamples->Observe(numericarray::NumericBufferSample::EncodedInput, input.bytes.Bytes());
     }
     output.header = input.header;
-    output.raw = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.raw));
+    output.raw = FixedScratchBuffer(target.empty() ? workspace.View<std::uint8_t>(input.memory.raw) :
+        numericarray::NumericDecodeOutputView(runtime.data.meta, input.header, target));
     auto& decoded = output.raw.Bytes();
     if (input.header.codecId == NumericArrayReferenceCodecId::NonReference) {
         if (input.header.referenceKind != NumericArrayReferenceKind::None ||
@@ -197,6 +199,8 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
         return detail::MakeGeometryDecodeFailure(CodecErrorCode::InvalidInput, std::move(error));
     }
     ParamSize committedElements = 0u;
+    auto* memory = dynamic_cast<bytestore::MemoryStore*>(geometry.bytes.get());
+    const auto target = memory ? memory->WritableBytes() : std::span<std::uint8_t>{};
     phase.reset();
     numericarray::NumericDecodeMemoryLayout nextMemory;
     const bool success = RunOrderedBlocks<numericarray::NumericArrayBlockPayload, detail::GeometryDecodedBlock>(
@@ -208,7 +212,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
         [&](const numericarray::NumericArrayBlockPayload& input, detail::GeometryDecodedBlock& output, WorkerContext& worker, DecodeBlockWorkspace& workspace) {
             std::string localError;
             if (runtime.recordCapacitySamples) { output.capacitySamples.emplace(); }
-            if (!detail::ComputeGeometryDecodedBlock(runtime, params, input, output, worker, workspace, &localError)) {
+            if (!detail::ComputeGeometryDecodedBlock(runtime, params, input, output, worker, workspace, &localError, target)) {
                 root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "geometry-block-decode", "ComputeGeometryDecodedBlock", localError));
                 return false;
@@ -234,7 +238,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
             std::uint64_t byteOffset = 0u;
             if (!validation::CheckedMulU64(committedElements, targetTupleBytes, byteOffset,
                     "geometry output offset", &error)) { return false; }
-            for (std::size_t offset = 0u; offset < points.size();) {
+            for (std::size_t offset = 0u; target.empty() && offset < points.size();) {
                 const auto bytes = std::min(kIoWindowBytes, points.size() - offset);
                 if (!geometry.bytes->WriteBytesAt(byteOffset + offset, points.subspan(offset, bytes), &error)) { return false; }
                 offset += bytes;
@@ -249,7 +253,7 @@ inline GeometryDecodeResult DecodeGeometryBlocks(GeometryDecodeRuntime& runtime,
             const auto* referenceMeta = runtime.data.keyFrameReference && runtime.data.keyFrameReference->store
                 ? &runtime.data.keyFrameReference->store->StorageParams() : nullptr;
             nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, meta.blockLayouts[cursor.nextBlock],
-                referenceMeta, false);
+                referenceMeta, false, !target.empty());
             return nextMemory;
         });
     if (!success) {

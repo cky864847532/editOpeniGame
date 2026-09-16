@@ -11,6 +11,20 @@ struct NumericDecodeMemoryLayout : DecodeBlockMemoryPlan {
     DecodeMemoryRange input, raw, converted, reference, scratch;
 };
 
+// 目标由 driver 定长分配并持有，块布局已验证互不重叠，全部任务结束后统一封存
+inline FixedArrayView<std::uint8_t> NumericDecodeOutputView(
+    const NumericArrayStorageParams& meta, const NumericArrayBlockHeader& block,
+    std::span<std::uint8_t> output) {
+    const auto tuple = DecodeBlockMemoryPlan::Multiply(static_cast<std::size_t>(meta.dimension),
+        static_cast<std::size_t>(NumericArrayValueSize(meta)));
+    const auto offset = DecodeBlockMemoryPlan::Multiply(static_cast<std::size_t>(block.elementOffset), tuple);
+    const auto size = DecodeBlockMemoryPlan::Multiply(static_cast<std::size_t>(block.elementCount), tuple);
+    if (offset > output.size() || size > output.size() - offset) {
+        throw std::length_error("numeric decode output exceeds its store");
+    }
+    return FixedArrayView<std::uint8_t>(output.subspan(offset, size));
+}
+
 inline std::size_t NumericComponentWorkBytes(std::size_t n, std::size_t valueSize,
     std::span<const NumericArrayComponentLayoutParams> components, std::size_t prefix = 0u) {
     DecodeBlockMemoryPlan layout;
@@ -25,7 +39,7 @@ inline std::size_t NumericComponentWorkBytes(std::size_t n, std::size_t valueSiz
 
 inline NumericDecodeMemoryLayout MakeNumericDecodeMemoryLayout(
     const NumericArrayStorageParams& meta, const NumericArrayBlockLayoutParams& block,
-    const NumericArrayStorageParams* referenceMeta, bool geometry) {
+    const NumericArrayStorageParams* referenceMeta, bool geometry, bool directOutput = false) {
     if (meta.dimension <= 0 || NumericArrayValueSize(meta) == 0u ||
         block.elementCount > std::numeric_limits<std::size_t>::max() ||
         block.encodedByteLength > std::numeric_limits<std::size_t>::max()) {
@@ -40,7 +54,7 @@ inline NumericDecodeMemoryLayout MakeNumericDecodeMemoryLayout(
     const auto raw = DecodeBlockMemoryPlan::Multiply(n, tuple);
     result.block = block.elementOffset;
     result.input = result.Append<std::uint8_t>(Region::Input, static_cast<std::size_t>(block.encodedByteLength));
-    result.raw = result.Append<std::uint8_t>(Region::Output, raw);
+    if (!directOutput) { result.raw = result.Append<std::uint8_t>(Region::Output, raw); }
     if (geometry && meta.dataType != DataType::Float32) {
         auto converted = result.Append<float>(Region::Output, DecodeBlockMemoryPlan::Multiply(n, c));
         result.converted = converted;

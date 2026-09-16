@@ -71,7 +71,60 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
                 root.StorageCapacity()->Snapshot().peakReservedBytes == 0u,
                 "numericDecode.rejectOversized", "oversized blocks must fail before reading or allocating output");
         }
-        for (const bool truncated : {false, true}) {
+        for (const bool file : {false, true}) {
+            for (const bool truncated : {false, true}) {
+                DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 2u, 4u},
+                    limit, 2u, true, true, file});
+                CodecRunScope scope(root);
+                CacheResources resources;
+                resources.BindRun(root);
+                bytestore::ByteStoreSession session;
+                session.BindStorage(root.StorageCapacity(), file);
+                CodecStorageParams storage;
+                AttrStorageParams attr;
+                static_cast<NumericArrayStorageParams&>(attr) = meta;
+                attr.name = "bounded_attribute";
+                attr.binaryCount = payload.size();
+                storage.attrParams.push_back(attr);
+                storage.attrPayloadOrder.push_back(0u);
+                DecodedAttributeCacheSet attributes;
+                bool unexpectedReference = false;
+                auto referenceDecoder = [&](auto&, const auto&, const auto&, std::string*) {
+                    unexpectedReference = true;
+                    return false;
+                };
+                decodeimpl::detail::AttributePayloadDecodeRuntime runtime{
+                    .data = {.storageParams = storage},
+                    .cache = {.cacheResources = resources, .byteStoreSession = session, .attributes = attributes},
+                };
+                const std::size_t target = 0u;
+                const auto input = std::span<const std::uint8_t>(payload).first(payload.size() - (truncated ? 1u : 0u));
+                error.clear();
+                const bool decoded = decodeimpl::detail::DecodeAttributePayloadRangesToCache(
+                    runtime, input, std::span<const std::size_t>(&target, 1u), referenceDecoder, &error);
+                bool matches = !unexpectedReference && decoded != truncated;
+                if (decoded) {
+                    std::vector<double> output(source.size());
+                    matches = matches && attributes.Complete(0u) && attributes.Bytes(0u)->Read(0u,
+                        {reinterpret_cast<std::uint8_t*>(output.data()), output.size() * sizeof(double)}, &error);
+                    for (std::size_t i = 0u; matches && i < source.size(); ++i) {
+                        matches = std::abs(output[i] - source[i]) <= 0.00101;
+                    }
+                } else {
+                    matches = matches && !attributes.Complete(0u) && !attributes.Bytes(0u);
+                }
+                scope.Finish(decoded);
+                attributes.Reset();
+                ResourceDebugSnapshot snapshot;
+                Require(result, matches && CopyExecutionSnapshot(root, snapshot) &&
+                    snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u &&
+                    root.StorageCapacity()->Snapshot().reservedBytes == 0u,
+                    "numericDecode.attributeFlow", "file=" + std::to_string(file) + ";truncated=" + std::to_string(truncated) + ";decoded=" + std::to_string(decoded) +
+                    ";error=" + error + ";failure=" + (root.FirstFailure() ? root.FirstFailure()->message.data() : "none"));
+            }
+        }
+        // 第二块读取失败时，首块可能已经直接写入目标，失败结果不得发布
+        {
             DataCodecExecutionResources root(ResolvedResourceConfiguration{{limit, 2u, 4u},
                 limit, 2u, true, true, false});
             CodecRunScope scope(root);
@@ -79,47 +132,32 @@ inline TestResult RunDataCodecFeatureNumericDecodeExecution() {
             resources.BindRun(root);
             bytestore::ByteStoreSession session;
             session.BindStorage(root.StorageCapacity(), false);
-            CodecStorageParams storage;
-            AttrStorageParams attr;
-            static_cast<NumericArrayStorageParams&>(attr) = meta;
-            attr.name = "bounded_attribute";
-            attr.binaryCount = payload.size();
-            storage.attrParams.push_back(attr);
-            storage.attrPayloadOrder.push_back(0u);
-            DecodedAttributeCacheSet attributes;
-            bool unexpectedReference = false;
-            auto referenceDecoder = [&](auto&, const auto&, const auto&, std::string*) {
-                unexpectedReference = true;
-                return false;
-            };
-            decodeimpl::detail::AttributePayloadDecodeRuntime runtime{
-                .data = {.storageParams = storage},
-                .cache = {.cacheResources = resources, .byteStoreSession = session, .attributes = attributes},
-            };
-            const std::size_t target = 0u;
-            const auto input = std::span<const std::uint8_t>(payload).first(payload.size() - (truncated ? 1u : 0u));
-            error.clear();
-            const bool decoded = decodeimpl::detail::DecodeAttributePayloadRangesToCache(
-                runtime, input, std::span<const std::size_t>(&target, 1u), referenceDecoder, &error);
-            bool matches = !unexpectedReference && decoded != truncated;
-            if (decoded) {
-                std::vector<double> output(source.size());
-                matches = matches && attributes.Complete(0u) && attributes.Bytes(0u)->Read(0u,
-                    {reinterpret_cast<std::uint8_t*>(output.data()), output.size() * sizeof(double)}, &error);
-                for (std::size_t i = 0u; matches && i < source.size(); ++i) {
-                    matches = std::abs(output[i] - source[i]) <= 0.00101;
+            struct FailingStream {
+                const std::vector<std::uint8_t>& bytes;
+                std::size_t boundary, offset{0u};
+                std::uint64_t Position() const noexcept { return offset; }
+                bool ReadBytes(void* target, std::size_t count, std::string* error) {
+                    if (offset >= boundary || count > boundary - offset) {
+                        return validation::AssignError(error, "injected second block read failure");
+                    }
+                    std::memcpy(target, bytes.data() + offset, count);
+                    offset += count;
+                    return true;
                 }
-            } else {
-                matches = matches && !attributes.Complete(0u) && !attributes.Bytes(0u);
-            }
-            scope.Finish(decoded);
-            attributes.Reset();
+            } stream{payload, static_cast<std::size_t>(meta.blockLayouts.front().encodedByteLength)};
+            DecodedGeometryCache geometry;
+            GeometryDecodeRuntime runtime{
+                .data = {.meta = meta, .payloadBytes = payload.size()},
+                .cache = {.cacheResources = resources, .byteStoreSession = session, .geometry = geometry},
+            };
+            const auto decoded = DecodeGeometryBlocks(runtime, stream);
+            scope.Finish(false);
             ResourceDebugSnapshot snapshot;
-            Require(result, matches && CopyExecutionSnapshot(root, snapshot) &&
+            Require(result, !decoded && !geometry.complete && !geometry.bytes &&
+                stream.offset == stream.boundary && CopyExecutionSnapshot(root, snapshot) &&
                 snapshot.admittedBlocks == 0u && snapshot.activeComputeUnits == 0u &&
                 root.StorageCapacity()->Snapshot().reservedBytes == 0u,
-                "numericDecode.attributeFlow", "truncated=" + std::to_string(truncated) + ";decoded=" + std::to_string(decoded) +
-                ";error=" + error + ";failure=" + (root.FirstFailure() ? root.FirstFailure()->message.data() : "none"));
+                "numericDecode.partialOutputFailure", "failed block flow must drain workers before releasing partial output");
         }
         for (const bool file : {false, true}) {
             for (const bool threaded : {false, true}) {

@@ -687,13 +687,15 @@ inline bool ComputeAttributeDecodedBlock(
     const CodecStorageParams& storageParams, const AttrStorageParams& meta,
     const DecodedAttributeCacheSet& attributes, DecodedAttributeReference* attributeKeyFrameReference,
     const numericarray::NumericArrayBlockPayload& input, AttributeDecodedBlock& output,
-    WorkerContext& worker, DecodeBlockWorkspace& workspace, const bool collectTiming, std::string* error) {
+    WorkerContext& worker, DecodeBlockWorkspace& workspace, const bool collectTiming, std::string* error,
+    std::span<std::uint8_t> target = {}) {
     auto scratchBytes = workspace.View<std::uint8_t>(input.memory.scratch);
     scratchBytes.resize(scratchBytes.capacity());
     ArrayWorkspace scratch(scratchBytes.Span());
     const auto block = numericarray::MakeParsedBlockView(input);
     output.header = input.header;
-    output.bytes = FixedScratchBuffer(workspace.View<std::uint8_t>(input.memory.raw));
+    output.bytes = FixedScratchBuffer(target.empty() ? workspace.View<std::uint8_t>(input.memory.raw) :
+        numericarray::NumericDecodeOutputView(meta, input.header, target));
     auto& decodedBlockBytes = output.bytes.Bytes();
     auto* capacitySamples = output.capacitySamples ? &*output.capacitySamples : nullptr;
     if (capacitySamples != nullptr) {
@@ -866,6 +868,8 @@ inline bool DecodeSingleAttributeRangeToCache(
     } guard{attributes, payloadRange.attrIndex};
     if (params.elementCount == 0u) { return attributes.EndAttribute(payloadRange.attrIndex, error); }
     ParamSize committed = 0u;
+    auto* memory = dynamic_cast<bytestore::MemoryStore*>(attributes.Bytes(payloadRange.attrIndex).get());
+    const auto target = memory ? memory->WritableBytes() : std::span<std::uint8_t>{};
     phase.reset();
     numericarray::NumericDecodeMemoryLayout nextMemory;
     return RunOrderedBlocks<numericarray::NumericArrayBlockPayload, AttributeDecodedBlock>(
@@ -880,7 +884,7 @@ inline bool DecodeSingleAttributeRangeToCache(
             std::string localError;
             if (recordCapacitySamples) { output.capacitySamples.emplace(); }
             if (!ComputeAttributeDecodedBlock(storageParams, meta, attributes, attributeKeyFrameReference,
-                    input, output, worker, workspace, workBreakdown != nullptr, &localError)) {
+                    input, output, worker, workspace, workBreakdown != nullptr, &localError, target)) {
                 root.RecordFailure(MakeCodecFailureRecord(CodecErrorCode::DecodeFailure,
                     "attribute-block-decode", "ComputeAttributeDecodedBlock", localError));
                 return false;
@@ -892,13 +896,18 @@ inline bool DecodeSingleAttributeRangeToCache(
                 return validation::AssignError(error, "attribute commit range is not contiguous");
             }
             const auto start = callback::StartTiming(workBreakdown != nullptr);
-            if (!WriteDecodedAttributeBlock(attributes, payloadRange.attrIndex, meta,
+            if (target.empty() && !WriteDecodedAttributeBlock(attributes, payloadRange.attrIndex, meta,
                     output.header, output.bytes.Span(), error)) { return false; }
+            std::size_t expectedBytes = 0u;
+            if (!numericarray::ResolveNumericArrayBlockRawByteCount(params, output.header.elementCount, expectedBytes, error) ||
+                output.bytes.Span().size() != expectedBytes) {
+                return validation::AssignError(error, "attribute decoded block does not match its logical shape");
+            }
             if (workBreakdown != nullptr) {
                 AccumulateAttributeDecodeWork(*workBreakdown, output.work);
                 workBreakdown->cacheWriteMs += callback::ElapsedMilliseconds(start);
                 workBreakdown->cacheWriteBytes = SaturatingParamSizeAdd(
-                    workBreakdown->cacheWriteBytes, output.bytes.Span().size());
+                    workBreakdown->cacheWriteBytes, target.empty() ? output.bytes.Span().size() : 0u);
             }
             if (output.capacitySamples && recordCapacitySamples) {
                 output.capacitySamples->Observe(numericarray::NumericBufferSample::Output, output.bytes.Bytes());
@@ -924,7 +933,7 @@ inline bool DecodeSingleAttributeRangeToCache(
                 }
                 referenceMeta = &attributeKeyFrameReference->reference.storageParams.attrParams[index];
             }
-            nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, layout, referenceMeta, false);
+            nextMemory = numericarray::MakeNumericDecodeMemoryLayout(meta, layout, referenceMeta, false, !target.empty());
             return nextMemory;
         });
 }

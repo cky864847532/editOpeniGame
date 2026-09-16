@@ -312,7 +312,7 @@ private:
                     }
                 }
             }
-            const auto memory = numericarray::MakeNumericDecodeMemoryLayout(meta, block, reference, geometry);
+            const auto memory = numericarray::MakeNumericDecodeMemoryLayout(meta, block, reference, false, true);
             Work(DecodeStorageKind::BlockWork, memory.TotalBytes(), geometry ? "geometry-block" : "attribute-block",
                 frame.metadata.frameIndex, leaf, i);
         }
