@@ -108,6 +108,9 @@ public:
     void setDimension(int length);
     int getDimension() const { return m_Dimension; }
 
+    /** 该行对应 AttributeSet 里的下标（供转换后原地刷新挂载类型图标用） */
+    int attributeIndex() const { return index; }
+
     int currentIndex() const { return comboBox->currentIndex(); }
     void show() { comboBox->show(); }
     void hide() { comboBox->hide(); }
@@ -238,6 +241,8 @@ public:
     }
 
     int getDimension() const { return m_Dimension; }
+    /** 该行对应（子块）AttributeSet 里的下标 */
+    int attributeIndex() const { return m_Index; }
 
     int currentIndex() const { return m_Combo->currentIndex(); }
     void show() { m_Combo->show(); }
