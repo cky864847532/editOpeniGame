@@ -117,6 +117,60 @@
 #include "ui_igQtVariableCorrelationWidget.h"
 
 namespace {
+// ---------------------------------------------------------------------------
+// 「数据转换」辅助：把一个数据对象就地转换，并回传统计信息。
+//   1) 用核心既有的「就地转换」filter（不改动核心代码）；转换后单元属性会变成同名点属性，
+//      必须强制重算可绘制数据，否则画面/色条还是旧的；
+//   2) filter 在“该方向没有属性”时会空转并返回 true，所以这里先自己数候选属性，
+//      否则“什么都没做”会被当成转换成功（那就会出现点了菜单毫无反应、也不报错）；
+//   3) 只处理自身带网格数据的对象：PVD 这类复合模型的父容器只是空壳，
+//      调用方（数据转换）会把**当前帧挂载的**对象逐个传进来。
+struct ConvertApplyResult {
+    int candidateAttrs{0};    // 命中方向的属性数（转点数据=单元属性；转单元数据=点属性）
+    int convertedAttrs{0};    // 真正转换成功的属性数
+    bool filterFailed{false}; // filter 执行失败
+};
+
+ConvertApplyResult ConvertDataObjectInPlace(iGame::DataObject::Pointer object, bool toPointData) {
+    using namespace iGame;
+    ConvertApplyResult result;
+    if (object == nullptr) { return result; }
+    if (object->GetPoints() == nullptr || object->GetCellArray() == nullptr) { return result; }
+    auto attrs = object->GetAttributeSet();
+    if (attrs == nullptr) { return result; }
+
+    for (int i = 0; i < attrs->GetNumberOfAttributes(); ++i) {
+        auto& attr = attrs->GetAttribute(i);
+        if (attr.isDeleted || attr.pointer == nullptr) { continue; }
+        if (toPointData ? (attr.attachmentType == IG_CELL) : (attr.attachmentType == IG_POINT)) {
+            ++result.candidateAttrs;
+        }
+    }
+    if (result.candidateAttrs == 0) { return result; } // 该方向没有属性：空转不算转换
+
+    bool ok = false;
+    if (toPointData) {
+        ConvertToPointDataFilter::Pointer filter = ConvertToPointDataFilter::New();
+        filter->SetInput(object);
+        ok = filter->Execute();
+    } else {
+        ConvertToCellDataFilter::Pointer filter = ConvertToCellDataFilter::New();
+        filter->SetInput(object);
+        ok = filter->Execute();
+    }
+    if (!ok) {
+        result.filterFailed = true;
+        qDebug() << "Convert filter failed on object" << QString::fromStdString(object->GetName())
+                 << (toPointData ? "ToPointData" : "ToCellData");
+        return result;
+    }
+    result.convertedAttrs = result.candidateAttrs;
+    if (auto drawObject = DynamicCast<DrawObject>(object)) {
+        drawObject->ForceReConvertToDrawableData();
+    }
+    return result;
+}
+
 struct ToolbarSpacingMetrics {
     int btnGap;
     int edgeMargin;
@@ -317,6 +371,151 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
 }
 )";
+}
+
+// 「数据转换」：**就地**转换当前帧挂载的数据，转换完模型树里仍然只有这一个模型——
+// 不新增行，而是把该模型改名成转换后的名字（`原名[_fN]_PointData/_CellData`）。
+// 说明：
+//   - 目标：复合模型（PVD 等）= 当前挂载的子块（即当前帧，不是第一帧）；普通模型 = 自身；
+//   - 转换是就地的，所以原来那份数据本身已经变成点/单元数据（不是独立副本）；
+//   - 转换后同步刷新属性行的挂载类型图标与画面（否则看起来像"没反应"）。
+int igQtMainWindow::createConvertedFrameModel(bool toPointData, QString& reason, QStringList& createdNames) {
+    using namespace iGame;
+    reason.clear();
+    createdNames.clear();
+
+    if (rendererWidget == nullptr || modelTreeWidget == nullptr) {
+        reason = QStringLiteral("界面尚未就绪");
+        return 0;
+    }
+    auto scene = rendererWidget->GetScene();
+    auto model = scene ? scene->GetCurrentModel() : nullptr;
+    if (model == nullptr || model->GetDataObject() == nullptr) {
+        reason = QStringLiteral("请先加载模型");
+        return 0;
+    }
+    auto top = model->GetDataObject();
+
+    // 1) 目标：复合模型（PVD 等）→ 当前挂载的子块，也就是“当前帧”；普通模型 → 它自己
+    std::vector<DataObject::Pointer> targets;
+    if (top->HasSubDataObject()) {
+        for (auto it = top->SubDataObjectIteratorBegin();
+             it != top->SubDataObjectIteratorEnd(); ++it) {
+            auto sub = it->second;
+            if (sub == nullptr) { continue; }
+            if (sub->GetPoints() == nullptr || sub->GetCellArray() == nullptr) { continue; }
+            targets.push_back(sub);
+        }
+    } else if (top->GetPoints() != nullptr && top->GetCellArray() != nullptr) {
+        targets.push_back(top);
+    }
+    if (targets.empty()) {
+        reason = QStringLiteral("当前帧没有带网格数据的对象（子块可能尚未加载完成），无法转换。");
+        return 0;
+    }
+
+    // 2) 就地转换（共享模式下，转换结果就属于这份数据本身）
+    int convertedAttrs = 0;
+    int convertFailed = 0;
+    int noCandidates = 0;
+    for (auto& target : targets) {
+        const auto res = ConvertDataObjectInPlace(target, toPointData);
+        if (res.convertedAttrs <= 0) {
+            if (res.filterFailed) { ++convertFailed; } else { ++noCandidates; }
+            continue;
+        }
+        convertedAttrs += res.convertedAttrs;
+    }
+    if (convertedAttrs <= 0) {
+        if (convertFailed > 0) {
+            reason = QStringLiteral("转换 filter 执行失败，详见日志。");
+        } else if (noCandidates > 0) {
+            reason = toPointData ? QStringLiteral("当前帧没有单元属性（该帧只有点属性），无需转换。")
+                                 : QStringLiteral("当前帧没有点属性，无需转换。");
+        } else {
+            reason = QStringLiteral("当前帧没有可转换的数据。");
+        }
+        return 0;
+    }
+
+    // 3) 复合模型：父容器上的属性是各子块属性的“占位登记”，同步挂载类型并重算值域
+    if (top->HasSubDataObject()) {
+        if (auto parentAttrs = top->GetAttributeSet()) {
+            for (int i = 0; i < parentAttrs->GetNumberOfAttributes(); ++i) {
+                auto& parentAttr = parentAttrs->GetAttribute(i);
+                if (parentAttr.isDeleted || parentAttr.pointer == nullptr) { continue; }
+                const std::string name = parentAttr.pointer->GetName();
+                for (auto it = top->SubDataObjectIteratorBegin();
+                     it != top->SubDataObjectIteratorEnd(); ++it) {
+                    auto sub = it->second;
+                    if (sub == nullptr) { continue; }
+                    auto subAttrs = sub->GetAttributeSet();
+                    if (subAttrs == nullptr) { continue; }
+                    const int subIndex = subAttrs->GetAttributeIndex(name);
+                    if (subIndex < 0) { continue; }
+                    parentAttr.attachmentType = subAttrs->GetAttribute(subIndex).attachmentType;
+                    break;
+                }
+            }
+        }
+        top->ReCollectSubDataObjectDataRange();
+        top->UpdateSubDataObjectDataRange();
+        if (auto drawObject = DynamicCast<DrawObject>(top)) {
+            drawObject->ForceReConvertToDrawableData();
+        }
+    }
+    // 原行的属性图标/提示按新挂载类型就地刷新（只改图标与提示，不重建行，不会丢子块行）
+    modelTreeWidget->refreshAttributeBadges(top);
+
+    // 4) 模型树里只保留这一个模型：把该模型改名成转换后的名字（含发生转换的帧号）
+    int frameIndex = 0;
+    int frameCount = 1;
+    if (auto frames = top->PeekTimeFrames()) {
+        frameCount = static_cast<int>(frames->GetTimeNum());
+        if (frameCount > 0) {
+            frameIndex = ui->widget_Animation != nullptr ? ui->widget_Animation->currentFrameIndex() : 0;
+            frameIndex = std::max(0, std::min(frameIndex, frameCount - 1));
+        }
+    }
+    // 名字规则：基准名 + [_f<帧号>] + _PointData/_CellData。
+    // 之前已经转换过的话，名字里已经带了这两种后缀，这里先剥干净再拼，否则每转一次都会
+    // 多叠一段（`1_f1_PointData` → `1_f1_f12_CellData` → …）。
+    QString baseName = QString::fromStdString(top->GetName());
+    bool hadDataTypeSuffix = false;
+    for (const auto& suffix : {QStringLiteral("_PointData"), QStringLiteral("_CellData")}) {
+        if (baseName.endsWith(suffix)) {
+            baseName.chop(suffix.size());
+            hadDataTypeSuffix = true;
+            break;
+        }
+    }
+    // 只有名字确实带过我们加的数据类型后缀时才剪掉结尾的 `_f<数字>`，
+    // 免得误伤本来就叫 `xxx_f12` 的文件名。
+    if (hadDataTypeSuffix) {
+        const int underscore = baseName.lastIndexOf(QLatin1Char('_'));
+        if (underscore > 0 && underscore + 2 < baseName.size() &&
+            baseName.at(underscore + 1) == QLatin1Char('f')) {
+            bool digitsOnly = true;
+            for (int i = underscore + 2; i < baseName.size(); ++i) {
+                if (!baseName.at(i).isDigit()) {
+                    digitsOnly = false;
+                    break;
+                }
+            }
+            if (digitsOnly) { baseName.chop(baseName.size() - underscore); }
+        }
+    }
+    if (baseName.isEmpty()) { baseName = QStringLiteral("Model"); }
+    QString convertedName = baseName;
+    if (frameCount > 1) { convertedName += QStringLiteral("_f%1").arg(frameIndex + 1); }
+    convertedName += toPointData ? QStringLiteral("_PointData") : QStringLiteral("_CellData");
+
+    const QString finalName = modelTreeWidget->renameModelRow(top, convertedName);
+    createdNames << finalName;
+    qDebug() << "Convert in place, model renamed to:" << finalName << "converted attrs:" << convertedAttrs
+             << (toPointData ? "ToPointData" : "ToCellData");
+    rendererWidget->update();
+    return static_cast<int>(createdNames.size());
 }
 
 igQtMainWindow::igQtMainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui::MainWindow) {
@@ -1793,25 +1992,37 @@ void igQtMainWindow::initAllFilters() {
 
     //    });
     QMenu* convert = ui->menu_filters->addMenu(QStringLiteral("数据转换 (Convert)"));
-    connect(convert->addAction(QStringLiteral("转换为点数据 (Convert To PointData)")), &QAction::triggered, this, [&](bool checked) {
-        if (rendererWidget->GetScene()->GetCurrentModel() == nullptr) return;
-        auto obj = rendererWidget->GetScene()->GetCurrentModel()->GetDataObject();
-        ConvertToPointDataFilter::Pointer filter = ConvertToPointDataFilter::New();
-        filter->SetInput(obj);
-        if (filter->Execute()) {
-            modelTreeWidget->addDataObjectToModelTree(filter->GetOutput(), Algorithm);
-            rendererWidget->update();
+    // 转换就地作用于「当前帧」的数据（普通模型=自身；PVD 等复合模型=当前挂载的所有子块），
+    // 因为不再 addDataObjectToModelTree()，所以不会再出现“转换后多出一个同名模型”的问题。
+    connect(convert->addAction(QStringLiteral("转换为点数据 (Convert To PointData)")), &QAction::triggered, this, [this](bool checked) {
+        QString reason;
+        QStringList names;
+        const int created = createConvertedFrameModel(true, reason, names);
+        if (created <= 0) {
+            showDarkFramelessMessage(QStringLiteral("转换未完成"),
+                                     reason.isEmpty() ? QStringLiteral("未能完成转换。") : reason);
+            return;
         }
+        showDarkFramelessMessage(
+                QStringLiteral("转换完成"),
+                QStringLiteral("已就地转换当前帧，模型改名为「%1」")
+                        .arg(names.join(QStringLiteral("、"))),
+                true);
     });
-    connect(convert->addAction(QStringLiteral("转换为单元数据 (Convert To CellData)")), &QAction::triggered, this, [&](bool checked) {
-        if (rendererWidget->GetScene()->GetCurrentModel() == nullptr) return;
-        auto obj = rendererWidget->GetScene()->GetCurrentModel()->GetDataObject();
-        ConvertToCellDataFilter::Pointer filter = ConvertToCellDataFilter::New();
-        filter->SetInput(obj);
-        if (filter->Execute()) {
-            modelTreeWidget->addDataObjectToModelTree(filter->GetOutput(), Algorithm);
-            rendererWidget->update();
+    connect(convert->addAction(QStringLiteral("转换为单元数据 (Convert To CellData)")), &QAction::triggered, this, [this](bool checked) {
+        QString reason;
+        QStringList names;
+        const int created = createConvertedFrameModel(false, reason, names);
+        if (created <= 0) {
+            showDarkFramelessMessage(QStringLiteral("转换未完成"),
+                                     reason.isEmpty() ? QStringLiteral("未能完成转换。") : reason);
+            return;
         }
+        showDarkFramelessMessage(
+                QStringLiteral("转换完成"),
+                QStringLiteral("已就地转换当前帧，模型改名为「%1」")
+                        .arg(names.join(QStringLiteral("、"))),
+                true);
     });
 
 

@@ -55,6 +55,10 @@ public:
                                             int frameIndex);
     std::string GetDiffOutputName(const std::string& sourceAttrName) const;
 
+    // 当前显示帧在“源时间序列”中的下标（0 基）。
+    // 供「数据转换」等需要“作用于当前帧而不是第一帧”的功能读取。
+    int currentFrameIndex() const;
+
 public slots:
     void initAnimationComponents();
 

@@ -163,6 +163,17 @@ private:
     /** 与菜单「算法处理 / 特征提取」等一致：无边框 QMessageBox + 暗色圆角边框。 */
     void showDarkFramelessMessage(const QString& title, const QString& text, bool useInformationIcon = false);
 
+    /**
+     * 「数据转换」：**就地**转换当前帧挂载的数据（复合模型=当前挂载的子块，即当前帧；
+     * 普通模型=自身），转换完**模型树里仍然只有这一个模型**：不新增行，只把该模型改名成
+     * 转换后的名字（`原名[_fN]_PointData/_CellData`），并就地刷新属性行图标与画面。
+     * @param toPointData true=单元数据转点数据；false=点数据转单元数据
+     * @param reason 失败/未转换时的原因（供提示框显示）
+     * @param createdNames 转换后使用的模型名
+     * @return 1 = 已转换并改名；0 = 没有转换（见 reason）
+     */
+    int createConvertedFrameModel(bool toPointData, QString& reason, QStringList& createdNames);
+
     void rebuildActionsAsTwoRowWidget(QToolBar* toolbar, const QList<QAction*>& targetActions, int columns,
                                       QAction* insertBefore = nullptr);
     void addToolbarTitle(QToolBar* toolbar, const QString& title, int iconSizePx);

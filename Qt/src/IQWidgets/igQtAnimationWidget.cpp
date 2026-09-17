@@ -1413,6 +1413,13 @@ std::string igQtAnimationWidget::GetDiffOutputName(const std::string& sourceAttr
     return sourceAttrName + "_diff" + modeSuffix[mode];
 }
 
+int igQtAnimationWidget::currentFrameIndex() const {
+    // VcrController 记录的是“源时间序列”的下标：数据转换要作用于当前帧而不是第一帧。
+    if (VcrController != nullptr) { return VcrController->currentKeyframeIndex(); }
+    if (ui && ui->comboBoxCurrentAnimation) { return ui->comboBoxCurrentAnimation->currentIndex(); }
+    return 0;
+}
+
 void igQtAnimationWidget::SetDiffAutoCompute(bool enabled, const std::string& sourceAttrName) {
     using namespace iGame;
     m_DiffAutoCompute = enabled;
