@@ -118,19 +118,10 @@ void igQtScalarViewWidget::initScalarRange() {
 		return;
 	}
 	// 更新 ColorMapper 的范围到新的数据范围
-	double displayMin = scalarMin;
-	double displayMax = scalarMax;
 	if (m_ColorMapper && scalarMax >= scalarMin) {
-		// Stable means the application/user deliberately chose a shared display
-		// range.  Refreshing this panel must not silently replace that range.
-		if (!m_ColorMapper->GetStable()) {
-			m_ColorMapper->SetRange(scalarMin, scalarMax);
-		} else {
-			displayMin = m_ColorMapper->GetRange()[0];
-			displayMax = m_ColorMapper->GetRange()[1];
-		}
+		m_ColorMapper->SetRange(scalarMin, scalarMax);
 	}
-	ui->widget_DataRangeSlider->updateMinAndMax(displayMin, displayMax);
+	ui->widget_DataRangeSlider->updateMinAndMax(scalarMin, scalarMax);
 	ui->widget_DataRangeSlider->show();
 }
 void igQtScalarViewWidget::initScalarInfo()
@@ -143,10 +134,6 @@ void igQtScalarViewWidget::initScalarInfo()
 	oss << std::scientific << std::setprecision(6);
 	oss << scalarName << "\nMin Value : " << scalarMin
 		<< "\nMax Value : " << scalarMax;
-	if (m_ColorMapper && m_ColorMapper->GetStable()) {
-		oss << "\nDisplay Min : " << m_ColorMapper->GetRange()[0]
-			<< "\nDisplay Max : " << m_ColorMapper->GetRange()[1];
-	}
 	
 	ui->labelScalarInfo->setText(QString::fromStdString(oss.str()));
 }
@@ -163,12 +150,15 @@ void igQtScalarViewWidget::showScalarView() {
 	}
 }
 void igQtScalarViewWidget::updateDrawStyle() {
-	if (!m_ColorMapper) { m_ColorMapper = m_TmpColorMapper;}
-	m_ColorMapper->Modified();
 	auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
-	if (scene) {
-		scene->Update();
+	if (!scene) return;
+	auto model = scene->GetCurrentModel();
+	if (model && model->GetDataObject()) {
+		m_ColorMapper = model->GetDataObject()->GetColorMapper();
 	}
+	if (!m_ColorMapper) return;
+	m_ColorMapper->Modified();
+	scene->Update();
 }
 void igQtScalarViewWidget::editColorBar() { 
 	auto scene = iGame::SceneManager::Instance()->GetCurrentScene();

@@ -39,7 +39,6 @@ class QFontMetrics;
 class igQtChromeFramelessDialog;
 class igQtPartFocusWidget;
 class igQtAttributeSelectWidget;
-class igQtRemoteModelLibrary;
 
 class IG_QT_MODULE_EXPORT igQtMainWindow : public QMainWindow {
     Q_OBJECT
@@ -104,9 +103,6 @@ public:
     // Command Manager for MCP Server (端口 12345)
     igQtCommandManager* commandManager;
 
-    // Non-modal browser for packages published by the data server.
-    igQtRemoteModelLibrary* remoteModelLibrary{nullptr};
-
     // 零件聚焦弹窗
     igQtChromeFramelessDialog* partFocusDialog{nullptr};
     igQtPartFocusWidget* partFocusWidget{nullptr};
@@ -169,6 +165,17 @@ private:
 
     /** 与菜单「算法处理 / 特征提取」等一致：无边框 QMessageBox + 暗色圆角边框。 */
     void showDarkFramelessMessage(const QString& title, const QString& text, bool useInformationIcon = false);
+
+    /**
+     * 「数据转换」：**就地**转换当前帧挂载的数据（复合模型=当前挂载的子块，即当前帧；
+     * 普通模型=自身），转换完**模型树里仍然只有这一个模型**：不新增行，只把该模型改名成
+     * 转换后的名字（`原名[_fN]_PointData/_CellData`），并就地刷新属性行图标与画面。
+     * @param toPointData true=单元数据转点数据；false=点数据转单元数据
+     * @param reason 失败/未转换时的原因（供提示框显示）
+     * @param createdNames 转换后使用的模型名
+     * @return 1 = 已转换并改名；0 = 没有转换（见 reason）
+     */
+    int createConvertedFrameModel(bool toPointData, QString& reason, QStringList& createdNames);
 
     void rebuildActionsAsTwoRowWidget(QToolBar* toolbar, const QList<QAction*>& targetActions, int columns,
                                       QAction* insertBefore = nullptr);
