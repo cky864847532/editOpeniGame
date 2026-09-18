@@ -1,6 +1,8 @@
 #if defined(FFMPEG_ENABLE)
 #include "IQComponents/Dialog/igQtVideoOptionDialog.h"
 
+#include <IQWidgets/igQtRenderWidget.h>   // §82：角色色（uiRoleCss）
+#include <QEvent>                          // §82：changeEvent(QEvent*)
 #include <QFormLayout>
 #include <QIntValidator>
 #include <QLabel>
@@ -9,6 +11,28 @@
 #include <QRegExpValidator>
 #include <QVBoxLayout>
 
+namespace {
+// §82：本弹窗是独立顶层窗，body 上的控件级 QSS 会压过主窗口主题 QSS，
+//      所以配色必须用角色色当场生成，并在主题切换时重新生成
+//      （原先写死深色，切到 ✦浅白 后输入框/按钮仍是深色底）。
+QString bodyThemeQss() {
+    return QStringLiteral(
+                   "QWidget { background-color: transparent; color: %1; }"
+                   "QLabel { color: %1; }"
+                   "QLineEdit { background-color: %2; color: %1; border: 1px solid %3; padding: 4px; border-radius: 3px; }"
+                   "QLineEdit:focus { border: 1px solid %4; }"
+                   "QPushButton { background-color: %2; color: %1; border: 1px solid %3; padding: 6px 12px; border-radius: 4px; }"
+                   "QPushButton:hover { background-color: %5; }"
+                   "QPushButton:pressed { background-color: %6; }")
+            .arg(igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::Text),
+                 igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::PanelBg2),
+                 igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::Border),
+                 igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::Accent),
+                 igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::HoverBg),
+                 igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::SelectionBg));
+}
+}   // namespace
+
 igQtVideoOptionDialog::igQtVideoOptionDialog(QWidget* parent) : igQtChromeFramelessDialog(parent) {
     setDialogTitle(QStringLiteral("保存动画选项"));
     setMinimumSize(460, 300);
@@ -16,14 +40,9 @@ igQtVideoOptionDialog::igQtVideoOptionDialog(QWidget* parent) : igQtChromeFramel
     setMaximizeEnabled(false);
 
     auto* body = new QWidget(this);
+    m_body = body;
     body->setAttribute(Qt::WA_StyledBackground, true);
-    body->setStyleSheet(
-        "QWidget { background-color: transparent; color: #EAEAEA; }"
-        "QLabel { color: #D8D8D8; }"
-        "QLineEdit { background-color: #2A2A2A; color: #EAEAEA; border: 1px solid #3A3A3A; padding: 4px; border-radius: 3px; }"
-        "QPushButton { background-color: #2A2A2A; color: #EAEAEA; border: 1px solid #3A3A3A; padding: 6px 12px; border-radius: 4px; }"
-        "QPushButton:hover { background-color: #3A3A3A; }"
-        "QPushButton:pressed { background-color: #252526; }");
+    body->setStyleSheet(bodyThemeQss());   // §82：角色色，切主题时由 changeEvent 重新生成
 
     auto* layout = new QVBoxLayout(body);
     layout->setContentsMargins(14, 10, 14, 14);
@@ -74,5 +93,13 @@ iGame::VideoInputInfo igQtVideoOptionDialog::getInput() {
     res.frame_rate = m_frameRate_LineEdit->text().toInt();
     res.bit_rate = m_bitRate_LineEdit->text().toInt();
     return res;
+}
+
+// §82：切主题 → 重新按角色色生成 body 样式（本窗口是独立顶层窗，不继承主窗口 QSS）
+void igQtVideoOptionDialog::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange && m_body) {
+        m_body->setStyleSheet(bodyThemeQss());
+    }
+    igQtChromeFramelessDialog::changeEvent(e);
 }
 #endif

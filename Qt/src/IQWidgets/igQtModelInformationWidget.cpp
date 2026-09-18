@@ -5,7 +5,19 @@
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
 #include "iGameVolumeMesh.h"
+#include <QEvent>   // §82：changeEvent(QEvent*)
 #include <filesystem>
+
+// §82：切换主题时重建信息区。
+// updateInformationFrame() 是在创建标签/行的那一刻按当前主题取色（见 createLabel /
+// createPropertyLabel / infoCardPalette），所以不重建的话，已经生成的行会一直保留
+// 旧主题的颜色 —— 表现为切到 ✦浅白 后信息区仍是深色文字/深色行底。
+void igQtModelInformationWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        updateInformationFrame();
+    }
+    QWidget::changeEvent(e);
+}
 
 namespace {
 /** 在路径分隔符后插入零宽空格，便于 QLabel 在窄 dock 内按段换行（路径通常不含空格）。 */
