@@ -195,10 +195,12 @@ QString igQtFileLoader::RemoteMemoryCacheStatus() const
     auto data = s.cache.PeekData();
     iGame::Scene::Pointer scene = m_SceneManager->GetCurrentScene();
     const bool mounted = static_cast<bool>(MountedRemoteData(scene.get(), data.get()));
-    return QStringLiteral("%1 | %2 | %3 (CPU array estimate; excludes process/render overhead)")
+    return QStringLiteral("%1 | %2 | %3 | %4 (CPU estimate; excludes GPU/process overhead)")
             .arg(QFileInfo(s.cache.DatasetPath()).fileName(),
                  mounted ? QStringLiteral("displayed") : QStringLiteral("not in model tree"),
-                 HasRemoteGpu(data.get()) ? QStringLiteral("CPU + GPU resident") : QStringLiteral("CPU ready; GPU resources = 0"));
+                 HasRemoteGpu(data.get()) ? QStringLiteral("CPU + GPU resident") : QStringLiteral("CPU ready; GPU resources = 0"),
+                 s.cache.HasPreparedCpuData() ? QStringLiteral("surface + LOD + draw arrays retained")
+                                             : QStringLiteral("parsed data; display preparation required"));
 }
 
 void igQtFileLoader::ReleaseDetachedRemoteGpuResources()
@@ -216,13 +218,26 @@ void igQtFileLoader::ReleaseDetachedRemoteGpuResources()
     }
     RemoteCacheGLScope gl(s.renderer);
     if (QOpenGLContext::currentContext() != s.cacheContext.data()) return;
-    if (auto* draw = dynamic_cast<iGame::DrawObject*>(data.get())) draw->ReleaseDrawableResources();
     const auto key = s.cache.Key();
     const auto path = s.cache.DatasetPath();
-    s.cache.CaptureCpu(scene, data, key, path);
+    QString preparedReason;
+    const bool prepared = s.cache.HasPreparedCpuData() && s.cache.LookupData(scene, key, preparedReason);
+    if (auto* draw = dynamic_cast<iGame::DrawObject*>(data.get())) {
+        if (prepared) draw->ReleaseGpuResourcesKeepCpuData();
+        else draw->ReleaseDrawableResources();
+    }
+    if (prepared) s.cache.CapturePreparedCpu(scene, data, key, path);
+    else s.cache.CaptureCpu(scene, data, key, path);
     s.cacheContext.clear();
+    if (!s.cache.HasEntry() || s.cache.MemoryBytes() > s.limitBytes) {
+        // A detached prepared graph may contain shell/meshlet/self references.
+        // Full release is still required on rejection/eviction.
+        if (auto* draw = dynamic_cast<iGame::DrawObject*>(data.get())) draw->ReleaseDrawableResources();
+        s.cache.Clear();
+    }
     igDebug("[RemoteCpuCache] Detached model demoted to CPU; gpu_resources={} scene_user_models={} cpu_bytes={}",
             HasRemoteGpu(data.get()) ? 1 : 0, RemoteUserModelCount(scene.get()), s.cache.MemoryBytes());
+    igDebug("[RemoteCpuCache] prepared_cpu={} (retained surface/LOD/draw arrays)", s.cache.HasPreparedCpuData());
     emit RemoteMemoryCacheChanged();
 }
 
@@ -290,6 +305,11 @@ bool igQtFileLoader::ClearResidentRemoteCache()
     QScopedValueRollback<bool> clearing(s.clearingCache, true);
     Q_ASSERT(QThread::currentThread() == thread());
     if (!s.cacheContext && !HasRemoteGpu(s.cache.PeekData().get())) {
+        auto data = s.cache.PeekData();
+        iGame::Scene::Pointer scene = m_SceneManager->GetCurrentScene();
+        if (!MountedRemoteData(scene.get(), data.get())) {
+            if (auto* draw = dynamic_cast<iGame::DrawObject*>(data.get())) draw->ReleaseDrawableResources();
+        }
         s.cache.Clear();
         emit RemoteMemoryCacheChanged();
         return true;
@@ -431,10 +451,22 @@ void igQtFileLoader::ContinueResidentRemoteRequest()
                 // Bind the resource generation BEFORE any display callback can
                 // allocate GL names, so cancel/failure teardown stays safe too.
                 s.cacheContext = s.renderer->context();
-                // CPU-only cache never keeps GPU resources. Normal GUI setup
-                // prepares the display and original scalar mapping anew.
-                emit NewModel(data, ItemSource::File);
-                emit FinishReading();
+                if (s.cache.HasPreparedCpuData()) {
+                    QElapsedTimer uploadTimer;
+                    uploadTimer.start();
+                    auto* draw = dynamic_cast<iGame::DrawObject*>(data.get());
+                    if (!draw || !draw->UploadPreparedCpuData()) {
+                        FailResidentRemoteRequest(QStringLiteral("Prepared CPU buffer upload failed; model was not attached"));
+                        return;
+                    }
+                    igDebug("[RemoteCpuCache] Prepared GPU upload submitted elapsed_ms={} (no CPU geometry conversion; GPU completion not timed)", uploadTimer.elapsed());
+                    // Reattach the original objects without the normal initial
+                    // scalar setup, which invalidates shell/LOD and color data.
+                    emit RemoteCachedDatasetReattach(data);
+                } else {
+                    emit NewModel(data, ItemSource::File);
+                    emit FinishReading();
+                }
             } else { emit RemoteCachedDatasetReattach(data); }
             model = MountedRemoteData(scene.get(), data.get());
         }
@@ -450,7 +482,8 @@ void igQtFileLoader::ContinueResidentRemoteRequest()
                 s.requestId, reattached, RemoteUserModelCount(scene.get()), scene->GetModelList()->GetObjectCount());
         igDebug("[RemoteMemoryCache] HIT request={} elapsed_ms={} model_id={} gpu_reused={}; no archive I/O or parsing",
                 s.requestId, s.timer.elapsed(), scene->GetCurrentModelID(), !cpuReady);
-        emit RemotePackageStatusChanged(QStringLiteral("Using independent memory cache (no model transfer or parsing); presenting full-resolution frame"));
+        igDebug("[RemoteCpuCache] reuse_prepared_cpu={} gpu_upload_required={}", s.cache.HasPreparedCpuData(), cpuReady);
+        emit RemotePackageStatusChanged(QStringLiteral("Using independent memory cache (no model transfer or parsing); requesting normal view refresh"));
         PrepareResidentRemoteFrame(s.datasetPath);
         return;
     }
@@ -563,7 +596,7 @@ void igQtFileLoader::PrepareResidentRemoteFrame(const QString& datasetPath)
     iGame::Scene::Pointer scene = m_SceneManager->GetCurrentScene();
     auto model = scene ? scene->GetCurrentModel() : nullptr;
     if (!model || !model->GetVisibility() || !model->GetDataObject()) {
-        FailResidentRemoteRequest(QStringLiteral("No visible prepared model for the full-frame measurement"));
+        FailResidentRemoteRequest(QStringLiteral("No visible prepared model for remote view refresh"));
         return;
     }
     const auto surface = igQtRemoteSurfaceSnapshot::Inspect(scene.get(), model.get());
@@ -583,14 +616,14 @@ void igQtFileLoader::PrepareResidentRemoteFrame(const QString& datasetPath)
     s.preparedObject = model->GetDataObject().get();
     s.preparedModelId = scene->GetCurrentModelID();
     s.awaitingFrame = true;
-    igDebug("[RemoteOpen] CPU-ready request={} elapsed_ms={} memory_hit={}; awaiting real full-resolution GPU frame",
+    igDebug("[RemoteOpen] CPU-ready request={} elapsed_ms={} memory_hit={}; awaiting normal Qt view refresh (not full-resolution verification)",
             s.requestId, s.timer.elapsed(), s.memoryHit);
     emit RemoteRenderRequested(s.requestId);
     const quint64 id = s.requestId;
     QTimer::singleShot(180000, this, [this, id]() {
         auto& state = *m_ResidentRemote;
         if (state.active && state.awaitingFrame && state.requestId == id) {
-            FailResidentRemoteRequest(QStringLiteral("Timed out waiting for a full-resolution presented frame"));
+            FailResidentRemoteRequest(QStringLiteral("Timed out waiting for the normal Qt view refresh"));
         }
     });
 }
@@ -616,30 +649,33 @@ void igQtFileLoader::NotifyRemoteFrameCompleted(quint64 requestId, bool success,
             s.renderer->context() && s.renderer->isValid()) {
         // Clear while GL is current if this replaces a detached cached object.
         if (s.cache.PeekData().get() == model->GetDataObject().get() || ClearResidentRemoteCache()) {
-            s.cache.Capture(scene, model, s.identity, s.datasetPath);
+            s.cache.CapturePrepared(scene, model, s.identity, s.datasetPath);
             if (s.cache.HasEntry()) s.cacheContext = s.renderer->context();
         } else { success = false; }
         if (success && s.cache.HasEntry() && s.cache.MemoryBytes() > s.limitBytes) {
-            igDebug("[RemoteCpuCache] Visible model exceeds cache admission limit; keeping display without caching");
+            igDebug("[RemoteCpuCache] Visible model exceeds cache admission limit: estimated_cpu_bytes={} limit_bytes={}; keeping display without caching",
+                    s.cache.MemoryBytes(), s.limitBytes);
             ClearResidentRemoteCache();
         }
         if (success && s.cache.HasEntry()) {
             s.cacheContext = s.renderer->context();
             igDebug("[RemoteMemoryCache] STORED request={} independent_owner=true leaves={} point_records={} face_cells={}",
                     requestId, s.preparedLeaves, s.preparedPoints, s.preparedFaces);
+            igDebug("[RemoteCpuCache] prepared_cpu={} estimated_cpu_bytes={} limit_bytes={}",
+                    s.cache.HasPreparedCpuData(), s.cache.MemoryBytes(), s.limitBytes);
         }
     } else { ClearResidentRemoteCache(); }
     emit RemoteMemoryCacheChanged();
     const QString resultDetail = (success ? detail :
-            QStringLiteral("Frame failed, model changed or was hidden during measurement: ") + detail) +
+            QStringLiteral("View refresh failed, model changed or was hidden: ") + detail) +
             QStringLiteral("; ") + surface.detail;
     const bool memoryHit = s.memoryHit;
     const QString datasetPath = s.datasetPath;
-    igDebug("[RemoteOpen] complete request={} memory_hit={} rendered={} elapsed_ms={} within_100s={} detail={}",
-            requestId, memoryHit, success, elapsed, success && elapsed < 100000,
+    igDebug("[RemoteOpen] complete request={} memory_hit={} view_refreshed={} elapsed_ms={} full_resolution_verified=false detail={}",
+            requestId, memoryHit, success, elapsed,
             resultDetail.toStdString());
     if (success) {
-        emit RemotePackageStatusChanged(QStringLiteral("Remote model fully rendered: ") + datasetPath);
+        emit RemotePackageStatusChanged(QStringLiteral("Remote model loaded; normal view refreshed: ") + datasetPath);
         emit RemotePackageDatasetOpened(datasetPath);
     } else { emit RemotePackageFailed(resultDetail); }
     emit RemotePackageProgressChanged(1.0);

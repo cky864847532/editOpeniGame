@@ -43,6 +43,14 @@ public:
         m_Colors = cp;
     }
     void AddFallbackSelfCycle() { m_RenderableMesh.SimplifiedMesh = this; }
+    void PrepareCpuDisplay() {
+        ConvertToDrawableData();
+        if (m_RenderableMesh.SimplifiedMesh && m_RenderableMesh.SimplifiedMesh.get() != this)
+            m_RenderableMesh.SimplifiedMesh->ConvertToDrawableData();
+        ConvertToDrawableData(); // settle the shared color mapper timestamp
+    }
+    std::size_t LineIndexValueCount() const { return m_LineIndices->GetNumberOfValues(); }
+    bool HasBuiltEdges() const { return m_Edges != nullptr; }
     void SetTestMeshleter(iGame::Meshleter::Pointer meshleter) { m_RenderableMesh.mMeshleter = meshleter; }
     bool DerivedStateEmpty() const {
         return !m_RenderableMesh.SurfaceMesh && !m_RenderableMesh.SimplifiedMesh && !m_RenderableMesh.mMeshleter &&
@@ -59,12 +67,60 @@ private:
     ~ProbeSurface() override { if (destroyed) { *destroyed = true; } }
 };
 
+ProbeSurface::Pointer MakeTriangleSurface() {
+    auto surface = ProbeSurface::New();
+    auto points = iGame::Points::New();
+    points->AddPoint(0.f, 0.f, 0.f);
+    points->AddPoint(1.f, 0.f, 0.f);
+    points->AddPoint(0.f, 1.f, 0.f);
+    auto faces = iGame::CellArray::New();
+    faces->AddCellId3(0, 1, 2);
+    surface->SetPoints(points);
+    surface->SetFaces(faces);
+    return surface;
+}
+
+void CheckLazyWireframeGeometry() {
+    auto surface = MakeTriangleSurface();
+    surface->ConvertToDrawableData();
+    Require(!surface->HasBuiltEdges() && surface->LineIndexValueCount() == 0,
+            "surface-only-display-skips-edge-topology-and-line-indices");
+
+    surface->SetViewStyle(IG_SURFACE | IG_WIREFRAME);
+    surface->ConvertToDrawableData();
+    Require(!surface->HasBuiltEdges() && surface->LineIndexValueCount() == 0,
+            "opaque-surface-wireframe-uses-single-pass-without-line-indices");
+
+    surface->SetViewStyle(IG_WIREFRAME);
+    surface->ConvertToDrawableData();
+    Require(surface->HasBuiltEdges() && surface->LineIndexValueCount() == 6,
+            "pure-wireframe-builds-explicit-line-indices-on-demand");
+
+    auto transparent = MakeTriangleSurface();
+    transparent->SetViewStyle(IG_SURFACE | IG_WIREFRAME);
+    transparent->SetTransparency(0.5f);
+    transparent->ConvertToDrawableData();
+    Require(transparent->HasBuiltEdges() && transparent->LineIndexValueCount() == 6,
+            "transparent-wireframe-fallback-builds-line-indices-on-demand");
+}
+
+class PreparedGrid final : public iGame::UnstructuredMesh {
+public:
+    using Pointer = iGame::SmartPointer<PreparedGrid>;
+    static Pointer New() { return new PreparedGrid; }
+    void PrepareCpuDisplay() {
+        ConvertToDrawableData();
+        if (m_RenderableMesh.SurfaceMesh) m_RenderableMesh.SurfaceMesh->ConvertToDrawableData();
+        if (m_RenderableMesh.SimplifiedMesh) m_RenderableMesh.SimplifiedMesh->ConvertToDrawableData();
+        if (m_RenderableMesh.SurfaceMesh) m_RenderableMesh.SurfaceMesh->ConvertToDrawableData();
+    }
+};
+
 void CheckCpuReleaseAndRebuild() {
     bool destroyed = false;
     auto root = iGame::DrawObject::New();
     auto surface = ProbeSurface::New();
     surface->destroyed = &destroyed;
-    surface->SetAutoBuildInteractionLod(false);
     auto points = iGame::Points::New();
     points->AddPoint(0.f, 0.f, 0.f);
     points->AddPoint(1.f, 0.f, 0.f);
@@ -132,9 +188,46 @@ void CheckCpuReleaseAndRebuild() {
     Require(destroyed, "released-surface-is-destroyed-after-last-external-owner");
 }
 
+void CheckPreparedCpuRetention() {
+    bool destroyed = false;
+    auto root = iGame::DrawObject::New();
+    auto surface = ProbeSurface::New();
+    surface->destroyed = &destroyed;
+    auto points = iGame::Points::New();
+    points->AddPoint(0.f, 0.f, 0.f); points->AddPoint(1.f, 0.f, 0.f); points->AddPoint(0.f, 1.f, 0.f);
+    auto cells = iGame::CellArray::New(); cells->AddCellId3(0, 1, 2);
+    auto cp = iGame::FloatArray::New(); cp->SetName("PressureCoefficient");
+    cp->AddValue(-1); cp->AddValue(0); cp->AddValue(1);
+    surface->SetPoints(points); surface->SetFaces(cells);
+    surface->GetAttributeSet()->AddAttribute(IG_SCALAR, IG_POINT, cp);
+    surface->SelectCp(); root->AddSubDataObject(surface);
+    surface->PrepareCpuDisplay();
+    auto lod = surface->GetRenderableObject(true);
+    const auto before = root->InspectCpuDisplayCache();
+    if (!before.ready) std::cerr << "Prepared state: " << before.notReadyReason << '\n';
+    Require(before.ready, "prepared-CPU-geometry-and-scalar-ready");
+    Require(before.estimatedBytes > root->GetRealMemorySize(), "prepared-budget-includes-derived-arrays");
+    root->ReleaseGpuResourcesKeepCpuData();
+    root->ReleaseGpuResourcesKeepCpuData();
+    const auto retained = root->InspectCpuDisplayCache();
+    Require(retained.ready && retained.signature == before.signature && retained.estimatedBytes == before.estimatedBytes,
+            "GPU-only-release-retains-CPU-array-identities-timestamps-LOD-and-colors");
+    Require(!root->HasGpuResources() && surface->GetRenderableObject(true).get() == lod.get(),
+            "GPU-only-release-preserves-simplified-object-with-no-GPU-handles");
+    surface->PrepareCpuDisplay();
+    Require(root->InspectCpuDisplayCache().signature == before.signature,
+            "next-CPU-conversion-does-not-rebuild-prepared-data");
+    cp->Modified();
+    Require(root->InspectCpuDisplayCache().signature != before.signature, "prepared-signature-detects-scalar-edit");
+    surface->ForceReConvertToDrawableData();
+    Require(!root->InspectCpuDisplayCache().ready, "dirty-geometry-not-upload-only-ready");
+    root->ReleaseDrawableResources();
+    lod = nullptr; root->ClearSubDataObject(); surface = nullptr;
+    Require(destroyed, "prepared-cache-eviction-breaks-retained-ownership-cycles");
+}
+
 void CheckUnstructuredShellRelease() {
     auto mesh = iGame::UnstructuredMesh::New();
-    mesh->SetAutoBuildInteractionLod(false);
     auto points = iGame::Points::New();
     points->AddPoint(0.f, 0.f, 0.f); points->AddPoint(1.f, 0.f, 0.f); points->AddPoint(0.f, 1.f, 0.f);
     auto cells = iGame::CellArray::New(); cells->AddCellId3(0, 1, 2);
@@ -153,12 +246,34 @@ void CheckUnstructuredShellRelease() {
             "unstructured-source-recreates-a-fresh-renderable-shell");
     mesh->ReleaseDrawableResources();
 }
+
+void CheckPreparedGridRetention() {
+    auto grid = PreparedGrid::New();
+    auto points = iGame::Points::New();
+    points->AddPoint(0.f, 0.f, 0.f); points->AddPoint(1.f, 0.f, 0.f); points->AddPoint(0.f, 1.f, 0.f);
+    auto cells = iGame::CellArray::New(); cells->AddCellId3(0, 1, 2);
+    auto types = iGame::UnsignedIntArray::New(); types->AddValue(iGame::IG_TRIANGLE);
+    grid->SetPoints(points); grid->SetCells(cells, types);
+    grid->PrepareCpuDisplay();
+    auto shell = grid->GetRenderableObject(); auto lod = grid->GetRenderableObject(true);
+    const auto before = grid->InspectCpuDisplayCache();
+    Require(before.ready, "VTU-shell-and-LOD-prepared-ready");
+    grid->ReleaseGpuResourcesKeepCpuData();
+    grid->PrepareCpuDisplay();
+    const auto after = grid->InspectCpuDisplayCache();
+    Require(after.ready && after.signature == before.signature && grid->GetRenderableObject().get() == shell.get() &&
+                grid->GetRenderableObject(true).get() == lod.get(), "VTU-reopen-retains-extracted-shell-and-LOD-without-rebuild");
+    grid->ReleaseDrawableResources();
+}
 }
 
 int main() {
     try {
+        CheckLazyWireframeGeometry();
         CheckCpuReleaseAndRebuild();
         CheckUnstructuredShellRelease();
+        CheckPreparedCpuRetention();
+        CheckPreparedGridRetention();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';

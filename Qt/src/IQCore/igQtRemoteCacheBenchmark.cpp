@@ -119,18 +119,18 @@ void igQtMainWindow::ConfigureRemoteCacheBenchmark(const QString& package, const
         report.insert(QStringLiteral("complete"), state->finished);
         report.insert(QStringLiteral("failed"), state->failed);
         report.insert(QStringLiteral("failureReason"), state->failureReason);
+        report.insert(QStringLiteral("fullResolutionValidationAvailable"), false);
         report.insert(QStringLiteral("cachePolicy"), state->preloadOnly
                 ? QStringLiteral("CPU-only preload; no Open rounds, no scene attachment and no GPU-resource allocation by this preload; "
                                  "the cache remains available in this process unless the client exits or the cache is cleared")
                 : state->preloadFirst
                 ? QStringLiteral("CPU-only preload is measured separately and does not mount a scene model or upload GPU resources; "
-                                 "each Open includes fresh C/S INFO, CPU-cache reuse, display preparation/upload and a completed full-resolution frame; "
-                                 "displayed models are removed and a blank control frame is completed between Open rounds")
+                                 "full-resolution Open benchmark is unavailable after reverting Scene instrumentation")
                 : QStringLiteral("same-process independent data-object cache; displayed model removed from scene and tree between rounds; "
-                                 "a completed blank control frame precedes each fresh C/S INFO and cached-object reattachment"));
+                                 "full-resolution Open benchmark is unavailable after reverting Scene instrumentation"));
         report.insert(QStringLiteral("timing"), state->preloadOnly
                 ? QStringLiteral("Only PreloadRemotePackage is measured; no Open/display time is measured or claimed")
-                : QStringLiteral("C/S OpenRemotePackage entry through validated INFO, full-resolution DrawFrame, glFinish and frameSwapped; excludes prior prewarm"));
+                : QStringLiteral("Unavailable: normal Qt refresh does not certify full-resolution rendering or GPU completion"));
         QSaveFile file(outputPath);
         const QByteArray json = QJsonDocument(report).toJson(QJsonDocument::Indented);
         if (!file.open(QIODevice::WriteOnly) || file.write(json) != json.size() || !file.commit()) {
@@ -167,6 +167,15 @@ void igQtMainWindow::ConfigureRemoteCacheBenchmark(const QString& package, const
             QTimer::singleShot(1500, qApp, &QCoreApplication::quit);
         }
     };
+
+    // Keep CPU-only preload tests, but never pass the old 100-second rendering
+    // acceptance using an ordinary refresh that may show a previous/LOD frame.
+    if (!state->preloadOnly) {
+        finish(true, QStringLiteral(
+                "Full-resolution render benchmark is unavailable after reverting Scene instrumentation; "
+                "normal C/S Open and CPU caching remain available"));
+        return;
+    }
 
     state->startedConnection = connect(fileLoader, &igQtFileLoader::RemoteOpenStarted, this,
             [=](quint64 requestId, const QString& address, quint16 startedPort,

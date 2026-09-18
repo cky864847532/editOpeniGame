@@ -13,9 +13,9 @@
     #include <sstream>
 #endif
 
+#include <algorithm>
 #include <iostream>
 #include <utility>
-#include <algorithm>
 #include <functional>
 #include <unordered_set>
 
@@ -248,10 +248,6 @@ void DrawObject::ReleaseDrawableResources() {
             destroy(draw->m_TriangleEBO); destroy(draw->m_CellPositionVBO); destroy(draw->m_CellColorVBO);
             destroy(draw->m_EdgeMaskBuffer); destroy(draw->m_CellEdgeMaskBuffer);
             draw->m_Flag = false;
-            draw->m_ConstantEdgeMask = -1;
-            draw->m_ConstantCellEdgeMask = -1;
-            draw->m_EdgeMaskAvailable = false;
-            draw->m_CellEdgeMaskAvailable = false;
             draw->m_CellPositionSize = 0;
 
             // NEVER Reset/Initialize these old arrays: positions can alias the
@@ -265,9 +261,13 @@ void DrawObject::ReleaseDrawableResources() {
             draw->m_LineIndices = indexArray(2);
             draw->m_TriangleIndices = indexArray(3);
             draw->m_TriangleEdgeMasks = masksArray();
+            draw->m_ConstantEdgeMask = -1;
+            draw->m_EdgeMaskAvailable = false;
             draw->m_CellPositions = floatArray(3);
             draw->m_CellColors = floatArray(4);
             draw->m_CellTriangleEdgeMasks = masksArray();
+            draw->m_ConstantCellEdgeMask = -1;
+            draw->m_CellEdgeMaskAvailable = false;
             draw->m_ReConvertToDrawableData = true;
             draw->m_AttributeChanged = true;
             draw->m_ForceGpuBufferUpload = true;
@@ -571,13 +571,6 @@ void DrawObject::SetRenderableObject(DataObject::Pointer dataObject) {
 
     m_RenderableMesh.SimplifiedMesh = nullptr;
 #ifndef __EMSCRIPTEN__
-    // Interaction switches to the simplified representation only when a
-    // single renderable piece exceeds one million triangles (see Model::Draw).
-    // Building and retaining an LOD for smaller pieces wastes memory and can
-    // dominate the cost of large partitioned VTM data sets. Also bound the
-    // automatic work: simplification allocates topology, adjacency, and edge
-    // collapse arrays in addition to the original mesh, before any upload.
-    // Very large single meshes must remain loadable without this hidden job.
     constexpr IGsize maxAutomaticLodFaces = 20000000;
     auto surfaceMesh = DynamicCast<SurfaceMesh>(dataObject);
     if (m_AutoBuildInteractionLod && m_ShellRendering && surfaceMesh != nullptr &&
@@ -955,7 +948,7 @@ void DrawObject::SyncGpuBuffers() {
 
 #ifndef __EMSCRIPTEN__
     auto syncEdgeMasks = [this](UnsignedCharArray::Pointer masks, GLBuffer::Pointer buffer,
-                               GLTextureBuffer::Pointer texture, int& constantMask, bool& available) {
+                                GLTextureBuffer::Pointer texture, int& constantMask, bool& available) {
         if (!m_ForceGpuBufferUpload && masks->GetMTime() <= buffer->GetMTime()) { return; }
         const IGsize count = masks->GetNumberOfValues();
         constantMask = -1;
@@ -963,14 +956,12 @@ void DrawObject::SyncGpuBuffers() {
         if (count) {
             const auto* data = masks->RawPointer();
             if (std::all_of(data + 1, data + count, [data](unsigned char value) { return value == data[0]; })) {
-                // Pure triangles have mask 7 for every primitive. A uniform
-                // preserves every edge without a texture or giant GPU buffer.
                 constantMask = data[0];
                 available = true;
                 GLAllocateGLBuffer(buffer, 0, nullptr);
                 if (count > 1000000) {
                     IGAME_RENDERING_INFO("{} uses constant edge mask {} for {} triangles; no edge-mask texture allocation.",
-                                        GetName(), constantMask, count);
+                                         GetName(), constantMask, count);
                 }
             } else {
                 GLint maxTexels = 0;
@@ -980,11 +971,9 @@ void DrawObject::SyncGpuBuffers() {
                     texture->Buffer(GL_R8, buffer);
                     available = true;
                 } else {
-                    // Never bind an unsupported texture. Filled Surface stays
-                    // usable; the single-pass wireframe path is unavailable.
                     GLAllocateGLBuffer(buffer, 0, nullptr);
                     IGAME_RENDERING_WARN("{} has {} nonconstant edge masks, exceeding GL_MAX_TEXTURE_BUFFER_SIZE={}; single-pass wireframe is unavailable for this mesh.",
-                                        GetName(), count, maxTexels);
+                                         GetName(), count, maxTexels);
                 }
             }
         }

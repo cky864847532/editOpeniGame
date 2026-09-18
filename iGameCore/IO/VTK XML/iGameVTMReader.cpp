@@ -356,10 +356,6 @@ bool iGameVTMReader::Parsing() {
         object->SetName(FileSystem::PathToUtf8(referencedPath.stem()));
         if (disableEagerPieceLod) {
             if (auto drawObject = DynamicCast<DrawObject>(object)) {
-                // AddSubDataObject converts drawable leaves immediately. Set
-                // this before insertion so loading hundreds of large pieces
-                // does not synchronously simplify every piece on the reader
-                // thread. Static rendering already uses complete geometry.
                 drawObject->SetAutoBuildInteractionLod(false);
             }
         }

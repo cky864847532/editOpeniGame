@@ -35,8 +35,9 @@ public:
   void ChangeInteractorStyle(IGenum style);
   void update() { QOpenGLWidget::update(); }
 
-  // GUI-thread only. The caller binds the intended model, scalar and visible
-  // blocks first, then requests one full-resolution GPU-completed Qt frame.
+  // GUI-thread only. Request a normal repaint and acknowledge its Qt swap.
+  // Scene's frame pacing and interaction LOD are unchanged: this notification
+  // does not certify a new full-resolution frame or GPU completion.
   // Hidden/not-exposed windows may never swap; the caller owns the timeout.
   void RequestCompletedFrame(quint64 requestId);
   // Cancels only the matching request, without emitting CompletedFrame.
@@ -74,7 +75,5 @@ private:
   bool m_CompletedFrameRequestPending = false;
   bool m_CompletedFrameAwaitingSwap = false;
   quint64 m_CompletedFrameRequestId = 0;
-  std::uint64_t m_RequestedAfterFrameSerial = 0;
-  std::uint64_t m_RequestedGpuFrameSerial = 0;
   QString m_CompletedFrameDetail;
 };

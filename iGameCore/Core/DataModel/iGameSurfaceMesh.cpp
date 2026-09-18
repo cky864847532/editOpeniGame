@@ -860,7 +860,7 @@ void SurfaceMesh::GetDrawableArray(FloatArray::Pointer& positions, UnsignedIntAr
     triangleEdgeMasks->Reset();
     triangleEdgeMasks->SetDimension(1);
 
-    // Surface rendering does not consume the explicit edge list.  Build it
+    // Surface rendering does not consume the explicit edge list. Build it
     // lazily when wireframe is requested; SetViewStyle marks the draw data
     // dirty so switching representation later remains correct.
     const bool needLineIndices = NeedsExplicitWireframeGeometry(m_ViewStyle);

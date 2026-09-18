@@ -276,6 +276,37 @@ void igQtResidentModelCache::CaptureCpu(iGame::Scene::Pointer scene,
     CaptureData(scene, data, key, datasetPath, true);
 }
 
+void igQtResidentModelCache::CapturePrepared(iGame::Scene::Pointer scene,
+                                            iGame::Model::Pointer model,
+                                            const QString& key, const QString& datasetPath)
+{
+    Capture(scene, model, key, datasetPath);
+    CaptureDisplayState();
+}
+
+void igQtResidentModelCache::CapturePreparedCpu(iGame::Scene::Pointer scene,
+                                               iGame::DataObject::Pointer data,
+                                               const QString& key, const QString& datasetPath)
+{
+    CaptureCpu(scene, data, key, datasetPath);
+    CaptureDisplayState();
+}
+
+void igQtResidentModelCache::CaptureDisplayState()
+{
+    auto* draw = dynamic_cast<iGame::DrawObject*>(m_DataObject.get());
+    if (!HasEntry() || !draw) return;
+    auto state = draw->InspectCpuDisplayCache();
+    // Charge derived allocations even if this display is not eligible for the
+    // upload-only path. Never admit tens of GB of LOD/indices as "zero bytes".
+    m_MemoryBytes = state.estimatedBytes;
+    QString reason;
+    m_PreparedCpu = state.ready && ValidateCpuSurface(m_DataObject.get(), reason);
+    if (m_PreparedCpu) m_DisplaySignature = std::move(state.signature);
+}
+
+bool igQtResidentModelCache::HasPreparedCpuData() const { return HasEntry() && m_PreparedCpu; }
+
 void igQtResidentModelCache::CaptureData(iGame::Scene::Pointer scene,
                                         iGame::DataObject::Pointer data,
                                         const QString& key,
@@ -359,6 +390,15 @@ iGame::DataObject::Pointer igQtResidentModelCache::LookupData(iGame::Scene::Poin
             return nullptr;
         }
     }
+    if (m_PreparedCpu) {
+        auto* draw = dynamic_cast<iGame::DrawObject*>(data.get());
+        if (!draw) { reason = QStringLiteral("prepared-display-missing"); return nullptr; }
+        const auto state = draw->InspectCpuDisplayCache();
+        if (!state.ready || state.signature != m_DisplaySignature) {
+            reason = QStringLiteral("prepared-display-state-changed");
+            return nullptr;
+        }
+    }
     reason = QStringLiteral("resident-data-hit");
     return data;
 }
@@ -396,6 +436,8 @@ void igQtResidentModelCache::Clear()
     m_DatasetPath.clear();
     m_MemoryBytes = 0;
     m_Snapshot.clear();
+    m_PreparedCpu = false;
+    m_DisplaySignature.clear();
 }
 
 bool igQtResidentModelCache::HasEntry() const { return m_Scene && m_ModelPool && m_DataObject; }

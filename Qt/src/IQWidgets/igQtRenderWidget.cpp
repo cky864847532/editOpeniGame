@@ -12,8 +12,6 @@
 #include <IQWidgets/igQtRenderWidget.h>
 #include <QMouseEvent>
 #include <QOpenGLFunctions> //
-#include <QOpenGLDebugLogger>
-#include <QStringList>
 #include <iGamePointSet.h>
 #include <iGameUnstructuredMesh.h>
 #include <iGameVolumeMesh.h>
@@ -219,10 +217,8 @@ void igQtRenderWidget::RequestCompletedFrame(quint64 requestId) {
     m_CompletedFrameRequestPending = true;
     m_CompletedFrameAwaitingSwap = false;
     m_CompletedFrameRequestId = requestId;
-    m_RequestedAfterFrameSerial = m_Scene->GetCompletedDrawFrameSerial();
-    m_RequestedGpuFrameSerial = 0;
     m_CompletedFrameDetail.clear();
-    m_Scene->RequestFullResolutionFrame();
+    update();
 }
 
 void igQtRenderWidget::CancelCompletedFrame(quint64 requestId) {
@@ -232,9 +228,7 @@ void igQtRenderWidget::CancelCompletedFrame(quint64 requestId) {
     m_CompletedFrameRequestPending = false;
     m_CompletedFrameAwaitingSwap = false;
     m_CompletedFrameDetail.clear();
-    if (m_Scene) { m_Scene->CancelFullResolutionFrameRequest(); }
-    // The debug logger is local to paintGL, never persistent between frames.
-    // In the GUI thread a queued cancellation cannot interrupt glFinish.
+    // A queued ordinary repaint needs no Scene-level cancellation.
 }
 
 void igQtRenderWidget::CompleteRequestedFrame(bool success, const QString& detail) {
@@ -248,10 +242,9 @@ void igQtRenderWidget::CompleteRequestedFrame(bool success, const QString& detai
 
 void igQtRenderWidget::OnFrameSwapped() {
     if (!m_CompletedFrameRequestPending || !m_CompletedFrameAwaitingSwap) { return; }
-    if (!m_Scene ||
-        m_Scene->GetCompletedDrawFrameSerial() != m_RequestedGpuFrameSerial) {
+    if (!m_Scene || !isValid()) {
         CompleteRequestedFrame(false, QStringLiteral(
-                "The GPU-completed frame was replaced before Qt frameSwapped"));
+                "Render scene or OpenGL context was lost before Qt frameSwapped"));
         return;
     }
     const QString detail = m_CompletedFrameDetail +
@@ -260,91 +253,19 @@ void igQtRenderWidget::OnFrameSwapped() {
 }
 
 void igQtRenderWidget::paintGL() {
-    if (!m_CompletedFrameRequestPending || m_CompletedFrameAwaitingSwap) {
-        m_Scene->Draw();
-        return;
-    }
-
+    const bool acknowledgeRepaint =
+            m_CompletedFrameRequestPending && !m_CompletedFrameAwaitingSwap;
     const quint64 requestedId = m_CompletedFrameRequestId;
-    auto* currentContext = QOpenGLContext::currentContext();
-    if (!currentContext || currentContext != context() || !currentContext->isValid()) {
-        CompleteRequestedFrame(false, QStringLiteral("Expected OpenGL context is not current for the requested frame"));
-        return;
-    }
-    auto* glFunctions = currentContext->functions();
-    QStringList errors;
-    QStringList preexistingErrors;
-    auto collectErrors = [glFunctions](QStringList& destination, const char* phase) {
-        for (GLenum error = glFunctions->glGetError(); error != GL_NO_ERROR; error = glFunctions->glGetError()) {
-            destination.append(QStringLiteral("%1: GL error 0x%2")
-                                  .arg(QString::fromLatin1(phase))
-                                  .arg(static_cast<quint32>(error), 0, 16));
-            if (destination.size() >= 32) { break; }
-        }
-    };
-    // Do not attribute old context errors (possibly from earlier UI work) to
-    // this measured frame, but preserve them in diagnostics instead of hiding
-    // them. Context loss is still rejected below via context()->isValid().
-    collectErrors(preexistingErrors, "before requested frame");
-    if (!preexistingErrors.isEmpty()) {
-        qWarning() << "Completed-frame request" << requestedId
-                   << "found preexisting OpenGL errors:" << preexistingErrors;
-    }
-
-    // Several renderer helpers consume glGetError themselves. A scoped,
-    // synchronous debug logger also observes those errors when KHR_debug is
-    // available. Normal frames never create this logger or call glFinish.
-    QOpenGLDebugLogger debugLogger;
-    connect(&debugLogger, &QOpenGLDebugLogger::messageLogged, this,
-            [&errors](const QOpenGLDebugMessage& message) {
-                if (message.type() == QOpenGLDebugMessage::ErrorType && errors.size() < 32) {
-                    errors.append(message.message());
-                }
-            }, Qt::DirectConnection);
-    const bool debugAvailable = debugLogger.initialize();
-    if (debugAvailable) {
-        debugLogger.startLogging(QOpenGLDebugLogger::SynchronousLogging);
-    }
-
-    const auto serialBeforeDraw = m_Scene->GetCompletedDrawFrameSerial();
     m_Scene->Draw();
-    if (!m_CompletedFrameRequestPending || m_CompletedFrameRequestId != requestedId) {
-        if (debugAvailable) { debugLogger.stopLogging(); }
+    if (!acknowledgeRepaint || !m_CompletedFrameRequestPending ||
+        m_CompletedFrameRequestId != requestedId) {
         return;
     }
-    const auto frameSerial = m_Scene->GetCompletedDrawFrameSerial();
-    if (serialBeforeDraw != m_RequestedAfterFrameSerial || frameSerial <= serialBeforeDraw) {
-        if (debugAvailable) { debugLogger.stopLogging(); }
-        CompleteRequestedFrame(false, QStringLiteral(
-                "No new complete DrawFrame was submitted; an old-frame copy is not completion"));
-        return;
-    }
-
-    // This explicit benchmark barrier includes uploads, every visible block's
-    // full-resolution draw, overlays, and the final copy into the Qt FBO.
-    glFunctions->glFinish();
-    collectErrors(errors, "after requested frame glFinish");
-    if (debugAvailable) { debugLogger.stopLogging(); }
-    if (!m_CompletedFrameRequestPending || m_CompletedFrameRequestId != requestedId) { return; }
-    if (!context() || !context()->isValid()) {
-        errors.append(QStringLiteral("OpenGL context became invalid"));
-    }
-    if (!errors.isEmpty()) {
-        CompleteRequestedFrame(false, errors.join(QStringLiteral("; ")));
-        return;
-    }
-
-    m_RequestedGpuFrameSerial = frameSerial;
+    // Observe the normal renderer without overriding pacing or interaction.
+    // Draw may reuse the old framebuffer; do not label this as full rendering.
     m_CompletedFrameDetail = QStringLiteral(
-            "Full-resolution DrawFrame serial=%1; GPU glFinish completed; %2")
-                                    .arg(static_cast<qulonglong>(frameSerial))
-                                    .arg(debugAvailable
-                                                 ? QStringLiteral("synchronous GL debug error capture enabled")
-                                                 : QStringLiteral("KHR_debug unavailable: only remaining GL errors checked; consumed errors cannot be excluded"));
-    if (!preexistingErrors.isEmpty()) {
-        m_CompletedFrameDetail += QStringLiteral("; preexisting errors not attributed to this frame: ") +
-                preexistingErrors.join(QStringLiteral(", "));
-    }
+            "Normal Scene::Draw returned with original frame pacing and interaction LOD; "
+            "new full-resolution rendering and GPU completion are not verified");
     m_CompletedFrameAwaitingSwap = true;
 }
 

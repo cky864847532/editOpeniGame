@@ -458,11 +458,6 @@ void UnstructuredMesh::ConvertToDrawableData() {
     if (m_ShellRendering) {
         if (!needReConvertGeometry && !needReConvertScalar) { return; }
 
-        // A surface-only unstructured grid does not need shell extraction.
-        // Reuse its points, cells, and attributes directly when clipping is
-        // disabled.  This is especially important for partitioned VTM data:
-        // deep-copying every already-surface piece doubles the resident mesh
-        // data without changing its geometry.
         if (m_Clipper->IsAllDisable() && this->GetNumberOfCells() > 0) {
             bool isSurfaceOnly = true;
             const IGsize cellCount = this->GetNumberOfCells();
@@ -472,14 +467,10 @@ void UnstructuredMesh::ConvertToDrawableData() {
                     break;
                 }
             }
-
             if (isSurfaceOnly) {
                 SurfaceMesh::Pointer surfaceMesh = SurfaceMesh::New();
                 AttributeSet::Pointer surfaceAttributes = AttributeSet::New();
                 for (IGsize attributeId = 0; attributeId < m_Attributes->GetNumberOfAttributes(); ++attributeId) {
-                    // Copy only the lightweight Attribute record.  The actual
-                    // data arrays remain shared with the source grid, while
-                    // each DataObject keeps its own AttributeSet owner link.
                     surfaceAttributes->GetAllAttributes()->AddElement(m_Attributes->GetAttribute(attributeId));
                 }
                 surfaceMesh->SetName(this->GetName());

@@ -14,6 +14,7 @@
 #include "OpenGL/GLVertexArray.h"
 
 #include "Meshleter/iGameMeshleter.h"
+#include <cstdint>
 
 IGAME_NAMESPACE_BEGIN
 class Scene;
@@ -34,6 +35,27 @@ public:
     virtual bool IsUseSinglePassWireframeRendering(); // 是否使用单通道线框渲染
     IGenum GetDataObjectType() const override;
     IGsize GetRealMemorySize() override;
+
+    // Opt-in static display cache. Unlike ReleaseDrawableResources(), keep
+    // extracted surface, LOD, colors and CPU drawing arrays. The owning GL
+    // context must be current if any handle is live. Eviction must still use
+    // ReleaseDrawableResources() to break derived-object ownership cycles.
+    void ReleaseGpuResourcesKeepCpuData();
+    // Upload a validated, GPU-detached prepared graph without CPU conversion.
+    // Requires a current owning GL context; does not enable empty attributes.
+    bool UploadPreparedCpuData();
+
+    struct CpuDisplayCacheState {
+        std::vector<std::uint64_t> signature;
+        std::uint64_t estimatedBytes{0};
+        bool ready{true};
+        std::string notReadyReason;
+    };
+    // Metadata-only inspection, no mesh scan, conversion or GL calls. Supports
+    // the ordinary (non-meshlet) surface path. Estimate includes original and
+    // derived arrays/capacity and can conservatively double-count shared data;
+    // it is not process RSS or a hard process-memory limit.
+    CpuDisplayCacheState InspectCpuDisplayCache();
 
     // Explicit CPU-only cache boundary. Recursively release GL objects and
     // derived CPU draw arrays, including shell/LOD/meshlet ownership cycles.

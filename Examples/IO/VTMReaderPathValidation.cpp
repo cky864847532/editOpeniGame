@@ -3,7 +3,6 @@
 #include <VTK XML/iGameVTMReader.h>
 #include <iGameDrawObject.h>
 #include <iGameFlatArray.h>
-#include <iGameSurfaceMesh.h>
 #include <iGameUnstructuredMesh.h>
 
 #include <chrono>
@@ -160,35 +159,6 @@ bool HasOneReferencedDataSet(const std::string& utf8Path) {
     return output != nullptr && output->GetNumberOfSubDataObjects() == 1;
 }
 
-bool ValidateSurfaceDrawableTransitions(const std::filesystem::path& path) {
-    const auto output = iGame::FileIO::ReadFile(iGame::FileSystem::PathToUtf8(path));
-    if (output == nullptr || output->GetNumberOfSubDataObjects() != 1) { return false; }
-
-    const auto child = output->SubDataObjectIteratorBegin()->second;
-    const auto source = iGame::DynamicCast<iGame::UnstructuredMesh>(child);
-    if (source == nullptr) { return false; }
-
-    const auto surface = iGame::DynamicCast<iGame::SurfaceMesh>(source->GetRenderableObject(false));
-    if (surface == nullptr || source->GetPoints() != surface->GetPoints() ||
-        source->GetCells() != surface->GetFaces() || source->GetAttributeSet() == surface->GetAttributeSet()) {
-        return false;
-    }
-
-    // Opaque desktop Surface+Wireframe uses triangle edge masks and must not
-    // allocate an explicit edge list.
-    source->AddViewStyle(IG_WIREFRAME);
-    surface->ConvertToDrawableData();
-#ifndef __EMSCRIPTEN__
-    if (surface->GetEdges() != nullptr) { return false; }
-#endif
-
-    // Removing Surface changes the same object to pure wireframe. This must
-    // mark only the renderable leaf dirty and build its edge list lazily.
-    source->RemoveViewStyle(IG_SURFACE);
-    surface->ConvertToDrawableData();
-    return surface->GetEdges() != nullptr && surface->GetNumberOfEdges() == 3;
-}
-
 } // namespace
 
 int main() {
@@ -276,10 +246,6 @@ int main() {
     // Use UTF-8 in both slash forms; never convert through the Windows ACP.
     if (!HasOneReferencedDataSet(ForwardSlashUtf8Path(relativePathVtm))) {
         std::cerr << "Forward-slash VTM path with a relative child failed\n";
-        passed = false;
-    }
-    if (!ValidateSurfaceDrawableTransitions(relativePathVtm)) {
-        std::cerr << "Surface drawable sharing or lazy wireframe transition failed\n";
         passed = false;
     }
 

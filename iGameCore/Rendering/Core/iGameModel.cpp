@@ -155,9 +155,7 @@ void Model::SetPickedItemSwitch(bool action) {
     }
 }
 
-// Apply a recursive DrawObject operation once per drawable subtree. DrawObject's
-// view-style methods already forward to their children, so descending again
-// here would process every VTM leaf repeatedly.
+// Helper: apply a functor to every DrawObject in the model's DataObject tree (root included)
 namespace
 {
 static void SetPointSizeIfSupported(float pointSize) {
@@ -172,11 +170,9 @@ static void
 ForEachDrawObject(DataObject::Pointer root,
                   const std::function<void(DrawObject::Pointer)>& fn) {
     if (!root) return;
-    if (auto draw = DynamicCast<DrawObject>(root)) {
-        fn(draw);
-        return;
-    }
-    // Recurse through non-drawable containers until the first drawable root.
+    // apply on this node if drawable
+    if (auto draw = DynamicCast<DrawObject>(root)) { fn(draw); }
+    // recurse children safely (even if non-draw DataObject exists)
     if (root->HasSubDataObject()) {
         for (auto it = root->SubDataObjectIteratorBegin();
              it != root->SubDataObjectIteratorEnd(); ++it) {
@@ -322,7 +318,6 @@ void Model::Draw() {
             if (constantEdgeMask < 0) { edgeMaskTexture->Active(GL_TEXTURE1); }
             shader->SetUniformi("edgeMasks", 1);
             shader->SetUniformi("constantEdgeMask", constantEdgeMask);
-            shader->SetUniformi("edgeMaskPrimitiveOffset", 0);
 
             if (useColor && !colorWithCell) {
                 shader->SetUniformi("edgeColorMode", 0);
@@ -347,8 +342,7 @@ void Model::Draw() {
                                 1,
                         renderableObject->m_TriangleIndices
                                 ->GetNumberOfValues(),
-                        GL_UNSIGNED_INT, nullptr,
-                        glGetUniformLocation(shader->ProgramID(), "edgeMaskPrimitiveOffset"));
+                        GL_UNSIGNED_INT);
             }
         } else {
 #else

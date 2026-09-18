@@ -182,13 +182,7 @@ void Meshleter::SyncGpuBuffers() {
 }
 
 void Meshleter::ReleaseGpuBuffers() {
-    // Destroy explicitly before replacing wrappers: other owners must not keep
-    // the old GL handles alive. VAOs go first so their buffer references vanish.
-    auto destroy = [](const auto& object) { if (object) { object->Destroy(); } };
 #ifdef GL_SUPPORTS_MESH_SHADER
-    destroy(m_MeshletBuffer); destroy(m_MeshletVertexBuffer); destroy(m_MeshletTriangleBuffer);
-    destroy(m_MeshletDescriptorBuffer); destroy(m_InvisibleMeshletBuffer);
-    destroy(m_PositionBuffer); destroy(m_ColorBuffer); destroy(m_NormalBuffer); destroy(m_UVBuffer);
     m_MeshletBuffer = GLBuffer::New();
     m_MeshletVertexBuffer = GLBuffer::New();
     m_MeshletTriangleBuffer = GLBuffer::New();
@@ -201,12 +195,6 @@ void Meshleter::ReleaseGpuBuffers() {
     m_NormalBuffer = GLBuffer::New();
     m_UVBuffer = GLBuffer::New();
 #else
-    destroy(m_TriangleVAO); destroy(m_CellTriangleVAO);
-    destroy(m_TriangleEBO); destroy(m_PositionVBO); destroy(m_ColorVBO);
-    destroy(m_NormalVBO); destroy(m_UVVBO); destroy(m_MeshletDescriptorBuffer);
-    destroy(m_DrawCommandBuffer); destroy(m_VisibleMeshletBuffer); destroy(m_FinalDrawCommandBuffer);
-    destroy(m_CellPositionVBO); destroy(m_CellColorVBO);
-    destroy(m_CellDrawCommandBuffer); destroy(m_CellFinalDrawCommandBuffer);
     m_TriangleVAO = GLVertexArray::New();
     m_TriangleEBO = GLBuffer::New();
 

@@ -180,8 +180,7 @@ function(igame_register_example_test EXAMPLE_TARGET)
 
         if ("${EXAMPLE_TARGET}" STREQUAL "testModelGeometryParallelValidation" OR
             "${EXAMPLE_TARGET}" STREQUAL "testVTKXMLDataArrayDecoderValidation" OR
-            "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation" OR
-            "${EXAMPLE_TARGET}" STREQUAL "testVTPRawAppendedValidation")
+            "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation")
             list(APPEND _TEST_COMMAND -TimeoutSeconds 180 -RequireExit)
             set(_TEST_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${EXAMPLE_TARGET}>")
         elseif ("${EXAMPLE_TARGET}" STREQUAL "testLosslessEncode")
@@ -200,8 +199,7 @@ function(igame_register_example_test EXAMPLE_TARGET)
 
     if ("${EXAMPLE_TARGET}" STREQUAL "testModelGeometryParallelValidation" OR
         "${EXAMPLE_TARGET}" STREQUAL "testVTKXMLDataArrayDecoderValidation" OR
-        "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation" OR
-        "${EXAMPLE_TARGET}" STREQUAL "testVTPRawAppendedValidation")
+        "${EXAMPLE_TARGET}" STREQUAL "testVTMReaderPathValidation")
         add_test(
             NAME ${EXAMPLE_TARGET}
             COMMAND "$<TARGET_FILE:${EXAMPLE_TARGET}>"
@@ -297,7 +295,6 @@ igame_add_example(testSplineReaderCPU IO/SplineReaderCPU.cpp)
 igame_add_example(testVTKXMLDataArrayDecoderValidation IO/VTKXMLDataArrayDecoderValidation.cpp)
 igame_add_example(testUtf8FilePathValidation IO/Utf8FilePathValidation.cpp)
 igame_add_example(testVTMReaderPathValidation IO/VTMReaderPathValidation.cpp)
-igame_add_example(testVTPRawAppendedValidation IO/VTPRawAppendedValidation.cpp)
 
 if (ENABLE_CGNS_MODULE)
     igame_add_example(testCGNS IO/CGNSReader.cpp)
@@ -384,7 +381,16 @@ igame_link_standard_example(testDrawObjectResourcesValidation)
 add_test(NAME testDrawObjectResourcesValidation COMMAND testDrawObjectResourcesValidation)
 set_tests_properties(testDrawObjectResourcesValidation PROPERTIES TIMEOUT 30)
 if (TARGET Qt_module)
-find_package(Qt5 REQUIRED COMPONENTS Core)
+find_package(Qt5 REQUIRED COMPONENTS Core Gui)
+add_executable(testPreparedCpuGpuValidation IO/PreparedCpuGpuValidation.cpp)
+target_link_libraries(testPreparedCpuGpuValidation PRIVATE Qt5::Gui)
+igame_link_standard_example(testPreparedCpuGpuValidation)
+add_test(NAME testPreparedCpuGpuValidation COMMAND testPreparedCpuGpuValidation)
+set_tests_properties(testPreparedCpuGpuValidation PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+get_target_property(_IGAME_TEST_QMAKE Qt5::qmake IMPORTED_LOCATION)
+get_filename_component(_IGAME_TEST_QT_BIN "${_IGAME_TEST_QMAKE}" DIRECTORY)
+set_tests_properties(testPreparedCpuGpuValidation PROPERTIES ENVIRONMENT
+    "QT_QPA_PLATFORM_PLUGIN_PATH=${_IGAME_TEST_QT_BIN}/../plugins/platforms")
 add_executable(testResidentModelCacheValidation
     IO/ResidentModelCacheValidation.cpp
     "${CMAKE_SOURCE_DIR}/Qt/src/IQCore/igQtResidentModelCache.cpp")

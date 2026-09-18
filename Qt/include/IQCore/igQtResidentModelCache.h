@@ -37,6 +37,14 @@ public:
     // so refresh via Capture after that frame completes.
     void CaptureCpu(iGame::Scene::Pointer scene, iGame::DataObject::Pointer data,
                     const QString& key, const QString& datasetPath);
+    // Opt-in prepared display cache. Call the mounted variant after a frame;
+    // the detached variant after ReleaseGpuResourcesKeepCpuData(). Falls back
+    // to ordinary raw-data metadata if the CPU drawing state is not ready.
+    void CapturePrepared(iGame::Scene::Pointer scene, iGame::Model::Pointer model,
+                         const QString& key, const QString& datasetPath);
+    void CapturePreparedCpu(iGame::Scene::Pointer scene, iGame::DataObject::Pointer data,
+                            const QString& key, const QString& datasetPath);
+    bool HasPreparedCpuData() const;
     // Eligibility for this first CPU-preload implementation: a static triangle
     // surface with one Float32 PressureCoefficient value per point on each leaf.
     // Does not require a Scene, Model, selected scalar, visibility, or GL context.
@@ -56,7 +64,9 @@ public:
     // Unvalidated retained pointer, for lifecycle/eviction only. Opening a
     // dataset must use LookupData; PeekData does not check identity or MTime.
     iGame::DataObject::Pointer PeekData() const;
-    // Snapshot of GetRealMemorySize(), in BYTES, queried at capture time. This
+    // Prepared variants include extracted surfaces, LOD and drawing arrays
+    // (conservative capacity estimate; shared source data may be counted twice).
+    // Legacy variants snapshot GetRealMemorySize(), in BYTES. This
     // estimates original CPU arrays; it omits some reserved capacity, drawable
     // arrays, LOD, parsing temporaries, GPU memory and allocator overhead. It is
     // NOT a hard memory limit or process private-byte/working-set measurement.
@@ -84,4 +94,7 @@ private:
     QString m_DatasetPath;
     std::uint64_t m_MemoryBytes{0};
     std::vector<Stamp> m_Snapshot;
+    void CaptureDisplayState();
+    bool m_PreparedCpu{false};
+    std::vector<std::uint64_t> m_DisplaySignature;
 };

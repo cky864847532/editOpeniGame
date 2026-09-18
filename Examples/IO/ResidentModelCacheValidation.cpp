@@ -66,6 +66,55 @@ unsigned RegisterHidden(iGame::Scene::Pointer scene, iGame::Model::Pointer model
     return scene->GetModelList()->AllocateObject(model);
 }
 
+class PreparedSurface final : public iGame::SurfaceMesh {
+public:
+    using Pointer = iGame::SmartPointer<PreparedSurface>;
+    static Pointer New() { return new PreparedSurface; }
+    void Prepare() {
+        m_AttributeIndex = 0; m_AttributeDimension = 0; m_UseColor = true;
+        m_AttributeChanged = true;
+        ConvertToDrawableData();
+        if (m_RenderableMesh.SimplifiedMesh && m_RenderableMesh.SimplifiedMesh.get() != this)
+            m_RenderableMesh.SimplifiedMesh->ConvertToDrawableData();
+        ConvertToDrawableData();
+    }
+};
+
+void CheckPreparedCpuCache() {
+    auto mesh = PreparedSurface::New();
+    auto points = iGame::Points::New();
+    points->AddPoint(0, 0, 0); points->AddPoint(1, 0, 0); points->AddPoint(0, 1, 0);
+    auto faces = iGame::CellArray::New(); faces->AddCellId3(0, 1, 2);
+    auto cp = iGame::FloatArray::New(); cp->SetName("PressureCoefficient");
+    cp->AddValue(-1); cp->AddValue(0); cp->AddValue(1);
+    mesh->SetPoints(points); mesh->SetFaces(faces);
+    mesh->GetAttributeSet()->AddAttribute(IG_SCALAR, IG_POINT, cp);
+    mesh->Prepare();
+    auto scene = iGame::Scene::New();
+    auto model = iGame::Model::New(); model->SetDataObject(mesh);
+    const auto id = RegisterHidden(scene, model);
+    igQtResidentModelCache cache;
+    const QString key = QStringLiteral("prepared-cpu-v1");
+    cache.CapturePrepared(scene, model, key, QStringLiteral("prepared.vtp"));
+    Require(cache.HasPreparedCpuData(), "prepared-cache-captures-settled-drawing-state");
+    Require(cache.MemoryBytes() > mesh->GetRealMemorySize(), "prepared-cache-charges-derived-memory");
+    QString reason;
+    scene->RemoveModel(id); model->SetScene(nullptr);
+    mesh->ReleaseGpuResourcesKeepCpuData();
+    Require(cache.LookupData(scene, key, reason).get() == mesh.get(), "GPU-demotion-preserves-prepared-cache-hit");
+    cache.CapturePreparedCpu(scene, mesh, key, QStringLiteral("prepared.vtp"));
+    Require(cache.HasPreparedCpuData() && !mesh->HasGpuResources(), "detached-prepared-cache-has-no-GPU-resources");
+    Require(!cache.LookupData(scene, key + "-changed", reason), "prepared-cache-version-mismatch-rejected");
+    mesh->GetColorMapper()->Modified();
+    Require(!cache.LookupData(scene, key, reason) && reason == QStringLiteral("prepared-display-state-changed"),
+            "prepared-cache-color-mapping-edit-invalidates");
+    mesh->Prepare(); cache.CapturePreparedCpu(scene, mesh, key, QStringLiteral("prepared.vtp"));
+    cp->Modified();
+    Require(!cache.LookupData(scene, key, reason), "prepared-cache-physical-scalar-edit-invalidates");
+    mesh->ReleaseDrawableResources(); cache.Clear(); scene->Finalize();
+    Require(!cache.HasPreparedCpuData(), "prepared-clear-removes-display-signature");
+}
+
 void CheckCpuPreload() {
     // Parse before even constructing a Scene. No GUI application or OpenGL
     // context exists, so any actual GPU call would fail this headless test.
@@ -244,6 +293,7 @@ void CheckSurfaceSnapshotLogicalConnectivity() {
 
 int main() {
     try {
+        CheckPreparedCpuCache();
         CheckCpuPreload();
         CheckSurfaceSnapshotLogicalConnectivity();
         auto scene = iGame::Scene::New();

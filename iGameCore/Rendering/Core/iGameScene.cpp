@@ -864,15 +864,12 @@ void Scene::ResizeHzb() {
 }
 
 void Scene::Draw() {
-    const bool forceFullResolution = m_ForceFullResolutionFrame;
-    m_ForceFullResolutionFrame = false;
-
     // save default framebuffer, because it is not 0 in Qt
     GLint defaultFramebuffer = GL_NONE;
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &defaultFramebuffer);
 
     // If throttling is enabled and the time point for the next frame has not been reached, return in advance (do not render)
-    if (!forceFullResolution && m_FramePacingEnabled && m_LastRenderEndValid) {
+    if (m_FramePacingEnabled && m_LastRenderEndValid) {
         if (!ShouldRenderThisCall()) {
             // Still copy the result of the previous frame to Qt's default frame buffer to avoid flickering
 #ifndef __EMSCRIPTEN__
@@ -892,17 +889,7 @@ void Scene::Draw() {
 #endif
 
     // render
-    {
-        // A completion request must measure the full mesh rather than an
-        // interaction LOD. Restore the user's interaction state afterwards.
-        struct InteractionStateRestore {
-            bool& state;
-            bool previous;
-            ~InteractionStateRestore() { state = previous; }
-        } restore{m_IsInteracting, m_IsInteracting};
-        if (forceFullResolution) { m_IsInteracting = false; }
-        DrawFrame();
-    }
+    DrawFrame();
 #ifndef __EMSCRIPTEN__
     RenderToSpecificFrame(defaultFramebuffer);
 #endif
@@ -944,16 +931,6 @@ void Scene::Draw() {
     m_LastRenderEndValid = true;
 
     GLCheckError();
-    ++m_CompletedDrawFrameSerial;
-}
-
-void Scene::RequestFullResolutionFrame() {
-    m_ForceFullResolutionFrame = true;
-    Update();
-}
-
-void Scene::CancelFullResolutionFrameRequest() {
-    m_ForceFullResolutionFrame = false;
 }
 
 void Scene::RefreshHzb() {

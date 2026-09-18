@@ -24,7 +24,6 @@
 #include "iGameShaderManager.h"
 #include "iGameTextOverlay2DActor.h"
 #include <chrono>
-#include <cstdint>
 
 IGAME_NAMESPACE_BEGIN
 
@@ -211,16 +210,6 @@ public:
      */
     void Draw();
 
-    // Queue one actual, full-resolution frame even when frame pacing would
-    // otherwise reuse the old framebuffer. This does not wait for the GPU.
-    void RequestFullResolutionFrame();
-    void CancelFullResolutionFrameRequest();
-    // Advances only after DrawFrame and its final framebuffer copy return;
-    // an early frame-pacing copy of an older frame never advances this value.
-    std::uint64_t GetCompletedDrawFrameSerial() const {
-        return m_CompletedDrawFrameSerial;
-    }
-
     /**
      * @brief 调整视口大小。
      * @param width 宽度。
@@ -392,7 +381,6 @@ public:
      * @param toggled 是否启用。
      */
     void SetVolumeRendering(bool toggled);
-    bool GetVolumeRendering() const { return m_EnableVolumeRendering; }
 
     /**
      * @brief 捕获屏幕图像。
@@ -602,9 +590,6 @@ protected:
     // 上一帧结束的时间点（用于“提前返回”判定）
     std::chrono::steady_clock::time_point m_LastRenderEnd;
     bool m_LastRenderEndValid = false;
-
-    bool m_ForceFullResolutionFrame = false;
-    std::uint64_t m_CompletedDrawFrameSerial = 0;
 
     // 记录是否处于交互状态
     bool m_IsInteracting = false;

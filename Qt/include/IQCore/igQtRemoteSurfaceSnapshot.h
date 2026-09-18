@@ -13,8 +13,9 @@
 #include <limits>
 #include <unordered_set>
 
-// Lightweight acceptance guard for the previously validated, static triangle
-// surface benchmark. It never reads coordinate/scalar/connectivity values,
+// Lightweight metadata guard for caching the validated, static triangle
+// surface data. It does not certify renderer mode or a completed GPU frame.
+// It never reads coordinate/scalar/connectivity values,
 // constructs renderable meshes, computes ranges, modifies state, or calls GL.
 // Counts are point records and source face/cell records, not deduplicated points.
 // Uniform cell types and variable-offset triangle arity remain the responsibility
@@ -35,11 +36,6 @@ struct igQtRemoteSurfaceSnapshot {
             result.detail = QStringLiteral("Surface guard: no visible model in the expected scene");
             return result;
         }
-        if (scene->GetVolumeRendering()) {
-            result.detail = QStringLiteral("Surface guard: volume-rendering mode is enabled");
-            return result;
-        }
-
         std::unordered_set<const iGame::DataObject*> visited;
         std::function<bool(iGame::DataObject*, const QString&, unsigned)> visit;
         visit = [&](iGame::DataObject* object, const QString& path, unsigned depth) {
@@ -158,7 +154,7 @@ struct igQtRemoteSurfaceSnapshot {
                                 .arg(result.valid ? QStringLiteral("PASS") : QStringLiteral("FAIL"))
                                 .arg(result.leafCount).arg(result.pointCount).arg(result.faceCount)
                                 .arg(result.valid
-                                             ? QStringLiteral("all visible, opaque Surface with point Float32 PressureCoefficient; topology types/variable arity rely on prior offline validation")
+                                             ? QStringLiteral("visible, opaque Surface metadata with point Float32 PressureCoefficient; renderer mode/GPU output not checked; topology types/variable arity rely on prior offline validation")
                                              : failure);
         return result;
     }

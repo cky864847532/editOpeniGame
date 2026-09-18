@@ -18,13 +18,6 @@ endif ()
 #--------------------------------------------------------------------
 file(GLOB_RECURSE IGAME_CORE_FILE CONFIGURE_DEPENDS ./*.h ./*.cpp)
 
-if (MSVC)
-    # The bounded raw reader uses exceptions to reject malformed data. Ensure
-    # temporary buffers and streams are unwound on every validation failure.
-    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/IO/VTK XML/iGameVTPReader.cpp"
-        APPEND PROPERTY COMPILE_OPTIONS /EHsc)
-endif ()
-
 # Currently, only shared libraries for the Linux system are supported
 if (IGAME_BUILD_SHARED AND UNIX AND NOT APPLE)
     add_library(${MODULE_NAME} SHARED ${IGAME_CORE_FILE})
