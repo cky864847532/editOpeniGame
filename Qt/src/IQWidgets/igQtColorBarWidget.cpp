@@ -1,4 +1,5 @@
-﻿#include <IQWidgets/igQtColorBarWidget.h>
+#include <IQWidgets/igQtColorBarWidget.h>
+#include <IQWidgets/igQtRenderWidget.h>   // §61：面板/控件主题化（角色色）
 #include <QDebug>
 #include <iGameSceneManager.h>
 #include "iGameSmartPointer.h"
@@ -143,7 +144,7 @@ void igQtColorBarWidget::initDrawStringStyle()
 void igQtColorBarWidget::mousePressEvent(QMouseEvent* _event)
 {
 	this->isPressed = true;
-	this->boundColor = Qt::white;
+	this->boundColor = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text);
 	this->lastPos = _event->pos();
 }
 void igQtColorBarWidget::mouseMoveEvent(QMouseEvent* _event)
@@ -160,7 +161,7 @@ void igQtColorBarWidget::mouseMoveEvent(QMouseEvent* _event)
 void igQtColorBarWidget::mouseReleaseEvent(QMouseEvent* _event)
 {
 	this->isPressed = false;
-	this->boundColor = Qt::white;
+	this->boundColor = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text);
 	update();
 
 }
@@ -182,10 +183,10 @@ void igQtColorBarWidget::paintEvent(QPaintEvent* event)
 {
 	updateColorBarDrawInfo();
 	QPainter painter(this);
-	painter.setPen(Qt::white); // Set text color to white
+	painter.setPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text)); // Set text color to white
 	
 	// Set boundColor to white for ParaView style
-	this->boundColor = Qt::white;
+	this->boundColor = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text);
 	
 	QVector<QRect>data;
 	data.resize(6);
@@ -268,5 +269,15 @@ void igQtColorBarWidget::paintEvent(QPaintEvent* event)
 	
 	//std::cout << minWidth << " " << this->width() << '\n';
 	Q_EMIT PaintFinished();
+}
+
+// §61：切主题 → 文字/框线原本写死 Qt::white（浅色主题下看不见）已改走角色色 Text，
+//       这里在 StyleChange 时重绘一次即可生效
+void igQtColorBarWidget::changeEvent(QEvent* e)
+{
+	if (e && e->type() == QEvent::StyleChange) {
+		update();
+	}
+	QWidget::changeEvent(e);
 }
 

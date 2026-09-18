@@ -1,4 +1,4 @@
-﻿#ifndef IGQTCOLORMANAGERWIDGET_H
+#ifndef IGQTCOLORMANAGERWIDGET_H
 #define IGQTCOLORMANAGERWIDGET_H
 
 #include <IQCore/igQtExportModule.h>
@@ -59,6 +59,8 @@ protected:
 	void syncSpinBoxesFromColor(const QColor& c);
 	void applyColorBarToModel();
 
+	// §57：切主题时按角色色重映射面板自带 QSS，并重绘自绘卡片
+	void changeEvent(QEvent* e) override;
 	Ui::ColorManager* ui{nullptr};
 	QColor myColor;
 	QString customColorStr;

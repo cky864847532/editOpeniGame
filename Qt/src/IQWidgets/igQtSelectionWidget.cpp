@@ -1,9 +1,13 @@
-﻿#include <IQWidgets/igQtSelectionWidget.h>
+#include <IQWidgets/igQtRenderWidget.h>   // §52：面板主题化（角色色/令牌重映射）
+#include <IQWidgets/igQtSelectionWidget.h>
 #include <iGameSelectionParameter.h>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 igQtSelectionWidget::igQtSelectionWidget(QWidget* parent) : QWidget(parent), ui(new Ui::SelectionView) {
     ui->setupUi(this);
+
+    // §52（4b）：把 .ui 里那套深色样式存成"底"，按当前主题套用（切主题时 changeEvent 会再刷新）
+    igQtPanelTheme::attach(this);
     connect(ui->NONE_SELECTION, &QCheckBox::clicked, this, &igQtSelectionWidget::SelectionStationNone);
     connect(ui->POINT_SELECTION, &QRadioButton::clicked, this, &igQtSelectionWidget::SelectionStationPoint);
     connect(ui->CELL_SELECTION, &QRadioButton::clicked, this, &igQtSelectionWidget::SelectionStationCell);
@@ -357,4 +361,12 @@ void igQtSelectionWidget::ShowBoxUi() {
     //ui->clearBox->show();
     //ui->settingBox->show();
     //ui->useBox->show();
+}
+
+// §52（4b）：切主题 → 主窗口 setStyleSheet 会给子控件发 StyleChange → 这里刷新面板配色
+void igQtSelectionWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refresh(this);
+    }
+    QWidget::changeEvent(e);
 }

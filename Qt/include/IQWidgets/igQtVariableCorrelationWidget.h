@@ -72,6 +72,8 @@ private slots:
     void RangeChooseButtonClicked(bool checked);
 
 protected:
+    void changeEvent(QEvent* e) override;   // §52：切主题时刷新面板配色
+    void applyChromeTheme();                 // §52：把内联 chrome 颜色接到角色色
     void mousePressEvent(QMouseEvent* event);
     void mouseReleaseEvent(QMouseEvent* event);
     void paintEvent(QPaintEvent* QPE);

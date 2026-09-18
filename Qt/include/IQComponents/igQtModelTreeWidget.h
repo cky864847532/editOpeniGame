@@ -208,9 +208,15 @@ public:
     SubAttribTreeWidgetItem(int index, QTreeWidget* treeview = nullptr, SubObjectTreeWidgetItem* parent = nullptr)
         : QTreeWidgetItem(parent), m_Index(index), m_Tree(treeview), m_Parent(parent) {
         QWidget* widget = new QWidget(treeview);
+        widget->setStyleSheet(QStringLiteral("background-color: transparent; border: none;"));
         m_Combo = new MComboBox(this, widget);
-        m_Combo->setStyleSheet("QComboBox { background-color: transparent; }"
-                               "QComboBox QAbstractItemView { background-color: white; }");
+        // 让维度下拉框填满第二列宽度，属性栏占比更大时不再留空。
+        auto* comboLayout = new QHBoxLayout(widget);
+        comboLayout->setContentsMargins(0, 0, 0, 0);
+        comboLayout->addWidget(m_Combo);
+        m_Combo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        // 弹层不再硬编码白底：让其跟随主窗口当前 QSS（原始深色 / 现代深色均能正确显示）
+        m_Combo->setStyleSheet("QComboBox { background-color: transparent; }");
         setDimension(1);
         treeview->setItemWidget(this, 1, widget);
         hide();
@@ -275,17 +281,29 @@ public:
 
     ModelTreeWidgetItem* getItem(const QPoint& p) const;
     QTreeWidgetItem* getChild(const QPoint& p) const;
+    // 让两列随窗口宽度自适应：name 列占 m_leftPercent%，右侧属性列占剩余比例。
+    void setLeftColumnPercent(int percent);
 
     //void setCurrentModelItem(ModelTreeWidgetItem* item);
     //ModelTreeWidgetItem* getCurrentModelItem();
 
 protected:
     void mousePressEvent(QMouseEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 
 signals:
     void ChangeCurrentModel(iGame::Model* model);
     void ViewCloudPicture();
 
 private:
+    void applyColumnProportions();
+    // §48：眼睛（显示/隐藏）图标的命中区。用样式算出的"文本起始位置"界定，
+    //      这样主题 QSS 里的 item padding / 缩进 / 图标尺寸变化都能自动跟上，
+    //      不再依赖写死的 cell.left()+4（曾因主题 padding 6px 12px 把图标右移 12px 而点不中）。
+    QRect eyeHitRect(const QTreeWidgetItem* item) const;
     //ModelTreeWidgetItem* currentModelItem{nullptr};
+    int m_leftPercent = 36;   // 名字列占比（右侧属性列仍略占大头）
+    int m_lastLeft = -1;      // 避免在 resize 中反复重设造成抖动
+    int m_lastRight = -1;
 };

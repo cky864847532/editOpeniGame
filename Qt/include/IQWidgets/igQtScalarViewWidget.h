@@ -34,6 +34,7 @@ signals:
 	void ChangeShowColorManager();
 	void UpdateRenderWidget();
 protected:
+	void changeEvent(QEvent* e) override;   // §52：切主题时刷新面板配色
 
 private:
 	Ui::ScalarView* ui;

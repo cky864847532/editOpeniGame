@@ -1,5 +1,6 @@
 #include "ui_igQtDataChangeWidget.h"
 #include <IQWidgets/igQtDataChangeWidget.h>
+#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色）
 #include <QElapsedTimer>
 #include <QEvent>
 #include <iGameThreadPool.h>
@@ -355,8 +356,10 @@ void igQtDataChangeWidget::DrawRadial() {
 }
 
 void igQtDataChangeWidget::GenerateBackgroundColor() {
-    // 与主界面/变量相关性等深色面板一致 (#2b2b2b)
-    m_BackgroundColor = {0x2b, 0x2b, 0x2b};
+    // §57：原来是写死的深色底 (#2b2b2b)；改为跟随主题的角色色
+    //       （深色族 ≈ #2A2A2A，浅色 / 悬浮·浅色族为浅底），切主题时重新生成
+    const QColor c = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg);
+    m_BackgroundColor = {c.red(), c.green(), c.blue()};
 }
 
 void igQtDataChangeWidget::SetUiData() {
@@ -453,7 +456,7 @@ void igQtDataChangeWidget::SetRadialData() {
 void igQtDataChangeWidget::_PaintPlotOnDrawWidget(QPainter& painter) {
     const QRect plotRect = ui->drawWidget->rect();
     if (m_CurrentModelDataIndex < 0 || m_DataChangeDatas.size() <= m_CurrentModelDataIndex) {
-        painter.fillRect(plotRect, QColor(0x2b, 0x2b, 0x2b));
+        painter.fillRect(plotRect, igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg));   // §57
         return;
     }
     QRect smallDrawFrame = InsetRectByBoundaryRatio(plotRect, boundaryRatio);
@@ -695,7 +698,8 @@ void igQtDataChangeWidget::_DrawBackground(QPainter& painter, const QRect& range
 }
 
 void igQtDataChangeWidget::_DrawCoordinateRect(QPainter& painter, const QRect& range) {
-    painter.setPen(QPen(QColor(0xa8, 0xa8, 0xa8), 1));
+    // §57：坐标框描边原为写死的 #a8a8a8 → 走角色色（Text）
+    painter.setPen(QPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawRect(range);
 }
@@ -850,4 +854,14 @@ void igQtDataChangeWidget::TempSlot_SetRadialData() {
     _GenerateVariableImage(m_VariableShow, Data);
     _GenerateChoosedVariableImage(m_VariableShow, Data);
     update();
+}
+
+// §57：切主题 → 重算绘图底色（角色色）并重绘。本面板 .ui 没有自带样式表，
+//       所以配色全部走"绘制时取角色色"这条路，不需要 igQtPanelTheme。
+void igQtDataChangeWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        GenerateBackgroundColor();
+        update();
+    }
+    QWidget::changeEvent(e);
 }

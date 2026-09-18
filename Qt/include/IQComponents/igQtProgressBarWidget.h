@@ -13,6 +13,7 @@
 #include <QProgressBar>
 #include <QLabel>
 #include <QWidget>
+#include <QTimer>
 #include <IQCore/igQtExportModule.h>
 
 class IG_QT_MODULE_EXPORT igQtProgressBarWidget : public QWidget{
@@ -27,6 +28,10 @@ public:
     void updateProgressBarLabel(const char* info);
 private:
     void resetTextMode();
+    // 按当前主题统一标签与进度条文字颜色
+    void applyThemeStyle();
+    // 显示并重置自动隐藏计时器
+    void showWithAutoHide();
 
     // 进度事件可能来自工作线程（PVD / 切帧经 ThreadPool 读子文件），
     // 必须投递回本控件所在线程后再改 widget。
@@ -35,6 +40,7 @@ private:
     QProgressBar* progressBar;
     QLabel *progressBarLabel;
     iGame::ProgressObserver* progressObserver;
+    QTimer* m_hideTimer{nullptr};
     bool hasExternalText{false};
     unsigned long m_ProgressObserverTag{kInvalidObserverTag};
     unsigned long m_TextObserverTag{kInvalidObserverTag};

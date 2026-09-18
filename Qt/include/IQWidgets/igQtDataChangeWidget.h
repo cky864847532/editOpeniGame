@@ -90,6 +90,8 @@ protected:
 
 protected:
     void hideEvent(QHideEvent* event) override;
+    // §57：切主题时重算绘图角色色并重绘
+    void changeEvent(QEvent* e) override;
 
 signals:
     void Hided();

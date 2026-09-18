@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <ui_igStreamTracer.h>
 //#include <iGameManager.h>
 #include <QHideEvent>
@@ -20,6 +20,8 @@ public:
 protected:
     void hideEvent(QHideEvent* event);
     void showEvent(QShowEvent* event);
+    // §57：切主题时按角色色重映射面板自带 QSS
+    void changeEvent(QEvent* e) override;
 
 public slots:
     void generateStreamline();

@@ -209,7 +209,7 @@ bool Scene::Initialize() {
     // 添加中心坐标轴到模型池
     m_CenterAxesModel->AddViewStyle(
             IG_WIREFRAME);                   // 添加线框视图样式（默认不显示线）
-    //m_CenterAxesModel->SetAlwaysOnTop(true); // 设置为总在最上层
+    m_CenterAxesModel->SetAlwaysOnTop(true); // 中心轴始终显示在最上层，避免被模型遮挡导致颜色不可见
     m_CenterAxesModel->ConvertToDrawableData(); // 初始化几何数据
     m_CenterAxesModel->SyncGpuBuffers();        // 上传GPU数据
     this->AddModel(m_CenterAxesModel);          // 加入模型池
@@ -1130,7 +1130,10 @@ void Scene::DrawFrame() {
 #endif
 
         // Draw painter 2d and axes
-        BindFramebuffer();
+        // 叠加层必须画到「最终单采样图像」m_Framebuffer 上：RenderToSpecificFrame 呈现给
+        // Qt 的正是这张纹理，而体渲染 / 透明(OIT) 通道也是直接合成写入它。
+        // 画进 MSAA 缓冲则永远不会出现在画面上（旧版坐标轴/2D 就是这样丢失的）。
+        m_Framebuffer->Bind();
         glViewport(0, 0, viewport.x, viewport.y);
         {
             // Draw painter 2D in the image top
@@ -1140,10 +1143,10 @@ void Scene::DrawFrame() {
             }
             if (m_TextOverlay2DActor) { m_TextOverlay2DActor->Draw(); }
 
-            // Draw axes in bottom left
+            // Draw axes in bottom left（适度缩小，更贴近现代工业风）
             if (m_AxesVisible) {
                 int mx = std::max(viewport.x, viewport.y);
-                glViewport(0, 0, mx / 10, mx / 10);
+                glViewport(0, 0, mx / 12, mx / 12);
                 m_Axes->Draw();
             }
         }
@@ -1328,6 +1331,10 @@ void Scene::ForwardPass() {
     BindFramebuffer();
     m_Painter3D->Draw();
 
+    // 不透明几何绘制完成后，把 MSAA 结果 resolve 到最终单采样图像 m_Framebuffer。
+    // 必须发生在 TransparentPass / VolumeRenderingPass 之前：这两个通道是直接合成写入
+    // m_Framebuffer 的，若之后再 resolve 一次，会把它们的结果整体覆盖掉
+    // （体渲染下表现为“按下体渲染后模型直接消失”）。
 #ifndef __EMSCRIPTEN__
     ResolveFrameBuffer();
 #endif

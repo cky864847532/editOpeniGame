@@ -1,3 +1,4 @@
+#include <IQWidgets/igQtRenderWidget.h>   // §52：面板主题化
 /**
  * @class   igQtAiChatWidget
  * @brief   iGameAiTool AI聊天助手Widget实现 - 简化版本
@@ -90,6 +91,9 @@ void igQtAiChatWidget::setupUI()
     
     // 加载样式表
     loadStyleSheet();
+
+    // §52（4b）：把这份深色 QSS 存成"底"，按当前主题重映射（切主题时 changeEvent 再刷新）
+    igQtPanelTheme::attach(this);
     
     // Main layout
     mainLayout = new QVBoxLayout(this);
@@ -824,3 +828,10 @@ void igQtAiChatWidget::loadStyleSheet()
     }
 }
 
+// §52（4b）：切主题 → 主窗口 setStyleSheet 会给子控件发 StyleChange → 这里刷新面板配色
+void igQtAiChatWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refresh(this);
+    }
+    QWidget::changeEvent(e);
+}

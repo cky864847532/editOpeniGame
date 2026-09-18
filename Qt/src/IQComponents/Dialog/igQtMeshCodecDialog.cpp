@@ -1,7 +1,9 @@
 #include "IQComponents/Dialog/igQtMeshCodecDialog.h"
 #include "IQComponents/Dialog/igQtDarkFramelessMessage.h"
+#include <IQWidgets/igQtRenderWidget.h>   // §67：角色色（uiRole）与面板主题刷新
 #include <QBrush>
 #include <QColor>
+#include <QEvent>
 #include <QPen>
 #include <QTimer>
 #include <QScreen>
@@ -16,24 +18,26 @@
 #include <filesystem>
 
 namespace {
-constexpr QColor kChartPlotBg(0x25, 0x25, 0x26);
-constexpr QColor kChartLabelColor(0xD8, 0xD8, 0xD8);
-constexpr QColor kChartGridColor(0x3A, 0x3A, 0x3A);
-constexpr QColor kChartAxisLine(0x5A, 0x5A, 0x5A);
-constexpr QColor kChartSeriesFill(0xC0, 0xC0, 0xC0);
-constexpr QColor kChartSeriesBorder(0xA0, 0xA0, 0xA0);
+// §67：原来这里是一组**写死的深色常量**（绘图区 #252526 / 标签 #D8D8D8 / 网格 #3A3A3A /
+//      轴线 #5A5A5A / 序列 #C0C0C0·#A0A0A0），浅色主题下整块图表仍是深底 → 改为按当前主题取角色色。
+inline QColor ChartPlotBg() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg); }
+inline QColor ChartLabelColor() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text); }
+inline QColor ChartGridColor() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Border); }
+inline QColor ChartAxisLine() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::BorderStrong); }
+inline QColor ChartSeriesFill() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::TextDim); }
+inline QColor ChartSeriesBorder() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::BorderStrong); }
 
 void StyleChartAxes(QValueAxis* axisX, QValueAxis* axisY)
 {
     if (axisX) {
-        axisX->setLabelsColor(kChartLabelColor);
-        axisX->setGridLineColor(kChartGridColor);
-        axisX->setLinePenColor(kChartAxisLine);
+        axisX->setLabelsColor(ChartLabelColor());
+        axisX->setGridLineColor(ChartGridColor());
+        axisX->setLinePenColor(ChartAxisLine());
     }
     if (axisY) {
-        axisY->setLabelsColor(kChartLabelColor);
-        axisY->setGridLineColor(kChartGridColor);
-        axisY->setLinePenColor(kChartAxisLine);
+        axisY->setLabelsColor(ChartLabelColor());
+        axisY->setGridLineColor(ChartGridColor());
+        axisY->setLinePenColor(ChartAxisLine());
     }
 }
 
@@ -43,8 +47,8 @@ void ApplyDarkChartShell(QChart* chart)
     chart->setBackgroundVisible(true);
     chart->setBackgroundBrush(QBrush(Qt::transparent));
     chart->setPlotAreaBackgroundVisible(true);
-    chart->setPlotAreaBackgroundBrush(QBrush(kChartPlotBg));
-    chart->setPlotAreaBackgroundPen(QPen(kChartGridColor, 1));
+    chart->setPlotAreaBackgroundBrush(QBrush(ChartPlotBg()));
+    chart->setPlotAreaBackgroundPen(QPen(ChartGridColor(), 1));
     if (chart->legend()) chart->legend()->setVisible(false);
 }
 
@@ -71,6 +75,7 @@ void ApplyKeyAreaDarkStyle(QGroupBox* groupBox, QChartView* chartView, QWidget* 
     if (chartView) {
         chartView->setAttribute(Qt::WA_StyledBackground, true);
         chartView->setStyleSheet("background-color: #252526; border: none;");
+        igQtPanelTheme::attach(chartView);   // §67：存底并按当前主题重映射
     }
     if (checkBoxContainer) {
         checkBoxContainer->setAttribute(Qt::WA_StyledBackground, true);
@@ -86,6 +91,7 @@ void ApplyKeyAreaDarkStyle(QGroupBox* groupBox, QChartView* chartView, QWidget* 
             "  background-color: #569CD6;"
             "  border: 1px solid #569CD6;"
             "}");
+        igQtPanelTheme::attach(checkBoxContainer);   // §67
     }
 }
 } // namespace
@@ -134,6 +140,9 @@ igQtMeshCodecDialog::igQtMeshCodecDialog(QWidget* parent, iGame::DataObject::Poi
         "QGroupBox#groupbox_dataDistGroup { background-color: #252526; border: 1px solid #3A3A3A; }"
         "QTableWidget { background-color: #2A2A2A; color: #EAEAEA; gridline-color: #3A3A3A; }"
         "QHeaderView::section { background-color: #333333; color: #EAEAEA; border: 1px solid #3A3A3A; }");
+    // §67：以上是"深色原文"作底 → 全部存底并按当前主题重映射（独立顶层窗，需由 changeEvent 刷新）
+    igQtPanelTheme::attachDeep(m_bodyWidget);
+    igQtPanelTheme::attachDeep(this);
 
     ui->setupUi(m_bodyWidget);
     setContentWidget(m_bodyWidget);
@@ -909,6 +918,9 @@ void igQtMeshCodecDialog::on_checkbox_exportNumpy_clicked(bool checked)
         "QPushButton:pressed { background-color: #252526; }"
         "QPushButton:disabled { background-color: #252526; color: #707070; "
         "border-color: #333333; }");
+    // §67：深色原文作底 → 按当前主题重映射（该弹窗是独立顶层窗，
+    //      由 igQtChromeFramelessDialog 的 changeEvent → refreshDeep 负责刷新）
+    igQtPanelTheme::attachDeep(&selector);
 
     auto* layout = new QVBoxLayout(body);
     layout->setContentsMargins(14, 10, 14, 14);
@@ -1058,8 +1070,8 @@ void igQtMeshCodecDialog::DrawFeatureHistogram(QChart* chart)
         barSeries->setLowerSeries(lowerLine);
         barSeries->setUpperSeries(upperLine);
 
-        barSeries->setColor(kChartSeriesFill);
-        barSeries->setBorderColor(kChartSeriesBorder);
+        barSeries->setColor(ChartSeriesFill());
+        barSeries->setBorderColor(ChartSeriesBorder());
 
         chart->addSeries(barSeries);
         barSeries->attachAxis(axisX);
@@ -1113,8 +1125,8 @@ void igQtMeshCodecDialog::DrawFeatureHistogramFromData(QChart* chart, const std:
         barSeries->setLowerSeries(lowerLine);
         barSeries->setUpperSeries(upperLine);
 
-        barSeries->setColor(kChartSeriesFill);
-        barSeries->setBorderColor(kChartSeriesBorder);
+        barSeries->setColor(ChartSeriesFill());
+        barSeries->setBorderColor(ChartSeriesBorder());
 
         chart->addSeries(barSeries);
         barSeries->attachAxis(axisX);
@@ -1584,4 +1596,27 @@ iGame::CodecControlParams igQtMeshCodecDialog::BuildCodecParams() const
     }
 
     return params;
+}
+
+// §67：切主题 → ① refreshDeep 重映射本窗口（含 m_bodyWidget / 图标区 / 复选框容器等的自带 QSS）
+//                  ② 重设图表本体配色（QChart 不认 QSS：绘图区/坐标轴/网格/序列边框）
+//                  ③ 重绘
+void igQtMeshCodecDialog::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refreshDeep(this);
+        if (m_chartView && m_chartView->chart()) {
+            QChart* c = m_chartView->chart();
+            ApplyDarkChartShell(c);
+            const QList<QAbstractAxis*> axes = c->axes();
+            for (QAbstractAxis* axis : axes) {
+                if (!axis) continue;
+                axis->setLabelsColor(ChartLabelColor());
+                axis->setGridLineColor(ChartGridColor());
+                axis->setLinePenColor(ChartAxisLine());
+            }
+            m_chartView->update();
+        }
+        update();
+    }
+    igQtChromeFramelessDialog::changeEvent(e);
 }

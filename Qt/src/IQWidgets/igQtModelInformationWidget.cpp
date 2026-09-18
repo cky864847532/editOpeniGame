@@ -1,4 +1,5 @@
 #include "IQWidgets/igQtModelInformationWidget.h"
+#include "IQWidgets/igQtRenderWidget.h"
 #include "iGameSceneManager.h"
 #include "iGameStructuredMesh.h"
 #include "iGameSurfaceMesh.h"
@@ -17,6 +18,32 @@ QString pathForLabelWrap(const QString& path) {
         if (c == QLatin1Char('/') || c == QLatin1Char('\\')) out.append(QChar(0x200B));
     }
     return out;
+}
+
+// §45：信息卡片（#InfoCard）与分割线的颜色原先**写死在代码里**（#252526/#2D2D30/#3A3A3A），
+//      而 widget 级 setStyleSheet 优先级高于主题 QSS —— 于是「悬浮·浅色」等浅色变体上
+//      卡片仍是深底、文字却是深色（深压深看不清）。这里改成按"颜色族"取色：
+//      2/13 浅色族、9/14 石墨·现代、10/15 石墨·哑光，其余（11/12 深色）保持原值不变。
+struct InfoCardPalette {
+    const char* bg;
+    const char* border;
+    const char* line;
+};
+
+InfoCardPalette infoCardPalette() {
+    switch (igQtRenderWidget::globalStyleMode()) {
+        case 2:
+        case 13:
+            return { "#F1F3F7", "#CBD2DC", "#D6DBE4" };
+        case 9:
+        case 14:
+            return { "#22262C", "#31363D", "#31363D" };
+        case 10:
+        case 15:
+            return { "#20242A", "#2C3038", "#2C3038" };
+        default:
+            return { "#252526", "#2D2D30", "#3A3A3A" };   // 11 GitCode 暗色 / 12 悬浮卡片：与原值完全一致
+    }
 }
 } // namespace
 
@@ -130,6 +157,11 @@ void igQtModelInformationWidget::updateInformationFrame() {
     }
 
 
+    const int styleModeNow = igQtRenderWidget::globalStyleMode();
+    // §45：13/14/15 也是悬浮卡片布局（只是换色）
+    const bool floatingCards = (styleModeNow >= 12 && styleModeNow <= 15);
+    if (floatingCards) frameLayout->setSpacing(10); // 卡片之间留缝隙
+
     frameLayout->addWidget(createLabel(QStringLiteral("文件属性")));
 
 
@@ -138,11 +170,20 @@ void igQtModelInformationWidget::updateInformationFrame() {
     QWidget* filePropWidget = new QWidget(this->informationFrame);
     QFormLayout* filePropForm = new QFormLayout(filePropWidget);
     filePropForm->setContentsMargins(0, 0, 0, 0);
-    filePropForm->setHorizontalSpacing(10);
-    filePropForm->setVerticalSpacing(6);
+    filePropForm->setHorizontalSpacing(8);
+    filePropForm->setVerticalSpacing(0);
     filePropForm->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    m_tableRow = 0;
     createPropertyLabel(filePropForm, QStringLiteral("名称"), pathForLabelWrap(fileName));
     createPropertyLabel(filePropForm, QStringLiteral("路径"), pathForLabelWrap(directory));
+    if (floatingCards) {
+        const InfoCardPalette cardPal = infoCardPalette();   // §45：随颜色族
+        filePropWidget->setObjectName(QStringLiteral("InfoCard"));
+        filePropWidget->setStyleSheet(
+                QStringLiteral("QWidget#InfoCard { background-color: %1; border: 1px solid %2; border-radius: 4px; }")
+                        .arg(QString::fromLatin1(cardPal.bg), QString::fromLatin1(cardPal.border)));
+        filePropWidget->setContentsMargins(8, 8, 8, 8);
+    }
     frameLayout->addWidget(filePropWidget);
 
     // 数据统计
@@ -151,9 +192,10 @@ void igQtModelInformationWidget::updateInformationFrame() {
     QWidget* statWidget = new QWidget(this->informationFrame);
     QFormLayout* statForm = new QFormLayout(statWidget);
     statForm->setContentsMargins(0, 0, 0, 0);
-    statForm->setHorizontalSpacing(10);
-    statForm->setVerticalSpacing(6);
+    statForm->setHorizontalSpacing(8);
+    statForm->setVerticalSpacing(0);
     statForm->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    m_tableRow = 0;
     if (obj->HasSubDataObject()) {
         createPropertyLabel(statForm, QStringLiteral("类型"), QStringLiteral("多块网格"));
         createPropertyLabel(statForm, QStringLiteral("块数"), QString::number(obj->GetNumberOfSubDataObjects()));
@@ -169,6 +211,14 @@ void igQtModelInformationWidget::updateInformationFrame() {
         index++;
     }
     createPropertyLabel(statForm, QStringLiteral("内存占用"), QString::number(memorySize) + dw[index]);
+    if (floatingCards) {
+        const InfoCardPalette cardPal = infoCardPalette();   // §45：随颜色族
+        statWidget->setObjectName(QStringLiteral("InfoCard"));
+        statWidget->setStyleSheet(
+                QStringLiteral("QWidget#InfoCard { background-color: %1; border: 1px solid %2; border-radius: 4px; }")
+                        .arg(QString::fromLatin1(cardPal.bg), QString::fromLatin1(cardPal.border)));
+        statWidget->setContentsMargins(8, 8, 8, 8);
+    }
     frameLayout->addWidget(statWidget);
 
     // 处理边界框（并入表单布局，保持与其它项一致对齐）
@@ -199,40 +249,65 @@ QLabel* igQtModelInformationWidget::createLabel(const QString& text) {
     QLabel* label = new QLabel(text);
     label->setWordWrap(false);                                            // 禁用换行
     label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);   // 允许水平压缩
-    label->setStyleSheet(R"(
-        QLabel {
-            font-size: 14px !important;
-            color: #FFFFFF !important; /* 纯纯白，匹配iOS的#FFFFFF */
-        }
-    )");
+    // 分区标题同样跟随主题，避免深色主题下 Qt 默认黑字导致看不清
+    const bool light = igQtRenderWidget::globalLightBackground();
+    const int styleModeNow = igQtRenderWidget::globalStyleMode();
+    const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);   // §45：15 也是哑光族
+    const QString color = light ? QStringLiteral("#2D3748")
+                                : (matte ? QStringLiteral("#D4D4D4") : QStringLiteral("#E2E8F0"));
+    label->setStyleSheet(QStringLiteral("QLabel { font-size: 12px !important; color: %1; background: transparent; font-weight: 600; }").arg(color));
     return label;
 }
 
 void igQtModelInformationWidget::createPropertyLabel(QFormLayout* formLayout, const QString& name, const QString& value) {
-    QLabel* nameLabel = new QLabel(name + ":");
-    nameLabel->setAlignment(Qt::AlignCenter);
-    nameLabel->setMinimumWidth(120);
-    nameLabel->setStyleSheet("QLabel { font-size: 14px; color: #C8C8C8; }");
+    // 每行用一个容器行，便于画交替底色，模拟表格效果
+    auto* row = new QWidget(informationFrame);
+    auto* rowLayout = new QHBoxLayout(row);
+    rowLayout->setContentsMargins(6, 3, 6, 3);
+    rowLayout->setSpacing(10);
 
-    QLabel* valueLabel = new QLabel(value);
+    // 文字颜色随主题自适应（浅色用深色文字，深色用浅色文字）
+    const bool light = igQtRenderWidget::globalLightBackground();
+    const int styleModeNow = igQtRenderWidget::globalStyleMode();
+    const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);   // §45：15 也是哑光族
+    const QString nameColor = light ? QStringLiteral("#4A5568")
+                                    : (matte ? QStringLiteral("#858585") : QStringLiteral("#C8C8C8"));
+    const QString valueColor = light ? QStringLiteral("#1F2A3A")
+                                     : (matte ? QStringLiteral("#CCCCCC") : QStringLiteral("#FFFFFF"));
+
+    QLabel* nameLabel = new QLabel(name + ":", row);
+    nameLabel->setAlignment(Qt::AlignCenter);
+    nameLabel->setMinimumWidth(80);
+    nameLabel->setStyleSheet(QStringLiteral("QLabel { font-size: 12px; color: %1; background: transparent; }").arg(nameColor));
+
+    QLabel* valueLabel = new QLabel(value, row);
     valueLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     valueLabel->setWordWrap(true);
     valueLabel->setMinimumWidth(0);
     valueLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    valueLabel->setStyleSheet("QLabel { font-size: 14px; color: #FFFFFF; }");
-    formLayout->addRow(nameLabel, valueLabel);
+    valueLabel->setStyleSheet(QStringLiteral("QLabel { font-size: 12px; color: %1; background: transparent; }").arg(valueColor));
+
+    rowLayout->addWidget(nameLabel);
+    rowLayout->addWidget(valueLabel);
+
+    // 交替行底色
+    const QString rowBg = (m_tableRow % 2 == 1)
+            ? (light ? QStringLiteral("rgba(0,0,0,0.05)") : QStringLiteral("rgba(255,255,255,0.05)"))
+            : QStringLiteral("transparent");
+    row->setStyleSheet(QStringLiteral("QWidget { background-color: %1; }").arg(rowBg));
+    ++m_tableRow;
+
+    formLayout->addRow(row);
 }
 QFrame* igQtModelInformationWidget::createSeparator() {
     QFrame* line = new QFrame();
     line->setFrameShape(QFrame::HLine);
     line->setFrameShadow(QFrame::Sunken);
-    //添加修改样式
-    line->setStyleSheet(R"(
-        QWidget {
-            background-color: #3A3A3A !important; /* 深灰分割线，适配深色主题 */
-            height: 1px !important;
-            margin: 4px 0 !important;
-        }
-    )");
+    // §45：分割线颜色也随颜色族（原来写死 #3A3A3A，浅色变体上是一条黑线）
+    const InfoCardPalette cardPal = infoCardPalette();
+    line->setStyleSheet(
+            QStringLiteral("QWidget { background-color: %1 !important; height: 1px !important;"
+                           " margin: 4px 0 !important; }")
+                    .arg(QString::fromLatin1(cardPal.line)));
     return line;
 }

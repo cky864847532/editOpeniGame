@@ -11,6 +11,7 @@
 #include <IQCore/igQtAnimationVcrController.h>
 #include <IQCore/igQtOpenGLWidgetManager.h>
 #include <IQWidgets/igQtAnimationWidget.h>
+#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色/令牌重映射）
 #include <QAbstractButton>
 #include <QCheckBox>
 #include <QComboBox>
@@ -35,6 +36,12 @@
 igQtAnimationWidget::igQtAnimationWidget(QWidget* parent)
     : QWidget(parent), ui(new Ui::Animation) {
     ui->setupUi(this);
+
+    // §64：主题重映射必须在这里（setupUi 之后**立刻**）完成，不能放在构造函数末尾 ——
+    // 本构造函数后面有一处提前 return（timevalue 为空/只有一帧时不初始化动画组件），
+    // 之前放在末尾导致 attachDeep 根本执行不到：两棵关键帧树从未"存底"，
+    // 于是它们的自带深色 QSS 在任何主题下都不被重映射（用户看到的"数据显示区全黑"）。
+    igQtPanelTheme::attachDeep(this);
     VcrController = new igQtAnimationVcrController(this);
     ui->SliderAnimationTrack->installEventFilter(this);
 
@@ -218,6 +225,8 @@ igQtAnimationWidget::igQtAnimationWidget(QWidget* parent)
             QString::asprintf("%.20f", *(timevalue.end() - 1)));
     connect(ui->SliderAnimationTrack, &QSlider::sliderMoved, VcrController,
             &igQtAnimationVcrController::updateCurrentKeyframe);
+
+    // §57/§64：attachDeep 已移到构造函数开头（见上），此处不再重复（避免被提前 return 跳过）
 }
 
 bool igQtAnimationWidget::eventFilter(QObject* watched, QEvent* event) {
@@ -1478,4 +1487,12 @@ int igQtAnimationWidget::EnsureTimeDifferenceForCurrentFrame(iGame::DataObject::
     auto parentAttr = obj->GetAttributeSet();
     if (!parentAttr) return -1;
     return parentAttr->GetAttributeIndex(outputName);
+}
+
+// §57：切主题 → 刷新本面板配色；本面板深色 QSS 挂在子控件上，故用 refreshDeep
+void igQtAnimationWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refreshDeep(this);
+    }
+    QWidget::changeEvent(e);
 }

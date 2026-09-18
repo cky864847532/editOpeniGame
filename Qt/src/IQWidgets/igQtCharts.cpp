@@ -1,10 +1,12 @@
 #include "IQWidgets/igQtCharts.h"
+#include <IQWidgets/igQtRenderWidget.h>   // §66：角色色（uiRole）与面板主题刷新
 #include <QLineSeries>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QBrush>
 #include <QBitmap>
 #include <QColor>
+#include <QEvent>
 #include <QFrame>
 #include <QMouseEvent>
 #include <QPainter>
@@ -67,6 +69,11 @@ igQtCharts::igQtCharts(QWidget* parent)
     chart->setBackgroundPen(Qt::NoPen);
 
     this->setLayout(layout);
+    // §66：上面这套 QSS 是"深色原文"，后面不再手工写死颜色 ——
+    //      1) attachDeep 把它（以及 chartView 自己的 QSS）存成"底"，按当前主题做令牌重映射；
+    //      2) applyTheme() 负责 QChart 那一套非 QSS 的配色（背景/坐标轴/图例/网格线）。
+    igQtPanelTheme::attachDeep(this);
+    applyTheme();
     updateRoundedMask();
 }
 
@@ -153,39 +160,22 @@ void igQtCharts::drawBarChart(iGame::ArrayObject::Pointer data) {
     chart->addAxis(axisY, Qt::AlignLeft);
     series->attachAxis(axisY);
 
-    // 添加网格线
+    // 添加网格线（§66：颜色走角色色，浅色主题下也看得见/不刺眼）
     QLineSeries* lineSeries = new QLineSeries();
     for (int i = 0; i <= numberOfBins; ++i) { lineSeries->append(i, 0); }
-    QPen pen(QColor(255, 255, 255, 70));
+    QPen pen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Border));
+    pen.setWidthF(1.0);
     lineSeries->setPen(pen);
     chart->addSeries(lineSeries);
     lineSeries->attachAxis(axisX);
     lineSeries->attachAxis(axisY);
 
-    // 深色主题样式
-    chart->setBackgroundVisible(true);
-    chart->setBackgroundBrush(QBrush(QColor("#1F1F1F")));
-    chart->setBackgroundPen(Qt::NoPen);
-    chart->setBackgroundRoundness(0);
-    chart->setPlotAreaBackgroundVisible(true);
-    chart->setPlotAreaBackgroundBrush(QBrush(QColor("#252526")));
-    chart->setPlotAreaBackgroundPen(Qt::NoPen);
-    chart->setTitleBrush(QBrush(QColor("#E0E0E0")));
-
-    axisX->setLabelsColor(QColor("#C8C8C8"));
-    axisX->setTitleBrush(QBrush(QColor("#C8C8C8")));
-    axisX->setGridLineColor(QColor(255, 255, 255, 35));
-    axisX->setLinePenColor(QColor("#6A6A6A"));
-
-    axisY->setLabelsColor(QColor("#C8C8C8"));
-    axisY->setTitleBrush(QBrush(QColor("#C8C8C8")));
-    axisY->setGridLineColor(QColor(255, 255, 255, 35));
-    axisY->setLinePenColor(QColor("#6A6A6A"));
-
+    // §66：配色统一交给 applyTheme()（原来这里是一整套写死的深色：背景 #1F1F1F、
+    //      绘图区 #252526、标题/坐标轴 #E0E0E0/#C8C8C8、图例 #D0D0D0、网格 rgba(255,255,255,35)…）
+    chart->setTitle(QStringLiteral("数据分布直方图"));
     chart->legend()->setVisible(true);
     chart->legend()->setAlignment(Qt::AlignTop);
-    chart->legend()->setLabelColor(QColor("#D0D0D0"));
-    chart->setTitle(QStringLiteral("数据分布直方图"));
+    applyTheme();
 }
 
 
@@ -232,6 +222,9 @@ void igQtCharts::drawLineChart(iGame::ArrayObject::Pointer m_data) {
 
     // 设置图表的标题
     chart->setTitle(QStringLiteral("数据折线图"));
+
+    // §66：折线图同样按主题上色（原来完全依赖 Qt 默认主题，切主题后背景/坐标轴不会变）
+    applyTheme();
 
     // 更新图表视图
     chartView->setChart(chart);
@@ -287,4 +280,86 @@ void igQtCharts::mouseReleaseEvent(QMouseEvent* event) {
 void igQtCharts::resizeEvent(QResizeEvent* event) {
     QDialog::resizeEvent(event);
     updateRoundedMask();
+}
+
+// §66：按当前主题的角色色重设 QChart / QChartView 配色。
+//       这些颜色原来全部写死为深色（背景 #1F1F1F、绘图区 #252526、标题 #E0E0E0、
+//       坐标轴/图例 #C8C8C8/#D0D0D0、网格 rgba(255,255,255,35)、轴线 #6A6A6A），
+//       QtCharts 不认 QSS 的这套颜色 → 浅色主题下整块图表仍是黑底（用户反馈"未适配"）。
+void igQtCharts::applyTheme() {
+    using Role = igQtRenderWidget::UiRole;
+    const QColor bg = igQtRenderWidget::uiRole(Role::PanelBg2);       // 原 #1F1F1F
+    const QColor plotBg = igQtRenderWidget::uiRole(Role::CardBg);     // 原 #252526
+    const QColor text = igQtRenderWidget::uiRole(Role::Text);         // 原 #C8C8C8 / #D0D0D0
+    const QColor textStrong = igQtRenderWidget::uiRole(Role::TextStrong); // 原 #E0E0E0
+    const QColor border = igQtRenderWidget::uiRole(Role::Border);         // 原网格 rgba(255,255,255,35)
+    const QColor borderStrong = igQtRenderWidget::uiRole(Role::BorderStrong); // 原轴线 #6A6A6A
+
+    if (chartView) {
+        chartView->setBackgroundBrush(QBrush(bg));
+        chartView->update();
+    }
+
+    // §67：标题栏直接按角色色重设（不依赖 QSS 令牌重映射），保证 8 套风格下都跟随主题：
+    //       底色 PanelBg、分隔线 Border、标题字 Text、关闭按钮 Text（hover/pressed 保留语义红）
+    if (m_titleBar) {
+        m_titleBar->setStyleSheet(QStringLiteral("background-color: %1; border-bottom: 1px solid %2;")
+                                          .arg(igQtRenderWidget::uiRoleCss(Role::PanelBg),
+                                               igQtRenderWidget::uiRoleCss(Role::Border)));
+    }
+    if (m_titleLabel) {
+        m_titleLabel->setStyleSheet(QStringLiteral(
+                "color: %1; background: transparent; font-size: 13px; padding-left: 8px;")
+                                            .arg(igQtRenderWidget::uiRoleCss(Role::Text)));
+    }
+    if (m_closeButton) {
+        m_closeButton->setStyleSheet(QStringLiteral(
+                "min-width: 28px; max-width: 28px; min-height: 24px; max-height: 24px;"
+                "background-color: transparent; color: %1; border: none; font-size: 14px;")
+                                             .arg(igQtRenderWidget::uiRoleCss(Role::Text))
+                + QStringLiteral("QPushButton#chartCloseButton:hover { background-color: #C42B1C; color: #FFFFFF; }"
+                                 "QPushButton#chartCloseButton:pressed { background-color: #A2261A; color: #FFFFFF; }"));
+    }
+
+    if (!chart) return;
+
+    chart->setBackgroundVisible(true);
+    chart->setBackgroundBrush(QBrush(bg));
+    chart->setBackgroundPen(Qt::NoPen);
+    chart->setBackgroundRoundness(0);
+    chart->setPlotAreaBackgroundVisible(true);
+    chart->setPlotAreaBackgroundBrush(QBrush(plotBg));
+    chart->setPlotAreaBackgroundPen(Qt::NoPen);
+    chart->setTitleBrush(QBrush(textStrong));
+
+    if (chart->legend()) chart->legend()->setLabelColor(text);
+
+    const QList<QAbstractAxis*> axes = chart->axes();
+    for (QAbstractAxis* axis : axes) {
+        if (!axis) continue;
+        axis->setLabelsColor(text);
+        axis->setTitleBrush(QBrush(text));
+        axis->setGridLineColor(border);
+        axis->setLinePenColor(borderStrong);
+    }
+
+    // 直方图里那条"网格线辅助序列"（无名的 QLineSeries）跟着描边走；
+    // 数据序列（有名字）保持自己的颜色不动（那是数据语义色）。
+    const QList<QAbstractSeries*> seriesList = chart->series();
+    for (QAbstractSeries* s : seriesList) {
+        if (auto* line = qobject_cast<QLineSeries*>(s)) {
+            if (line->name().isEmpty()) line->setPen(QPen(border, 1));
+        }
+    }
+}
+
+// §66：切主题 → ① 重映射本窗口 QSS（标题栏/关闭按钮，含 chartView 自己的 QSS）
+//                  ② applyTheme() 重设 QChart 内部配色 ③ 重绘
+void igQtCharts::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refreshDeep(this);
+        applyTheme();
+        update();
+    }
+    QDialog::changeEvent(e);
 }

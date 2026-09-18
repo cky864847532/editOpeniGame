@@ -1,4 +1,5 @@
 #include "IQComponents/Dialog/igQtChromeFramelessDialog.h"
+#include <IQWidgets/igQtRenderWidget.h>   // §45：浅色族下换浅色壳 + 深色图标
 
 #include <QHBoxLayout>
 #include <QLabel>
@@ -37,7 +38,12 @@ igQtChromeFramelessDialog::igQtChromeFramelessDialog(QWidget* parent) : QDialog(
     setWindowFlags(Qt::Dialog | Qt::FramelessWindowHint | Qt::WindowSystemMenuHint | Qt::WindowMinMaxButtonsHint);
     if (parentWidget()) setWindowIcon(parentWidget()->windowIcon());
 
-    setStyleSheet(
+    // §64：以前这里用 §45 的 adaptQssToLightPalette 做"仅浅色族"一次性硬换 ——
+    //       结果是：在浅色主题下创建窗口后切到暗色，标题文字仍是浅色族的深蓝
+    //       （压在新绘制的深色外壳上 → 看不清，用户截图即此）。
+    //       改为 §52 的统一机制：深色原文存成"底"，按当前主题做角色色令牌重映射，
+    //       并在 changeEvent(StyleChange) 里 refresh（见文件末尾）。
+    setStyleSheet(QStringLiteral(
         "QDialog#ChromeToolFramelessDialog { background: transparent; border: none; }"
         "QWidget#ChromeCaptionBar { background: transparent; border: none; }"
         "QLabel#ChromeCaptionTitle { background: transparent; color: rgba(220, 222, 228, 0.88); font-size: 13px; font-weight: 500; padding-left: 10px; }"
@@ -59,7 +65,9 @@ igQtChromeFramelessDialog::igQtChromeFramelessDialog(QWidget* parent) : QDialog(
         "}"
         "QPushButton#ChromeCloseButton:hover { background-color: rgba(232, 17, 35, 0.88); color: rgba(255, 255, 255, 0.95); }"
         "QPushButton#ChromeCloseButton:pressed { background-color: rgba(197, 15, 31, 0.9); color: rgba(255, 255, 255, 0.95); }"
-        "QWidget#ChromeContentHost { background: transparent; border: none; }");
+        "QWidget#ChromeContentHost { background: transparent; border: none; }"));
+    // §64：把上面这套"深色原文"存成底，按当前主题重映射（标题/按钮/悬停全跟着走）
+    igQtPanelTheme::attach(this);
 
     m_rootLayout = new QVBoxLayout(this);
     m_rootLayout->setContentsMargins(kRootMarginNormal, kRootMarginNormal, kRootMarginNormal, kRootMarginNormal);
@@ -78,7 +86,10 @@ igQtChromeFramelessDialog::igQtChromeFramelessDialog(QWidget* parent) : QDialog(
 
     m_minimizeButton = new QPushButton(m_titleBar);
     m_minimizeButton->setObjectName(QStringLiteral("ChromeMinimizeButton"));
-    m_minimizeButton->setIcon(QIcon(QStringLiteral(":/Ticon/Icons/window_minimize_white.svg")));
+    // §45：浅色族用深色图标（浅标题栏上白图标会看不见）
+    m_minimizeButton->setIcon(QIcon(igQtRenderWidget::globalLightBackground()
+                                            ? QStringLiteral(":/Ticon/Icons/window_minimize_dark.svg")
+                                            : QStringLiteral(":/Ticon/Icons/window_minimize_white.svg")));
     m_minimizeButton->setIconSize(QSize(12, 12));
     m_minimizeButton->setCursor(Qt::PointingHandCursor);
     m_minimizeButton->setFlat(true);
@@ -123,8 +134,10 @@ void igQtChromeFramelessDialog::paintEvent(QPaintEvent* event) {
     painter.setRenderHint(QPainter::Antialiasing, true);
     const QRect r = rect().adjusted(1, 1, -1, -1);
     const int fillA = isMaximized() ? kShellFillAlphaMaximized : kShellFillAlphaNormal;
-    const QColor fill(30, 30, 30, fillA);
-    const QColor border(90, 92, 98, kShellBorderAlpha);
+    // §45：浅色族（浅色 / 悬浮·浅色）下，工具窗外壳也换成浅色，否则标题栏浅字会压在深壳上
+    const bool light = igQtRenderWidget::globalLightBackground();
+    const QColor fill = light ? QColor(241, 243, 247, fillA) : QColor(30, 30, 30, fillA);
+    const QColor border = light ? QColor(203, 210, 220, kShellBorderAlpha) : QColor(90, 92, 98, kShellBorderAlpha);
     if (isMaximized()) {
         painter.fillRect(rect(), fill);
         return;
@@ -270,6 +283,13 @@ void igQtChromeFramelessDialog::changeEvent(QEvent* event) {
         updateMaximizeButtonIcon();
         updateFrameMarginsForWindowState();
     }
+    // §64/§67：切主题 → 重映射本窗口自带的整套 QSS（标题栏文字/图标按钮/悬停底）并重绘外壳。
+    //      本窗口是独立顶层窗，不继承主窗口的主题 QSS，必须自己刷新（否则标题字色会停在旧主题）。
+    //      用 refreshDeep：内容页里"自己带 QSS"的子控件（如消息框 body / 压缩对话框 body）也要刷新。
+    if (event->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refreshDeep(this);
+        update();
+    }
     QDialog::changeEvent(event);
 }
 
@@ -282,8 +302,13 @@ void igQtChromeFramelessDialog::leaveEvent(QEvent* event) {
 
 void igQtChromeFramelessDialog::updateMaximizeButtonIcon() {
     if (!m_maximizeButton) return;
-    m_maximizeButton->setIcon(QIcon(isMaximized() ? QStringLiteral(":/Ticon/Icons/window_restore_white.svg")
-                                                    : QStringLiteral(":/Ticon/Icons/window_maximize_white.svg")));
+    // §45：浅色族用深色图标
+    const bool light = igQtRenderWidget::globalLightBackground();
+    m_maximizeButton->setIcon(QIcon(isMaximized()
+                                            ? (light ? QStringLiteral(":/Ticon/Icons/window_restore_dark.svg")
+                                                     : QStringLiteral(":/Ticon/Icons/window_restore_white.svg"))
+                                            : (light ? QStringLiteral(":/Ticon/Icons/window_maximize_dark.svg")
+                                                     : QStringLiteral(":/Ticon/Icons/window_maximize_white.svg"))));
     m_maximizeButton->setIconSize(isMaximized() ? QSize(15, 15) : QSize(12, 12));
     m_maximizeButton->setText(QString());
 }

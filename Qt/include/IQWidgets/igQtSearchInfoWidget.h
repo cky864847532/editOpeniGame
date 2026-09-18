@@ -104,4 +104,8 @@ private:
     bool currentPropertyValue(int itemId, double& value) const;
     void rebuildFilteredItems(const QString& operatorStr = QString(), bool hasFilter = false, double filterValue = 0.0);
     void renderCurrentPage();
+
+protected:
+    // §57：切主题时按角色色重映射面板自带 QSS
+    void changeEvent(QEvent* e) override;
 };

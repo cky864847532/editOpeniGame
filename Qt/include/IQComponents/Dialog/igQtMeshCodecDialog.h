@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @class   igMeshCodecDialog
  * @brief   网格编解码参数设置窗口
  */
@@ -122,6 +122,8 @@ private slots:
 protected:
     void resizeEvent(QResizeEvent* event) override;
     void showEvent(QShowEvent* event) override;
+    // §67：切主题时刷新本窗口 QSS 与 QChart 配色（独立顶层窗收不到主窗口 QSS 变化）
+    void changeEvent(QEvent* e) override;
 
 private:
     Ui::MeshCodecDialog* ui;

@@ -47,6 +47,10 @@ private slots:
     void onSetSelectionBox();
     void onFocusBoth();
 
+protected:
+    // §67：切主题时按角色色重映射本面板（含代码里 setStyleSheet 时的各控件）
+    void changeEvent(QEvent* e) override;
+
 private:
     // 计算选中 part 的合并包围盒，返回 false 表示无有效 part
     bool computeBoundingBoxForSelected(iGame::BoundingBox& outBBox) const;

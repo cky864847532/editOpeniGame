@@ -24,6 +24,9 @@
 #include <array>
 #undef QT_NO_OPENGL
 
+class QMenu;
+class QHBoxLayout;
+
 class igQtModelDrawWidget;
 class igQtFileLoader;
 class igQtColorManagerWidget;
@@ -79,29 +82,29 @@ public:
     void closeLeftToolPanel(LeftToolPanelId id);
 
 public:
-    igQtModelDrawWidget* rendererWidget;
-    igQtFileLoader* fileLoader;
-    igQtModelDialogWidget* modelTreeWidget;
+    igQtModelDrawWidget* rendererWidget = nullptr;
+    igQtFileLoader* fileLoader = nullptr;
+    igQtModelDialogWidget* modelTreeWidget = nullptr;
 
-    igQtColorManagerWidget* ColorManagerWidget;
-    igQtFilterDialogDockWidget* filterDialogDockWidget;
-    QDockWidget* SliceDockWidget;
-    QDockWidget* ContourDockWidget;
-    igQtModelClipWidget* SliceWidget;
-    QDockWidget* DeformationDockWidget;
-    igQtDeformationWidget* DeformationWidget;
+    igQtColorManagerWidget* ColorManagerWidget = nullptr;
+    igQtFilterDialogDockWidget* filterDialogDockWidget = nullptr;
+    QDockWidget* SliceDockWidget = nullptr;
+    QDockWidget* ContourDockWidget = nullptr;
+    igQtModelClipWidget* SliceWidget = nullptr;
+    QDockWidget* DeformationDockWidget = nullptr;
+    igQtDeformationWidget* DeformationWidget = nullptr;
 
-    igQtProgressBarWidget* progressBarWidget;
-    QComboBox* viewStyleCombox;
-    QComboBox* attributeViewIndexCombox;
-    QComboBox* attributeViewDimCombox;
+    igQtProgressBarWidget* progressBarWidget = nullptr;
+    QComboBox* viewStyleCombox = nullptr;
+    QComboBox* attributeViewIndexCombox = nullptr;
+    QComboBox* attributeViewDimCombox = nullptr;
     
     // AI Chat DockWidget
-    QDockWidget* aiChatDockWidget;
-    igQtAiChatWidget* aiChatWidget;
+    QDockWidget* aiChatDockWidget = nullptr;
+    igQtAiChatWidget* aiChatWidget = nullptr;
 
     // Command Manager for MCP Server (端口 12345)
-    igQtCommandManager* commandManager;
+    igQtCommandManager* commandManager = nullptr;
 
     // 零件聚焦弹窗
     igQtChromeFramelessDialog* partFocusDialog{nullptr};
@@ -137,9 +140,20 @@ private:
     // 自定义标题栏相关
     QWidget* m_titleBar = nullptr;
     QLabel* m_titleLabel = nullptr;
+    // logo + iGameVis 文字的圆角框
+    QWidget* m_brandBox = nullptr;
+    // 顶栏菜单按钮所在的横向布局（原生 QMenuBar 内嵌到这里）
+    QHBoxLayout* m_topMenuLayout = nullptr;
+    // 顶栏品牌框 + 内嵌 QMenuBar 的配色（切换主题时刷新）
+    void applyTopMenuButtonStyle();
     QPushButton* m_btnMinimize = nullptr;
     QPushButton* m_btnMaximize = nullptr;
     QPushButton* m_btnClose = nullptr;
+    QPushButton* m_styleToggleButton = nullptr;
+    QLabel* m_logoIconLabel = nullptr;
+    QLabel* m_projectChip = nullptr;
+    QFrame* m_titleAccentLine = nullptr;
+    QFrame* m_rightDivider = nullptr;
     bool m_titleBarDragging = false;
     QPoint m_dragOffset;
     bool m_isMinimizing = false;
@@ -180,6 +194,42 @@ private:
     void relayoutToolbarWrappers();
     void initCustomTitleBar();
 
+    // ---- 界面风格切换（原始深色 / 现代深色 / 浅色） ----
+    void applyStyleMode(int mode);
+    QString styleSheetForMode(int mode) const;
+    QString loadModernStyleSheet() const;
+    QString loadLightStyleSheet() const;
+    QString loadProStyleSheet() const;
+    QString loadNebulaStyleSheet() const;
+    QString loadWorkspaceStyleSheet() const;
+    QString loadGraphiteModernStyleSheet() const;
+    QString loadMatteGraphiteStyleSheet() const;
+    QString loadGitCodeDarkStyleSheet() const;
+    QString loadFloatingDarkStyleSheet() const;
+    QString styleToggleButtonQss() const;
+    QString styleModeDisplayName(int mode) const;
+    void createStyleMenu();
+    void updateTitleBarIcons();
+    QString toolbarButtonQss(int fontPx) const;
+    QString twoRowGridButtonQss() const;
+    QString toolbarTitleLabelQss() const;
+    QString toolbarCaptionLabelQss(int fontPx) const;
+    // 工具栏「图标 + 文字」整块按钮的悬停反馈（颜色与 twoRowGridButtonQss 对齐）
+    QString toolbarItemQss() const;
+    QString toolbarSeamColor() const;
+    QString toolbarAccentColor() const;
+
+    // ---- 工作台布局（第 7 种风格：紧凑命令栏 + 右侧工具组 + 模型树保持悬浮）----
+    void applyWorkspaceLayout(bool enabled);
+    // ---- 悬浮卡片（第 12 种风格：视口/属性圆角卡片 + 细缝 + XZ 网格质感）----
+    void applyFloatingCards(bool enabled);
+    // §46b：卡片底色/描边/视口外底色按"颜色族"重设（12 与 13/14/15 互切时必须调用）
+    void applyFloatingCardPalette();
+    // ---- 视图栏（右悬浮竖向快捷栏）----
+    void applyViewRail(bool enabled);
+    void updateViewRailPosition();
+    QDockWidget* m_viewDock = nullptr;
+
     // ---- 工具栏单排适配（宽度拟合 + 文字自动换行）----
     /** 按指定 iconSize 重建 3×2 轴网格与 4 组「按钮行 + 标题」容器 */
     void rebuildToolbarRow(int iconSize);
@@ -192,6 +242,33 @@ private:
 
     int m_currentToolbarIconSize = 40;
     bool m_toolbarRebuilding = false;
+
+    // 界面风格（§44 精简后菜单里只剩这 5 种）：2 = 浅色；9 = 石墨·现代；10 = 石墨·哑光；
+    // 11 = GitCode 暗色；12 = 悬浮卡片。
+    // 已从菜单删除（QSS 资源仍保留、不再可选）：0 原始深色 / 1 现代深色 v2 / 3 石墨专业深色 /
+    // 4 深空青蓝 / 5 Fluent / 6 工作台 / 7 石墨·视图栏 / 8 深空·视图栏；
+    // 这些模式号若要落到运行时，都会被 normalizeStyleMode() 回退到 9。
+    QString m_originalStyleSheet;
+    int m_styleMode = 9;
+    // 悬浮卡片模式下的中央视口卡片容器
+    QWidget* m_centralCardContainer = nullptr;
+    // 悬浮卡片模式下被圆角遮罩的属性内容控件
+    QWidget* m_floatingCardWidget = nullptr;
+    // 悬浮卡片模式下被圆角遮罩的属性 dock 本身
+    QDockWidget* m_floatingCardDock = nullptr;
+    // 悬浮卡片模式下被圆角遮罩的模型树 dock
+    QDockWidget* m_floatingTreeDock = nullptr;
+    // 悬浮卡片模式下模型树内容被包进的外层容器
+    QWidget* m_floatingTreeWrapper = nullptr;
+    // 悬浮前模型树原始内容控件，退出时恢复
+    QWidget* m_floatingTreeOriginalWidget = nullptr;
+    // 悬浮前模型树原始标题栏控件，退出时恢复
+    QWidget* m_floatingTreeOriginalTitleBar = nullptr;
+    // 进入悬浮前属性 dock 的原始内容控件，退出时恢复
+    QWidget* m_floatingCardOriginalWidget = nullptr;
+    // 进入悬浮卡片前属性 dock 的原始最小宽度，退出时恢复
+    int m_propertiesOriginalMinWidth = 0;
+    QMenu* m_styleMenu = nullptr;
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;

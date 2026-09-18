@@ -1,5 +1,6 @@
 #include "IQWidgets/igQtSearchInfoWidget.h"
 #include "ui_igQtSearchInfo.h"
+#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色/令牌重映射）
 
 #include <QDockWidget>
 #include <QHBoxLayout>
@@ -24,6 +25,11 @@ igQtSearchInfoWidget::igQtSearchInfoWidget(QWidget* parent)
     ui->setupUi(this);
     initUI();
     initConnections();
+
+    // §57 + §61：把 .ui 里那套深色样式存成"底"，按当前主题重映射；切主题由 changeEvent 刷新。
+    // 本面板 .ui 有 13 处**控件级** styleSheet（分组框/单选框/下拉框/输入框/结果表格…），
+    // 只 attach 顶层会漏掉它们（数据显示区表格一直是深色）→ 用 attachDeep 覆盖全部自带 QSS 的控件。
+    igQtPanelTheme::attachDeep(this);
 }
 
 igQtSearchInfoWidget::~igQtSearchInfoWidget() { delete ui; }
@@ -527,4 +533,12 @@ void igQtSearchInfoWidget::renderCurrentPage() {
     }
     table->resizeColumnsToContents();
     table->setSortingEnabled(true);
+}
+
+// §57 + §61：切主题 → 主窗口 setStyleSheet 会给子控件发 StyleChange → 这里刷新面板配色
+void igQtSearchInfoWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        igQtPanelTheme::refreshDeep(this);   // §61：本面板 QSS 分散在多个控件上
+    }
+    QWidget::changeEvent(e);
 }

@@ -31,4 +31,5 @@ private:
 	QScrollArea* scrollArea;
 	QFrame* informationFrame;
 	QVBoxLayout* frameLayout;
+	int m_tableRow{0};
 };

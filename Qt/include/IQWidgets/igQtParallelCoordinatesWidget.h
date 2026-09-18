@@ -51,6 +51,8 @@ private slots:
     void RangeChooseButtonClicked(bool checked);
 
 protected:
+    // §57：切主题时重算绘图角色色并重绘
+    void changeEvent(QEvent* e) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void paintEvent(QPaintEvent* QPE) override;

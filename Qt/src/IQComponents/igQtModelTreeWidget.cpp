@@ -2,11 +2,17 @@
 #include <QAction>
 #include <QMenu>
 #include <QHeaderView>
+#include <QEvent>
+#include <QStyle>
+#include <QStyleOptionViewItem>   // §48：眼睛命中区用样式计算文本/图标位置
 
 #include "iGameSceneManager.h"
 
 ModelTreeWidgetItem::ModelTreeWidgetItem(QTreeWidget* parent) : QTreeWidgetItem(parent), visibility(true) {
     QWidget* buttonWidget = new QWidget(parent);
+    // 关键：默认停靠面板 QSS 会把 QWidget 涂成 #121721，盖住行高亮。
+    // 置为透明后，选中/悬停背景能透过来，右侧空的第二列不再是一块“黑色”。
+    buttonWidget->setStyleSheet(QStringLiteral("background-color: transparent; border: none;"));
     QHBoxLayout* layout = new QHBoxLayout(buttonWidget);
 
     view_bbox = new HoverButton(buttonWidget);
@@ -28,6 +34,7 @@ ModelTreeWidgetItem::ModelTreeWidgetItem(QTreeWidget* parent) : QTreeWidgetItem(
     layout->addWidget(view_wireframe);
     layout->addWidget(view_fill);
     layout->addWidget(view_pickedItem);
+    layout->addStretch();
     layout->setContentsMargins(0, 2, 2, 2);
 
     parent->setItemWidget(this, 1, buttonWidget);
@@ -163,9 +170,15 @@ AttribTreeWidgetItem::AttribTreeWidgetItem(int index, QTreeWidget* treeview, Mod
     : index(index), QTreeWidgetItem(parent), parent(parent) {
 
     QWidget* widget = new QWidget(treeview);
+    widget->setStyleSheet(QStringLiteral("background-color: transparent; border: none;"));
     comboBox = new MComboBox(this, widget);
-    comboBox->setStyleSheet("QComboBox { background-color: transparent; }"
-                            "QComboBox QAbstractItemView { background-color: white; }");
+    // 让维度下拉框填满第二列宽度，属性栏占比更大时不再留空。
+    auto* comboLayout = new QHBoxLayout(widget);
+    comboLayout->setContentsMargins(0, 0, 0, 0);
+    comboLayout->addWidget(comboBox);
+    comboBox->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    // 弹层不再硬编码白底：让其跟随主窗口当前 QSS（原始深色 / 现代深色均能正确显示）
+    comboBox->setStyleSheet("QComboBox { background-color: transparent; }");
 
     setDimension(1);
 
@@ -207,11 +220,78 @@ igQtModelTreeWidget::igQtModelTreeWidget(QWidget* parent) : QTreeWidget(parent) 
     }
 }
 
+void igQtModelTreeWidget::setLeftColumnPercent(int percent) {
+    m_leftPercent = qBound(30, percent, 60);
+    m_lastLeft = -1;
+    m_lastRight = -1;
+    applyColumnProportions();
+}
+
+void igQtModelTreeWidget::resizeEvent(QResizeEvent* event) {
+    QTreeWidget::resizeEvent(event);
+    applyColumnProportions();
+}
+
+void igQtModelTreeWidget::showEvent(QShowEvent* event) {
+    QTreeWidget::showEvent(event);
+    applyColumnProportions();
+}
+
+void igQtModelTreeWidget::applyColumnProportions() {
+    if (!header() || columnCount() < 2) return;
+    // 用树控件自身宽度作为“可用总宽”，避免启动早期 viewport 宽度尚未就绪时把列宽算小；
+    // 再预留竖向滚动条宽度：两列若刚好占满，竖向滚动条一出现就会挤出底部横向滚动条。
+    const int sbW = style()->pixelMetric(QStyle::PM_ScrollBarExtent, nullptr, this);
+    const int vw = qMax(220, width() - sbW);
+    int leftW = qRound(vw * m_leftPercent / 100.0);
+    const int minLeft = 108;                      // 名字列下限（原 130，整体收窄一点）
+    const int maxLeft = qMax(minLeft, vw - 140);  // 右侧属性列保底 140
+    leftW = qBound(minLeft, leftW, maxLeft);
+    const int rightW = vw - leftW;
+    if (leftW == m_lastLeft && rightW == m_lastRight) return;
+    m_lastLeft = leftW;
+    m_lastRight = rightW;
+    setColumnWidth(0, leftW);
+    setColumnWidth(1, rightW);
+}
+
 ModelTreeWidgetItem* igQtModelTreeWidget::getItem(const QPoint& p) const {
     return dynamic_cast<ModelTreeWidgetItem*>(itemAt(p));
 }
 QTreeWidgetItem* igQtModelTreeWidget::getChild(const QPoint& p) const {
     return dynamic_cast<QTreeWidgetItem*>(itemAt(p));
+}
+
+// §48：眼睛图标命中区 = 该行"文本起点之前"的整段（缩进 + 分支箭头 + 图标）。
+// 用 QStyle 算文本起点，避免写死偏移：主题 QSS 的 `item { padding: 6px 12px; }` 会把图标右移，
+// 实测（探针 _probe48，悬浮卡片主题）：visualItemRect=[x8..288]，图标实际在 x25..36，文字起点 42；
+// 而老写法 cell.left()+4 得到 [12..28] —— 正好压在图标左侧，所以"点眼睛没反应"。
+// 注意：visualItemRect 返回的矩形**已经包含缩进**，不能再手动加 indentation，否则会算到文字里。
+QRect igQtModelTreeWidget::eyeHitRect(const QTreeWidgetItem* item) const {
+    if (!item) return QRect();
+    const QRect cell = visualItemRect(item);
+    if (cell.isEmpty()) return QRect();
+
+    QStyleOptionViewItem opt;
+    opt.initFrom(this);
+    opt.rect = cell;
+    opt.features = QStyleOptionViewItem::HasDecoration | QStyleOptionViewItem::HasDisplay;
+    opt.decorationPosition = QStyleOptionViewItem::Left;
+    opt.decorationAlignment = Qt::AlignLeft | Qt::AlignVCenter;
+    opt.displayAlignment = Qt::AlignLeft | Qt::AlignVCenter;
+    opt.text = item->text(0);
+    opt.icon = item->icon(0);
+    opt.decorationSize = iconSize();
+    opt.font = font();
+    opt.fontMetrics = QFontMetrics(opt.font);
+    const QRect textRect = style()->subElementRect(QStyle::SE_ItemViewItemText, &opt, this);
+    if (textRect.isValid() && !textRect.isEmpty() && textRect.left() > cell.left() + 2) {
+        return QRect(cell.left(), cell.top(), textRect.left() - cell.left(), cell.height());
+    }
+
+    // 退化路径：样式没给出文本矩形时，仍按图标实际尺寸 + 4px 偏移（老算法）
+    const QSize sz = item->icon(0).actualSize(iconSize());
+    return QRect(cell.left() + 4, cell.top() + (cell.height() - sz.height()) / 2, sz.width(), sz.height());
 }
 
 //void igQtModelTreeWidget::setCurrentModelItem(ModelTreeWidgetItem* item) {
@@ -237,11 +317,9 @@ void igQtModelTreeWidget::mousePressEvent(QMouseEvent* event) {
     QTreeWidgetItem* child = nullptr;
 
     if (item) {
-        // Gets the position of the click and the position of the icon
-        QRect iconItem = visualItemRect(item);
-        QSize iconSize = item->icon(0).actualSize(QSize(20, 24));
-        QRect iconRect(iconItem.left() + 4, iconItem.top() + (iconItem.height() - iconSize.height()) / 2,
-                       iconSize.width(), iconSize.height());
+        // §48：眼睛图标命中区（按样式给出的文本起点界定，跟得上主题的 item padding）
+        const QRect iconItem = visualItemRect(item);
+        const QRect eyeRect = eyeHitRect(item);
 
         // Check if click is on the expand/collapse indicator (branch arrow)
         int indentation_level = 0;
@@ -311,8 +389,12 @@ void igQtModelTreeWidget::mousePressEvent(QMouseEvent* event) {
             menu.exec(viewport()->mapToGlobal(event->pos()));
         }
 
-        // Determine if the icon area has been clicked
-        if (iconRect.contains(event->pos())) {
+        // §48：顺序很重要 —— 分支箭头在"文本左侧"的最左边，眼睛图标紧随其后；
+        // 先判箭头（展开/收起交给基类），再判眼睛图标，否则点箭头会被误判成切换显示。
+        if (clickedOnIndicator) {
+            // Clicked on expand/collapse indicator, only handle expand/collapse, don't change attribute display
+            // Just let the base class handle the expand/collapse
+        } else if (eyeRect.contains(event->pos())) {
             item->changeVisibility();
             // sync all sub-block icons under this model to reflect current visibility
             for (int i = 0; i < item->childCount(); ++i) {
@@ -321,9 +403,6 @@ void igQtModelTreeWidget::mousePressEvent(QMouseEvent* event) {
                 }
             }
             call = false;
-        } else if (clickedOnIndicator) {
-            // Clicked on expand/collapse indicator, only handle expand/collapse, don't change attribute display
-            // Just let the base class handle the expand/collapse
         } else if (currentItem() != item) { // Check operation - only when clicking on the model itself
             if (item->getModel() != iGame::SceneManager::Instance()->GetCurrentScene()->GetCurrentModel()) {
                 iGame::SceneManager::Instance()->GetCurrentScene()->SetCurrentModel(item->getModel());
@@ -359,11 +438,12 @@ void igQtModelTreeWidget::mousePressEvent(QMouseEvent* event) {
                 menu.exec(viewport()->mapToGlobal(event->pos()));
             } else {
                 // Left click: eye icon toggle or select parent model
-                QRect iconItem = visualItemRect(sub);
-                QSize iconSize = sub->icon(0).actualSize(QSize(20, 24));
-                QRect iconRect(iconItem.left() + 4, iconItem.top() + (iconItem.height() - iconSize.height()) / 2,
-                               iconSize.width(), iconSize.height());
-                if (iconRect.contains(event->pos())) {
+                const QRect eyeRect = eyeHitRect(sub);   // §48：按样式文本起点算，不再写死偏移
+                // 分支箭头区域（缩进）让给基类做展开/收起，别被"眼睛区"吃掉
+                int subLevel = 0;
+                for (QTreeWidgetItem* p = sub->parent(); p; p = p->parent()) { ++subLevel; }
+                const QRect subIndicator(0, eyeRect.top(), indentation() * (subLevel + 1), eyeRect.height());
+                if (!subIndicator.contains(event->pos()) && eyeRect.contains(event->pos())) {
                     sub->changeVisibility();
                     call = false;
                 } else {
