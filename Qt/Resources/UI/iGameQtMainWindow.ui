@@ -955,7 +955,7 @@ QLabel#CustomTitleLabel {
       <iconset resource="../iGameQtMainWindow.qrc">
        <normaloff>:/Ticon/Icons/Open.png</normaloff>:/Ticon/Icons/Open.png</iconset>
      </property>
-     <addaction name="action_TmpFile"/>
+     <!-- action_TmpFile 的引用已移除：该 action 文字为空且全代码零引用，会在「最近文件」菜单顶部显示成一个空白行 -->
     </widget>
     <addaction name="menu_RecentFiles"/>
     <addaction name="action_SaveMeshAs"/>
