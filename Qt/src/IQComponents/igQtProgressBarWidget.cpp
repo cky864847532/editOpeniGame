@@ -6,6 +6,7 @@
 #include <IQWidgets/igQtRenderWidget.h>
 #include <QHBoxLayout>
 #include <QColor>
+#include <QEvent>
 #include <QMetaObject>
 #include <QThread>
 #include <string>
@@ -100,6 +101,11 @@ void igQtProgressBarWidget::resetTextMode() {
 }
 
 void igQtProgressBarWidget::applyThemeStyle() {
+    // §81：防重入。本函数会给子控件 setStyleSheet，而 setStyleSheet 会派发 StyleChange；
+    // 若不加护栏，changeEvent → applyThemeStyle → setStyleSheet 可能形成回环（§68b 的栈溢出教训）。
+    if (m_applyingTheme) return;
+    m_applyingTheme = true;
+
     const bool light = igQtRenderWidget::globalLightBackground();
     // 与状态栏标签一致的文字颜色
     const QString textColor = light ? QStringLiteral("#4A5568") : QStringLiteral("#A5ADB8");
@@ -123,6 +129,25 @@ void igQtProgressBarWidget::applyThemeStyle() {
                 "QProgressBar::chunk { background-color: %4; }")
                 .arg(textColor, bgColor, borderCol, chunkCol));
     }
+
+    m_applyingTheme = false;
+}
+
+// §81：本控件是状态栏常驻件（igQtMainWindow 构造期创建一次，之后不重建），
+// 所以主题切换时必须自己重新取色；否则会一直保留启动那一刻的配色，
+// 表现为「切到✦浅白后，进度条仍是黑底 + 青色 chunk」。
+void igQtProgressBarWidget::changeEvent(QEvent* e) {
+    if (e && e->type() == QEvent::StyleChange) {
+        applyThemeStyle();
+        update();
+    }
+    QWidget::changeEvent(e);
+}
+
+// §81：每次显示前也按当前主题重取一次色，覆盖「启动即浅色、用户从未切过主题」的情形。
+void igQtProgressBarWidget::showEvent(QShowEvent* e) {
+    applyThemeStyle();
+    QWidget::showEvent(e);
 }
 
 void igQtProgressBarWidget::showWithAutoHide() {

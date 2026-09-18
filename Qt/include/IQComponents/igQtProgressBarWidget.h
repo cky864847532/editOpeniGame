@@ -26,6 +26,11 @@ public:
     void updateProgressBar(double value);
 
     void updateProgressBarLabel(const char* info);
+protected:
+    // §81：本控件是状态栏常驻件（MainWindow 构造期创建一次，之后不重建），
+    // 所以必须在主题切换 / 每次显示时自己重新取色，否则会一直用启动那一刻的配色。
+    void changeEvent(QEvent* e) override;
+    void showEvent(QShowEvent* e) override;
 private:
     void resetTextMode();
     // 按当前主题统一标签与进度条文字颜色
@@ -42,6 +47,7 @@ private:
     iGame::ProgressObserver* progressObserver;
     QTimer* m_hideTimer{nullptr};
     bool hasExternalText{false};
+    bool m_applyingTheme{false};   // §81：applyThemeStyle() 重入护栏（防 StyleChange 回环）
     unsigned long m_ProgressObserverTag{kInvalidObserverTag};
     unsigned long m_TextObserverTag{kInvalidObserverTag};
 };
