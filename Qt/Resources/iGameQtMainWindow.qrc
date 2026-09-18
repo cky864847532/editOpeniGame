@@ -65,11 +65,19 @@
         <file>Icons/window_minimize_white.svg</file>
         <file>Icons/window_maximize_white.svg</file>
         <file>Icons/window_restore_white.svg</file>
+        <file>Icons/window_minimize_dark.svg</file>
+        <file>Icons/window_maximize_dark.svg</file>
+        <file>Icons/window_restore_dark.svg</file>
+        <file>Icons/dock_close_dark.svg</file>
+        <file>Icons/check_dark.svg</file>
         <file>Icons/spin_up_silver.svg</file>
         <file>Icons/spin_down_silver.svg</file>
         <file>Icons/loop_silver.svg</file>
         <file>Icons/tree_arrow_right_silver.svg</file>
         <file>Icons/tree_arrow_down_silver.svg</file>
+        <file>Icons/check_white.svg</file>
+        <file>Icons/radio_off.svg</file>
+        <file>Icons/radio_on.svg</file>
     </qresource>
     <qresource prefix="/uiwidgets">
         <file>UI/QualityDetection.ui</file>
@@ -82,5 +90,19 @@
     <qresource prefix="/Styles">
         <file>Styles/SourceHanSansCN-Normal.otf</file>
         <file alias="AiChatWidget.qss">../src/IQWidgets/igQtAiChat/igQtAiChatWidget.qss</file>
+        <file alias="iGameVisModernDark.qss">Styles/iGameVisModernDark.qss</file>
+        <file alias="iGameVisModernDark2.qss">Styles/iGameVisModernDark2.qss</file>
+        <file alias="iGameVisLight.qss">Styles/iGameVisLight.qss</file>
+        <file alias="iGameVisPro.qss">Styles/iGameVisPro.qss</file>
+        <file alias="iGameVisNebula.qss">Styles/iGameVisNebula.qss</file>
+        <file alias="iGameVisWorkspace.qss">Styles/iGameVisWorkspace.qss</file>
+        <file alias="iGameVisGraphiteModern.qss">Styles/iGameVisGraphiteModern.qss</file>
+        <file alias="iGameVisMatteGraphite.qss">Styles/iGameVisMatteGraphite.qss</file>
+        <file alias="iGameVisGitCodeDark.qss">Styles/iGameVisGitCodeDark.qss</file>
+        <file alias="iGameVisFloatingDark.qss">Styles/iGameVisFloatingDark.qss</file>
+        <!-- §45 悬浮卡片的纯换色变体（结构与 FloatingDark 完全一致，仅调色板不同） -->
+        <file alias="iGameVisFloatingLight.qss">Styles/iGameVisFloatingLight.qss</file>
+        <file alias="iGameVisFloatingGraphiteModern.qss">Styles/iGameVisFloatingGraphiteModern.qss</file>
+        <file alias="iGameVisFloatingMatteGraphite.qss">Styles/iGameVisFloatingMatteGraphite.qss</file>
     </qresource>
 </RCC>
