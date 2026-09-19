@@ -310,6 +310,10 @@ bool UnstructuredMesh::_GetCell(const IGsize cellId, Cell* cell) const {
 Cell* UnstructuredMesh::GetTypedCell(const IGsize cellId) {
     Cell* cell = nullptr;
     switch (GetCellType(cellId)) {
+        case IG_VERTEX: {
+            if (m_Vertex == nullptr) { m_Vertex = Vertex::New(); }
+            cell = m_Vertex.get();
+        } break;
         case IG_LINE: {
             if (m_Line == nullptr) { m_Line = Line::New(); }
             cell = m_Line.get();
@@ -389,6 +393,9 @@ Cell* UnstructuredMesh::GetTypedCell(const IGsize cellId) {
 void UnstructuredMesh::GetTypedCell(const IGsize cellId, Cell::Pointer& cell) const {
     if (cell != nullptr && cell->GetCellType() == GetCellType(cellId)) return;
     switch (GetCellType(cellId)) {
+        case IG_VERTEX: {
+            cell = Vertex::New();
+        } break;
         case IG_LINE: {
             cell = Line::New();
         } break;
