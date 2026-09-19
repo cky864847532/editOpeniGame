@@ -258,8 +258,12 @@ void igQtFileLoader::OpenFiles(const QStringList& filePaths) {
     /* Add left FilePaths to be as SubDataObject. */
     if(filePaths.size() > 1)
     {
-        iGame::DataObject::Pointer outerObj = iGame::DrawObject::New();
-
+        auto outerObj = iGame::DrawObject::New();
+        // Playback/export propagates this container's style to every frame.
+        // Initialize it once from the reader so VERTEX sequences stay visible.
+        if (auto firstFrame = DynamicCast<DrawObject>(obj)) {
+            outerObj->SetViewStyle(firstFrame->GetViewStyle());
+        }
 
         double dataRange_max[64], dataRange_min[64];
         for(int k = 0; k < obj->GetAttributeSet()->GetAllAttributes()->GetNumberOfElements(); k ++){

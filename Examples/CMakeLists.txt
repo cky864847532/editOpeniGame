@@ -171,16 +171,24 @@ function(igame_register_example_test EXAMPLE_TARGET)
         return()
     endif ()
 
-    if ("${EXAMPLE_TARGET}" STREQUAL "testModelTreeViewStyleValidation")
+    if ("${EXAMPLE_TARGET}" STREQUAL "testModelTreeViewStyleValidation" OR
+        "${EXAMPLE_TARGET}" STREQUAL "testAnimationVertexValidation")
         get_target_property(_VIEW_QMAKE Qt5::qmake IMPORTED_LOCATION)
         get_filename_component(_VIEW_QT_BIN "${_VIEW_QMAKE}" DIRECTORY)
+        set(_VIEW_ENV)
+        if (WIN32)
+            # The animation test has its own directory to isolate recent-file settings.
+            string(REPLACE ";" "\\;" _VIEW_PATH "$<TARGET_FILE_DIR:iGameVis>;${_VIEW_QT_BIN};$ENV{PATH}")
+            list(APPEND _VIEW_ENV "PATH=${_VIEW_PATH}")
+        endif ()
         add_test(NAME ${EXAMPLE_TARGET}
             COMMAND "${CMAKE_COMMAND}" -E env
                 "QT_QPA_PLATFORM=offscreen"
                 "QT_QPA_PLATFORM_PLUGIN_PATH=${_VIEW_QT_BIN}/../plugins/platforms"
+                ${_VIEW_ENV}
                 "$<TARGET_FILE:${EXAMPLE_TARGET}>"
-            WORKING_DIRECTORY "$<TARGET_FILE_DIR:${EXAMPLE_TARGET}>")
-        set_tests_properties(${EXAMPLE_TARGET} PROPERTIES TIMEOUT 30)
+            WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
+        set_tests_properties(${EXAMPLE_TARGET} PROPERTIES TIMEOUT 120)
         return()
     endif ()
 
@@ -348,6 +356,15 @@ if (TARGET Qt_module AND TARGET iGameVis)
     set_target_properties(testModelTreeViewStyleValidation PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:iGameVis>")
     add_dependencies(testModelTreeViewStyleValidation iGameVis)
+
+    igame_add_example(testAnimationVertexValidation Animation/AnimationVertexValidation.cpp)
+    target_link_libraries(testAnimationVertexValidation PRIVATE Qt_module)
+    if (NOT IGAME_BUILD_SHARED)
+        target_compile_definitions(testAnimationVertexValidation PRIVATE IG_QT_COMPILE_EXPORT)
+    endif ()
+    set_target_properties(testAnimationVertexValidation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vertex-animation-validation/$<CONFIG>")
+    add_dependencies(testAnimationVertexValidation iGameVis)
 endif ()
 
 if (FFMPEG_FOUND)
