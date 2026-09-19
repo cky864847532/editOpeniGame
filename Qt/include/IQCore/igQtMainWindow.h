@@ -193,15 +193,6 @@ private:
 
     void applyStyleMode(int mode);
     QString styleSheetForMode(int mode) const;
-    QString loadModernStyleSheet() const;
-    QString loadLightStyleSheet() const;
-    QString loadProStyleSheet() const;
-    QString loadNebulaStyleSheet() const;
-    QString loadWorkspaceStyleSheet() const;
-    QString loadGraphiteModernStyleSheet() const;
-    QString loadMatteGraphiteStyleSheet() const;
-    QString loadGitCodeDarkStyleSheet() const;
-    QString loadFloatingDarkStyleSheet() const;
     QString styleToggleButtonQss() const;
     QString styleModeDisplayName(int mode) const;
     void createStyleMenu();

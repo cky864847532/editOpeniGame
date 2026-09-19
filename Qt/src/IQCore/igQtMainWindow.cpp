@@ -4729,102 +4729,8 @@ QString igQtMainWindow::LoadExternalFonts() {
     return family;
 }
 
-/* ============================================================
-   界面风格切换（原始深色 / 现代深色 / 浅色）
-   ============================================================ */
-QString igQtMainWindow::loadModernStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisModernDark2.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load modern style sheet :/Styles/iGameVisModernDark2.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadLightStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisLight.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load light style sheet :/Styles/iGameVisLight.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadProStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisPro.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load pro style sheet :/Styles/iGameVisPro.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadNebulaStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisNebula.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load nebula style sheet :/Styles/iGameVisNebula.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadWorkspaceStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisWorkspace.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load workspace style sheet :/Styles/iGameVisWorkspace.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadGraphiteModernStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisGraphiteModern.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load graphite modern style sheet :/Styles/iGameVisGraphiteModern.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadMatteGraphiteStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisMatteGraphite.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load matte graphite style sheet :/Styles/iGameVisMatteGraphite.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadGitCodeDarkStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisGitCodeDark.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load gitcode dark style sheet :/Styles/iGameVisGitCodeDark.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
-QString igQtMainWindow::loadFloatingDarkStyleSheet() const {
-    QFile qssFile(QStringLiteral(":/Styles/iGameVisFloatingDark.qss"));
-    if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qWarning() << "iGameVis: failed to load floating dark style sheet :/Styles/iGameVisFloatingDark.qss";
-        return QString();
-    }
-    return QString::fromUtf8(qssFile.readAll());
-}
-
 QString igQtMainWindow::styleSheetForMode(int mode) const {
-    if (mode == 1) return loadModernStyleSheet();
-    if (mode == 2) return loadLightStyleSheet();
-    if (mode == 3) return loadProStyleSheet();
-    if (mode == 4) return loadWorkspaceStyleSheet();
-    if (mode == 6) return loadWorkspaceStyleSheet();
-    if (mode == 7) return loadProStyleSheet();
-    if (mode == 8) return loadWorkspaceStyleSheet();
-    if (mode == 9) return loadGraphiteModernStyleSheet();
-    if (mode == 10) return loadMatteGraphiteStyleSheet();
-    if (mode == 11) return loadGitCodeDarkStyleSheet();
-    if (mode == 12) return loadFloatingDarkStyleSheet();
+    if (mode == 12) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingDark.qss"));
     if (mode == 13) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingLight.qss"));
     if (mode == 14) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingGraphiteModern.qss"));
     if (mode == 15) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingMatteGraphite.qss"));
@@ -4954,17 +4860,6 @@ QString igQtMainWindow::styleToggleButtonQss() const {
 }
 
 QString igQtMainWindow::styleModeDisplayName(int mode) const {
-    if (mode == 0) return QStringLiteral("✦ 原始深色");
-    if (mode == 1) return QStringLiteral("✦ 深灰蓝");
-    if (mode == 2) return QStringLiteral("✦ 浅色");
-    if (mode == 3) return QStringLiteral("✦ 石墨深色");
-    if (mode == 4) return QStringLiteral("✦ 深空青蓝");
-    if (mode == 6) return QStringLiteral("✦ 工作台");
-    if (mode == 7) return QStringLiteral("✦ 石墨·视图栏");
-    if (mode == 8) return QStringLiteral("✦ 深空·视图栏");
-    if (mode == 9) return QStringLiteral("✦ 石墨·现代");
-    if (mode == 10) return QStringLiteral("✦ 石墨·哑光");
-    if (mode == 11) return QStringLiteral("✦ GitCode 暗色");
     if (mode == 12) return QStringLiteral("✦ 深灰");
     if (mode == 13) return QStringLiteral("✦ 浅白");
     if (mode == 14) return QStringLiteral("✦ 石墨");
