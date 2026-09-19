@@ -54,6 +54,8 @@ UnstructuredMesh::UnstructuredMesh() {
 SurfaceMesh::Pointer UnstructuredMesh::TransferToSurfaceMesh() {
 
     int cellNum = this->GetNumberOfCells();
+    // A point cloud has no surface topology, even when it has coordinates.
+    if (cellNum <= 0) { return nullptr; }
     bool CouldTransfer = true;
     igIndex cellType = IG_NONE;
     for (igIndex i = 0; i < cellNum; i++) {
@@ -454,6 +456,15 @@ void UnstructuredMesh::GetTypedCell(const IGsize cellId, Cell::Pointer& cell) co
 }
 
 void UnstructuredMesh::ConvertToDrawableData() {
+    // Zero-cell datasets still contain drawable points. Do not extract an empty
+    // shell or change real VERTEX/mixed-cell topology to make them visible.
+    if (GetNumberOfPoints() > 0 && GetNumberOfCells() == 0) {
+        SetShellRenderingOption(false);
+        m_RenderableMesh.SurfaceMesh = nullptr;
+        m_RenderableMesh.SimplifiedMesh = nullptr;
+        if (m_ViewStyle == IG_SURFACE) { m_ViewStyle = IG_POINTS; }
+    }
+
     bool needReConvertGeometry = m_ReConvertToDrawableData;
     needReConvertGeometry |= m_Points->GetMTime() > m_ReConvertHelper->GetMTime();
     needReConvertGeometry |= m_Clipper->GetMTime() > m_ReConvertHelper->GetMTime();

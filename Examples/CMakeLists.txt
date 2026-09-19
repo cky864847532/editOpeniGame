@@ -201,12 +201,18 @@ function(igame_register_example_test EXAMPLE_TARGET)
 
         if ("${EXAMPLE_TARGET}" STREQUAL "testModelGeometryParallelValidation" OR
             "${EXAMPLE_TARGET}" STREQUAL "testVTKXMLDataArrayDecoderValidation" OR
-            "${EXAMPLE_TARGET}" STREQUAL "testVertexReaderValidation")
+            "${EXAMPLE_TARGET}" STREQUAL "testVertexReaderValidation" OR
+            "${EXAMPLE_TARGET}" STREQUAL "testZeroCellPointCloudValidation" OR
+            "${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
             list(APPEND _TEST_COMMAND -TimeoutSeconds 180 -RequireExit)
             set(_TEST_WORKING_DIRECTORY "$<TARGET_FILE_DIR:${EXAMPLE_TARGET}>")
         elseif ("${EXAMPLE_TARGET}" STREQUAL "testLosslessEncode")
             list(APPEND _TEST_COMMAND -TimeoutSeconds 120
                 -Arguments "Models/Quad_Plane_Tensor.vtk")
+        endif ()
+        if ("${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
+            # Shaders/fonts are deployed in the Examples build directory.
+            set(_TEST_WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
         endif ()
 
         add_test(
@@ -215,18 +221,31 @@ function(igame_register_example_test EXAMPLE_TARGET)
             WORKING_DIRECTORY "${_TEST_WORKING_DIRECTORY}"
         )
         set_tests_properties(${EXAMPLE_TARGET} PROPERTIES TIMEOUT 200)
+        if ("${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
+            set_tests_properties(${EXAMPLE_TARGET} PROPERTIES SKIP_RETURN_CODE 77)
+        endif ()
         return()
     endif ()
 
     if ("${EXAMPLE_TARGET}" STREQUAL "testModelGeometryParallelValidation" OR
         "${EXAMPLE_TARGET}" STREQUAL "testVTKXMLDataArrayDecoderValidation" OR
-        "${EXAMPLE_TARGET}" STREQUAL "testVertexReaderValidation")
+        "${EXAMPLE_TARGET}" STREQUAL "testVertexReaderValidation" OR
+        "${EXAMPLE_TARGET}" STREQUAL "testZeroCellPointCloudValidation" OR
+        "${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
+        set(_VALIDATION_COMMAND "$<TARGET_FILE:${EXAMPLE_TARGET}>")
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+            "${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
+            list(PREPEND _VALIDATION_COMMAND xvfb-run -a)
+        endif ()
         add_test(
             NAME ${EXAMPLE_TARGET}
-            COMMAND "$<TARGET_FILE:${EXAMPLE_TARGET}>"
+            COMMAND ${_VALIDATION_COMMAND}
             WORKING_DIRECTORY "$<TARGET_FILE_DIR:${EXAMPLE_TARGET}>"
         )
         set_tests_properties(${EXAMPLE_TARGET} PROPERTIES TIMEOUT 180)
+        if ("${EXAMPLE_TARGET}" STREQUAL "testAnimationExportRangeValidation")
+            set_tests_properties(${EXAMPLE_TARGET} PROPERTIES SKIP_RETURN_CODE 77)
+        endif ()
         return()
     endif ()
 
@@ -315,6 +334,7 @@ igame_add_example(testConvertToLagrangeUnstructuredMesh Filter/Convert/TestConve
 igame_add_example(testSplineReaderCPU IO/SplineReaderCPU.cpp)
 igame_add_example(testVTKXMLDataArrayDecoderValidation IO/VTKXMLDataArrayDecoderValidation.cpp)
 igame_add_example(testVertexReaderValidation IO/VertexReaderValidation.cpp)
+igame_add_example(testZeroCellPointCloudValidation Rendering/ZeroCellPointCloudValidation.cpp)
 igame_add_example(testUtf8FilePathValidation IO/Utf8FilePathValidation.cpp)
 
 if (ENABLE_CGNS_MODULE)
@@ -370,6 +390,9 @@ endif ()
 if (FFMPEG_FOUND)
     igame_add_example(testSaveAnimation Animation/SaveAnimation.cpp)
     target_compile_definitions(testSaveAnimation PUBLIC FFMPEG_ENABLE)
+    igame_add_example(testAnimationExportRangeValidation Animation/AnimationExportRangeValidation.cpp)
+    target_sources(testAnimationExportRangeValidation PRIVATE Animation/SaveAnimation.cpp)
+    target_compile_definitions(testAnimationExportRangeValidation PRIVATE FFMPEG_ENABLE IGAME_ANIMATION_EXPORT_LIBRARY)
 endif ()
 
 igame_add_example(testClip Filter/TestClip.cpp)
