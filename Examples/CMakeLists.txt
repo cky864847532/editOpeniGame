@@ -171,6 +171,19 @@ function(igame_register_example_test EXAMPLE_TARGET)
         return()
     endif ()
 
+    if ("${EXAMPLE_TARGET}" STREQUAL "testModelTreeViewStyleValidation")
+        get_target_property(_VIEW_QMAKE Qt5::qmake IMPORTED_LOCATION)
+        get_filename_component(_VIEW_QT_BIN "${_VIEW_QMAKE}" DIRECTORY)
+        add_test(NAME ${EXAMPLE_TARGET}
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "QT_QPA_PLATFORM=offscreen"
+                "QT_QPA_PLATFORM_PLUGIN_PATH=${_VIEW_QT_BIN}/../plugins/platforms"
+                "$<TARGET_FILE:${EXAMPLE_TARGET}>"
+            WORKING_DIRECTORY "$<TARGET_FILE_DIR:${EXAMPLE_TARGET}>")
+        set_tests_properties(${EXAMPLE_TARGET} PROPERTIES TIMEOUT 30)
+        return()
+    endif ()
+
     if (WIN32)
         set(_TEST_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/ci/run_smoke_test.ps1")
         set(_TEST_COMMAND powershell -NoProfile -NonInteractive
@@ -323,6 +336,19 @@ igame_add_example(testLsDynaReader IO/LsDynaReader.cpp)
 
 # Animation / Filters
 igame_add_example(testAnimation Animation/TestAnimation.cpp)
+
+if (TARGET Qt_module AND TARGET iGameVis)
+    find_package(Qt5 REQUIRED COMPONENTS Core Widgets OpenGL Charts Svg)
+    igame_add_example(testModelTreeViewStyleValidation Rendering/ModelTreeViewStyleValidation.cpp)
+    target_link_libraries(testModelTreeViewStyleValidation PRIVATE Qt_module)
+    if (NOT IGAME_BUILD_SHARED)
+        target_compile_definitions(testModelTreeViewStyleValidation PRIVATE IG_QT_COMPILE_EXPORT)
+    endif ()
+    # Reuse the desktop application's deployed Qt/runtime DLLs.
+    set_target_properties(testModelTreeViewStyleValidation PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:iGameVis>")
+    add_dependencies(testModelTreeViewStyleValidation iGameVis)
+endif ()
 
 if (FFMPEG_FOUND)
     igame_add_example(testSaveAnimation Animation/SaveAnimation.cpp)
