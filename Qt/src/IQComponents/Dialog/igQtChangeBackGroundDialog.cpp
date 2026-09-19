@@ -10,8 +10,8 @@
 
 #include "IQComponents/Dialog/igQtChangeBackGroundDialog.h"
 #include "ui_igQtChangeBackGroundDialog.h"
-#include <IQWidgets/igQtRenderWidget.h>   // §74：角色色（uiRole）
-#include <QEvent>                          // §74：changeEvent(QEvent*)
+#include <IQWidgets/igQtRenderWidget.h>
+#include <QEvent>
 #include <QVBoxLayout>
 #include <QLineEdit>
 #include <QPushButton>
@@ -93,8 +93,6 @@ public:
 };
 }
 
-// §75：本弹窗是独立顶层窗，QLineEdit 既不在 .ui 的深色 QSS 里、也拿不到主窗口主题 QSS
-//      → 直接落到深色 palette（黑底）。这里用角色色**当场**生成它们的样式表。
 static void ApplyInputTheme(QWidget* root) {
     if (!root) return;
     const QString qss = QStringLiteral(
@@ -118,10 +116,8 @@ igQtChangeBackGroundDialog::igQtChangeBackGroundDialog(QWidget *parent) : QDialo
     setAttribute(Qt::WA_StyledBackground, true);
     setAttribute(Qt::WA_TranslucentBackground, true);
     setAutoFillBackground(false);
-    // §74：本弹窗 .ui 里有 5 处控件级深色 QSS（对话框自身 + 标签 + 颜色预览框 + 两个按钮）
-    //      → 在此统一登记"底"，按当前主题做颜色令牌重映射；切主题由 changeEvent → refreshDeep 刷新。
     igQtPanelTheme::attachDeep(this);
-    ApplyInputTheme(this);   // §75
+    ApplyInputTheme(this);
     if (parentWidget()) {
         setWindowIcon(parentWidget()->windowIcon());
     }
@@ -140,8 +136,6 @@ igQtChangeBackGroundDialog::igQtChangeBackGroundDialog(QWidget *parent) : QDialo
     m_Green_LineEdit->setText(QString::number(m_G));
     m_Blue_LineEdit->setText(QString::number(m_B));
     if (ui->frame_ColorPreview) {
-        // §74：预览色块的颜色是"用户选的数据色"（语义色，必须保留），但其描边随主题；
-        //      同时清掉它的底 QSS 登记 —— 否则切主题时 refreshDeep 会用旧底覆盖掉这里的动态颜色。
         ui->frame_ColorPreview->setProperty("igPanelBaseQss", QVariant());
         ui->frame_ColorPreview->setStyleSheet(
             QString("QFrame#frame_ColorPreview { background-color: rgb(%1,%2,%3); border: 1px solid %4; border-radius: 4px; }")
@@ -234,9 +228,9 @@ void igQtChangeBackGroundDialog::paintEvent(QPaintEvent* event) {
 
     QPainterPath path;
     path.addRoundedRect(r, m_cornerRadius, m_cornerRadius);
-    p.fillPath(path, igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::PanelBg2)); // §74：内容背景（按主题）
+    p.fillPath(path, igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::PanelBg2));
 
-    QPen pen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Border));           // §74：描边（按主题）
+    QPen pen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Border));
     pen.setWidth(1);
     p.setPen(pen);
     p.drawPath(path);
@@ -247,11 +241,10 @@ void igQtChangeBackGroundDialog::resizeEvent(QResizeEvent* event) {
     updateRoundedMask();
 }
 
-// §74：切主题 → 重映射本弹窗 QSS 并重绘外壳（本窗口是独立顶层窗，不继承主窗口 QSS）
 void igQtChangeBackGroundDialog::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         igQtPanelTheme::refreshDeep(this);
-        ApplyInputTheme(this);   // §75
+        ApplyInputTheme(this);
         update();
     }
     QDialog::changeEvent(e);

@@ -1,5 +1,5 @@
 #include "IQComponents/igQtDataRangeSlider.h"
-#include <IQWidgets/igQtRenderWidget.h>   // §61：面板主题化（角色色）
+#include <IQWidgets/igQtRenderWidget.h>
 #include <sstream>
 #include <iomanip>
 
@@ -36,8 +36,6 @@ void igQtDataRangeSlider::paintEvent(QPaintEvent* aEvent)
 	this->sliderBarLength = this->width() - 2 * LeftRightMargin;
 	int st = range[0] * sliderBarLength;
 	int ed = range[1] * sliderBarLength;
-	// §61：滑轨"未选中段"原为写死的中性色 0.9 灰（浅色主题下几乎看不见）→ 走角色色 CardBg，
-	//      与主题里 QSlider::groove(#2A2A2C) 的约定一致；"选中段" teal 属语义高亮，保留不动。
 	const QColor trackColor = igQtRenderWidget::uiRole(Role::CardBg);
 	for (int i = 0; i < sliderBarLength; i++) {
 		if (i >= st && i <= ed) {
@@ -51,8 +49,6 @@ void igQtDataRangeSlider::paintEvent(QPaintEvent* aEvent)
 	}
 	QPen pen;
 	painter.setRenderHint(QPainter::Antialiasing);
-	// §61：手柄/描边原为写死的 #FAFAFA + darkGray（浅色主题下白手柄糊在白底上）
-	//      → 手柄走 Text（与主题 QSlider::handle 的 #CCCCCC 同族）、描边走 Border
 	QBrush handleBrush(igQtRenderWidget::uiRole(Role::Text));
 	painter.setBrush(handleBrush);
 
@@ -81,7 +77,6 @@ void igQtDataRangeSlider::paintEvent(QPaintEvent* aEvent)
 	int textWidth = rect.width();
 	int textHeight = rect.height();
 	QRect textRect(LeftRightMargin, 2 * TopMargin + SliderBarHeight + 5, 2 * textWidth, textHeight);
-	// §61：范围文字原来用默认黑笔（深色主题下几乎看不见）→ 走角色色 Text
 	pen.setColor(igQtRenderWidget::uiRole(Role::Text));
 	pen.setWidth(1);
 	painter.setPen(pen);

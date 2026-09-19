@@ -1,4 +1,4 @@
-#include <IQWidgets/igQtRenderWidget.h>   // §52：面板主题化
+#include <IQWidgets/igQtRenderWidget.h>
 #include "ui_igQtVariableCorrelationWidget.h"
 #include <IQWidgets/igQtVariableCorrelationWidget.h>
 #include <QElapsedTimer>
@@ -175,8 +175,6 @@ igQtVariableCorrelationWidget::igQtVariableCorrelationWidget(QWidget* parent)
     : QWidget(parent), ui(new Ui::igQtVariableCorrelationWidget) {
     ui->setupUi(this);
 
-    // §52（4b）+ §61：把 .ui 里那套深色样式存成"底"，按当前主题重映射（切主题时 changeEvent 再刷新）。
-    // 本面板 .ui 有 6 处**控件级** styleSheet（图表/表格等）→ 用 attachDeep 一并覆盖。
     igQtPanelTheme::attachDeep(this);
 
     // Qt 5 uic may misread Qt 6-style orientation enums from the .ui file.
@@ -258,7 +256,6 @@ igQtVariableCorrelationWidget::igQtVariableCorrelationWidget(QWidget* parent)
     forceSpinBoxDark(ui->choosedLightSpinBox);
     forceSpinBoxDark(ui->unChoosedLightSpinBox);
 
-    // §52（4b）：用角色色覆盖上面那些写死的 chrome 颜色（切主题时 changeEvent 会再调）
     applyChromeTheme();
 
     connect(ui->choosedAlphaSlider, &QSlider::valueChanged, this,
@@ -1092,17 +1089,14 @@ void igQtVariableCorrelationWidget::CompleteImageLoading() {
     update();
 }
 
-// §52（4b）：切主题 → 刷新面板配色
 void igQtVariableCorrelationWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
-        igQtPanelTheme::refreshDeep(this);   // §61：本面板 QSS 分散在多个控件上
+        igQtPanelTheme::refreshDeep(this);
         applyChromeTheme();
     }
     QWidget::changeEvent(e);
 }
 
-// §52（4b）：把面板里"代码写死的 chrome 颜色"（分隔条 / 横线 / 标题文字 / 数字框）接到角色色。
-//   构造函数里原有那套设置保持不动（它管结构与尺寸），这里在其后用角色色覆盖一遍颜色。
 void igQtVariableCorrelationWidget::applyChromeTheme() {
     using Role = igQtRenderWidget::UiRole;
     const QColor line = igQtRenderWidget::uiRole(Role::BorderStrong);

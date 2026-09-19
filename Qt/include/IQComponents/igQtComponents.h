@@ -78,8 +78,6 @@ protected:
         if (!m_checked) { setStyleSheet(defaultStyle); }
     }
 
-    // §48：兜底 —— enterEvent 偶尔会因父项/覆盖层/重排被漏掉，这里再用 Hover 事件补一次悬停高亮。
-    // 只在 HoverEnter/HoverLeave 处理（HoverMove 会高频触发，重复设样式表代价大）。
     bool event(QEvent* e) override {
         if (e->type() == QEvent::HoverEnter || e->type() == QEvent::HoverMove) {
             if (!m_checked && styleSheet() != honorStyle) { setStyleSheet(honorStyle); }

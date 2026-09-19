@@ -1,7 +1,7 @@
 #include "StreamView/iGameStreamlineSimplifier.h"
 #include "iGameSelection.h"
 #include <IQWidgets/igQtStreamTracerWidget.h>
-#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色/令牌重映射）
+#include <IQWidgets/igQtRenderWidget.h>
 #include <iGameBoxStyle.h>
 #include <iGameSceneManager.h>
 
@@ -183,7 +183,6 @@ igQtStreamTracerWidget::igQtStreamTracerWidget(QWidget* parent) : QWidget(parent
     ui->control_comboBox->setCurrentIndex(1);
     streamlineResult = UnstructuredMesh::New();
 
-    // §57：把 .ui 里那套深色样式存成"底"，按当前主题重映射；切主题由 changeEvent 刷新
     igQtPanelTheme::attach(this);
 }
 
@@ -861,7 +860,6 @@ void igQtStreamTracerWidget::Simplifier() {
     Q_EMIT UpdateStreamObject(target);
 }
 
-// §57：切主题 → 主窗口 setStyleSheet 会给子控件发 StyleChange → 这里刷新面板配色
 void igQtStreamTracerWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         igQtPanelTheme::refresh(this);

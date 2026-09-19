@@ -1,5 +1,5 @@
 #include <IQWidgets/igQtColorBarWidget.h>
-#include <IQWidgets/igQtRenderWidget.h>   // §61：面板/控件主题化（角色色）
+#include <IQWidgets/igQtRenderWidget.h>
 #include <QDebug>
 #include <iGameSceneManager.h>
 #include "iGameSmartPointer.h"
@@ -183,7 +183,7 @@ void igQtColorBarWidget::paintEvent(QPaintEvent* event)
 {
 	updateColorBarDrawInfo();
 	QPainter painter(this);
-	painter.setPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text)); // Set text color to white
+	painter.setPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text));
 	
 	// Set boundColor to white for ParaView style
 	this->boundColor = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text);
@@ -271,8 +271,6 @@ void igQtColorBarWidget::paintEvent(QPaintEvent* event)
 	Q_EMIT PaintFinished();
 }
 
-// §61：切主题 → 文字/框线原本写死 Qt::white（浅色主题下看不见）已改走角色色 Text，
-//       这里在 StyleChange 时重绘一次即可生效
 void igQtColorBarWidget::changeEvent(QEvent* e)
 {
 	if (e && e->type() == QEvent::StyleChange) {

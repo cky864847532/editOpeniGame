@@ -158,7 +158,6 @@ void igQtFileLoader::LoadFile() {
             break;
 #endif
         default:
-            // 单文件走 OpenFile（已验证稳定）；多文件仍走批量 OpenFiles
             if (filePath.size() == 1) {
                 this->OpenFile(filePath[0].toStdString());
             } else {
@@ -588,14 +587,10 @@ void igQtFileLoader::SaveFileAs() {
 
 void igQtFileLoader::SaveCurrentFileToRecentFile(QString path) {
     if (path.isEmpty()) return;
-    // 统一用 '/'，避免同一文件同时出现 E:/... 和 E:\... 两条记录
     const QString normalized = QDir::fromNativeSeparators(path);
     for (int i = 0; i < recentFileActionList.size(); i++) {
         QAction* act = recentFileActionList.at(i);
         if (QDir::fromNativeSeparators(act->data().toString()) == normalized) {
-            // 注意：不能 delete 这个 action，它仍可能挂在“最近文件”菜单里，
-            // 删掉会导致后续更新菜单时访问悬空指针并崩溃。
-            // 这里只把它移到列表末尾表示“最近打开”。
             recentFileActionList.removeAt(i);
             act->setText(normalized);
             act->setData(normalized);
@@ -623,7 +618,6 @@ void igQtFileLoader::AddCurrentFileToRecentFilePath(QString filePath) {
 void igQtFileLoader::UpdateIniFileInfo() {
     //为了能记住上次打开的路径
     QSettings setting(QCoreApplication::applicationDirPath() + "/config/savePath.ini", QSettings::IniFormat);
-    // 先清掉旧的 LastFilePath*，避免历史脏数据/翻倍转义残留
     const QStringList oldKeys = setting.allKeys();
     for (const QString& key : oldKeys) {
         if (key.startsWith(QStringLiteral("LastFilePath"))) setting.remove(key);
@@ -633,7 +627,6 @@ void igQtFileLoader::UpdateIniFileInfo() {
     for (int i = 0; i < num && idx < maxFileNr; i++) {
         if (recentFileActionList.at(i)->isVisible()) {
             const QString p = recentFileActionList.at(i)->data().toString();
-            // 防护：异常超长路径不允许写回，避免再次把 savePath.ini 撑爆
             if (p.isEmpty() || p.length() > 4096) continue;
             idx++;
             const QString name = "LastFilePath" + QString::fromStdString(std::to_string(idx));
@@ -645,15 +638,12 @@ void igQtFileLoader::UpdateIniFileInfo() {
 
 void igQtFileLoader::InitRecentFilePaths() {
     const QString path = QCoreApplication::applicationDirPath() + "/config/savePath.ini";
-    // 防护：最近文件记录一旦异常膨胀（上次崩溃/脏数据写入超长路径），直接废弃重建，避免启动读 1GB+ 文件。
     QFileInfo info(path);
     if (info.exists() && info.size() > 1024 * 1024) {
         QFile::remove(path);
         return;
     }
 
-    // 用 QSettings 读取，交给 Qt 处理 INI 的转义/反转义；
-    // 之前手动 readLine 不反转义，导致路径中的反斜杠每读写一次就翻倍，最终撑爆文件并引发崩溃。
     QSettings setting(path, QSettings::IniFormat);
     QMap<int, QString> entries;
     QSet<QString> seenPaths;

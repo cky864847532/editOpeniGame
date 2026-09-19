@@ -15,7 +15,7 @@
 #include <QObject>
 #include <QString>
 #include <QTreeWidget>
-#include <functional>   // §49：收起按钮回调
+#include <functional>
 #include <iostream>
 
 class QDockWidget;
@@ -60,8 +60,6 @@ public slots:
     }
     void positionTreeDockToRendererCorner(QWidget* rendererWidget);
 
-    // §49：模型树卡片收起/展开。收起后整块变成一个主题色圆角小方块（右下角不动），
-    //        点击小方块即可还原成原来的模型树（尺寸与位置都恢复）。
     void setTreeDockCollapsed(bool collapsed);
     bool isTreeDockCollapsed() const { return m_treeCollapsed; }
 
@@ -94,18 +92,16 @@ private:
     QDockWidget* m_propertiesDock = nullptr; // 下半
     static bool m_AutoAccelerate;
 
-    // §49：树卡片收起态相关
     bool m_treeCollapsed = false;
-    QRect m_treeGeomBeforeCollapse;          // 收起前的几何（展开时原样恢复）
-    QSize m_treeMinBeforeCollapse;           // 收起前的最小尺寸（展开时恢复）
-    QWidget* m_treeTitleBar = nullptr;       // 正常标题栏（DockTitleBar）
-    QWidget* m_collapsedBlock = nullptr;     // 收起态：圆角小方块
-    QString m_treeDockSavedStyleSheet;       // §51b：收起时临时改过 dock 样式表，展开需还原
-    // §49b：收起态小方块的拖动状态
+    QRect m_treeGeomBeforeCollapse;
+    QSize m_treeMinBeforeCollapse;
+    QWidget* m_treeTitleBar = nullptr;
+    QWidget* m_collapsedBlock = nullptr;
+    QString m_treeDockSavedStyleSheet;
     bool m_blockDragActive = false;
     bool m_blockDragged = false;
-    QRect m_blockRectAtCollapse;       // §51c：收起那一刻方块所在矩形（展开时算位移量的基准）
+    QRect m_blockRectAtCollapse;
     QPoint m_blockDragOffset;
-    std::function<void(bool)> m_setCollapseVisible;   // 悬浮时才显示"收起"按钮
+    std::function<void(bool)> m_setCollapseVisible;
     void refreshCollapsedBlockStyle();
 };

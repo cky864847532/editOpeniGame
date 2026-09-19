@@ -1,4 +1,4 @@
-#include <IQWidgets/igQtRenderWidget.h>   // §52：面板主题化（角色色/令牌重映射）
+#include <IQWidgets/igQtRenderWidget.h>
 #include "iGameSceneManager.h"
 #include <IQWidgets/igQtScalarViewWidget.h>
 #include <QRegExpValidator>
@@ -19,9 +19,6 @@ igQtScalarViewWidget::igQtScalarViewWidget(QWidget* parent)
 	SetCustomScaleRangeUi = new Ui::SetCustomScaleRange;
 	SetCustomScaleRangeUi->setupUi(SetCustomScaleRangeWidget);
 
-	// §52（4b）+ §61：把 .ui 里那套深色样式存成"底"，并按当前主题套用（切主题时 changeEvent 会再刷新）。
-	// 本面板 .ui 有 13 处**控件级** styleSheet（分组框/按钮/复选框/标签/数据范围滑块…），
-	// 只 attach 顶层会漏掉它们（数据区一直是深色）→ 用 attachDeep 覆盖全部自带 QSS 的控件。
 	igQtPanelTheme::attachDeep(this);
 	SetCustomScaleRangeWidget->hide();
 	ui->widget_DataRangeSlider->hide();
@@ -240,10 +237,9 @@ int igQtScalarViewWidget::getCurrentSelectedScalarIdx() {
 	return currentSelectedScalarIdx;
 }
 
-// §52（4b）+ §61：切主题 → 主窗口 setStyleSheet 会给子控件发 StyleChange → 这里刷新面板配色
 void igQtScalarViewWidget::changeEvent(QEvent* e) {
 	if (e && e->type() == QEvent::StyleChange) {
-		igQtPanelTheme::refreshDeep(this);   // §61：本面板 QSS 分散在多个控件上
+		igQtPanelTheme::refreshDeep(this);
 	}
 	QWidget::changeEvent(e);
 }

@@ -5,13 +5,9 @@
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
 #include "iGameVolumeMesh.h"
-#include <QEvent>   // §82：changeEvent(QEvent*)
+#include <QEvent>
 #include <filesystem>
 
-// §82：切换主题时重建信息区。
-// updateInformationFrame() 是在创建标签/行的那一刻按当前主题取色（见 createLabel /
-// createPropertyLabel / infoCardPalette），所以不重建的话，已经生成的行会一直保留
-// 旧主题的颜色 —— 表现为切到 ✦浅白 后信息区仍是深色文字/深色行底。
 void igQtModelInformationWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         updateInformationFrame();
@@ -32,10 +28,6 @@ QString pathForLabelWrap(const QString& path) {
     return out;
 }
 
-// §45：信息卡片（#InfoCard）与分割线的颜色原先**写死在代码里**（#252526/#2D2D30/#3A3A3A），
-//      而 widget 级 setStyleSheet 优先级高于主题 QSS —— 于是「悬浮·浅色」等浅色变体上
-//      卡片仍是深底、文字却是深色（深压深看不清）。这里改成按"颜色族"取色：
-//      2/13 浅色族、9/14 石墨·现代、10/15 石墨·哑光，其余（11/12 深色）保持原值不变。
 struct InfoCardPalette {
     const char* bg;
     const char* border;
@@ -54,7 +46,7 @@ InfoCardPalette infoCardPalette() {
         case 15:
             return { "#20242A", "#2C3038", "#2C3038" };
         default:
-            return { "#252526", "#2D2D30", "#3A3A3A" };   // 11 GitCode 暗色 / 12 悬浮卡片：与原值完全一致
+            return { "#252526", "#2D2D30", "#3A3A3A" };
     }
 }
 } // namespace
@@ -170,9 +162,8 @@ void igQtModelInformationWidget::updateInformationFrame() {
 
 
     const int styleModeNow = igQtRenderWidget::globalStyleMode();
-    // §45：13/14/15 也是悬浮卡片布局（只是换色）
     const bool floatingCards = (styleModeNow >= 12 && styleModeNow <= 15);
-    if (floatingCards) frameLayout->setSpacing(10); // 卡片之间留缝隙
+    if (floatingCards) frameLayout->setSpacing(10);
 
     frameLayout->addWidget(createLabel(QStringLiteral("文件属性")));
 
@@ -189,7 +180,7 @@ void igQtModelInformationWidget::updateInformationFrame() {
     createPropertyLabel(filePropForm, QStringLiteral("名称"), pathForLabelWrap(fileName));
     createPropertyLabel(filePropForm, QStringLiteral("路径"), pathForLabelWrap(directory));
     if (floatingCards) {
-        const InfoCardPalette cardPal = infoCardPalette();   // §45：随颜色族
+        const InfoCardPalette cardPal = infoCardPalette();
         filePropWidget->setObjectName(QStringLiteral("InfoCard"));
         filePropWidget->setStyleSheet(
                 QStringLiteral("QWidget#InfoCard { background-color: %1; border: 1px solid %2; border-radius: 4px; }")
@@ -224,7 +215,7 @@ void igQtModelInformationWidget::updateInformationFrame() {
     }
     createPropertyLabel(statForm, QStringLiteral("内存占用"), QString::number(memorySize) + dw[index]);
     if (floatingCards) {
-        const InfoCardPalette cardPal = infoCardPalette();   // §45：随颜色族
+        const InfoCardPalette cardPal = infoCardPalette();
         statWidget->setObjectName(QStringLiteral("InfoCard"));
         statWidget->setStyleSheet(
                 QStringLiteral("QWidget#InfoCard { background-color: %1; border: 1px solid %2; border-radius: 4px; }")
@@ -261,10 +252,9 @@ QLabel* igQtModelInformationWidget::createLabel(const QString& text) {
     QLabel* label = new QLabel(text);
     label->setWordWrap(false);                                            // 禁用换行
     label->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);   // 允许水平压缩
-    // 分区标题同样跟随主题，避免深色主题下 Qt 默认黑字导致看不清
     const bool light = igQtRenderWidget::globalLightBackground();
     const int styleModeNow = igQtRenderWidget::globalStyleMode();
-    const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);   // §45：15 也是哑光族
+    const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);
     const QString color = light ? QStringLiteral("#2D3748")
                                 : (matte ? QStringLiteral("#D4D4D4") : QStringLiteral("#E2E8F0"));
     label->setStyleSheet(QStringLiteral("QLabel { font-size: 12px !important; color: %1; background: transparent; font-weight: 600; }").arg(color));
@@ -272,16 +262,14 @@ QLabel* igQtModelInformationWidget::createLabel(const QString& text) {
 }
 
 void igQtModelInformationWidget::createPropertyLabel(QFormLayout* formLayout, const QString& name, const QString& value) {
-    // 每行用一个容器行，便于画交替底色，模拟表格效果
     auto* row = new QWidget(informationFrame);
     auto* rowLayout = new QHBoxLayout(row);
     rowLayout->setContentsMargins(6, 3, 6, 3);
     rowLayout->setSpacing(10);
 
-    // 文字颜色随主题自适应（浅色用深色文字，深色用浅色文字）
     const bool light = igQtRenderWidget::globalLightBackground();
     const int styleModeNow = igQtRenderWidget::globalStyleMode();
-    const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);   // §45：15 也是哑光族
+    const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);
     const QString nameColor = light ? QStringLiteral("#4A5568")
                                     : (matte ? QStringLiteral("#858585") : QStringLiteral("#C8C8C8"));
     const QString valueColor = light ? QStringLiteral("#1F2A3A")
@@ -302,7 +290,6 @@ void igQtModelInformationWidget::createPropertyLabel(QFormLayout* formLayout, co
     rowLayout->addWidget(nameLabel);
     rowLayout->addWidget(valueLabel);
 
-    // 交替行底色
     const QString rowBg = (m_tableRow % 2 == 1)
             ? (light ? QStringLiteral("rgba(0,0,0,0.05)") : QStringLiteral("rgba(255,255,255,0.05)"))
             : QStringLiteral("transparent");
@@ -315,7 +302,6 @@ QFrame* igQtModelInformationWidget::createSeparator() {
     QFrame* line = new QFrame();
     line->setFrameShape(QFrame::HLine);
     line->setFrameShadow(QFrame::Sunken);
-    // §45：分割线颜色也随颜色族（原来写死 #3A3A3A，浅色变体上是一条黑线）
     const InfoCardPalette cardPal = infoCardPalette();
     line->setStyleSheet(
             QStringLiteral("QWidget { background-color: %1 !important; height: 1px !important;"

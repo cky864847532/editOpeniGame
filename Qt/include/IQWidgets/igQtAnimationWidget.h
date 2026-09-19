@@ -127,6 +127,5 @@ private:
     iGame::DataObject::Pointer m_AnimationFilterSourceObject{nullptr};
 
 protected:
-    // §57：切主题时按角色色重映射本面板自带 QSS（含挂在子控件上的那份）
     void changeEvent(QEvent* e) override;
 };

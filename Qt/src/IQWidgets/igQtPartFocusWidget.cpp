@@ -1,6 +1,6 @@
 #include <IQWidgets/igQtPartFocusWidget.h>
-#include <IQWidgets/igQtRenderWidget.h>   // §52/§67：面板主题化（角色色 / 令牌重映射）
-#include <QEvent>                          // §67：changeEvent(QEvent*)
+#include <IQWidgets/igQtRenderWidget.h>
+#include <QEvent>
 
 #include <iGameBoundingBox.h>
 #include <iGameBoxStyle.h>
@@ -81,7 +81,6 @@ void igQtPartFocusWidget::setupUI() {
 
     m_partContainer = new QWidget();
     m_partContainer->setObjectName("partContainer");
-    // §69：纯 QWidget 需 WA_StyledBackground，样式表背景才会绘制（否则露出 viewport 的深色 palette）
     m_partContainer->setAttribute(Qt::WA_StyledBackground, true);
     m_partContainer->setLayout(new QVBoxLayout());
     m_partContainer->layout()->setContentsMargins(4, 4, 4, 4);
@@ -122,10 +121,6 @@ void igQtPartFocusWidget::setupUI() {
     connect(m_btnSetBox,      &QPushButton::clicked, this, &igQtPartFocusWidget::onSetSelectionBox);
     connect(m_btnFocusBoth,   &QPushButton::clicked, this, &igQtPartFocusWidget::onFocusBoth);
 
-    // §67：本面板整套深色样式是**代码里 setStyleSheet** 写死的（面板自身 + 四个按钮）。
-    //       原来只在"浅色族"下用 §45 的 adaptQssToLightPalette 硬换一次 → 其它风格保持深色。
-    //       改为 §52 通用机制：现有 QSS 存成"底"，按当前主题做颜色令牌重映射；
-    //       切主题由 changeEvent → refreshDeep 刷新（列表项由 RefreshPartList 末尾再 attachDeep）。
     igQtPanelTheme::attachDeep(this);
 }
 
@@ -204,7 +199,6 @@ void igQtPartFocusWidget::RefreshPartList() {
         delete it;
     }
 
-    // §67：深色原文作底（不再做 §45 的浅色族硬换）
     const QString cbStyle = QStringLiteral(
         "QCheckBox { color: rgba(255,255,255,204); font-size: 10pt; padding: 3px 6px; } "
         "QCheckBox::indicator { width: 14px; height: 14px; border: 1px solid rgba(255,255,255,80); "
@@ -221,7 +215,6 @@ void igQtPartFocusWidget::RefreshPartList() {
     }
     containerLayout->addStretch();
 
-    // §67：本次新建的复选框纳入主题重映射（attach 幂等）
     igQtPanelTheme::attachDeep(this);
 
     setStatus(QString(QStringLiteral("共 %1 个零件，可勾选后操作")).arg(partFaceCount.size()));
@@ -374,7 +367,6 @@ bool igQtPartFocusWidget::applySelectionBox(const iGame::BoundingBox& bbox) {
     return true;
 }
 
-// §67：切主题 → 刷新本面板配色（面板自身/按钮/各零件复选框）
 void igQtPartFocusWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         igQtPanelTheme::refreshDeep(this);

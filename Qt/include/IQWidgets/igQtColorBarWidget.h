@@ -18,7 +18,6 @@ protected:
 	void mousePressEvent(QMouseEvent* _event)override;
 	void mouseMoveEvent(QMouseEvent* _event)override;
 	void mouseReleaseEvent(QMouseEvent* _event)override;
-	// §61：切主题时重绘（图上文字/框线走角色色）
 	void changeEvent(QEvent* e) override;
 
 signals:

@@ -32,7 +32,6 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;
     void showEvent(QShowEvent* event) override;
-    // §74：切主题时重映射本弹窗 QSS（独立顶层窗，收不到主窗口 QSS 变化）
     void changeEvent(QEvent* e) override;
 
 protected:

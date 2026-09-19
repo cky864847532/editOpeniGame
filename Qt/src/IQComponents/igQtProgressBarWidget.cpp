@@ -34,15 +34,12 @@ igQtProgressBarWidget::igQtProgressBarWidget(QWidget *parent) : QWidget(parent) 
     layout->setContentsMargins(0, 0, 0, 0);
     this->setLayout(layout);
 
-    // 默认隐藏，只有加载/处理时才显示
     this->hide();
 
-    // 无操作自动隐藏：加载进度停止更新后 1.5 秒隐藏
     m_hideTimer = new QTimer(this);
     m_hideTimer->setSingleShot(true);
     connect(m_hideTimer, &QTimer::timeout, this, [this]() { this->hide(); });
 
-    // 统一标签与进度条文字颜色
     applyThemeStyle();
 
     progressObserver = iGame::ProgressObserver::Instance();
@@ -101,13 +98,10 @@ void igQtProgressBarWidget::resetTextMode() {
 }
 
 void igQtProgressBarWidget::applyThemeStyle() {
-    // §81：防重入。本函数会给子控件 setStyleSheet，而 setStyleSheet 会派发 StyleChange；
-    // 若不加护栏，changeEvent → applyThemeStyle → setStyleSheet 可能形成回环（§68b 的栈溢出教训）。
     if (m_applyingTheme) return;
     m_applyingTheme = true;
 
     const bool light = igQtRenderWidget::globalLightBackground();
-    // 与状态栏标签一致的文字颜色
     const QString textColor = light ? QStringLiteral("#4A5568") : QStringLiteral("#A5ADB8");
     const QString bgColor   = light ? QStringLiteral("#FFFFFF") : QStringLiteral("#22262B");
     const QString borderCol = light ? QStringLiteral("#CBD2DC") : QStringLiteral("#343B43");
@@ -133,9 +127,6 @@ void igQtProgressBarWidget::applyThemeStyle() {
     m_applyingTheme = false;
 }
 
-// §81：本控件是状态栏常驻件（igQtMainWindow 构造期创建一次，之后不重建），
-// 所以主题切换时必须自己重新取色；否则会一直保留启动那一刻的配色，
-// 表现为「切到✦浅白后，进度条仍是黑底 + 青色 chunk」。
 void igQtProgressBarWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         applyThemeStyle();
@@ -144,7 +135,6 @@ void igQtProgressBarWidget::changeEvent(QEvent* e) {
     QWidget::changeEvent(e);
 }
 
-// §81：每次显示前也按当前主题重取一次色，覆盖「启动即浅色、用户从未切过主题」的情形。
 void igQtProgressBarWidget::showEvent(QShowEvent* e) {
     applyThemeStyle();
     QWidget::showEvent(e);
@@ -153,7 +143,7 @@ void igQtProgressBarWidget::showEvent(QShowEvent* e) {
 void igQtProgressBarWidget::showWithAutoHide() {
     this->show();
     if (m_hideTimer) {
-        m_hideTimer->start(1500); // 1.5 秒无新进度后自动隐藏
+        m_hideTimer->start(1500);
     }
 }
 
@@ -164,14 +154,12 @@ void igQtProgressBarWidget::updateProgressBar(double value) {
     int progress = value * 100;
 
     if (progress < 100) {
-        // 加载中：显示进度条并重置自动隐藏计时
         showWithAutoHide();
         if (!hasExternalText) {
             updateProgressBarLabel(PROCESSING);
         }
         progressBar->setValue(progress);
     } else {
-        // 加载完成：立即隐藏
         resetTextMode();
         progressBar->setValue(100);
         progressBar->setValue(0);

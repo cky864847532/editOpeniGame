@@ -1,5 +1,5 @@
 #include "IQWidgets/igQtCharts.h"
-#include <IQWidgets/igQtRenderWidget.h>   // §66：角色色（uiRole）与面板主题刷新
+#include <IQWidgets/igQtRenderWidget.h>
 #include <QLineSeries>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -69,9 +69,6 @@ igQtCharts::igQtCharts(QWidget* parent)
     chart->setBackgroundPen(Qt::NoPen);
 
     this->setLayout(layout);
-    // §66：上面这套 QSS 是"深色原文"，后面不再手工写死颜色 ——
-    //      1) attachDeep 把它（以及 chartView 自己的 QSS）存成"底"，按当前主题做令牌重映射；
-    //      2) applyTheme() 负责 QChart 那一套非 QSS 的配色（背景/坐标轴/图例/网格线）。
     igQtPanelTheme::attachDeep(this);
     applyTheme();
     updateRoundedMask();
@@ -160,7 +157,6 @@ void igQtCharts::drawBarChart(iGame::ArrayObject::Pointer data) {
     chart->addAxis(axisY, Qt::AlignLeft);
     series->attachAxis(axisY);
 
-    // 添加网格线（§66：颜色走角色色，浅色主题下也看得见/不刺眼）
     QLineSeries* lineSeries = new QLineSeries();
     for (int i = 0; i <= numberOfBins; ++i) { lineSeries->append(i, 0); }
     QPen pen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Border));
@@ -170,8 +166,6 @@ void igQtCharts::drawBarChart(iGame::ArrayObject::Pointer data) {
     lineSeries->attachAxis(axisX);
     lineSeries->attachAxis(axisY);
 
-    // §66：配色统一交给 applyTheme()（原来这里是一整套写死的深色：背景 #1F1F1F、
-    //      绘图区 #252526、标题/坐标轴 #E0E0E0/#C8C8C8、图例 #D0D0D0、网格 rgba(255,255,255,35)…）
     chart->setTitle(QStringLiteral("数据分布直方图"));
     chart->legend()->setVisible(true);
     chart->legend()->setAlignment(Qt::AlignTop);
@@ -223,7 +217,6 @@ void igQtCharts::drawLineChart(iGame::ArrayObject::Pointer m_data) {
     // 设置图表的标题
     chart->setTitle(QStringLiteral("数据折线图"));
 
-    // §66：折线图同样按主题上色（原来完全依赖 Qt 默认主题，切主题后背景/坐标轴不会变）
     applyTheme();
 
     // 更新图表视图
@@ -282,26 +275,20 @@ void igQtCharts::resizeEvent(QResizeEvent* event) {
     updateRoundedMask();
 }
 
-// §66：按当前主题的角色色重设 QChart / QChartView 配色。
-//       这些颜色原来全部写死为深色（背景 #1F1F1F、绘图区 #252526、标题 #E0E0E0、
-//       坐标轴/图例 #C8C8C8/#D0D0D0、网格 rgba(255,255,255,35)、轴线 #6A6A6A），
-//       QtCharts 不认 QSS 的这套颜色 → 浅色主题下整块图表仍是黑底（用户反馈"未适配"）。
 void igQtCharts::applyTheme() {
     using Role = igQtRenderWidget::UiRole;
-    const QColor bg = igQtRenderWidget::uiRole(Role::PanelBg2);       // 原 #1F1F1F
-    const QColor plotBg = igQtRenderWidget::uiRole(Role::CardBg);     // 原 #252526
-    const QColor text = igQtRenderWidget::uiRole(Role::Text);         // 原 #C8C8C8 / #D0D0D0
-    const QColor textStrong = igQtRenderWidget::uiRole(Role::TextStrong); // 原 #E0E0E0
-    const QColor border = igQtRenderWidget::uiRole(Role::Border);         // 原网格 rgba(255,255,255,35)
-    const QColor borderStrong = igQtRenderWidget::uiRole(Role::BorderStrong); // 原轴线 #6A6A6A
+    const QColor bg = igQtRenderWidget::uiRole(Role::PanelBg2);
+    const QColor plotBg = igQtRenderWidget::uiRole(Role::CardBg);
+    const QColor text = igQtRenderWidget::uiRole(Role::Text);
+    const QColor textStrong = igQtRenderWidget::uiRole(Role::TextStrong);
+    const QColor border = igQtRenderWidget::uiRole(Role::Border);
+    const QColor borderStrong = igQtRenderWidget::uiRole(Role::BorderStrong);
 
     if (chartView) {
         chartView->setBackgroundBrush(QBrush(bg));
         chartView->update();
     }
 
-    // §67：标题栏直接按角色色重设（不依赖 QSS 令牌重映射），保证 8 套风格下都跟随主题：
-    //       底色 PanelBg、分隔线 Border、标题字 Text、关闭按钮 Text（hover/pressed 保留语义红）
     if (m_titleBar) {
         m_titleBar->setStyleSheet(QStringLiteral("background-color: %1; border-bottom: 1px solid %2;")
                                           .arg(igQtRenderWidget::uiRoleCss(Role::PanelBg),
@@ -343,8 +330,6 @@ void igQtCharts::applyTheme() {
         axis->setLinePenColor(borderStrong);
     }
 
-    // 直方图里那条"网格线辅助序列"（无名的 QLineSeries）跟着描边走；
-    // 数据序列（有名字）保持自己的颜色不动（那是数据语义色）。
     const QList<QAbstractSeries*> seriesList = chart->series();
     for (QAbstractSeries* s : seriesList) {
         if (auto* line = qobject_cast<QLineSeries*>(s)) {
@@ -353,8 +338,6 @@ void igQtCharts::applyTheme() {
     }
 }
 
-// §66：切主题 → ① 重映射本窗口 QSS（标题栏/关闭按钮，含 chartView 自己的 QSS）
-//                  ② applyTheme() 重设 QChart 内部配色 ③ 重绘
 void igQtCharts::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         igQtPanelTheme::refreshDeep(this);

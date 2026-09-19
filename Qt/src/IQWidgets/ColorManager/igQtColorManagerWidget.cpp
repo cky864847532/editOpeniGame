@@ -1,6 +1,6 @@
 #include "IQWidgets/ColorManager/igQtColorManagerWidget.h"
 #include "IQCore/igQtFramelessWidget.h"
-#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色/令牌重映射）
+#include <IQWidgets/igQtRenderWidget.h>
 #include <QMessageBox>
 #include <QPainter>
 #include <QSignalBlocker>
@@ -63,7 +63,6 @@ igQtColorManagerWidget::igQtColorManagerWidget(QWidget* parent)
 
 	connect(ui->comboBox_ColorMode, SIGNAL(currentIndexChanged(QString)), this, SLOT(changeColorMapMode()));
 
-	// §57：把 .ui 里那套深色样式存成"底"，按当前主题重映射；切主题由 changeEvent 刷新
 	igQtPanelTheme::attach(this);
 }
 
@@ -74,7 +73,6 @@ void igQtColorManagerWidget::paintEvent(QPaintEvent* event) {
 	QPainter painter(this);
 	painter.setRenderHint(QPainter::Antialiasing, true);
 	const QRect r = this->rect().adjusted(1, 1, -1, -1);
-	// §57：卡片描边/底色改走角色色（原 #4A4A4A → BorderStrong，原 #1E1E1E → PanelBg2）
 	painter.setPen(QPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::BorderStrong), 2));
 	painter.setBrush(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::PanelBg2));
 	painter.drawRoundedRect(r, 10, 10);
@@ -238,7 +236,6 @@ void igQtColorManagerWidget::slotSetTmpHSVToColor() {
 	}
 }
 
-// §57：切主题 → 刷新面板 QSS 配色，并让自绘卡片按新角色色重绘
 void igQtColorManagerWidget::changeEvent(QEvent* e)
 {
 	if (e && e->type() == QEvent::StyleChange) {

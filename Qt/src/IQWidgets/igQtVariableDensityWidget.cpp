@@ -1,5 +1,5 @@
 #include <IQWidgets/igQtVariableDensityWidget.h>
-#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色）
+#include <IQWidgets/igQtRenderWidget.h>
 #include "ui_igQtVariableDensityWidget.h"
 #include <QElapsedTimer>
 #include <QEvent>
@@ -475,8 +475,6 @@ void igQtVariableDensityWidget::GenerateSecondChoosedDensityImage() {
 }
 
 void igQtVariableDensityWidget::GenerateBackgroundColor() {
-    // §57：原为写死的深色底 (#2b2b2b，colorBar 自适应逻辑被早退屏蔽)；改为跟随主题角色色
-    //       （深色族 ≈ #2A2A2A，浅色 / 悬浮·浅色族为浅底），切主题时重新生成
     const QColor c = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg);
     m_BackgroundColor = {c.red(), c.green(), c.blue()};
 }
@@ -484,7 +482,7 @@ void igQtVariableDensityWidget::GenerateBackgroundColor() {
 void igQtVariableDensityWidget::_PaintPlotOnDrawWidget(QPainter& painter) {
     const QRect plotRect = ui->drawWidget->rect();
     if (m_CurrentModelDataIndex < 0 || m_VariableDensityDatas.size() <= m_CurrentModelDataIndex) {
-        painter.fillRect(plotRect, igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg));   // §57
+        painter.fillRect(plotRect, igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg));
         return;
     }
     QRect smallDrawFrame = InsetRectByBoundaryRatio(plotRect, boundaryRatio);
@@ -665,14 +663,12 @@ void igQtVariableDensityWidget::_CalculateFrameCenterCut(const QRect& frame, QRe
 }
 
 void igQtVariableDensityWidget::_DrawCoordinateRect(QPainter& painter, const QRect& range) {
-    // §57：坐标框描边原为写死的 #a8a8a8 → 走角色色（Text）
     painter.setPen(QPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawRect(range);
 }
 
 void igQtVariableDensityWidget::_DrawCenterLine(QPainter& painter, const QRect& range) {
-    // §57：中心分隔线原为写死的 #a8a8a8 → 走角色色（Text）
     painter.setPen(QPen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text), 1));
     painter.setBrush(Qt::NoBrush);
     if (m_ImageShowDirection == ImageShowDirection::Vertical)
@@ -969,8 +965,6 @@ void igQtVariableDensityWidget::RefreshData() {
     //GenerateBackgroundColor();
 }
 
-// §57：切主题 → 重算绘图底色（角色色）并重绘。本面板 .ui 没有自带样式表，
-//       配色走"绘制时取角色色"这条路，不需要 igQtPanelTheme。
 void igQtVariableDensityWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         GenerateBackgroundColor();

@@ -106,7 +106,7 @@
 #include <QScreen>
 #include <QWindow>
 #include <QApplication>
-#include <IQWidgets/igQtRenderWidget.h>   // §62：面板主题刷新（igQtPanelTheme）与全局风格模式
+#include <IQWidgets/igQtRenderWidget.h>
 #include <QPropertyAnimation>
 #include <QEasingCurve>
 #include <QStyle>
@@ -128,22 +128,15 @@
 #include <IQWidgets/igQtRoundedCornerHelper.h>
 
 namespace {
-// 悬浮卡片主题(12)下，面板外围的底色：圆角覆盖层用它把四角涂掉
 const QColor kFloatingCoverColor(0x1E, 0x1E, 0x1E);
 
-// 给控件设置圆角遮罩，OpenGL/子控件都能被裁出圆角。
 //
-// 说明：Qt 的遮罩（QRegion / QBitmap）永远是 1bit 的，不可能真正抗锯齿，但“边界落在哪里”可以做得准。
-// 旧实现用 QPainterPath::toFillPolygon() 的多边形填充，圆弧被量化成忽大忽小的台阶（实测 2~6 设备像素一跳），
-// 视觉上就是很粗的锯齿。这里改成：
-//   4 倍超采样画抗锯齿圆角 → 平滑降采样回逻辑尺寸 → 按 50% 覆盖率取阈值生成遮罩，
-// 边界贴着真实圆弧，台阶恒为 1 逻辑像素（高 DPI 下视觉粒度减半）。
 void applyRoundedMask(QWidget* w, int radius) {
     if (!w || radius <= 0) return;
     const QSize sz = w->size();
     if (sz.isEmpty()) return;
 
-    const int ss = 4;  // 超采样倍数
+    const int ss = 4;
     QImage big(sz.width() * ss, sz.height() * ss, QImage::Format_ARGB32_Premultiplied);
     if (big.isNull()) return;
     big.fill(Qt::transparent);
@@ -155,7 +148,6 @@ void applyRoundedMask(QWidget* w, int radius) {
         p.drawRoundedRect(QRectF(0, 0, big.width(), big.height()), qreal(radius) * ss, qreal(radius) * ss);
     }
     const QImage small = big.scaled(sz, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-    // createAlphaMask(): alpha >= 128（= 覆盖率过半）为不透明 → 边界就是 50% 覆盖率等值线
     w->setMask(QRegion(QBitmap::fromImage(small.createAlphaMask())));
 }
 
@@ -279,9 +271,8 @@ int resolveToolbarIconSizeForWidget(const QWidget* widget) {
 constexpr int kToolbarIconMin = 24;             // 图标尺寸下限（与 resolveToolbarIconSize 的 clamp 下限一致）
 constexpr int kToolbarIconMax = 56;             // 图标尺寸上限（放大填充时允许略超分档表，让宽屏更饱满）
 constexpr double kToolbarFillRatio = 0.92;      // 单排填充目标：工具栏总宽达到可用宽度的 92% 左右即停止放大
-constexpr int kToolbarButtonTextMinWidth = 48;  // 按钮文字“单行”宽度下限；超过则自动断行（上限 = max(icon+16, 48)，
-                                                // 避免为了显示完整文字把单个按钮拉得过宽）
-constexpr int kToolbarButtonTextMaxLines = 3;   // 均衡断行的行数上限（兜底仍完整显示，不使用省略号截断）
+constexpr int kToolbarButtonTextMinWidth = 48;
+constexpr int kToolbarButtonTextMaxLines = 3;
 
 // 按钮字号（逻辑像素）随图标尺寸联动。
 // 注意：必须用像素单位而非 pt，否则在高 DPI 缩放下文字宽度会随 DPI 放大，导致换行/压宽度失效。
@@ -416,21 +407,9 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 }
 )";
 
-// ---------------------------------------------------------------------------
-// §44 界面风格精简：风格菜单只保留下面 5 种，其余模式号一律回退。
-//   保留：2 浅色 / 9 石墨·现代 / 10 石墨·哑光 / 11 GitCode 暗色 / 12 悬浮卡片
-//   删除：0 原始深色 / 1 深灰蓝 / 3 石墨深色 / 4 深空青蓝 / 5 Fluent / 6 工作台 /
-//         7 石墨·视图栏 / 8 深空·视图栏
-//   ※ QSS 资源文件与 styleSheetForMode() 里的分支**先保留**（不删文件，便于随时恢复），
-//     只是不再出现在风格菜单里、也无法再被选中。
-// §45 又以「悬浮卡片」为模板新增 3 个**纯换色**变体（结构完全相同，只是调色板不同）：
-//   13 悬浮·浅色 / 14 悬浮·石墨现代 / 15 悬浮·石墨哑光
-//   —— 它们沿用悬浮卡片的布局与卡片行为，只是"颜色族"取自对应的旧主题。
-// ---------------------------------------------------------------------------
-constexpr int kFallbackStyleMode = 12;  // §73：已删除风格（2/9/10/11 等）统一回退到「悬浮卡片」
+constexpr int kFallbackStyleMode = 12;
 
 bool isStyleModeAvailable(int mode) {
-    // §73：只保留"后四套"悬浮风格（12 悬浮卡片 / 13 悬浮·浅色 / 14 悬浮·石墨现代 / 15 悬浮·石墨哑光）
     return mode >= 12 && mode <= 15;
 }
 
@@ -438,29 +417,23 @@ int normalizeStyleMode(int mode) {
     return isStyleModeAvailable(mode) ? mode : kFallbackStyleMode;
 }
 
-// ---- §45 风格「族」判定：新变体复用既有的布局/配色分支，避免到处加 mode == 13/14/15 ----
 
-// 悬浮卡片族（12 深色 + 13/14/15 换色）：卡片布局、圆角遮罩、悬浮模型树等行为一致
 bool isFloatingCardStyle(int mode) { return mode >= 12 && mode <= 15; }
 
-// 浅色族：标题栏图标/菜单文字/视口背景等需要按"亮底深字"处理
 bool isLightStyle(int mode) { return mode == 2 || mode == 13; }
 
-// "现代"族（9~15）：工具栏间距/行高等比旧主题更紧凑一档
 bool isModernDenseStyle(int mode) { return mode >= 9; }
 
-// 代码侧配色族：把 13/14/15 映射回 2/9/10（即复用浅色、石墨·现代、石墨·哑光的代码配色）
 int styleColorFamily(int mode) {
     switch (mode) {
         case 2:  case 13: return 2;
         case 9:  case 14: return 9;
         case 10: case 15: return 10;
         case 11: return 11;
-        default: return 12;   // 12 悬浮卡片（深色）
+        default: return 12;
     }
 }
 
-// §45：新增变体的 QSS 统一从资源里读（不新增一堆 loadXxx 成员函数）
 QString loadQssResource(const QString& path) {
     QFile qssFile(path);
     if (!qssFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -470,20 +443,18 @@ QString loadQssResource(const QString& path) {
     return QString::fromUtf8(qssFile.readAll());
 }
 
-// §45：悬浮卡片**布局**里由代码写死的颜色（QSS 管不到的部分）也要跟着颜色族走，
-//      否则 13/14/15 会露出深色底板/描边。13/14/15 分别取 浅色 / 石墨·现代 / 石墨·哑光 的色板。
 struct FloatingCardPalette {
-    const char* backdrop;    // 视口外、遮罩外的底色
-    const char* cardBg;      // 属性卡片底色（#FloatingCard）
-    const char* cardBorder;  // 属性卡片描边
+    const char* backdrop;
+    const char* cardBg;
+    const char* cardBorder;
 };
 
 FloatingCardPalette floatingCardPalette(int mode) {
     switch (styleColorFamily(mode)) {
-        case 2:  return { "#EAEEF3", "#F1F3F7", "#CBD2DC" };   // 悬浮·浅色
-        case 9:  return { "#121316", "#22262C", "#31363D" };   // 悬浮·石墨现代
-        case 10: return { "#14161A", "#20242A", "#2C3038" };   // 悬浮·石墨哑光
-        default: return { "#1E1E1E", "#1E1E1E", "#2D2D30" };   // 悬浮卡片（深色）：与原实现完全一致
+        case 2:  return { "#EAEEF3", "#F1F3F7", "#CBD2DC" };
+        case 9:  return { "#121316", "#22262C", "#31363D" };
+        case 10: return { "#14161A", "#20242A", "#2C3038" };
+        default: return { "#1E1E1E", "#1E1E1E", "#2D2D30" };
     }
 }
 }
@@ -637,26 +608,17 @@ igQtMainWindow::igQtMainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui
     ui->setupUi(this);
     qApp->setStyleSheet(qApp->styleSheet() + QString::fromUtf8(kGlobalSpinBoxDarkQss));
 
-    // 保存 .ui 中自带的原始深色 QSS，供风格切换回退使用（不覆盖原 UI）
     m_originalStyleSheet = this->styleSheet();
 
-    // 读取上次保存的风格选择；新风格需要尽早生效，以便 initCustomTitleBar / initToolbarComponent 按当前风格生成控件
     QSettings settings(QStringLiteral("iGame"), QStringLiteral("iGameVis"));
-    // §44 风格精简：读取上次保存的风格号。已删除的风格（含旧布尔标记 ui/modernStyle 指向的
-    // 「现代深色」）统一由 normalizeStyleMode() 回退到 kFallbackStyleMode，避免启动落到已删除模式。
     const int savedMode = settings.value(QStringLiteral("ui/styleMode"), kFallbackStyleMode).toInt();
     m_styleMode = normalizeStyleMode(qBound(0, savedMode, 15));
-    // §64：启动路径**之前漏了**这一步 —— 这里只 setStyleSheet 却没设"全局风格模式"，
-    // 而"全局模式"只在 applyStyleMode() 里设置（只有用户手动切风格才会调用）。
-    // 结果：启动时创建的所有面板（动画/标量场/数据查找…）在做"颜色令牌重映射"时读到的
-    // 还是默认(深色)模式 → 它们会按深色调色板重映射 → 自带 QSS 的区域（如动画关键帧树）
-    // 在浅色主题下依旧全黑，直到用户手动切一次风格才自愈。
     igQtRenderWidget::setGlobalStyleMode(m_styleMode);
     const QString initialQss = styleSheetForMode(m_styleMode);
     if (!initialQss.isEmpty()) {
         this->setStyleSheet(initialQss);
     } else {
-        m_styleMode = kFallbackStyleMode;   // 资源缺失兜底（正常不会走到）
+        m_styleMode = kFallbackStyleMode;
     }
 
     // 设置窗口标题为iGameVis
@@ -665,7 +627,6 @@ igQtMainWindow::igQtMainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui
     this->setWindowFlags(Qt::FramelessWindowHint | Qt::Window | Qt::WindowSystemMenuHint | Qt::WindowMinMaxButtonsHint);
     initCustomTitleBar();
     initAllUnDefinedComponents();
-    // 悬浮卡片依赖 rendererWidget/modelTreeWidget，只能在创建后补一次，否则启动时不会呈现卡片效果
     if (isFloatingCardStyle(m_styleMode)) applyFloatingCards(true);
     UpdateIcons();
     initAllComponents();
@@ -676,16 +637,11 @@ igQtMainWindow::igQtMainWindow(QWidget* parent) : QMainWindow(parent), ui(new Ui
     updateRecentFilePaths();
     initToolbarComponent();  // 内部会重建 toolBar_4 的 3×2 轴网格 + 4 组「按钮行+标题」容器 + 单排宽度拟合
 
-    // 顶栏按钮挂的是**原始 QMenu**（不再克隆），因此菜单项（含 initAllFilters/initAllComponents
-    // 里动态 addMenu/addAction 的那些）本来就是实时可见的；这里重建只为让按钮重新排布，
-    // 并保证按钮顺序/位置正确。
-    // 顶栏菜单改为内嵌原生 QMenuBar（见 initCustomTitleBar），不再自建按钮/容器
-    updateRecentFilePaths();  // 把 fileLoader 的最近文件项填进原始「最近文件」菜单
+    updateRecentFilePaths();
 
 
     connect(modelTreeWidget, &igQtModelDialogWidget::Update, rendererWidget, &igQtRenderWidget::update);
 
-    // 顶部模型名称 Chip 随当前模型刷新
     connect(modelTreeWidget, &igQtModelDialogWidget::CurrendModelChanged, this, [this]() {
         if (!m_projectChip) return;
         auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
@@ -712,13 +668,10 @@ void igQtMainWindow::initCustomTitleBar() {
 
     m_titleBar = new QWidget(this);
     m_titleBar->setObjectName("CustomTitleBar");
-    // 让标题栏的背景/边框 QSS 真正绘制（普通 QWidget 需开启 styled-background）
     m_titleBar->setAttribute(Qt::WA_StyledBackground, true);
-    // 标题栏整体高度（单行布局，适当收矮）
     m_titleBar->setFixedHeight(50);
     // 标题栏 QSS 见 iGameQtMainWindow.ui 中 MainWindow.styleSheet（QWidget#CustomTitleBar 等）
 
-    // 单行标题栏：logo + 菜单栏 + 标题 + 右侧控制区
     auto* mainLayout = new QVBoxLayout(m_titleBar);
     mainLayout->setContentsMargins(8, 0, 0, 0);
     mainLayout->setSpacing(0);
@@ -729,7 +682,6 @@ void igQtMainWindow::initCustomTitleBar() {
     topLayout->setContentsMargins(0, 0, 0, 0);
     topLayout->setSpacing(4);
 
-    // Logo 徽章：圆角渐变底 + 窗口图标
     m_logoIconLabel = new QLabel(topRow);
     m_logoIconLabel->setObjectName(QStringLiteral("AppLogoLabel"));
     m_logoIconLabel->setFixedSize(28, 28);
@@ -739,7 +691,6 @@ void igQtMainWindow::initCustomTitleBar() {
     m_logoIconLabel->setScaledContents(true);
     m_logoIconLabel->setAlignment(Qt::AlignCenter);
 
-    // logo + iGameVis 文字包成一个圆角框，和顶栏其它区域区分开
     m_brandBox = new QWidget(topRow);
     m_brandBox->setObjectName(QStringLiteral("TitleBrandBox"));
     m_brandBox->setAttribute(Qt::WA_StyledBackground, true);
@@ -755,22 +706,17 @@ void igQtMainWindow::initCustomTitleBar() {
 
     topLayout->addWidget(m_brandBox, 0, Qt::AlignVCenter);
 
-    // 顶栏菜单：**直接内嵌原生 QMenuBar**（方案 A，用户确认）。
-    // 不再自建 QToolButton + 自建 QMenu 容器 —— 那套在 Qt 里踩了太多边界（克隆快照、子菜单二次挂载、
-    // visible 继承、旧按钮叠加…）。原生菜单栏的展开/二级菜单/动态加项/enable/check/点击映射天然正确。
     m_topMenuLayout = topLayout;
     if (ui->menuBar) {
         ui->menuBar->setParent(topRow);
         ui->menuBar->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
         ui->menuBar->setFixedHeight(28);
-        ui->menuBar->show();          // 不再隐藏
+        ui->menuBar->show();
         m_topMenuLayout->insertWidget(1, ui->menuBar, 0, Qt::AlignVCenter);
     }
 
-    // logo 与右侧控件之间保留可伸缩空白，让模型名标签保持靠右
     topLayout->addStretch(1);
 
-    // 模型名称 Chip（随当前模型更新）
     m_projectChip = new QLabel(QStringLiteral("iGameVis"), topRow);
     m_projectChip->setObjectName(QStringLiteral("ProjectChip"));
     m_projectChip->setAttribute(Qt::WA_StyledBackground, true);
@@ -786,7 +732,6 @@ void igQtMainWindow::initCustomTitleBar() {
     m_btnClose = new QPushButton(QStringLiteral("×"), topRow);
     m_btnClose->setObjectName(QStringLiteral("CloseButton"));
 
-    // 风格切换按钮：在“原始深色 / 现代深色”之间切换（不影响原有 UI，默认仍为原风格）
     m_styleToggleButton = new QPushButton(topRow);
     m_styleToggleButton->setObjectName(QStringLiteral("StyleToggleButton"));
     m_styleToggleButton->setCursor(Qt::PointingHandCursor);
@@ -809,7 +754,6 @@ void igQtMainWindow::initCustomTitleBar() {
 
     topLayout->addWidget(m_styleToggleButton, 0);
 
-    // 右侧控制区与窗口控制之间的垂直分隔线
     m_rightDivider = new QFrame(topRow);
     m_rightDivider->setObjectName(QStringLiteral("RightDivider"));
     m_rightDivider->setFixedSize(1, 24);
@@ -824,7 +768,6 @@ void igQtMainWindow::initCustomTitleBar() {
     // 添加顶部行到主布局
     mainLayout->addWidget(topRow, 0);
 
-    // 标题栏底部主题色强调线
     m_titleAccentLine = new QFrame(m_titleBar);
     m_titleAccentLine->setObjectName(QStringLiteral("TitleBarAccentLine"));
     m_titleAccentLine->setFixedHeight(2);
@@ -852,10 +795,8 @@ void igQtMainWindow::initCustomTitleBar() {
         this->close();
     });
 
-    // 风格切换：改为下拉列表，可四选一（原始深色 / 黑灰深色 / 浅色 / 石墨深色）
     createStyleMenu();
 
-    // 按当前风格刷新切换按钮外观与文案
     applyStyleMode(m_styleMode);
 
     // 监听全局鼠标释放，防止拖动状态在某些场景下卡住
@@ -866,20 +807,15 @@ void igQtMainWindow::initCustomTitleBar() {
 bool igQtMainWindow::eventFilter(QObject* watched, QEvent* event) {
     if (!m_titleBar) return QMainWindow::eventFilter(watched, event);
 
-    // 悬浮卡片：视口与模型树（顶层窗口）的圆角遮罩依赖尺寸，resize 时必须重建；
-    // 属性卡片走抗锯齿覆盖层，覆盖层自带 resize 同步，不在这里处理。
     if (isFloatingCardStyle(m_styleMode) && event->type() == QEvent::Resize) {
         if (watched == rendererWidget) {
             applyRoundedMask(rendererWidget, 8);
         } else if (watched == m_floatingTreeDock) {
-            // §51b：收起态（48px 小方块）用更大的遮罩半径 —— 同样 1px 的台阶，弧线长一点就不显眼；
-            //        展开态仍用卡片原来的 8px。
             const int radius = (modelTreeWidget && modelTreeWidget->isTreeDockCollapsed()) ? 12 : 8;
             applyRoundedMask(m_floatingTreeDock, radius);
         }
     }
 
-    // 工具栏「图标 + 文字」整块按钮：文字区域也响应点击（内部子控件已设为鼠标穿透）
     if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) {
         const QVariant btnProp = watched->property("igToolbarButton");
         if (btnProp.isValid()) {
@@ -890,7 +826,6 @@ bool igQtMainWindow::eventFilter(QObject* watched, QEvent* event) {
                     auto* host = qobject_cast<QWidget*>(watched);
                     if (btn && host && host->rect().contains(me->pos())) { btn->click(); }
                 }
-                // 吃掉事件：保证只触发一次，同时避免 QToolBar 把这块当空白区开始拖动
                 return true;
             }
         }
@@ -1254,12 +1189,11 @@ void igQtMainWindow::initAllUnDefinedComponents() {
     QTimer::singleShot(0, this, [this]() {
         if (m_leftFieldDock) {
             const int curW = m_leftFieldDock->width();
-            const int targetW = qMax(curW + 40, 320); // 比默认稍宽一点，但保持紧凑
+            const int targetW = qMax(curW + 40, 320);
             this->resizeDocks({m_leftFieldDock}, {targetW}, Qt::Horizontal);
         }
     });
 
-    // 延迟定位图层树悬浮窗口到OpenGL渲染窗口右下角；工作台保持悬浮并重排右侧；视图栏主题显示右悬浮快捷栏
     QTimer::singleShot(100, this, [this]() {
         if (rendererWidget && modelTreeWidget) {
             if (m_styleMode == 6) {
@@ -1306,7 +1240,6 @@ void igQtMainWindow::initToolbarComponent() {
 }
 
 void igQtMainWindow::initAllComponents() {
-    // 定向轴按钮改成勾选式，并让勾选状态直接控制左下角坐标轴的显示/隐藏
     ui->action_ShowOrientationAxes->setCheckable(true);
     ui->action_ShowOrientationAxes->setChecked(true);
     connect(ui->action_ShowOrientationAxes, &QAction::toggled, this, [&](bool checked){
@@ -4288,8 +4221,6 @@ void igQtMainWindow::initAllMySignalConnections() {
     });
 }
 void igQtMainWindow::updateRecentFilePaths() {
-    // 顶栏菜单改为内嵌原生 QMenuBar 后，「最近文件」直接写回**原始菜单**（与官方版一致）。
-    // 注意：只 removeAction、绝不 delete —— 这些 QAction 的父对象是 fileLoader，生命周期由它管理。
     if (!ui || !ui->menu_RecentFiles || !fileLoader) return;
 
     QMenu* menu = ui->menu_RecentFiles;
@@ -4302,21 +4233,19 @@ void igQtMainWindow::updateRecentFilePaths() {
     for (int i = list.size() - 1; i >= 0; --i) {
         QAction* a = list.at(i);
         if (!a) continue;
-        if (menu->actions().contains(a)) continue;   // 防御：已在菜单里就不重复加
+        if (menu->actions().contains(a)) continue;
         a->setProperty("igRecentFileEntry", true);
         menu->addAction(a);
     }
 }
 
 void igQtMainWindow::applyTopMenuButtonStyle() {
-    // 顶栏菜单改为内嵌原生 QMenuBar 后，这里只需维护品牌框配色（菜单栏样式由主题 QSS 负责）。
     const bool menuLight = isLightStyle(m_styleMode);
     if (m_brandBox) {
         m_brandBox->setStyleSheet(menuLight
                 ? QStringLiteral("QWidget#TitleBrandBox { background-color: rgba(0,0,0,0.05); border: 1px solid rgba(0,0,0,0.10); border-radius: 6px; }")
                 : QStringLiteral("QWidget#TitleBrandBox { background-color: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10); border-radius: 6px; }"));
     }
-    // 让内嵌的 QMenuBar 与顶栏配色一致（不透明背景会让它和标题栏脱节）
     if (ui && ui->menuBar) {
         ui->menuBar->setStyleSheet(menuLight
                 ? QStringLiteral("QMenuBar { background: transparent; color: #1F2A3A; border: none; }"
@@ -4888,15 +4817,14 @@ QString igQtMainWindow::styleSheetForMode(int mode) const {
     if (mode == 1) return loadModernStyleSheet();
     if (mode == 2) return loadLightStyleSheet();
     if (mode == 3) return loadProStyleSheet();
-    if (mode == 4) return loadWorkspaceStyleSheet(); // 深空青蓝：沿用工作台配色（仅改配色不改布局）
+    if (mode == 4) return loadWorkspaceStyleSheet();
     if (mode == 6) return loadWorkspaceStyleSheet();
-    if (mode == 7) return loadProStyleSheet();      // 石墨·视图栏
-    if (mode == 8) return loadWorkspaceStyleSheet(); // 深空·视图栏
-    if (mode == 9) return loadGraphiteModernStyleSheet(); // 石墨·现代
-    if (mode == 10) return loadMatteGraphiteStyleSheet(); // 石墨·哑光
-    if (mode == 11) return loadGitCodeDarkStyleSheet(); // GitCode 暗色
-    if (mode == 12) return loadFloatingDarkStyleSheet(); // 悬浮卡片
-    // §45 悬浮卡片的纯换色变体
+    if (mode == 7) return loadProStyleSheet();
+    if (mode == 8) return loadWorkspaceStyleSheet();
+    if (mode == 9) return loadGraphiteModernStyleSheet();
+    if (mode == 10) return loadMatteGraphiteStyleSheet();
+    if (mode == 11) return loadGitCodeDarkStyleSheet();
+    if (mode == 12) return loadFloatingDarkStyleSheet();
     if (mode == 13) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingLight.qss"));
     if (mode == 14) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingGraphiteModern.qss"));
     if (mode == 15) return loadQssResource(QStringLiteral(":/Styles/iGameVisFloatingMatteGraphite.qss"));
@@ -4904,7 +4832,7 @@ QString igQtMainWindow::styleSheetForMode(int mode) const {
 }
 
 QString igQtMainWindow::styleToggleButtonQss() const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
+    const int fam = styleColorFamily(m_styleMode);
     if (fam == 1) {
         return QStringLiteral(
                 "QPushButton#StyleToggleButton {"
@@ -5037,7 +4965,6 @@ QString igQtMainWindow::styleModeDisplayName(int mode) const {
     if (mode == 9) return QStringLiteral("✦ 石墨·现代");
     if (mode == 10) return QStringLiteral("✦ 石墨·哑光");
     if (mode == 11) return QStringLiteral("✦ GitCode 暗色");
-    // §77：四套保留风格的统一命名（去掉"悬浮"，四个名字等长、同一维度：颜色 + 质感）
     if (mode == 12) return QStringLiteral("✦ 深灰");
     if (mode == 13) return QStringLiteral("✦ 浅白");
     if (mode == 14) return QStringLiteral("✦ 石墨");
@@ -5048,9 +4975,7 @@ QString igQtMainWindow::styleModeDisplayName(int mode) const {
 void igQtMainWindow::createStyleMenu() {
     if (m_styleMenu) return;
     m_styleMenu = new QMenu(m_styleToggleButton);
-    // §44 风格精简：菜单只保留这 5 种风格（其余已下架；菜单下标 ≠ 模式号，模式号存在 data() 里）
-    static const int kStyleModes[] = {12, 13, 14, 15};   // §73：只保留后四套悬浮风格
-    // §73：风格下拉只保留后四套（12/13/14/15）—— 见 kStyleModes
+    static const int kStyleModes[] = {12, 13, 14, 15};
     for (const int mode : kStyleModes) {
         QAction* act = m_styleMenu->addAction(styleModeDisplayName(mode));
         act->setCheckable(true);
@@ -5074,34 +4999,24 @@ void igQtMainWindow::updateTitleBarIcons() {
 }
 
 void igQtMainWindow::applyStyleMode(int mode) {
-    // §44：已删除的风格号统一回退（防止旧配置/旧代码路径切到已下架风格）
     mode = normalizeStyleMode(qBound(0, mode, 15));
     if (styleSheetForMode(mode).isEmpty()) {
-        mode = kFallbackStyleMode; // 资源缺失时回退，避免界面异常
+        mode = kFallbackStyleMode;
     }
 
-    // 离开工作台时恢复默认 dock 布局
     if (m_styleMode == 6 && mode != 6 && modelTreeWidget) {
         applyWorkspaceLayout(false);
     }
-    // 离开悬浮卡片时恢复常规中央区
     if (isFloatingCardStyle(m_styleMode) && !isFloatingCardStyle(mode)) {
-        // §49：模型树若处于收起态，先展开再退出（停靠态不支持收起）
         if (modelTreeWidget && modelTreeWidget->isTreeDockCollapsed()) {
             modelTreeWidget->setTreeDockCollapsed(false);
         }
         applyFloatingCards(false);
     }
-    // 离开视图栏主题时隐藏右悬浮快捷栏
     if ((m_styleMode == 7 || m_styleMode == 8) && mode != 7 && mode != 8) {
         applyViewRail(false);
     }
     m_styleMode = mode;
-    // §62：必须**先**把当前风格写进 igQtRenderWidget，再 setStyleSheet。
-    // 原因：setStyleSheet 会同步给子控件发 QEvent::StyleChange，各面板的 changeEvent 会立刻
-    // 调用 igQtPanelTheme::refresh/refreshDeep 做"颜色令牌重映射"；若此刻全局模式还是旧值，
-    // 面板就会按**上一个主题**的调色板重映射 —— 症状正是：面板容器背景已随主题变化，
-    // 但自带 QSS 的子控件（如「查找数据」的结果表格）仍停留在旧主题的深色。
     igQtRenderWidget::setGlobalStyleMode(m_styleMode);
     this->setStyleSheet(styleSheetForMode(mode));
 
@@ -5109,11 +5024,9 @@ void igQtMainWindow::applyStyleMode(int mode) {
         m_styleToggleButton->setText(styleModeDisplayName(mode));
         m_styleToggleButton->setStyleSheet(styleToggleButtonQss());
     }
-    // 顶栏菜单按钮随主题配色
     applyTopMenuButtonStyle();
-    // 主题强调色
     QString accent = QStringLiteral("#4DD0E1");
-    switch (styleColorFamily(mode)) {   // §45：13/14/15 复用 2/9/10 的强调色
+    switch (styleColorFamily(mode)) {
         case 0:  accent = QStringLiteral("#3C3C3C"); break;
         case 1:  accent = QStringLiteral("#38BDF8"); break;
         case 2:  accent = QStringLiteral("#2563EB"); break;
@@ -5126,19 +5039,13 @@ void igQtMainWindow::applyStyleMode(int mode) {
     }
     const bool isLight = isLightStyle(mode);
 
-    // Logo 徽章渐变底
     if (m_logoIconLabel) {
         QString grad;
         if (isLight) {
-            // §65：浅色族原来用"蓝→紫"深色渐变做徽章底（#4F8CFF→#7C3AED），
-            //      而 AppLogo 本身就是蓝/青配色（含红色小点），前景与底色撞色 → 图标看不清。
-            //      改为几乎全白的浅底（带一点冷灰），让蓝/青 logo 清晰可辨。
             grad = QStringLiteral("qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #FFFFFF, stop:1 #E9EFF9)");
         } else if (styleColorFamily(mode) == 10) {
-            // 哑光石墨：暗青灰渐变，不用亮蓝
             grad = QStringLiteral("qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2A303A, stop:1 #1C1F25)");
         } else if (styleColorFamily(mode) >= 11) {
-            // GitCode 暗色 / 悬浮卡片：纯灰阶，无彩色
             grad = QStringLiteral("qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #2A2A2C, stop:1 #1E1E1E)");
         } else {
             grad = QStringLiteral("qlineargradient(x1:0,y1:0,x2:1,y2:1, stop:0 #4DD0E1, stop:1 #2B7CD3)");
@@ -5148,7 +5055,6 @@ void igQtMainWindow::applyStyleMode(int mode) {
                         .arg(grad));
     }
 
-    // 工程信息 Chip
     if (m_projectChip) {
         if (isLight) {
             m_projectChip->setStyleSheet(
@@ -5162,13 +5068,11 @@ void igQtMainWindow::applyStyleMode(int mode) {
         }
     }
 
-    // 标题栏底部强调线
     if (m_titleAccentLine) {
         m_titleAccentLine->setStyleSheet(
                 QStringLiteral("QFrame#TitleBarAccentLine { background-color: %1; }").arg(accent));
     }
 
-    // 右区分隔线
     if (m_rightDivider) {
         m_rightDivider->setStyleSheet(
                 isLight
@@ -5182,39 +5086,26 @@ void igQtMainWindow::applyStyleMode(int mode) {
         }
     }
     updateTitleBarIcons();
-    // 3D 视口背景按具体风格模式各自适配（§62：全局风格模式已在函数开头设置）
     if (rendererWidget) rendererWidget->applyThemeBackground();
-    // §46b：悬浮卡片族内部互切（12↔13/14/15）时，卡片底色/描边/视口外底色要按新颜色族重设
     if (isFloatingCardStyle(m_styleMode)) applyFloatingCardPalette();
-    // 模型树浮动窗口不继承主窗口 QSS，需手动刷新标题栏配色
     if (modelTreeWidget) modelTreeWidget->refreshStyle();
 
-    // 进入工作台时应用重排布局
     if (mode == 6 && modelTreeWidget) {
         applyWorkspaceLayout(true);
     }
-    // 悬浮卡片：中央视口 + 左侧属性卡片化
     if (mode == 12) {
         applyFloatingCards(true);
     }
-    // 视图栏主题：显示右悬浮快捷栏
     if (mode == 7 || mode == 8) {
         applyViewRail(true);
     }
 
-    // 工具栏按钮行内 QSS 与风格绑定，wrapper 已存在时需要重建以同步外观；
-    // 构造函数阶段 wrapper 尚未创建，由 initToolbarComponent 按当前风格首次构建。
     const bool wrappersExist = (this->findChild<QToolBar*>(QStringLiteral("wrapper_toolBar_meshfile")) != nullptr);
     if (wrappersExist && !m_toolbarRebuilding) {
         rebuildToolbarRow(m_currentToolbarIconSize);
         relayoutToolbarWrappers();
     }
 
-    // §62：兜底刷新——把所有"自带底 QSS"的面板按**最终**模式重映射一遍。
-    // 需要它的情况：① 面板位于独立顶层窗口（如「颜色管理」浮窗），主窗口 setStyleSheet 不会
-    // 给它发 StyleChange；② 上面各 apply* 步骤可能再次改动样式或建立新的子控件。
-    // 判据是动态属性 igPanelBaseQss（只有经 igQtPanelTheme::attach 处理过的控件才有），
-    // 因此不需要维护面板清单。
     {
         const QWidgetList tops = QApplication::topLevelWidgets();
         for (QWidget* top : tops) {
@@ -5227,10 +5118,6 @@ void igQtMainWindow::applyStyleMode(int mode) {
                     igQtPanelTheme::refresh(w);
                 }
             }
-            // §66：其它顶层窗口（工具浮窗 / 图表视图 / 各种对话框）不继承主窗口 QSS，
-            //       收不到 StyleChange 事件 → 它们自己的主题钩子（如 igQtCharts::applyTheme()
-            //       重设 QChart 的背景/坐标轴/图例配色）就跑不到。这里显式补发一次。
-            //       各窗口的 changeEvent 都是"重算并重设"（幂等），不会递归。
             if (top != this) {
                 QEvent styleEvent(QEvent::StyleChange);
                 QCoreApplication::sendEvent(top, &styleEvent);
@@ -5239,9 +5126,6 @@ void igQtMainWindow::applyStyleMode(int mode) {
     }
 }
 
-// §46b：悬浮卡片布局里"由代码写死颜色"的部分（视口外底色 / #FloatingCard 卡片底+描边）
-// 统一由这里按颜色族设置。12 ↔ 13/14/15 互切时必须重新调用，否则会残留上一个风格的配色
-// （用户实测：从 悬浮·浅色 切回 悬浮卡片 后，属性卡片边框仍是白的）。
 void igQtMainWindow::applyFloatingCardPalette() {
     if (!isFloatingCardStyle(m_styleMode)) return;
     const FloatingCardPalette cardPal = floatingCardPalette(m_styleMode);
@@ -5262,9 +5146,6 @@ void igQtMainWindow::applyFloatingCardPalette() {
 }
 
 void igQtMainWindow::applyFloatingCards(bool enabled) {
-    // 防止重复进入/退出导致模型树、属性被反复包裹（会丢失原始控件引用并引发崩溃）
-    // 但"卡片配色"必须每次都刷新：12 与 13/14/15 之间互切时，若不刷新就会残留
-    // "深色主题配白色卡片边框/白底"（用户实测到的问题）。所以这里早退前先刷新配色。
     if (enabled && m_centralCardContainer) {
         applyFloatingCardPalette();
         return;
@@ -5272,36 +5153,27 @@ void igQtMainWindow::applyFloatingCards(bool enabled) {
     if (!enabled && !m_centralCardContainer) return;
 
     if (enabled) {
-        // 中央视口包一层卡片容器，四周留出深色细缝
         if (!m_centralCardContainer && rendererWidget) {
             auto* container = new QWidget(this);
             container->setObjectName(QStringLiteral("CentralCardContainer"));
             container->setAttribute(Qt::WA_StyledBackground, true);
             auto* lay = new QVBoxLayout(container);
-            // 视口四周留 6px/11px 细缝，左右对称
             lay->setContentsMargins(11, 6, 11, 6);
             lay->setSpacing(0);
             lay->addWidget(rendererWidget);
             m_centralCardContainer = container;
             this->setCentralWidget(m_centralCardContainer);
         }
-        // 中央视口本身也裁成圆角，真正的“圆角窗口”效果
         if (rendererWidget) {
-            // 视口控件底色和背景一致，遮罩外的区域才不会显示成另一个颜色
             rendererWidget->setAutoFillBackground(true);
-            applyFloatingCardPalette();   // §46b：底色按当前颜色族设置
-            // 视口圆角：只能用 1bit 遮罩。
-            // 曾尝试在 paintGL 里用 QPainter 画抗锯齿四角，会破坏场景 GL 状态导致图像异常，已回退。
+            applyFloatingCardPalette();
             applyRoundedMask(rendererWidget, 8);
         }
-        // 左侧属性：默认宽度收窄 + 内容做成圆角悬浮卡片
         if (modelTreeWidget) {
             QDockWidget* props = modelTreeWidget->getPropertiesDock();
             if (!props) return;
-            // 记住原始最小宽度，退出悬浮时恢复
             m_propertiesOriginalMinWidth = props->minimumWidth();
             props->setMinimumWidth(200);
-            // 隐藏默认标题栏，避免它占满整个 dock 宽度而挡住外层留白
             {
                 auto* emptyTitle = new QWidget(props);
                 emptyTitle->setFixedHeight(0);
@@ -5310,12 +5182,10 @@ void igQtMainWindow::applyFloatingCards(bool enabled) {
             QWidget* original = props->widget();
             m_floatingCardOriginalWidget = original;
             if (original) {
-                // 属性 dock 本身透明，便于外层容器四周露出背景
                 props->setAttribute(Qt::WA_TranslucentBackground, true);
                 props->setAutoFillBackground(false);
                 props->setStyleSheet(
                         "QDockWidget#LayerPropertiesDock { background-color: transparent; border: none; }");
-                // 透明外层容器真实地让卡片四周露出背景色，而不是只做内部 padding
                 auto* outer = new QWidget(props);
                 outer->setObjectName(QStringLiteral("FloatingCardOuter"));
                 outer->setAttribute(Qt::WA_StyledBackground, true);
@@ -5330,23 +5200,15 @@ void igQtMainWindow::applyFloatingCards(bool enabled) {
                 outerLayout->addWidget(original);
                 props->setWidget(outer);
                 m_floatingCardWidget = original;
-                applyFloatingCardPalette();   // §46b：卡片底色/描边按当前颜色族设置
-                // 属性卡片的圆角完全交给 QSS（#FloatingCard 的 border-radius 本身就是抗锯齿的）：
-                // 1bit 遮罩会削掉 AA 过渡像素（锯齿）；"四角覆盖层"则会拿外围底色把角上的 Tab 内容
-                // 和 1px 边框一起盖住（看着很奇怪）。这里顺手清掉可能存在的旧覆盖层。
+                applyFloatingCardPalette();
                 igQtDetachRoundedCorners(original);
             }
-            // 属性 dock 外层透明，不需要圆角遮罩（形状由内部 FloatingCard 承载）
             m_floatingCardDock = props;
             QTimer::singleShot(0, this, [this, props]() {
                 if (props) this->resizeDocks({props}, {210}, Qt::Horizontal);
             });
-            // 模型树：dock 整体加圆角遮罩；标题栏保持为 dock 标题栏，只把内容用透明容器下移
             if (QDockWidget* treeDock = modelTreeWidget->getTreeDock()) {
                 m_floatingTreeDock = treeDock;
-                // 模型树是「独立悬浮窗口」（顶层窗口）：形状只能由窗口遮罩决定，子控件覆盖层对它无效
-                // （覆盖层会被同一个遮罩裁掉，且覆盖色也不可能等于桌面颜色）。这里用改进后的遮罩：
-                // 边界贴着真实圆弧、台阶 1 逻辑像素。
                 applyRoundedMask(treeDock, 8);
 
                 QWidget* originalTree = treeDock->widget();
@@ -5357,7 +5219,6 @@ void igQtMainWindow::applyFloatingCards(bool enabled) {
                     treeOuter->setObjectName(QStringLiteral("FloatingTreeOuter"));
                     treeOuter->setAttribute(Qt::WA_TranslucentBackground, true);
                     auto* treeLayout = new QVBoxLayout(treeOuter);
-                    // 顶部留 20px：标题栏本身已有高度，内容保留适度呼吸空间
                     treeLayout->setContentsMargins(0, 20, 0, 0);
                     treeLayout->setSpacing(0);
                     originalTree->setParent(treeOuter);
@@ -5425,11 +5286,9 @@ void igQtMainWindow::applyFloatingCards(bool enabled) {
                     w->setContentsMargins(0, 0, 0, 0);
                     w->setStyleSheet(QString());
                 }
-                // 恢复属性 dock 的透明/样式设置
                 props->setStyleSheet(QString());
                 props->setAttribute(Qt::WA_TranslucentBackground, false);
                 props->setAutoFillBackground(true);
-                // 恢复默认标题栏
                 props->setTitleBarWidget(nullptr);
                 QTimer::singleShot(0, this, [this, props, restoreW]() {
                     if (props) this->resizeDocks({props}, {restoreW}, Qt::Horizontal);
@@ -5463,7 +5322,6 @@ void igQtMainWindow::applyWorkspaceLayout(bool enabled) {
     };
 
     if (enabled) {
-        // 模型树保持悬浮：只把分析/数据面板移到右侧
         for (QDockWidget* d : analysisDocks) {
             if (d) this->addDockWidget(Qt::RightDockWidgetArea, d);
         }
@@ -5477,7 +5335,6 @@ void igQtMainWindow::applyWorkspaceLayout(bool enabled) {
         this->tabifyDockWidget(ui->dockWidget_SelectionField, ui->dockWidget_ModelList);
         this->tabifyDockWidget(ui->dockWidget_SelectionField, ui->dockWidget_ContourExtract);
 
-        // 左侧属性栏保持，宽度紧凑
         this->addDockWidget(Qt::LeftDockWidgetArea, propertiesDock);
         if (m_leftFieldDock) this->addDockWidget(Qt::LeftDockWidgetArea, m_leftFieldDock);
         this->splitDockWidget(m_leftFieldDock, propertiesDock, Qt::Vertical);
@@ -5491,10 +5348,8 @@ void igQtMainWindow::applyWorkspaceLayout(bool enabled) {
             }
         });
 
-        // 模型树悬浮位置仍按默认放置（不改变悬浮交互）
         modelTreeWidget->positionTreeDockToRendererCorner(rendererWidget);
     } else {
-        // 恢复默认布局
         for (QDockWidget* d : analysisDocks) {
             if (d) this->addDockWidget(Qt::LeftDockWidgetArea, d);
         }
@@ -5522,7 +5377,6 @@ void igQtMainWindow::applyViewRail(bool enabled) {
     if (!rendererWidget) return;
 
     if (enabled && !m_viewDock) {
-        // 右侧常驻快捷栏（QDockWidget，非悬浮）
         m_viewDock = new QDockWidget(QStringLiteral("视图"), this);
         m_viewDock->setObjectName(QStringLiteral("ViewDock"));
         m_viewDock->setAllowedAreas(Qt::RightDockWidgetArea);
@@ -5546,7 +5400,6 @@ void igQtMainWindow::applyViewRail(bool enabled) {
             b->setFixedSize(26, 26);
             b->setToolTip(tip);
             b->setCursor(Qt::PointingHandCursor);
-            // 直角按钮
             b->setStyleSheet(
                     "QToolButton { border-radius: 0; }"
                     "QToolButton:hover { background-color: rgba(255,255,255,0.10); }");
@@ -5578,7 +5431,6 @@ void igQtMainWindow::applyViewRail(bool enabled) {
 }
 
 void igQtMainWindow::updateViewRailPosition() {
-    // 右侧常驻列无需动态定位；占位保留以兼容 resize/show 调用
     if (m_viewDock && m_viewDock->isVisible()) {
         QTimer::singleShot(0, this, [this]() {
             if (m_viewDock) this->resizeDocks({m_viewDock}, {40}, Qt::Horizontal);
@@ -5587,7 +5439,7 @@ void igQtMainWindow::updateViewRailPosition() {
 }
 
 QString igQtMainWindow::toolbarButtonQss(int fontPx) const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
+    const int fam = styleColorFamily(m_styleMode);
     if (fam == 1) {
         return QStringLiteral(
                 "QToolButton { border: 1px solid transparent; border-radius: 8px; margin: 0; padding: 2px; font-size: %1px; color: #B8C4D4; }"
@@ -5652,7 +5504,7 @@ QString igQtMainWindow::toolbarButtonQss(int fontPx) const {
 }
 
 QString igQtMainWindow::twoRowGridButtonQss() const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
+    const int fam = styleColorFamily(m_styleMode);
     if (fam == 1) {
         return QStringLiteral(
                 "QToolButton { border: 1px solid transparent; border-radius: 6px; margin: 0; padding: 0; }"
@@ -5709,9 +5561,7 @@ QString igQtMainWindow::twoRowGridButtonQss() const {
 }
 
 QString igQtMainWindow::toolbarItemQss() const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
-    // 「图标 + 文字」是拆成两个控件的（见 addToolbarTitle），所以整块热区由外层 item 承担：
-    // 鼠标悬停/点击反馈画在 item 上，颜色跟着 twoRowGridButtonQss 的 hover 走。
+    const int fam = styleColorFamily(m_styleMode);
     QString hover;
     switch (fam) {
         case 1:  hover = QStringLiteral("rgba(56, 189, 248, 0.10)"); break;
@@ -5732,7 +5582,7 @@ QString igQtMainWindow::toolbarItemQss() const {
 }
 
 QString igQtMainWindow::toolbarTitleLabelQss() const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
+    const int fam = styleColorFamily(m_styleMode);
     if (fam == 1) {
         return QStringLiteral(
                 "QLabel { color: #8A99AC; padding: 3px 12px; background-color: rgba(255, 255, 255, 0.03); "
@@ -5774,7 +5624,7 @@ QString igQtMainWindow::toolbarTitleLabelQss() const {
 }
 
 QString igQtMainWindow::toolbarCaptionLabelQss(int fontPx) const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
+    const int fam = styleColorFamily(m_styleMode);
     if (fam == 1) {
         return QStringLiteral(
                 "QLabel { color: #B8C4D4; padding: 0; background-color: transparent; border: none; "
@@ -5824,8 +5674,7 @@ QString igQtMainWindow::toolbarCaptionLabelQss(int fontPx) const {
 }
 
 QString igQtMainWindow::toolbarSeamColor() const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
-    // 顶部“菜单行 ↔ 快捷工具栏”分隔线颜色，随主题变化
+    const int fam = styleColorFamily(m_styleMode);
     switch (fam) {
         case 0:  return QStringLiteral("#3C3C3C");
         case 1:  return QStringLiteral("#2E3D52");
@@ -5843,8 +5692,7 @@ QString igQtMainWindow::toolbarSeamColor() const {
 }
 
 QString igQtMainWindow::toolbarAccentColor() const {
-    const int fam = styleColorFamily(m_styleMode);   // §45：13/14/15 复用 2/9/10 的配色分支
-    // 工具栏分组底部强调线颜色，随主题变化
+    const int fam = styleColorFamily(m_styleMode);
     switch (fam) {
         case 0:  return QStringLiteral("#007ACC");
         case 1:  return QStringLiteral("#38BDF8");
@@ -5875,7 +5723,6 @@ void igQtMainWindow::rebuildActionsAsTwoRowWidget(QToolBar* toolbar, const QList
     QWidget* container = new QWidget(toolbar);
     QGridLayout* grid = new QGridLayout(container);
     QSize iconSize = toolbar->iconSize();
-    // 缩小 3×2 网格：图标和间距都压小，避免“视图设置”组比其它组高出太多
     int gridSpacing = qMax(2, iconSize.height() / 12);
     if (isModernDenseStyle(m_styleMode)) gridSpacing += 2;
     grid->setSpacing(gridSpacing);
@@ -5933,7 +5780,6 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
         area = Qt::TopToolBarArea; // 重建时原 toolbar 已不在 QMainWindow 管理下，统一回到顶部区域
     const QSize iconSize(iconSizePx, iconSizePx);
     ToolbarSpacingMetrics spacing = metricsForIconSize(iconSize.width());
-    // 石墨·现代 / 哑光：给按钮/分组更从容的留白
     if (isModernDenseStyle(m_styleMode)) {
         spacing.btnGap += 2;
         spacing.edgeMargin += 2;
@@ -5945,14 +5791,12 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
 
     QFont titleFont(QStringLiteral("PingFang SC"));
     titleFont.setPointSize(titlePointSizeForIcon(iconSizePx));
-    // 工作台(6) 使用紧凑命令栏：去掉组标题，保留更小按钮；视图栏(7,8) 保留文字但缩小
     const bool compact = (m_styleMode == 6);
     const int titleTextH = compact ? 0 : QFontMetrics(titleFont).height();
 
     QWidget* container = new QWidget(this);
     container->setObjectName("toolbarContainer_" + toolbar->objectName());
     container->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
-    // 让 QSS 能绘制该容器的边框/底色（普通 QWidget 需要开启 styled-background）
     container->setAttribute(Qt::WA_StyledBackground, true);
 
     QWidget* topRow = new QWidget(container);
@@ -5977,7 +5821,6 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
             }
         }
 
-        // 工作台(6)：紧凑命令栏，只保留图标按钮，tooltip 显示完整文字
         if (compact) {
             QToolButton* b = new QToolButton(topRow);
             b->setDefaultAction(act);
@@ -5993,14 +5836,9 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
             continue;
         }
 
-        // 普通按钮：拆成「图标按钮 + 下方说明文字」两个控件。
-        // 关键点：QToolButton 应用样式表后只会按“单行”绘制文字并做中间省略（截图里的“打…件”），
-        // 换行符 \n 不生效；因此把说明文字放到独立的 QLabel 上，才能完整显示并真正多行换行。
         QFont btnFont(QStringLiteral("PingFang SC"));
         btnFont.setPixelSize(fontPx);
         const QFontMetrics fm(btnFont);
-        // 单行宽度上限：比图标略宽即可，避免整行铺太宽；
-        // 放不下的内容靠“多断几行”消化，而不是让按钮无限变宽或截断。
         const int textMaxW = qMax(kToolbarButtonTextMinWidth, iconSize.width() + 16);
         const QString rawText = act->text();
         const QString wrappedText = wrapToolbarButtonText(rawText, textMaxW, fm);
@@ -6045,9 +5883,6 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
         item->setFixedSize(btnW, iconSize.height() + captionH + 2);
         item->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
 
-        // 「图标 + 文字」整体作为按钮热区：原先只有图标的 QToolButton 可点，文字 QLabel 上的点击无效。
-        // 做法：两个子控件都设为鼠标穿透，鼠标事件统一由 item 接管，再回放到内部 QToolButton，
-        // 这样 checkable 动作的勾选状态仍由 QToolButton/QAction 正常同步。
         item->setObjectName(QStringLiteral("toolbarButtonItem"));
         item->setAttribute(Qt::WA_StyledBackground, true);
         item->setStyleSheet(toolbarItemQss());
@@ -6069,9 +5904,7 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
     this->removeToolBar(toolbar);
     toolbar->hide();
 
-    // 垂直布局：标题在左上角，按钮在上方，底部加主题色底线
     QVBoxLayout* vLayout = new QVBoxLayout(container);
-    // 分组外框的内边距：让按钮/标题不贴着框线，观感更“成组”
     const int frameInset = 4;
     vLayout->setContentsMargins(spacing.edgeMargin + frameInset, frameInset,
                                 spacing.edgeMargin + frameInset, frameInset + 2);
@@ -6084,18 +5917,15 @@ void igQtMainWindow::addToolbarTitle(QToolBar* toolbar, const QString& title, in
         titleLabel->setObjectName("toolbarTitle_" + toolbar->objectName());
         titleLabel->setFont(titleFont);
         titleLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-        // 标题改为左上角小标签，不再居中底部
         titleLabel->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
         titleLabel->setStyleSheet(toolbarTitleLabelQss());
         vLayout->addWidget(titleLabel, 0, Qt::AlignLeft);
     }
 
-    // 让按钮在标题和底部线之间垂直居中
     vLayout->addStretch(1);
     vLayout->addWidget(topRow, 0, Qt::AlignHCenter);
     vLayout->addStretch(1);
 
-    // 每组底部主题色强调线
     QFrame* bottomLine = new QFrame(container);
     bottomLine->setObjectName("toolbarAccentLine_" + toolbar->objectName());
     bottomLine->setFixedHeight(2);
@@ -6171,7 +6001,6 @@ void igQtMainWindow::relayoutToolbarWrappers() {
     }
 
     const ToolbarSpacingMetrics spacing = metricsForIconSize(m_currentToolbarIconSize);
-    // 石墨·现代 / 哑光 / GitCode：组之间直接相接，避免露出底层颜色造成断层
     const int gap = isModernDenseStyle(m_styleMode)
             ? 2
             : spacing.groupGap;
@@ -6190,7 +6019,6 @@ void igQtMainWindow::relayoutToolbarWrappers() {
         const bool firstInRow = (usedWidth == 0);
         const QString seam = toolbarSeamColor();
         if (isModernDenseStyle(m_styleMode)) {
-            // 石墨·现代 / 哑光 / GitCode：组间仅保留 1px 暗分隔线，不留缝隙，避免颜色断层
             tb->setStyleSheet(QStringLiteral("#%1 { margin-top: %2px; border: none; border-top: 1px solid %3; %4 }")
                                       .arg(tb->objectName())
                                       .arg(startsNewRow ? rowGap : 0)
@@ -6213,9 +6041,7 @@ void igQtMainWindow::rebuildToolbarRow(int iconSize) {
     if (m_toolbarRebuilding) return;
     m_toolbarRebuilding = true;
 
-    // 记录传入的原始图标尺寸：视图栏主题内部用小尺寸构建，但缓存仍保存原始尺寸，避免切回其他主题时按钮变小
     const int originalIconSize = iconSize;
-    // 视图栏主题：整体缩小顶部按钮（保留文字，但图标/行高更小）
     if (m_styleMode == 7 || m_styleMode == 8) {
         iconSize = qMin(iconSize, 28);
     }
@@ -6258,20 +6084,16 @@ void igQtMainWindow::rebuildToolbarRow(int iconSize) {
             ui->action_rotateNinetyCounterClockwise
     );
 
-    // 5. 重建组容器（顺序：文件与输出、可视化、选择与编辑；视图设置主题下改由右悬浮快捷栏承载）
     addToolbarTitle(ui->toolBar_meshfile, QStringLiteral("文件与输出"), iconSize);
     addToolbarTitle(ui->toolBar_3, QStringLiteral("可视化"), iconSize);
     addToolbarTitle(ui->toolBar_2, QStringLiteral("选择与编辑"), iconSize);
     if (m_styleMode != 7 && m_styleMode != 8) {
         addToolbarTitle(ui->toolBar_4, QStringLiteral("视图设置"), iconSize);
     } else {
-        // 视图栏主题：把原始 toolBar_4 移出主窗口，避免顶部残留“视图设置”组
         this->removeToolBar(ui->toolBar_4);
         ui->toolBar_4->hide();
     }
 
-    // 6. 统一四个分组框的高度：视图设置含 3×2 轴网格 + 两行文字，天然更高；
-    //    其它组通过把容器固定到最高组高度，让内部 stretch 把按钮行上下居中。
     {
         const QStringList names = {QStringLiteral("toolBar_meshfile"), QStringLiteral("toolBar_3"),
                                    QStringLiteral("toolBar_2"), QStringLiteral("toolBar_4")};
@@ -6339,14 +6161,11 @@ QString igQtMainWindow::wrapToolbarButtonText(const QString& text, int maxWidth,
         return fm.horizontalAdvance(text.mid(from, count));
     };
 
-    // 先找「每行都 ≤ maxWidth」且整体最均衡的 2 行 / 3 行断点；
-    // 找不到（例如很长的一段英文）才走下面的多行兜底，兜底也不截断。
     int bestScore = std::numeric_limits<int>::max();
     int bestImbalance = std::numeric_limits<int>::max();
     int bestB1 = -1;
-    int bestB2 = -1; // == n 表示两行；< n 表示三行
+    int bestB2 = -1;
 
-    // 两行方案
     for (int b1 = 1; b1 < n; ++b1) {
         const int w1 = lineWidth(0, b1);
         const int w2 = lineWidth(b1, n - b1);
@@ -6361,7 +6180,6 @@ QString igQtMainWindow::wrapToolbarButtonText(const QString& text, int maxWidth,
         }
     }
 
-    // 三行方案（行数上限 kToolbarButtonTextMaxLines）
     if (n >= 3) {
         for (int b1 = 1; b1 < n - 1; ++b1) {
             const int w1 = lineWidth(0, b1);
@@ -6389,7 +6207,6 @@ QString igQtMainWindow::wrapToolbarButtonText(const QString& text, int maxWidth,
         return text.left(bestB1) + QLatin1Char('\n') + text.mid(bestB1, bestB2 - bestB1) + QLatin1Char('\n') + text.mid(bestB2);
     }
 
-    // 兜底：按字符逐行断开，完整显示全部文字，不用省略号。
     QStringList lines;
     int pos = 0;
     while (pos < n) {
@@ -6398,8 +6215,6 @@ QString igQtMainWindow::wrapToolbarButtonText(const QString& text, int maxWidth,
         lines.append(text.mid(pos, end - pos));
         pos = end;
         if (lines.size() >= kToolbarButtonTextMaxLines && pos < n) {
-            // 极端长文本：最多只做 3 行均衡 + 剩余整段保留，避免按钮高到离谱；
-            // 当前工具栏文案均为短标签，正常情况下不会走到这里。
             break;
         }
     }

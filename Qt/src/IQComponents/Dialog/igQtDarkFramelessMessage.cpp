@@ -1,5 +1,5 @@
 #include "IQComponents/Dialog/igQtDarkFramelessMessage.h"
-#include <IQWidgets/igQtRenderWidget.h>   // §45：浅色族下适配深色消息框
+#include <IQWidgets/igQtRenderWidget.h>
 
 #include <QHBoxLayout>
 #include <QLabel>
@@ -39,9 +39,6 @@ igQtDarkFramelessMessageDialog::igQtDarkFramelessMessageDialog(QWidget* parent, 
 
     auto* body = new QWidget(this);
     body->setAttribute(Qt::WA_StyledBackground, true);
-    // §67：原来用 §45 的 adaptQssToLightPalette 做"仅浅色族"一次性硬换（切主题后残留旧色）。
-    //       改为写入深色原文，交给 igQtPanelTheme 按当前主题做角色色重映射；
-    //       本对话框是 igQtChromeFramelessDialog 子类，其 changeEvent 里会 refreshDeep 刷新。
     body->setStyleSheet(QStringLiteral(
         "QWidget { background-color: transparent; color: #EAEAEA; }"
         "QLabel#DarkMessageText { color: #C9C9C9; background: transparent; }"

@@ -20,8 +20,6 @@ public:
     iGame::VideoInputInfo getInput();
 
 protected:
-    // §82：本弹窗是独立顶层窗，body 上的控件级 QSS 会压过主窗口主题 QSS，
-    //      故配色由角色色当场生成，并在主题切换时重新生成。
     void changeEvent(QEvent* e) override;
 
     QLineEdit* m_Width_LineEdit{nullptr};

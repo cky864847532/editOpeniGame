@@ -1,6 +1,6 @@
 #include "IQComponents/Dialog/igQtMeshCodecDialog.h"
 #include "IQComponents/Dialog/igQtDarkFramelessMessage.h"
-#include <IQWidgets/igQtRenderWidget.h>   // §67：角色色（uiRole）与面板主题刷新
+#include <IQWidgets/igQtRenderWidget.h>
 #include <QBrush>
 #include <QColor>
 #include <QEvent>
@@ -18,8 +18,6 @@
 #include <filesystem>
 
 namespace {
-// §67：原来这里是一组**写死的深色常量**（绘图区 #252526 / 标签 #D8D8D8 / 网格 #3A3A3A /
-//      轴线 #5A5A5A / 序列 #C0C0C0·#A0A0A0），浅色主题下整块图表仍是深底 → 改为按当前主题取角色色。
 inline QColor ChartPlotBg() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg); }
 inline QColor ChartLabelColor() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text); }
 inline QColor ChartGridColor() { return igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Border); }
@@ -75,7 +73,7 @@ void ApplyKeyAreaDarkStyle(QGroupBox* groupBox, QChartView* chartView, QWidget* 
     if (chartView) {
         chartView->setAttribute(Qt::WA_StyledBackground, true);
         chartView->setStyleSheet("background-color: #252526; border: none;");
-        igQtPanelTheme::attach(chartView);   // §67：存底并按当前主题重映射
+        igQtPanelTheme::attach(chartView);
     }
     if (checkBoxContainer) {
         checkBoxContainer->setAttribute(Qt::WA_StyledBackground, true);
@@ -91,7 +89,7 @@ void ApplyKeyAreaDarkStyle(QGroupBox* groupBox, QChartView* chartView, QWidget* 
             "  background-color: #569CD6;"
             "  border: 1px solid #569CD6;"
             "}");
-        igQtPanelTheme::attach(checkBoxContainer);   // §67
+        igQtPanelTheme::attach(checkBoxContainer);
     }
 }
 } // namespace
@@ -140,7 +138,6 @@ igQtMeshCodecDialog::igQtMeshCodecDialog(QWidget* parent, iGame::DataObject::Poi
         "QGroupBox#groupbox_dataDistGroup { background-color: #252526; border: 1px solid #3A3A3A; }"
         "QTableWidget { background-color: #2A2A2A; color: #EAEAEA; gridline-color: #3A3A3A; }"
         "QHeaderView::section { background-color: #333333; color: #EAEAEA; border: 1px solid #3A3A3A; }");
-    // §67：以上是"深色原文"作底 → 全部存底并按当前主题重映射（独立顶层窗，需由 changeEvent 刷新）
     igQtPanelTheme::attachDeep(m_bodyWidget);
     igQtPanelTheme::attachDeep(this);
 
@@ -918,8 +915,6 @@ void igQtMeshCodecDialog::on_checkbox_exportNumpy_clicked(bool checked)
         "QPushButton:pressed { background-color: #252526; }"
         "QPushButton:disabled { background-color: #252526; color: #707070; "
         "border-color: #333333; }");
-    // §67：深色原文作底 → 按当前主题重映射（该弹窗是独立顶层窗，
-    //      由 igQtChromeFramelessDialog 的 changeEvent → refreshDeep 负责刷新）
     igQtPanelTheme::attachDeep(&selector);
 
     auto* layout = new QVBoxLayout(body);
@@ -1598,9 +1593,6 @@ iGame::CodecControlParams igQtMeshCodecDialog::BuildCodecParams() const
     return params;
 }
 
-// §67：切主题 → ① refreshDeep 重映射本窗口（含 m_bodyWidget / 图标区 / 复选框容器等的自带 QSS）
-//                  ② 重设图表本体配色（QChart 不认 QSS：绘图区/坐标轴/网格/序列边框）
-//                  ③ 重绘
 void igQtMeshCodecDialog::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         igQtPanelTheme::refreshDeep(this);

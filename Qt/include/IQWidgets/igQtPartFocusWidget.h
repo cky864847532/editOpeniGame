@@ -48,7 +48,6 @@ private slots:
     void onFocusBoth();
 
 protected:
-    // §67：切主题时按角色色重映射本面板（含代码里 setStyleSheet 时的各控件）
     void changeEvent(QEvent* e) override;
 
 private:

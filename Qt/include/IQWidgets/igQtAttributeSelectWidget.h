@@ -57,16 +57,12 @@ private slots:
     void onCheckBoxToggled(bool checked);
 
 protected:
-    // §63/§68：切主题时按角色色重映射本面板（含代码里 setStyleSheet 的各控件）
     void changeEvent(QEvent* e) override;
-    // §68：每次显示时按当前主题重新生成样式（消除"创建时机"造成的一次主题滞后）
     void showEvent(QShowEvent* e) override;
 
 private:
     void setupUI();
-    // §68：按当前主题从"深色模板"重新生成整套样式（详见 cpp 注释）
     void applyThemeQss();
-    // §71：直接用代码设关键控件的 palette/前景（绕开 QSS 首帧时机问题）
     void applyPaletteTheme();    void setStatus(const QString& msg);
     void setBusy(bool busy);
 
@@ -76,7 +72,6 @@ private:
     QScrollArea*  m_scrollArea{nullptr};
     QWidget*      m_container{nullptr};
     QVector<QPair<QString, QCheckBox*>> m_checkBoxes;
-    // §68b：applyThemeQss() 重入保护（setStyleSheet 会同步发 StyleChange，防无限递归）
     bool m_applyingTheme{false};
     // 勾选顺序队列（最早勾选的在最前）：勾选数超过 m_maxSelectableCount 时，最早勾选的被自动取消
     QVector<QCheckBox*> m_selectionOrder;

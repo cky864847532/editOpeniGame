@@ -1,7 +1,7 @@
 #include "IQComponents/Dialog/igQtScreenShotOptionDialog.h"
 
-#include <IQWidgets/igQtRenderWidget.h>   // §82：角色色（uiRoleCss）
-#include <QEvent>                          // §82：changeEvent(QEvent*)
+#include <IQWidgets/igQtRenderWidget.h>
+#include <QEvent>
 #include <QFormLayout>
 #include <QIntValidator>
 #include <QLabel>
@@ -10,9 +10,6 @@
 #include <QVBoxLayout>
 
 namespace {
-// §82：本弹窗是独立顶层窗，body 上的控件级 QSS 会压过主窗口主题 QSS，
-//      所以配色必须用角色色当场生成，并在主题切换时重新生成
-//      （原先写死深色，切到 ✦浅白 后输入框/按钮仍是深色底）。
 QString bodyThemeQss() {
     return QStringLiteral(
                    "QWidget { background-color: transparent; color: %1; }"
@@ -29,7 +26,7 @@ QString bodyThemeQss() {
                  igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::HoverBg),
                  igQtRenderWidget::uiRoleCss(igQtRenderWidget::UiRole::SelectionBg));
 }
-}   // namespace
+}
 
 igQtScreenShotOptionDialog::igQtScreenShotOptionDialog(QWidget* parent) : igQtChromeFramelessDialog(parent) {
     setMinimumSize(460, 260);
@@ -39,7 +36,7 @@ igQtScreenShotOptionDialog::igQtScreenShotOptionDialog(QWidget* parent) : igQtCh
     auto* body = new QWidget(this);
     m_body = body;
     body->setAttribute(Qt::WA_StyledBackground, true);
-    body->setStyleSheet(bodyThemeQss());   // §82：角色色，切主题时由 changeEvent 重新生成
+    body->setStyleSheet(bodyThemeQss());
 
     auto* layout = new QVBoxLayout(body);
     layout->setContentsMargins(14, 10, 14, 14);
@@ -81,7 +78,6 @@ std::pair<int, int> igQtScreenShotOptionDialog::getInput() {
     return {m_WidthLineEdit->text().toInt(), m_HeightLineEdit->text().toInt()};
 }
 
-// §82：切主题 → 重新按角色色生成 body 样式（本窗口是独立顶层窗，不继承主窗口 QSS）
 void igQtScreenShotOptionDialog::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange && m_body) {
         m_body->setStyleSheet(bodyThemeQss());

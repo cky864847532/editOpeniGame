@@ -10,12 +10,10 @@ namespace {
 const char* const kOverlayObjectName = "RoundedCornerOverlay";
 const char* const kOverlaySyncObjectName = "RoundedCornerOverlaySync";
 
-// 画一个角的“楔形”：以 cornerBox 的圆心为圆心的四分圆盘之外、cornerBox 之内的区域。
-// startAngle 为该象限的起始角（Qt 角度：0=3 点钟方向，逆时针为正）。
 void paintCornerWedge(QPainter& painter, const QRectF& cornerBox, qreal startAngle, const QColor& coverColor) {
     QPainterPath disc;
     disc.moveTo(cornerBox.center());
-    disc.arcTo(cornerBox, startAngle, 90.0);  // 圆心 → 弧起点 → 逆时针 90° → 回圆心
+    disc.arcTo(cornerBox, startAngle, 90.0);
     disc.closeSubpath();
 
     QPainterPath wedge;
@@ -23,7 +21,6 @@ void paintCornerWedge(QPainter& painter, const QRectF& cornerBox, qreal startAng
     painter.fillPath(wedge.subtracted(disc), coverColor);
 }
 
-// 覆盖层跟随目标控件：尺寸变化 / 显示时重新铺满并置顶
 class OverlaySync final : public QObject {
 public:
     OverlaySync(QWidget* target, QWidget* overlay) : QObject(target), m_target(target), m_overlay(overlay) {}
@@ -52,14 +49,12 @@ private:
     QPointer<QWidget> m_overlay;
 };
 
-}  // namespace
+}
 
 igQtRoundedCornerOverlay::igQtRoundedCornerOverlay(QWidget* parent)
     : QWidget(parent), m_radius{0.0, 0.0, 0.0, 0.0}, m_coverColor(0x1E, 0x1E, 0x1E) {
     setObjectName(QString::fromLatin1(kOverlayObjectName));
-    // 鼠标穿透：不能影响 dock 拖动、标题栏按钮、树选择等交互
     setAttribute(Qt::WA_TransparentForMouseEvents, true);
-    // 只画四个角，中间必须保持透明，让下层内容照常显示
     setAttribute(Qt::WA_NoSystemBackground, true);
     setAttribute(Qt::WA_TranslucentBackground, true);
     setAutoFillBackground(false);
@@ -100,7 +95,6 @@ void igQtRoundedCornerOverlay::paintEvent(QPaintEvent*) {
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.setPen(Qt::NoPen);
 
-    // 0=左上（弧的起始角 90°）1=右上（0°）2=右下（270°）3=左下（180°）
     const qreal startAngles[4] = {90.0, 0.0, 270.0, 180.0};
     const bool isTop[4] = {true, true, false, false};
     const bool isLeft[4] = {true, false, false, true};
@@ -123,7 +117,6 @@ void igQtAttachRoundedCorners(QWidget* target, qreal topLeft, qreal topRight, qr
         overlay = new igQtRoundedCornerOverlay(target);
         auto* sync = new OverlaySync(target, overlay);
         sync->setObjectName(QString::fromLatin1(kOverlaySyncObjectName));
-        // 关键：把同步器装到目标控件上，否则目标 resize 时覆盖层不会跟着变大
         target->installEventFilter(sync);
     }
 

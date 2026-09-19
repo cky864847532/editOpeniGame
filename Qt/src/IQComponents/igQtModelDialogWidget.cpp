@@ -20,22 +20,17 @@
 #include <QPainterPath>
 #include <QRegion>
 #include <QEvent>
-#include <QTimer>       // §49d：展开后用单次定时器把位置钉死
-#include <functional>   // §49：标题栏"收起"按钮的回调
+#include <QTimer>
+#include <functional>
 
 namespace {
-// §49：树卡片收起后的小方块尺寸（悬浮时右下角保持不动）
 constexpr int kTreeCollapsedSize = 48;
 
-// §50 方案 A′：标题栏布局常量（§50c 按用户意见只保留左侧叠层图标）
-constexpr int kDockTitleBarHeight = 40;   // 原 38，略微加高更从容
+constexpr int kDockTitleBarHeight = 40;
 constexpr int kTitleLeftPad = 14;
-constexpr int kIconGap = 10;              // 图标与文字之间的间距
-constexpr int kTitleLabelLeft = kTitleLeftPad + 16 + kIconGap;   // = 40（文字起点）
+constexpr int kIconGap = 10;
+constexpr int kTitleLabelLeft = kTitleLeftPad + 16 + kIconGap;
 
-// §49d：把窗口矩形收进"屏幕可用区"（Windows 在贴近屏幕边缘/任务栏时会自己挪窗口，
-// 尤其 resize 之后会再调整一次位置 —— 这正是"靠近右下角再展开会错位"的来源）。
-// 我们自己先按可用区收敛，再用下一轮事件循环把位置钉死，就不会被系统挪走。
 void clampRectToAvailable(QRect& rect, const QWidget* w) {
     QScreen* screen = w ? w->screen() : nullptr;
     if (!screen) screen = QGuiApplication::screenAt(rect.center());
@@ -47,8 +42,6 @@ void clampRectToAvailable(QRect& rect, const QWidget* w) {
     if (rect.top() < avail.top()) rect.moveTop(avail.top());
 }
 
-// §51：收起态小方块的"面" —— 叠层图标 + 名称，一次性画成位图喂给按钮
-// （按钮自身仍负责渐变底/描边/悬停/按下；这样收起态与标题栏是同一套视觉语言）
 QPixmap buildCollapsedFacePixmap(int size, qreal dpr) {
     const qreal s = qMax(24, size);
     QPixmap pm(qRound(s * dpr), qRound(s * dpr));
@@ -62,7 +55,6 @@ QPixmap buildCollapsedFacePixmap(int size, qreal dpr) {
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::TextAntialiasing, true);
 
-    // 叠层图标（与标题栏同款：后浅前深两个圆角方块）
     const qreal cx = s / 2.0;
     const qreal top = s * 0.19;
     QColor back = ink;
@@ -76,7 +68,6 @@ QPixmap buildCollapsedFacePixmap(int size, qreal dpr) {
     frontPath.addRoundedRect(QRectF(cx - s * 0.125, top + s * 0.125, s * 0.32, s * 0.25), s * 0.065, s * 0.065);
     p.fillPath(frontPath, front);
 
-    // 名称（同一层渲染，避免"图标 + 控件文字"两层各自居中造成的廉价感）
     QFont f = QApplication::font();
     f.setPixelSize(qMax(8, qRound(s * 0.215)));
     f.setWeight(QFont::DemiBold);
@@ -91,26 +82,18 @@ QPixmap buildCollapsedFacePixmap(int size, qreal dpr) {
     return pm;
 }
 
-// §51b：收起态"外圈"（窗口 2px 边）的底色 = 小方块渐变的暗端。
-// 这样 1bit 窗口遮罩的 1px 台阶落在"深色对深色"之间，几乎看不出来（原来外圈是卡片底色 #252526，
-// 比方块底部亮，反而把那圈台阶衬出来了）。
 QString collapsedRingColor() {
     switch (igQtRenderWidget::globalStyleMode()) {
-        case 13: return QStringLiteral("#D3DBE6");   // 悬浮·浅色
-        case 14: return QStringLiteral("#1A1D22");   // 悬浮·石墨现代
-        case 15: return QStringLiteral("#16181C");   // 悬浮·石墨哑光
-        default: return QStringLiteral("#151517");   // 12 悬浮卡片 / 11 GitCode 暗色
+        case 13: return QStringLiteral("#D3DBE6");
+        case 14: return QStringLiteral("#1A1D22");
+        case 15: return QStringLiteral("#16181C");
+        default: return QStringLiteral("#151517");
     }
 }
 
-// §49：收起态小方块的样式 —— 纵向渐变 + 顶部亮边 + 1px 描边，做出"层次感"；
-// 颜色跟随全局颜色族（深色 12 / 浅色 13 / 石墨现代 14 / 石墨哑光 15）。
 QString collapsedBlockQss() {
-    // §51b：不再用"一圈亮描边"（小尺寸上方块边上一圈白边会把 1bit 窗口遮罩的台阶放大得很明显）。
-    //        现在：外侧只留极淡的深色描边（把边缘"收"住），顶部保留一丝高光做层次；
-    //        方块**内缩 2px**，让 QSS 自绘的抗锯齿圆角落在窗口遮罩之内，可见边就是平滑的那条。
     switch (igQtRenderWidget::globalStyleMode()) {
-        case 13:   // 悬浮·浅色
+        case 13:
             return QStringLiteral(
                     "QPushButton#TreeDockCollapsedButton {"
                     " color: #1F2A3A; font-size: 11px; font-weight: 600;"
@@ -130,7 +113,7 @@ QString collapsedBlockQss() {
                     " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
                     "                             stop:0 #E2E8F0, stop:1 #D3DBE6);"
                     "}");
-        case 14:   // 悬浮·石墨现代
+        case 14:
             return QStringLiteral(
                     "QPushButton#TreeDockCollapsedButton {"
                     " color: #D5DAE1; font-size: 11px; font-weight: 600;"
@@ -150,7 +133,7 @@ QString collapsedBlockQss() {
                     " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
                     "                             stop:0 #20242A, stop:1 #1A1D22);"
                     "}");
-        case 15:   // 悬浮·石墨哑光
+        case 15:
             return QStringLiteral(
                     "QPushButton#TreeDockCollapsedButton {"
                     " color: #D9DDE3; font-size: 11px; font-weight: 600;"
@@ -170,7 +153,7 @@ QString collapsedBlockQss() {
                     " background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
                     "                             stop:0 #1C1F25, stop:1 #16181C);"
                     "}");
-        default:   // 12 悬浮卡片 / 11 GitCode 暗色：贴合卡片的 #252526 底色
+        default:
             return QStringLiteral(
                     "QPushButton#TreeDockCollapsedButton {"
                     " color: #C6C6C6; font-size: 11px; font-weight: 600;"
@@ -201,7 +184,7 @@ void applyRoundedMask(QWidget* w, int radius) {
     path.addRoundedRect(QRectF(r), radius, radius);
     w->setMask(QRegion(path.toFillPolygon().toPolygon()));
 }
-} // namespace
+}
 #include <qaction.h>
 #include <qdebug.h>
 #include <qmenu.h>
@@ -217,14 +200,8 @@ public:
         : QWidget(parent), m_dock(dock) {
         setObjectName("DockTitleBar");
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        // 标题栏保持适度高度：左侧竖条向下延伸，底端横线作为标题/内容分隔
-        // §50：38 → 40，给微渐变/高光/装饰图标留出呼吸空间
         setFixedHeight(kDockTitleBarHeight);
-        // 自定义 QWidget 必须开启 StyledBackground，QSS 的 background-color/border 才会绘制
         setAttribute(Qt::WA_StyledBackground, true);
-        // 标题栏底色/圆角由 paintEvent 用抗锯齿路径绘制；
-        // QSS 这里只保留一个不透明底色（注意不能用 background: transparent，
-        // 那会让 Qt 把整块控件当透明处理，连 paintEvent 的输出一起丢掉）。
         setStyleSheet(
                 "DockTitleBar {"
                 "  background-color: #252526;"
@@ -246,7 +223,6 @@ public:
                 "}");
 
         auto* layout = new QHBoxLayout(this);
-        // §50c：左边距留给 paintEvent 画的"叠层图标"，文字从 kTitleLabelLeft 开始
         layout->setContentsMargins(kTitleLabelLeft, 0, 8, 0);
         layout->setSpacing(6);
 
@@ -255,7 +231,6 @@ public:
         m_titleLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         layout->addWidget(m_titleLabel);
 
-        // §49：收起按钮（仅悬浮时显示）——点击后整块树卡片收成一个主题色小方块
         m_collapseBtn = new QPushButton(QStringLiteral("–"), this);
         m_collapseBtn->setObjectName("DockTitleCollapseButton");
         m_collapseBtn->setFixedSize(22, 22);
@@ -281,7 +256,6 @@ public:
             connect(m_closeBtn, &QPushButton::clicked, m_dock, &QDockWidget::close);
         }
 
-        // 按当前全局主题初始化标题栏配色（文字/图标/底图）
         applyTheme();
     }
 
@@ -289,16 +263,12 @@ public:
         if (m_titleLabel) m_titleLabel->setText(t);
     }
 
-    // §49：收起回调（由 igQtModelDialogWidget 注入）；收起按钮只在悬浮时显示
     void setCollapseVisible(bool visible) {
         if (m_collapseBtn) m_collapseBtn->setVisible(visible);
     }
     std::function<void()> onCollapse;
 
-    // 按全局风格模式刷新标题栏配色；切换主题时由 igQtMainWindow::applyStyleMode 调用
     void applyTheme() {
-        // §45：浅色族判断统一走 globalLightBackground()（含 13 悬浮·浅色），
-        //      否则浅色变体上会出现白字压浅底。
         const bool light = igQtRenderWidget::globalLightBackground();
 
         if (m_titleLabel) {
@@ -310,7 +280,6 @@ public:
             }
             m_titleLabel->setStyleSheet(labelStyle);
         }
-        // 幽灵 × 按钮：平时透明，hover 才高亮；颜色随主题切换
         if (m_closeBtn) {
             if (light) {
                 m_closeBtn->setStyleSheet(
@@ -328,7 +297,6 @@ public:
                         "QPushButton#DockTitleCloseButton:hover { background-color: rgba(255,255,255,0.10); }");
             }
         }
-        // §49：收起按钮与关闭按钮同款幽灵样式
         if (m_collapseBtn) {
             if (light) {
                 m_collapseBtn->setStyleSheet(
@@ -384,10 +352,7 @@ protected:
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing, true);
         const QRect r = rect();
-        // 按全局风格模式适配：0=原始深色(中性灰) 1=现代深色(青蓝) 2=浅色 3=石墨深色
         const int styleMode = igQtRenderWidget::globalStyleMode();
-        // §45：悬浮卡片的换色变体沿用各自颜色族的标题栏配色（13→2 / 14→9 / 15→10），
-        //      但外形仍按"卡片布局"处理（styleMode 保留原值）。
         int mode = styleMode;
         if (mode == 13) mode = 2;
         else if (mode == 14) mode = 9;
@@ -395,62 +360,62 @@ protected:
 
         QColor titleBg, accent, bottomLine;
         switch (mode) {
-            case 0:  // 原始深色：中性灰，避免偏蓝
+            case 0:
                 titleBg    = QColor("#2D2D30");
                 accent     = QColor("#3F3F46");
                 bottomLine = QColor(255, 255, 255, 40);
                 break;
-            case 1:  // 现代深色：青蓝
+            case 1:
                 titleBg    = QColor("#2A3648");
                 accent     = QColor("#38BDF8");
                 bottomLine = QColor(56, 189, 248, 115);
                 break;
-            case 2:  // 浅色：浅灰蓝 + 蓝色强调
+            case 2:
                 titleBg    = QColor("#E4E9EF");
                 accent     = QColor("#3B82F6");
                 bottomLine = QColor("#8DA2B8");
                 break;
-            case 3:  // 石墨深色：扁平灰黑
+            case 3:
                 titleBg    = QColor("#2B2D30");
                 accent     = QColor("#4A4E54");
                 bottomLine = QColor(255, 255, 255, 30);
                 break;
-            case 4:  // 深空青蓝：深灰 + 蓝青
+            case 4:
                 titleBg    = QColor("#24282E");
                 accent     = QColor("#4DD0E1");
                 bottomLine = QColor(77, 208, 225, 115);
                 break;
-            case 6:  // 工作台：深灰 + 蓝青
+            case 6:
                 titleBg    = QColor("#24282E");
                 accent     = QColor("#4DD0E1");
                 bottomLine = QColor(77, 208, 225, 115);
                 break;
-            case 7:  // 石墨·视图栏：扁平灰黑
+            case 7:
                 titleBg    = QColor("#2B2D30");
                 accent     = QColor("#4A4E54");
                 bottomLine = QColor(255, 255, 255, 30);
                 break;
-            case 8:  // 深空·视图栏：深灰 + 蓝青
+            case 8:
                 titleBg    = QColor("#24282E");
                 accent     = QColor("#4DD0E1");
                 bottomLine = QColor(77, 208, 225, 115);
                 break;
-            case 9:  // 石墨·现代：分层深灰 + 低饱和蓝
+            case 9:
                 titleBg    = QColor("#22262C");
                 accent     = QColor("#6C8EAE");
                 bottomLine = QColor(108, 142, 174, 90);
                 break;
-            case 10: // 石墨·哑光：纯哑光深灰 + 暗青灰强调
+            case 10:
                 titleBg    = QColor("#20242A");
                 accent     = QColor("#2A303A");
                 bottomLine = QColor(42, 48, 58, 120);
                 break;
-            case 11: // GitCode 暗色：纯灰阶
+            case 11:
                 titleBg    = QColor("#252526");
                 accent     = QColor("#37373D");
                 bottomLine = QColor(55, 55, 61, 120);
                 break;
-            case 12: // 悬浮卡片：标题栏整行保持之前的灰色 + 底部可见淡细线
+            case 12:
                 titleBg    = QColor("#252526");
                 accent     = QColor("#37373D");
                 bottomLine = QColor("#4A4D52");
@@ -462,10 +427,6 @@ protected:
                 break;
         }
 
-        // 圆角标题栏：直接填充“圆角路径”（fillPath 走抗锯齿），
-        // 不能用 setClipPath()——裁剪路径是 1bit 的，Antialiasing 对裁剪无效，弧线必然呈阶梯。
-        // 悬浮卡片(12) 统一 8px，与中央视口 / 悬浮卡片一致；其余原本圆角的主题沿用原半径。
-        // §45：13/14/15 也是卡片布局，圆角同样按 8px（判断用原始 styleMode）。
         const bool rounded = (mode == 9 || mode == 10 || mode == 11 || mode == 12 || styleMode >= 12);
         const qreal radius = (styleMode >= 12) ? 8.0 : ((mode == 9) ? 6.0 : 4.0);
         QPainterPath titlePath;
@@ -475,7 +436,6 @@ protected:
             titlePath.addRect(QRectF(r));
         }
 
-        // §50 方案 A′：不再用单色平铺，改成"同一底色的浅→深"纵向微渐变（不引入新颜色）。
         const bool light = igQtRenderWidget::globalLightBackground();
         const QColor bgTop = light ? titleBg.lighter(104) : titleBg.lighter(112);
         QLinearGradient bgGrad(0, 0, 0, r.height());
@@ -483,19 +443,15 @@ protected:
         bgGrad.setColorAt(1.0, titleBg);
         p.fillPath(titlePath, bgGrad);
 
-        // 顶部 1px 高光：深色族用低透明白，浅色族用低透明黑（都是"该主题自己的明暗方向"）
         const QColor highlight = light ? QColor(0, 0, 0, 16) : QColor(255, 255, 255, 15);
         QPainterPath hiPath;
         hiPath.addRect(QRectF(r.left() + 6, r.top(), r.width() - 12, 1));
         p.fillPath(hiPath.intersected(titlePath), highlight);
 
-        // ---- 左侧只保留叠层图标（§50c：按用户意见去掉胶囊强调与抓握点）----
-        // accent 原本只给左侧胶囊用，去掉后这里显式标记未使用；颜色表保留以便将来复用。
         Q_UNUSED(accent);
         const int cy = r.height() / 2;
         {
             const int x = kTitleLeftPad;
-            // 叠层图标：两个圆角方块（后浅前深），用标题文字色的两档透明度（不引入新颜色）
             const QColor iconBase = light ? QColor("#1A1A1A") : QColor("#FFFFFF");
             QColor back = iconBase;
             back.setAlpha(55);
@@ -509,7 +465,6 @@ protected:
             p.fillPath(frontPath.intersected(titlePath), front);
         }
 
-        // 底部分隔线：1px、中间实两端淡出（颜色仍是各主题原有的 bottomLine）
         {
             QColor line = bottomLine;
             line.setAlpha(qMin(255, int(line.alpha() * 0.95)));
@@ -530,7 +485,7 @@ private:
     QDockWidget* m_dock = nullptr;
     QLabel* m_titleLabel = nullptr;
     QPushButton* m_closeBtn = nullptr;
-    QPushButton* m_collapseBtn = nullptr;   // §49：收起按钮
+    QPushButton* m_collapseBtn = nullptr;
     bool m_dragging = false;
     QPoint m_dragOffset;
 };
@@ -613,7 +568,6 @@ igQtModelDialogWidget::igQtModelDialogWidget(QWidget* parent) : QObject(parent),
     modelTreeWidget = ui->modelTreeWidget;
     propertyWidget = ui->propertyWidget;
 
-    // 紧凑布局：给树/属性面板一个较窄的默认宽度（200~240），避免左侧占用过多显示空间
     int totalWidth = parent ? qBound(200, parent->width() / 10, 240) : 220;
 
     // 上半部分：圖層/模型樹 Dock（可單獨拖出懸浮）
@@ -631,7 +585,6 @@ igQtModelDialogWidget::igQtModelDialogWidget(QWidget* parent) : QObject(parent),
     // 自定义标题栏（用于无边框 floating 时提供可拖拽移动）
     auto* treeTitle = new DockTitleBar(m_treeDock, m_treeDock->windowTitle(), m_treeDock);
     m_treeDock->setTitleBarWidget(treeTitle);
-    // §49：收起/展开接线（收起按钮只在悬浮时显示）
     m_treeTitleBar = treeTitle;
     treeTitle->onCollapse = [this]() { setTreeDockCollapsed(true); };
     m_setCollapseVisible = [treeTitle](bool visible) { treeTitle->setCollapseVisible(visible); };
@@ -657,17 +610,14 @@ igQtModelDialogWidget::igQtModelDialogWidget(QWidget* parent) : QObject(parent),
             // 關閉透明背景：使用樣式表來控制外觀與邊框
             m_treeDock->setAttribute(Qt::WA_TranslucentBackground, false);
             m_treeDock->show();
-            // 棱角分明：清除圆角蒙版
             m_treeDock->setMask(QRegion());
         } else {
             // 回到 docked：让 Qt 恢复正常 DockWidget 行为
-            // §49：停靠态不支持收起，先还原（否则会留一个小方块在停靠区）
             setTreeDockCollapsed(false);
             m_treeDock->setWindowFlags(Qt::Widget);
             m_treeDock->show();
             m_treeDock->setMask(QRegion());
         }
-        // §49：收起按钮只在悬浮（卡片态）时出现
         if (m_setCollapseVisible) m_setCollapseVisible(floating && !m_treeCollapsed);
     });
     m_treeDock->installEventFilter(this);
@@ -693,15 +643,12 @@ igQtModelDialogWidget::igQtModelDialogWidget(QWidget* parent) : QObject(parent),
 
     modelTreeWidget->setColumnCount(2);
     modelTreeWidget->header()->hide();
-    // 两列随窗口宽度自适应：名字列占 36%（原 42%，收窄一点），右侧属性列占剩余（更大）。
     modelTreeWidget->setLeftColumnPercent(36);
-    // 底部横向滚动条不好看，且列宽已按视口宽度自适应，直接隐藏（不会因此看不全内容）
     modelTreeWidget->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     // 减小缩进，让模型和 attribute 文本更靠近左侧
     modelTreeWidget->setIndentation(8);
     modelTreeWidget->setAlternatingRowColors(true);
     modelTreeWidget->setUniformRowHeights(true);
-    // 紧凑行高与图标：20px 按钮 + 24px 行高即可完整显示
     modelTreeWidget->setIconSize(QSize(16, 16));
     modelTreeWidget->setStyleSheet(modelTreeWidget->styleSheet() +
                                    QStringLiteral("QTreeView::item{height:24px;}"
@@ -719,7 +666,6 @@ igQtModelDialogWidget::igQtModelDialogWidget(QWidget* parent) : QObject(parent),
 
 
     propertyWidget->setHeaderVisible(false);
-    // 属性浏览器紧凑化：12px 字体，避免名称/值两列被大字号撑得过宽
     propertyWidget->setStyleSheet(QStringLiteral(
             "QTreeView { font-size: 12px; }"
             "QLabel { font-size: 12px; }"
@@ -791,16 +737,12 @@ void igQtModelDialogWidget::refreshStyle() {
             bar->applyTheme();
         }
     }
-    // §49：收起态小方块的配色也要跟着主题走
     refreshCollapsedBlockStyle();
-    // 模型信息页文字是动态创建并按当时主题上色的，切主题时要重建，避免浅色/深色文字残留
     if (ui && ui->ModelInformationWidget) {
         ui->ModelInformationWidget->updateInformationFrame();
     }
 }
 
-// §49：收起态小方块的样式刷新（按当前颜色族）
-// §51：同时把"面"（叠层图标 + 名称）重画成图标 —— 收起态与标题栏用同一套视觉语言
 void igQtModelDialogWidget::refreshCollapsedBlockStyle() {
     if (!m_collapsedBlock) return;
     m_collapsedBlock->setStyleSheet(collapsedBlockQss());
@@ -809,11 +751,10 @@ void igQtModelDialogWidget::refreshCollapsedBlockStyle() {
         if (m_treeDock) {
             if (QScreen* scr = m_treeDock->screen()) dpr = scr->devicePixelRatio();
         }
-        const int faceSize = kTreeCollapsedSize - 4;   // §51b：方块内缩 2px，面按内层尺寸画
+        const int faceSize = kTreeCollapsedSize - 4;
         btn->setIcon(QIcon(buildCollapsedFacePixmap(faceSize, dpr)));
         btn->setIconSize(QSize(faceSize, faceSize));
     }
-    // §51b：收起态外圈底色跟着颜色族（同时让遮罩台阶"藏"在深色里）
     if (m_treeDock && m_treeCollapsed) {
         m_treeDock->setStyleSheet(
                 QStringLiteral("QDockWidget#LayerTreeDock { background-color: %1; border: none; }")
@@ -821,36 +762,29 @@ void igQtModelDialogWidget::refreshCollapsedBlockStyle() {
     }
 }
 
-// §49：模型树卡片收起 / 展开。
-//   收起：内容与标题栏隐藏（不重 parent、不切换 titleBarWidget，避免打断树内 itemWidget 状态/
-//         旧标题栏被销毁），用一个内缩 2px 的圆角渐变小方块做"收起态"，右下角保持不动；
-//   展开：还原内容/标题栏/最小尺寸与原几何（尺寸和位置都回到收起前）。
 void igQtModelDialogWidget::setTreeDockCollapsed(bool collapsed) {
     if (!m_treeDock) return;
     if (collapsed == m_treeCollapsed) return;
-    // 停靠态不做收起（会变成停靠区里的一个小方块，很怪）
     if (collapsed && !m_treeDock->isFloating()) return;
 
     if (collapsed) {
         m_treeGeomBeforeCollapse = m_treeDock->geometry();
         m_treeMinBeforeCollapse = m_treeDock->minimumSize();
-        m_treeDockSavedStyleSheet = m_treeDock->styleSheet();   // §51b：收起时改外圈底色，展开时还原
+        m_treeDockSavedStyleSheet = m_treeDock->styleSheet();
         m_treeCollapsed = true;
 
-        // 内容与标题栏都藏起来（标题栏**不切换**：setTitleBarWidget 会销毁旧标题栏，风险大）
         if (QWidget* content = m_treeDock->widget()) content->hide();
         if (m_treeTitleBar) m_treeTitleBar->hide();
 
         if (!m_collapsedBlock) {
             auto* block = new QPushButton(m_treeDock);
             block->setObjectName(QStringLiteral("TreeDockCollapsedButton"));
-            block->setCursor(Qt::SizeAllCursor);   // §49b：可拖动
+            block->setCursor(Qt::SizeAllCursor);
             block->setFocusPolicy(Qt::NoFocus);
-            // §51：不再用控件文字；"叠层图标 + 名称"由图标位图一次性渲染（同一层，居中对齐更稳）
             block->setText(QString());
             block->setToolTip(QStringLiteral("点击展开模型树；按住可拖动"));
             connect(block, &QPushButton::clicked, this, [this]() { setTreeDockCollapsed(false); });
-            block->installEventFilter(this);        // §49b：拖动/点击判定
+            block->installEventFilter(this);
             m_collapsedBlock = block;
         }
         refreshCollapsedBlockStyle();
@@ -858,24 +792,18 @@ void igQtModelDialogWidget::setTreeDockCollapsed(bool collapsed) {
         m_treeDock->setMinimumSize(kTreeCollapsedSize, kTreeCollapsedSize);
         m_treeDock->setMaximumSize(kTreeCollapsedSize, kTreeCollapsedSize);
         m_treeDock->resize(kTreeCollapsedSize, kTreeCollapsedSize);
-        // §49c：锚点必须用**实际**尺寸 —— Qt 可能因为最小尺寸/布局把窗口撑得比请求值大，
-        //        用请求值算锚点会让"收起→展开"每循环一次漂移几像素。这里改成 resize 后回读 size()。
         const QSize actual = m_treeDock->size();
         const QRect g = m_treeGeomBeforeCollapse;
         m_treeDock->move(g.right() - actual.width() + 1, g.bottom() - actual.height() + 1);
 
-        // §51b：方块**内缩 2px**，让 QSS 自绘的抗锯齿圆角落在 1bit 窗口遮罩之内 ——
-        //        可见的那条边就是平滑的 AA 边，遮罩的 1px 台阶被留在外圈，且外圈不再有亮描边。
         m_collapsedBlock->setParent(m_treeDock);
         m_collapsedBlock->setGeometry(2, 2, qMax(8, actual.width() - 4), qMax(8, actual.height() - 4));
         m_collapsedBlock->raise();
         m_collapsedBlock->show();
         m_treeDock->show();
-        // §51c：记下"方块此刻所在矩形"——展开时用它当基准算用户挪动的位移量（不影响下一轮的基准）
         m_blockRectAtCollapse = m_treeDock->geometry();
     } else {
         m_treeCollapsed = false;
-        // §51b：还原 dock 自身的样式表（收起时为了压暗外圈临时改过）
         m_treeDock->setStyleSheet(m_treeDockSavedStyleSheet);
         if (m_collapsedBlock) m_collapsedBlock->hide();
         if (m_treeTitleBar) m_treeTitleBar->show();
@@ -885,15 +813,11 @@ void igQtModelDialogWidget::setTreeDockCollapsed(bool collapsed) {
         if (QWidget* content = m_treeDock->widget()) content->show();
         const QRect g = m_treeGeomBeforeCollapse;
         if (g.isValid() && !g.isEmpty()) {
-            // §51c：展开位置 = 保存的"展开态矩形" + 用户把方块挪动的位移量。
-            //   位移量以**收起那一刻方块所在位置**为基准计算（m_blockRectAtCollapse），
-            //   所以连续"收起→展开"不会累积任何漂移：没挪动时 delta == 0，就是精确回原位；
-            //   真拖动过则平移相同距离出现在你放下的位置。
             const QPoint delta = m_treeDock->geometry().topLeft() - m_blockRectAtCollapse.topLeft();
             QRect target = g.translated(delta);
             clampRectToAvailable(target, m_treeDock);
             m_treeDock->resize(target.size());
-            const QSize actual = m_treeDock->size();          // 布局可能让实际尺寸 ≠ 请求尺寸
+            const QSize actual = m_treeDock->size();
             QRect actualRect(target.topLeft(), actual);
             clampRectToAvailable(actualRect, m_treeDock);
             m_treeDock->setGeometry(actualRect);
@@ -1037,9 +961,6 @@ int igQtModelDialogWidget::addDataObjectToModelTree(iGame::DataObject::Pointer o
 }
 
 bool igQtModelDialogWidget::eventFilter(QObject* watched, QEvent* event) {
-    // §49b：收起态小方块支持拖动（拖得动就移动整块，几乎没动就当成"点击 → 展开"）。
-    // 这里不吞掉 Press：让按钮自己拿到按下事件，Qt 才会建立隐式鼠标抓取，
-    // 拖动过程中即使光标移出小方块也仍能收到 Move。
     if (watched == m_collapsedBlock && m_treeCollapsed && m_treeDock) {
         if (event->type() == QEvent::MouseButtonPress) {
             auto* me = static_cast<QMouseEvent*>(event);
@@ -1054,10 +975,9 @@ bool igQtModelDialogWidget::eventFilter(QObject* watched, QEvent* event) {
                 const QPoint target = me->globalPos() - m_blockDragOffset;
                 if (!m_blockDragged &&
                     (target - m_treeDock->frameGeometry().topLeft()).manhattanLength() > 8) {
-                    m_blockDragged = true;   // 超过 8px 才算拖动（点击抖动不会被当成拖动）
+                    m_blockDragged = true;
                 }
                 if (m_blockDragged) {
-                    // §49d：小方块也不允许被拖出屏幕可用区
                     QRect r(QPoint(0, 0), m_treeDock->size());
                     r.moveTopLeft(target);
                     clampRectToAvailable(r, m_treeDock);
@@ -1070,7 +990,7 @@ bool igQtModelDialogWidget::eventFilter(QObject* watched, QEvent* event) {
                 m_blockDragActive = false;
                 if (m_blockDragged) {
                     m_blockDragged = false;
-                    return true;   // 拖动结束：吞掉 release，避免再触发 clicked（那会展开）
+                    return true;
                 }
             }
         }
@@ -1154,7 +1074,6 @@ void igQtModelDialogWidget::updateCurrentModelProperty() {
     if (!scene) return;
     auto model = scene->GetCurrentModel();
     if (!model) {
-        // 没有模型（例如删掉了最后一个）：禁用并清零属性，避免残留已删除模型的值
         prop_PointSize->setEnabled(false);
         prop_PointSize->setValue(0);
         pror_LineWidth->setEnabled(false);
@@ -1250,9 +1169,6 @@ void igQtModelDialogWidget::deleteCurrentModel() {
     const int removedIndex = modelTreeWidget->indexOfTopLevelItem(currentItem);
     if (removedIndex != -1) { delete modelTreeWidget->takeTopLevelItem(removedIndex); }
 
-    // QTreeWidget 在移除项时会自己改选中项，但那条路径不会发出 ChangeCurrentModel，
-    // 所以这里必须显式选中"留下的那个模型"，并主动刷新属性栏/模型信息/顶栏模型名，
-    // 否则它们会继续显示被删除模型的信息。
     ModelTreeWidgetItem* nextItem = nullptr;
     const int count = modelTreeWidget->topLevelItemCount();
     if (count > 0) {
@@ -1324,10 +1240,8 @@ void igQtModelDialogWidget::positionTreeDockToRendererCorner(QWidget* rendererWi
     // 關閉透明背景，讓樣式表的背景與邊框生效
     m_treeDock->setAttribute(Qt::WA_TranslucentBackground, false);
 
-    // 先设置窗口大小（紧凑：与树列宽 110+140 匹配，约 300 即可）
-    // §49：收起态保持小方块尺寸，别在这儿被撑回 300×250
-    int dockWidth = m_treeCollapsed ? kTreeCollapsedSize : 300;  // 悬浮窗口宽度
-    int dockHeight = m_treeCollapsed ? kTreeCollapsedSize : 250; // 悬浮窗口高度
+    int dockWidth = m_treeCollapsed ? kTreeCollapsedSize : 300;
+    int dockHeight = m_treeCollapsed ? kTreeCollapsedSize : 250;
     m_treeDock->resize(dockWidth, dockHeight);
     m_treeDock->show(); // window flags 变更后需要 show()
     

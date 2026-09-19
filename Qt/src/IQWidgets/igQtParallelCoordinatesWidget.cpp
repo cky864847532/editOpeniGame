@@ -1,7 +1,7 @@
 #include "iGameSceneManager.h"
 #include <IQComponents/Dialog/igQtParallelCoordinatesSortVariableDialog.h>
 #include <IQWidgets/igQtParallelCoordinatesWidget.h>
-#include <IQWidgets/igQtRenderWidget.h>   // §57：面板主题化（角色色）
+#include <IQWidgets/igQtRenderWidget.h>
 #include <QElapsedTimer>
 #include <QRgb>
 #include <algorithm>
@@ -386,8 +386,6 @@ void igQtParallelCoordinatesWidget::UpdateUnChoosedColor() {
 }
 
 void igQtParallelCoordinatesWidget::UpdateBackgroundColor() {
-    // §57：原来是写死的浅灰底 {242,242,242}（深色主题下会白得刺眼）；
-    //       改为跟随主题的角色色（深色族 ≈ #2A2A2A，浅色 / 悬浮·浅色族为浅底）
     const QColor c = igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::CardBg);
     m_BackgroundColor = {c.red(), c.green(), c.blue()};
     return;
@@ -678,7 +676,6 @@ void igQtParallelCoordinatesWidget::DrawStrs(std::vector<QRect>& variableMaxFont
                                              std::vector<QRect>& variableNameFontPoints) {
     auto& Data = m_ParallelCoordinatesDatas[m_CurrentModelDataIndex];
     QPainter painter(this);
-    // §57：标签笔色原来用默认黑笔（深色底上看不见）→ 走角色色（Text）
     QPen pen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text));
     pen.setWidth(10);
     QFont font;
@@ -699,7 +696,6 @@ void igQtParallelCoordinatesWidget::DrawStrs(std::vector<QRect>& variableMaxFont
 void igQtParallelCoordinatesWidget::DrawLinkImage(QRect& linkImageArea) {
     QPainter painter(this);
     if (m_ImageLoading) {
-        // §57：同 DrawStrs —— 笔色走角色色，避免深底黑字
         QPen pen(igQtRenderWidget::uiRole(igQtRenderWidget::UiRole::Text));
         pen.setWidth(10);
         QFont font;
@@ -1030,8 +1026,6 @@ void igQtParallelCoordinatesWidget::GetDrawWidgetRect(QRect& frame) {
     frame = drawWidgetRect;
 }
 
-// §57：切主题 → 重算绘图底色/文字色（角色色）并重绘。本面板 .ui 没有自带样式表，
-//       配色走"绘制时取角色色"这条路，不需要 igQtPanelTheme。
 void igQtParallelCoordinatesWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         UpdateBackgroundColor();

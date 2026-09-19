@@ -1,5 +1,5 @@
 #include <IQWidgets/igQtAttributeSelectWidget.h>
-#include <IQWidgets/igQtRenderWidget.h>   // §45：浅色族下适配自带深色样式
+#include <IQWidgets/igQtRenderWidget.h>
 
 #include <IQComponents/Dialog/igQtDarkFramelessMessage.h>
 #include <iGameAttributeSet.h>
@@ -8,9 +8,9 @@
 #include "MeshReport/iGameMeshReportGenerator.h"
 
 #include <QFileDialog>
-#include <QEvent>          // §63：changeEvent(QEvent*) 需要完整类型
-#include <QTimer>          // §70：显示后兜底重绘
-#include <QStyle>          // §70：unpolish/polish
+#include <QEvent>
+#include <QTimer>
+#include <QStyle>
 #include <QHBoxLayout>
 #include <QThread>
 #include <QSettings>
@@ -70,9 +70,6 @@ QCheckBox:hover {
 }
 )";
 
-// §68：本面板的"深色模板"—— 作为**唯一底稿**。每次按当前主题 themeRemapQss() 重新生成，
-//      不再依赖"attach 时捕获到的当前 QSS"（那种做法受创建时机影响：若创建时全局模式尚未
-//      跟上，就会按旧主题配色生成，表现为"打开时是黑的、切两次风格回来才对"）。
 const char* kPanelDarkQss = R"(
 igQtAttributeSelectWidget { background-color: #222222; }
 QLabel { color: rgba(255,255,255,204); font-size: 10pt; }
@@ -121,8 +118,6 @@ void igQtAttributeSelectWidget::setupUI() {
 
     m_container = new QWidget();
     m_container->setObjectName("attrContainer");
-    // §69：纯 QWidget 必须带 WA_StyledBackground，样式表里的 background-color 才会真的画出来；
-    //      否则它下面的 viewport 会按 palette(Base)（深色）显出来 —— 浅色主题下的"黑底"。
     m_container->setAttribute(Qt::WA_StyledBackground, true);
     m_container->setLayout(new QVBoxLayout());
     m_container->layout()->setContentsMargins(4, 4, 4, 4);
@@ -152,24 +147,15 @@ void igQtAttributeSelectWidget::setupUI() {
     connect(m_configBtn, &QPushButton::clicked, this, &igQtAttributeSelectWidget::onConfigClicked);
     connect(m_btnGenerate, &QPushButton::clicked, this, &igQtAttributeSelectWidget::onGenerateClicked);
 
-    // §68：以"深色模板"为唯一底稿按当前主题生成（见 applyThemeQss 注释）
     applyThemeQss();
-    applyPaletteTheme();   // §71
+    applyPaletteTheme();
 }
 
 void igQtAttributeSelectWidget::setStatus(const QString& msg) {
     m_statusLabel->setText(msg);
 }
 
-// §68：本面板唯一底稿 = 编译期"深色模板"（kPanelDarkQss / kDarkButtonQss / kCheckBoxQss /
-//      kSectionLabelDarkQss）。每次按**当前**主题 themeRemapQss() 重新生成，并把底稿登记到
-//      动态属性 igPanelBaseQss —— 这样：
-//        ① 打开面板时一定用当前主题（不再受"创建时全局模式是否已跟上"影响）；
-//        ② 切主题时宿主对话框的 refreshDeep 也按同一底稿刷新，两条路径结果一致。
 void igQtAttributeSelectWidget::applyThemeQss() {
-    // §68b：必须有重入/幂等保护！setStyleSheet() 会**同步**发出 StyleChange → changeEvent
-    //        又调用本函数；若每次都无条件 setStyleSheet 就会无限递归 → 栈溢出崩溃。
-    //        双重保护：① 字符串相同就不设置；② 重入标志。
     if (m_applyingTheme) return;
     m_applyingTheme = true;
 
@@ -198,11 +184,9 @@ void igQtAttributeSelectWidget::applyThemeQss() {
     m_applyingTheme = false;
 }
 
-// §71：QSS 已证明生成正确，但"首次显示"时这些控件仍按 palette(Base/Window) 渲染（应用级 palette 是深色）
-//      → 直接**用代码设 palette/前景**，彻底摆脱"选择器匹配 + 首帧 polish 时机"的影响。
 void igQtAttributeSelectWidget::applyPaletteTheme() {
     using Role = igQtRenderWidget::UiRole;
-    const QColor areaBg = igQtRenderWidget::uiRole(Role::PanelBg2);   // 浅色=#FFFFFF / 深色=#1E1E1E
+    const QColor areaBg = igQtRenderWidget::uiRole(Role::PanelBg2);
     const QColor fg = igQtRenderWidget::uiRole(Role::Text);
 
     if (m_statusLabel) {
@@ -221,10 +205,6 @@ void igQtAttributeSelectWidget::applyPaletteTheme() {
         w->update();
     };
     if (m_scrollArea) {
-        // §72：滚动区**自己**的样式表也用角色色当场生成（不再经过"模板→重映射"这条链路）。
-        //      之前症状：标签文字（代码设色）已正确，但列表区仍黑 → 说明这块是样式表在画，
-        //      而它拿到的仍是深色值。这里给 QScrollArea / viewport / 容器三个选择器都写上当前配色，
-        //      控件的**自身**样式表优先级高于面板 QSS，因此必然生效。
         const QColor border = igQtRenderWidget::uiRole(Role::Border);
         m_scrollArea->setStyleSheet(QStringLiteral(
                 "QScrollArea { background-color: %1; border: 1px solid %2; border-radius: 4px; }"
@@ -240,10 +220,7 @@ void igQtAttributeSelectWidget::applyPaletteTheme() {
 
 void igQtAttributeSelectWidget::showEvent(QShowEvent* e) {
     applyThemeQss();
-    applyPaletteTheme();   // §71
-    // §70：首次显示时，滚动区 viewport / 容器可能已按旧 palette 画过，或没跟上刚设的样式表
-    //      → 强制重新 polish + 全链重绘（外加一次下一轮事件循环的重绘兜底）。
-    //      症状正是"打开时仍有黑块，切一次风格就正常"（样式本身没问题，只是少一次重绘）。
+    applyPaletteTheme();
     if (style()) {
         style()->unpolish(this);
         style()->polish(this);
@@ -374,9 +351,6 @@ void igQtAttributeSelectWidget::RefreshAttributeList() {
         delete it;
     }
 
-    // §63：这里用**深色原文**做"底"，交给 igQtPanelTheme 按主题重映射（不再做 §45 的浅色族硬换）
-    // §68：列表项也用"深色模板 + 当前主题重映射"生成，并登记底稿
-    //      （登记后：切主题时宿主对话框的 refreshDeep 也能刷新到它们）
     const QString cbBase = QString::fromUtf8(kCheckBoxQss);
     const QString cbThemed = igQtRenderWidget::themeRemapQss(cbBase);
     const QString sectionBase = QString::fromUtf8(kSectionLabelDarkQss);
@@ -401,7 +375,6 @@ void igQtAttributeSelectWidget::RefreshAttributeList() {
 
     containerLayout->addStretch();
 
-    // §68：本次刷新后按当前主题统一重生成（面板/按钮/复选框）
     applyThemeQss();
 
     if (m_checkBoxes.isEmpty()) {
@@ -431,8 +404,6 @@ void igQtAttributeSelectWidget::onConfigClicked() {
 
     auto* body = new QWidget(cfgDlg.contentHost());
     body->setAttribute(Qt::WA_StyledBackground, true);
-    // §63：这里同样用**深色原文**做底，随后由 igQtPanelTheme 按当前主题重映射
-    //      （原来是 §45 的浅色族硬换 → 非浅色风格一律保持深色）
     body->setStyleSheet(QStringLiteral(
         "QWidget { background-color: transparent; color: #EAEAEA; }"
         "QLabel { color: #D8D8D8; }"
@@ -457,7 +428,6 @@ void igQtAttributeSelectWidget::onConfigClicked() {
 
     cfgDlg.setContentWidget(body);
     cfgDlg.resize(300, 160);
-    // §63：配置弹窗是独立顶层窗（不继承主窗口主题 QSS）→ 同样纳入角色色重映射
     igQtPanelTheme::attachDeep(&cfgDlg);
 
     bool accepted = false;
@@ -579,12 +549,10 @@ void igQtAttributeSelectWidget::onAsyncFinished(bool success, const QString& mes
     emit SIGNAL_ReportFinished(success, message);
 }
 
-// §63/§68：切主题 → 按当前主题从"深色模板"重生成整套样式（面板/按钮/复选框）；
-//           列表里的标题标签已登记底稿，由宿主对话框的 refreshDeep 一并刷新。
 void igQtAttributeSelectWidget::changeEvent(QEvent* e) {
     if (e && e->type() == QEvent::StyleChange) {
         applyThemeQss();
-        applyPaletteTheme();   // §71
+        applyPaletteTheme();
         update();
     }
     QWidget::changeEvent(e);
