@@ -291,6 +291,9 @@ igame_add_example(testSetRenderingPressure Rendering/SetRenderingPressure.cpp)
 # Attribute
 igame_add_example(testChangeRange Attribute/TestSubDataRangeChangeAndRecollect.cpp)
 
+
+# Elevation
+igame_add_example(testElevation Filter/Elevation/TestElevation.cpp)
 # Vector / Tensor
 igame_add_example(testVector Filter/Vector/TestVector.cpp)
 igame_add_example(testTimeVaryingVector Filter/Vector/TestTimeVaryingVector.cpp)
