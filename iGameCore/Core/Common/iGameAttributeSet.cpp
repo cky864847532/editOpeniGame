@@ -263,6 +263,12 @@ bool iGame::AttributeSet::Attribute::DeepCopy(const iGame::AttributeSet::Attribu
     type = other.type;
     attachmentType = other.attachmentType;
     isDeleted = other.isDeleted;
+    rangeLocked = other.rangeLocked;
+    rangeMode = other.rangeMode;
+    rangeLockedDimension = other.rangeLockedDimension;
+    runningMin = other.runningMin;
+    runningMax = other.runningMax;
+    runningRangeValid = other.runningRangeValid;
 
     dataRange = DoubleArray::New();
     dataRange->DeepCopy(other.dataRange);
@@ -303,6 +309,8 @@ bool iGame::AttributeSet::Attribute::UpdateAllDataRange() {
         GetDataRange();
         return true;
     }
+    // 范围锁定：保留固定范围，不按数据重算（供"固定范围"开关使用）
+    if (rangeLocked) { return true; }
     int dim = this->pointer->GetDimension();
     double dimensionRanges[128];
     for (int i = 0; i < 2 * (dim + 1); i += 2) {

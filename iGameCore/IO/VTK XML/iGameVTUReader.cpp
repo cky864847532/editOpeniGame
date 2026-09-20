@@ -9,6 +9,7 @@
 
 #include "iGameFileReader.h"
 #include "iGameVTUReader.h"
+#include "iGameFileSystem.h"
 #include "iGameXMLUtils.h"
 #include "VTK/iGameVTKAbstractReader.h"
 
@@ -184,7 +185,7 @@ bool iGameVTUReader::DecodeDataArrayPayload(tinyxml2::XMLElement* element, vtkxm
     if (format != nullptr && std::strcmp(format, "appended") == 0 && m_parseRawBinaryData &&
         (context.sourceData == nullptr || context.sourceSize == 0)) {
         if (m_DataArraySourceBuffer.empty()) {
-            std::ifstream stream(m_FilePath, std::ios::binary | std::ios::ate);
+            std::ifstream stream(FileSystem::PathFromUtf8(m_FilePath), std::ios::binary | std::ios::ate);
             if (!stream) {
                 SetDataArrayDecodeError("cannot open the source file for raw AppendedData");
                 return false;
@@ -307,6 +308,58 @@ bool iGameVTUReader::ReadPointData() {
     return true;
 }
 
+ArrayObject::Pointer iGameVTUReader::ReadIntegerDataArray(const char* type, int scalarComponents) {
+    if (strcmp(type, "Int8") == 0) {
+        CharArray::Pointer arr = CharArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<char>(arr);
+        return arr;
+    }
+    if (strcmp(type, "UInt8") == 0) {
+        UnsignedCharArray::Pointer arr = UnsignedCharArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<unsigned char>(arr);
+        return arr;
+    }
+    if (strcmp(type, "Int16") == 0) {
+        ShortArray::Pointer arr = ShortArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<short>(arr);
+        return arr;
+    }
+    if (strcmp(type, "UInt16") == 0) {
+        UnsignedShortArray::Pointer arr = UnsignedShortArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<unsigned short>(arr);
+        return arr;
+    }
+    if (strcmp(type, "Int32") == 0) {
+        IntArray::Pointer arr = IntArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<int>(arr);
+        return arr;
+    }
+    if (strcmp(type, "UInt32") == 0) {
+        UnsignedIntArray::Pointer arr = UnsignedIntArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<unsigned int>(arr);
+        return arr;
+    }
+    if (strcmp(type, "Int64") == 0) {
+        LongLongArray::Pointer arr = LongLongArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<long long>(arr);
+        return arr;
+    }
+    if (strcmp(type, "UInt64") == 0) {
+        UnsignedLongLongArray::Pointer arr = UnsignedLongLongArray::New();
+        arr->SetDimension(scalarComponents);
+        ReadCurrentArray<unsigned long long>(arr);
+        return arr;
+    }
+    return nullptr;
+}
+
 bool iGameVTUReader::ReadPointAttribute() {
     const char* data;
     const char* attribute;
@@ -411,23 +464,8 @@ bool iGameVTUReader::ReadPointAttribute() {
                     }
                 }
             }
-            else if (!strncmp(type, "Int", 3)) {
-                if (strcmp(attribute, "binary") == 0) {
-                    //  Int32
-                    if (!strncmp(type + 3, "32", 2)) {
-                        IntArray::Pointer arr = IntArray::New();
-                        arr->SetDimension(scalarComponents);
-                        ReadBase64EncodedArray<int>(m_Header_8_byte_flag, data_p, arr);
-                        array = arr;
-                    }
-                    else /* Int64*/ {
-                        LongLongArray::Pointer arr = LongLongArray::New();
-                        arr->SetDimension(scalarComponents);
-                        ReadBase64EncodedArray<long long>(m_Header_8_byte_flag, data_p, arr);
-                        array = arr;
-                    }
-                }
-                else if (strcmp(attribute, "ascii") == 0) {
+            else if (!strncmp(type, "Int", 3) || !strncmp(type, "UInt", 4)) {
+                if (strcmp(attribute, "ascii") == 0) {
                     IntArray::Pointer arr = IntArray::New();
                     arr->SetDimension(scalarComponents);
                     int* ps = new int[scalarComponents];
@@ -443,29 +481,8 @@ bool iGameVTUReader::ReadPointAttribute() {
                     }
                     array = arr;
                     delete[] ps;
-                }
-                else if(strcmp(attribute, "appended") == 0){
-                    //  Int32
-                    if (!strncmp(type + 3, "32", 2)) {
-                        IntArray::Pointer arr = IntArray::New();
-                        arr->SetDimension(scalarComponents);
-                        if(m_parseRawBinaryData){
-                            ReadRawBinaryArray<int>(m_Header_8_byte_flag, data_p, arr);
-                        } else {
-                            ReadBase64EncodedArray<int>(m_Header_8_byte_flag, data_p, arr);
-                        }
-                        array = arr;
-                    }
-                    else /* Int64*/ {
-                        LongLongArray::Pointer arr = LongLongArray::New();
-                        arr->SetDimension(scalarComponents);
-                        if(m_parseRawBinaryData){
-                            ReadRawBinaryArray<long long>(m_Header_8_byte_flag, data_p, arr);
-                        } else {
-                            ReadBase64EncodedArray<long long>(m_Header_8_byte_flag, data_p, arr);
-                        }
-                        array = arr;
-                    }
+                } else if (strcmp(attribute, "binary") == 0 || strcmp(attribute, "appended") == 0) {
+                    array = ReadIntegerDataArray(type, scalarComponents);
                 }
             }
             if (array != nullptr) {
@@ -479,10 +496,17 @@ bool iGameVTUReader::ReadPointAttribute() {
 //					scalar_range_min = std::min(scalar_range_min, value);
 //                }
 //				m_Data.GetData()->AddScalar(IG_POINT, array, { scalar_range_min, scalar_range_max });
-                if(std::find(vector_names.begin(), vector_names.end(), scalarName) != vector_names.end())
+                // 以实际读入的点数为准做校验：属性元素数必须与点数一致，否则编码阶段
+                // AttrEncoder 的点重映射会越界崩溃。不一致时直接跳过该属性。
+                const IGsize actualPointCount = m_Data.GetPoints() ? m_Data.GetPoints()->GetNumberOfPoints() : 0;
+                if (m_PointsNum >= 0 && array->GetNumberOfElements() != actualPointCount) {
+                    igError("VTU point attribute '{}' size mismatch: expected {} elements, got {}; skipping attribute.",
+                            scalarName, actualPointCount, array->GetNumberOfElements());
+                } else if(std::find(vector_names.begin(), vector_names.end(), scalarName) != vector_names.end()) {
                     m_Data.GetData()->AddVector(IG_POINT, array);
-                else
+                } else {
                     m_Data.GetData()->AddScalar(IG_POINT, array);
+                }
             }
         }
         m_CurrentElem = m_CurrentElem->NextSiblingElement("DataArray");
@@ -596,23 +620,8 @@ bool iGameVTUReader::ReadCellData() {
                     }
                 }
             }
-            else if (!strncmp(type, "Int", 3)) {
-                if (strcmp(attribute, "binary") == 0) {
-                    //  Int32
-                    if (!strncmp(type + 3, "32", 2)) {
-                        IntArray::Pointer arr = IntArray::New();
-                        arr->SetDimension(scalarComponents);
-                        ReadBase64EncodedArray<int>(m_Header_8_byte_flag, data_p, arr);
-                        array = arr;
-                    }
-                    else /* Int64*/ {
-                        LongLongArray::Pointer arr = LongLongArray::New();
-                        arr->SetDimension(scalarComponents);
-                        ReadBase64EncodedArray<long long >(m_Header_8_byte_flag, data_p, arr);
-                        array = arr;
-                    }
-                }
-                else if (strcmp(attribute, "ascii") == 0) {
+            else if (!strncmp(type, "Int", 3) || !strncmp(type, "UInt", 4)) {
+                if (strcmp(attribute, "ascii") == 0) {
                     IntArray::Pointer arr = IntArray::New();
                     arr->SetDimension(scalarComponents);
                     int* ps = new int[scalarComponents];
@@ -628,29 +637,8 @@ bool iGameVTUReader::ReadCellData() {
                     }
                     array = arr;
                     delete[] ps;
-                }
-                else if (strcmp(attribute, "appended") == 0) {
-                    //  Int32
-                    if (!strncmp(type + 3, "32", 2)) {
-                        IntArray::Pointer arr = IntArray::New();
-                        arr->SetDimension(scalarComponents);
-                        if(m_parseRawBinaryData){
-                            ReadRawBinaryArray<int>(m_Header_8_byte_flag, data_p, arr);
-                        } else {
-                            ReadBase64EncodedArray<int>(m_Header_8_byte_flag, data_p, arr);
-                        }
-                        array = arr;
-                    }
-                    else /* Int64*/ {
-                        LongLongArray::Pointer arr = LongLongArray::New();
-                        arr->SetDimension(scalarComponents);
-                        if(m_parseRawBinaryData){
-                            ReadRawBinaryArray<long long >(m_Header_8_byte_flag, data_p, arr);
-                        } else {
-                            ReadBase64EncodedArray<long long>(m_Header_8_byte_flag, data_p, arr);
-                        }
-                        array = arr;
-                    }
+                } else if (strcmp(attribute, "binary") == 0 || strcmp(attribute, "appended") == 0) {
+                    array = ReadIntegerDataArray(type, scalarComponents);
                 }
             }
             if (array != nullptr) {
@@ -664,10 +652,14 @@ bool iGameVTUReader::ReadCellData() {
 //                    scalar_range_min = std::min(scalar_range_min, value);
 //                }
 //                m_Data.GetData()->AddScalar(IG_CELL, array, { scalar_range_min, scalar_range_max });
-                if(std::find(vector_names.begin(), vector_names.end(), scalarName) != vector_names.end())
+                if (m_CellsNum >= 0 && array->GetNumberOfElements() != static_cast<IGsize>(m_CellsNum)) {
+                    igError("VTU cell attribute '{}' size mismatch: expected {} elements, got {}; skipping attribute.",
+                            scalarName, m_CellsNum, array->GetNumberOfElements());
+                } else if(std::find(vector_names.begin(), vector_names.end(), scalarName) != vector_names.end()) {
                     m_Data.GetData()->AddVector(IG_CELL, array);
-                else
+                } else {
                     m_Data.GetData()->AddScalar(IG_CELL, array);
+                }
 
             }
         }

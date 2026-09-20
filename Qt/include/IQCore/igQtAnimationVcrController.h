@@ -35,6 +35,9 @@ public:
 
     void initController(int keyframeSum, int step_size);
 
+    // 当前帧在“源时间序列”中的下标（0 基）。供「转换当前帧」等功能读取。
+    int currentKeyframeIndex() const { return current_keyframe_index; }
+
     void onTick();
 
     void onPlay(bool);

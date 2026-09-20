@@ -54,6 +54,8 @@ UnstructuredMesh::UnstructuredMesh() {
 SurfaceMesh::Pointer UnstructuredMesh::TransferToSurfaceMesh() {
 
     int cellNum = this->GetNumberOfCells();
+    // A point cloud has no surface topology, even when it has coordinates.
+    if (cellNum <= 0) { return nullptr; }
     bool CouldTransfer = true;
     igIndex cellType = IG_NONE;
     for (igIndex i = 0; i < cellNum; i++) {
@@ -282,8 +284,9 @@ bool UnstructuredMesh::_GetCell(const IGsize cellId, Cell* cell) const {
             cell->m_Points->AddPoint(GetPoint(cell->m_PointIds->GetId(i)));
         }
     } else {
-        igIndex ids[IGAME_CELL_MAX_SIZE] = {};
-        igIndex size = m_Cells->GetCellIds(cellId, ids);
+        // 多面体单元的 id 列表可能超过 IGAME_CELL_MAX_SIZE(256)，改用指针版避免固定数组溢出
+        const igIndex* ids = nullptr;
+        igIndex size = static_cast<igIndex>(m_Cells->GetCellIds(cellId, ids));
         Polyhedron::Pointer polyhedron = DynamicCast<Polyhedron>(cell);
         polyhedron->m_FaceOffset->Reset();
         polyhedron->m_FaceOffset->Reserve(ids[0]);
@@ -309,6 +312,10 @@ bool UnstructuredMesh::_GetCell(const IGsize cellId, Cell* cell) const {
 Cell* UnstructuredMesh::GetTypedCell(const IGsize cellId) {
     Cell* cell = nullptr;
     switch (GetCellType(cellId)) {
+        case IG_VERTEX: {
+            if (m_Vertex == nullptr) { m_Vertex = Vertex::New(); }
+            cell = m_Vertex.get();
+        } break;
         case IG_LINE: {
             if (m_Line == nullptr) { m_Line = Line::New(); }
             cell = m_Line.get();
@@ -388,6 +395,9 @@ Cell* UnstructuredMesh::GetTypedCell(const IGsize cellId) {
 void UnstructuredMesh::GetTypedCell(const IGsize cellId, Cell::Pointer& cell) const {
     if (cell != nullptr && cell->GetCellType() == GetCellType(cellId)) return;
     switch (GetCellType(cellId)) {
+        case IG_VERTEX: {
+            cell = Vertex::New();
+        } break;
         case IG_LINE: {
             cell = Line::New();
         } break;
@@ -446,6 +456,15 @@ void UnstructuredMesh::GetTypedCell(const IGsize cellId, Cell::Pointer& cell) co
 }
 
 void UnstructuredMesh::ConvertToDrawableData() {
+    // Zero-cell datasets still contain drawable points. Do not extract an empty
+    // shell or change real VERTEX/mixed-cell topology to make them visible.
+    if (GetNumberOfPoints() > 0 && GetNumberOfCells() == 0) {
+        SetShellRenderingOption(false);
+        m_RenderableMesh.SurfaceMesh = nullptr;
+        m_RenderableMesh.SimplifiedMesh = nullptr;
+        if (m_ViewStyle == IG_SURFACE) { m_ViewStyle = IG_POINTS; }
+    }
+
     bool needReConvertGeometry = m_ReConvertToDrawableData;
     needReConvertGeometry |= m_Points->GetMTime() > m_ReConvertHelper->GetMTime();
     needReConvertGeometry |= m_Clipper->GetMTime() > m_ReConvertHelper->GetMTime();
@@ -725,7 +744,7 @@ void UnstructuredMesh::ConvertToDrawableData() {
 void UnstructuredMesh::SetAttributeWithCellData(ArrayObject::Pointer attr, DoubleArray::Pointer attrRange,
                                                 igIndex dimension) {
     /* 当pointMapper 外部更新（调整颜色映射的 Range）， 则不用调整ColorMap的范围*/
-    if (!m_ColorMapper->GetStable() && m_ColorMapper->GetMTime() <= attrRange->GetMTime()) {
+    if (!m_ColorMapper->GetStable()) {
         // Configure color mapper range using provided attrRange if available; otherwise initialize from data
         double minimal_val = attrRange ? attrRange->GetValue(2 + dimension * 2 + 0) : 0.0;
         double maximal_val = attrRange ? attrRange->GetValue(2 + dimension * 2 + 1) : 0.0;

@@ -726,6 +726,16 @@ private:
             } else {
                 // 非结构化网格：需要重映射
                 const auto& remapArray = params.attachmentType == IG_POINT ? pointRemap : topCellRemap;
+                // 属性元素数必须与网格点/单元数一致，否则下方 remapArray[j] 会越界。
+                // 数据不一致时截断到可重映射范围。ParamsEncoder 在 AttrEncoder 之后执行，
+                // 因此这里改小 elementCount 会同步写入参数块，解码端按同样数量读取，保持一致。
+                if (params.elementCount > static_cast<IGsize>(remapArray.size())) {
+                    IGAME_CORE_ERROR("AttrEncoder: attribute '{}' elementCount {} exceeds {} count {}, truncating.",
+                                     params.name, params.elementCount,
+                                     params.attachmentType == IG_POINT ? "point" : "cell",
+                                     remapArray.size());
+                    params.elementCount = static_cast<IGsize>(remapArray.size());
+                }
                 size_t valueCount = params.dimension * remapArray.size();
                 remappedBuffer.resize(valueCount);
 
@@ -764,13 +774,17 @@ private:
                 // 部署remap
                 std::vector<float> remappedFloatAttrBuffer;
                 std::vector<double> remappedDoubleAttrBuffer;
+                std::vector<unsigned char> remappedUInt8AttrBuffer;
 
                 if (attrParams.valueSize == sizeof(float)) {
                     // 直接使用attr.pointer，因为remapAttributeValues使用的是GetValue()虚函数
                     remapAttributeValues(attr.pointer, remappedFloatAttrBuffer, attrParams, i);
-                } else {
+                } else if (attrParams.valueSize == sizeof(double)) {
                     // 直接使用attr.pointer，因为remapAttributeValues使用的是GetValue()虚函数
                     remapAttributeValues(attr.pointer, remappedDoubleAttrBuffer, attrParams, i);
+                } else if (attrParams.valueSize == sizeof(unsigned char)) {
+                    // UInt8（1 字节）：按 unsigned char 无损存储
+                    remapAttributeValues(attr.pointer, remappedUInt8AttrBuffer, attrParams, i);
                 }
 
                 // 编码
@@ -826,6 +840,12 @@ private:
                                 preserve, remap, attrParams.elementCount, attrParams.dimension);
                         exportData.reconstructedDouble = RestoreAttributeOrder(
                                 remappedDoubleAttrBuffer, remap, attrParams.elementCount, attrParams.dimension);
+                    }
+                } else if (attrParams.valueSize == sizeof(unsigned char)) {
+                    // UInt8：无损原始字节拷贝
+                    encoded.resize(remappedUInt8AttrBuffer.size());
+                    if (!remappedUInt8AttrBuffer.empty()) {
+                        std::memcpy(encoded.data(), remappedUInt8AttrBuffer.data(), remappedUInt8AttrBuffer.size());
                     }
                 }
 

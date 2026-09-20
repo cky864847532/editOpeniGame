@@ -3,19 +3,29 @@
 //
 #include <iGameFileIO.h>
 #include <iGameSceneManager.h>
-#include <iGameThreadPool.h>
 
 #include <IQComponents/igQtAnimationTreeWidget_interpolate.h>
 #include <IQComponents/igQtAnimationTreeWidget_snap.h>
+#include <IQComponents/igQtFilterDialogDockWidget.h>
+#include <IQCore/igQtAnimationFilterAdapters.h>
 #include <IQCore/igQtAnimationVcrController.h>
 #include <IQCore/igQtOpenGLWidgetManager.h>
 #include <IQWidgets/igQtAnimationWidget.h>
 #include <QAbstractButton>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QFileDialog>
+#include <QMessageBox>
+#include <QMouseEvent>
+#include <QLineEdit>
+#include <QStyle>
+#include <QStyleOptionSlider>
 #include <IQComponents/Dialog/igQtDarkFramelessMessage.h>
 #include <Deformation/iGameStressDeformationFilter.h>
 #include <FeatureExtraction/iGameVortexFilter.h>
+#include <Animation/iGameAttrDiff.h>
 #include <iGameProgressObserver.h>
+#include <algorithm>
 #include <iostream>
 
 /**
@@ -26,6 +36,29 @@ igQtAnimationWidget::igQtAnimationWidget(QWidget* parent)
     : QWidget(parent), ui(new Ui::Animation) {
     ui->setupUi(this);
     VcrController = new igQtAnimationVcrController(this);
+    ui->SliderAnimationTrack->installEventFilter(this);
+
+    QString registrationError;
+    if (!igQtRegisterBuiltinAnimationFilters(
+                m_AnimationFilterManager, &registrationError)) {
+        std::cout << "[Animation][Filter] "
+                  << registrationError.toStdString() << std::endl;
+    }
+    ui->comboBoxAnimationFilter->clear();
+    ui->comboBoxAnimationFilter->addItem(QStringLiteral("无"), QString());
+    for (const auto& id : m_AnimationFilterManager.filterIds()) {
+        const auto* descriptor = m_AnimationFilterManager.descriptor(id);
+        if (descriptor) {
+            ui->comboBoxAnimationFilter->addItem(descriptor->displayName, id);
+        }
+    }
+
+    connect(ui->comboBoxAnimationFilter,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &igQtAnimationWidget::onAnimationFilterChanged);
+    connect(ui->btnAnimationFilterParameters, &QPushButton::clicked,
+            this, &igQtAnimationWidget::openAnimationFilterParameters);
+    onAnimationFilterChanged(ui->comboBoxAnimationFilter->currentIndex());
 
     connect(VcrController, &igQtAnimationVcrController::timeStepChanged_snap,
             this, &igQtAnimationWidget::playAnimation_snap);
@@ -118,15 +151,6 @@ igQtAnimationWidget::igQtAnimationWidget(QWidget* parent)
     connect(ui->spinBoxAnimationStride, QOverload<int>::of(&QSpinBox::valueChanged), this, [&](int val){
         VcrController->setStripe(ui->spinBoxAnimationStride->value());
     });
-    connect(ui->btnApplyAnimationOperation, &QPushButton::clicked, this,
-            [&](bool checked) {
-                VcrController->setStripe(ui->spinBoxAnimationStride->value());
-                ui->treeWidget_interpolate->updateInterpolateData(
-                        ui->lineEditStartTime->text().toFloat(),
-                        ui->lineEditEndTime->text().toFloat(),
-                        ui->lineEditKeyframeNum->text().toInt());
-            });
-
     auto* validator = new QIntValidator(
             2, 999, this); // 限制关键帧输入范围为2到999，根据需要修改
     auto* LineValidator =
@@ -134,6 +158,38 @@ igQtAnimationWidget::igQtAnimationWidget(QWidget* parent)
     ui->lineEditStartTime->setValidator(LineValidator);
     ui->lineEditEndTime->setValidator(LineValidator);
     ui->lineEditKeyframeNum->setValidator(validator);
+
+    auto applyAnimationOperation = [this]() {
+        // 原始时间模式不生成新的时间序列，应用操作没有意义。
+        if (!ui->rbtnInterpolateTimeMode->isChecked()) return;
+
+        const float start = ui->lineEditStartTime->text().toFloat();
+        const float end = ui->lineEditEndTime->text().toFloat();
+        const int frameCount = ui->lineEditKeyframeNum->text().toInt();
+
+        VcrController->setStripe(ui->spinBoxAnimationStride->value());
+        const bool applied = ui->treeWidget_interpolate->updateInterpolateData(
+                start, end, frameCount);
+
+        // 只有有效输入才保存，便于切回插值模式时恢复上一次设置。
+        if (applied) {
+            m_InterpolateStartTime = start;
+            m_InterpolateEndTime = end;
+            m_InterpolateFrameCount = frameCount;
+        }
+    };
+
+    connect(ui->btnApplyAnimationOperation, &QPushButton::clicked, this,
+            [applyAnimationOperation](bool) { applyAnimationOperation(); });
+    connect(ui->lineEditKeyframeNum, &QLineEdit::returnPressed, this,
+            applyAnimationOperation);
+    connect(ui->lineEditStartTime, &QLineEdit::returnPressed, this,
+            applyAnimationOperation);
+    connect(ui->lineEditEndTime, &QLineEdit::returnPressed, this,
+            applyAnimationOperation);
+
+    // 默认是原始时间模式；此时插值参数只作为信息显示，不允许编辑。
+    updateAnimationModeControls();
     //    ui->treeWidget_interpolate->header()->show();
     ui->treeWidget_interpolate->hide();
 
@@ -164,6 +220,50 @@ igQtAnimationWidget::igQtAnimationWidget(QWidget* parent)
             &igQtAnimationVcrController::updateCurrentKeyframe);
 }
 
+bool igQtAnimationWidget::eventFilter(QObject* watched, QEvent* event) {
+    auto* slider = ui->SliderAnimationTrack;
+    if (watched == slider && event->type() == QEvent::MouseButtonPress) {
+        auto* mouseEvent = static_cast<QMouseEvent*>(event);
+        if (mouseEvent->button() == Qt::LeftButton) {
+            QStyleOptionSlider option;
+            option.initFrom(slider);
+            option.orientation = slider->orientation();
+            option.minimum = slider->minimum();
+            option.maximum = slider->maximum();
+            option.sliderPosition = slider->sliderPosition();
+            option.sliderValue = slider->value();
+            option.singleStep = slider->singleStep();
+            option.pageStep = slider->pageStep();
+            option.tickPosition = slider->tickPosition();
+            option.tickInterval = slider->tickInterval();
+            option.upsideDown = slider->invertedAppearance();
+            if (slider->layoutDirection() == Qt::RightToLeft) {
+                option.upsideDown = !option.upsideDown;
+            }
+
+            const QRect handleRect = slider->style()->subControlRect(
+                    QStyle::CC_Slider, &option, QStyle::SC_SliderHandle,
+                    slider);
+
+            // Move the handle under the cursor before QSlider processes the
+            // press. This provides click-to-seek without consuming the event:
+            // QSlider then sees a handle press and keeps its native dragging
+            // behavior instead of applying the default pageStep (10).
+            const int handleLength = handleRect.width();
+            const int span = qMax(0, slider->width() - handleLength);
+            const int position = mouseEvent->pos().x() - handleLength / 2;
+            const int value = QStyle::sliderValueFromPosition(
+                    slider->minimum(), slider->maximum(), position, span,
+                    option.upsideDown);
+
+            slider->setValue(value);
+            VcrController->updateCurrentKeyframe(value);
+        }
+    }
+
+    return QWidget::eventFilter(watched, event);
+}
+
 #include <iGameType.h>
 #include <iGamePointSet.h>
 #include <Abaqus/iGameODBReader.h>
@@ -178,8 +278,21 @@ void igQtAnimationWidget::playAnimation_snap(unsigned int keyframe_idx) {
         m_IsAnimationPlaying = false;
         return;
     }
-    auto currentDrawObject = DynamicCast<DrawObject>(
-            currentScene->GetCurrentModel()->GetDataObject());
+    auto currentModel = currentScene->GetCurrentModel();
+    const QString filterId = selectedAnimationFilterId();
+    const bool filterSelected = m_AnimationFilterManager.contains(filterId);
+    if (filterSelected && m_AnimationFilterSourceModel &&
+        m_AnimationFilterSourceModel.GetPointer() != currentModel.GetPointer()) {
+        restoreAnimationFilterSource();
+    }
+    if (filterSelected && !m_AnimationFilterSourceModel) {
+        m_AnimationFilterSourceModel = currentModel;
+        m_AnimationFilterSourceObject = currentModel->GetDataObject();
+    }
+    auto sourceObject = filterSelected && m_AnimationFilterSourceObject
+                                ? m_AnimationFilterSourceObject
+                                : currentModel->GetDataObject();
+    auto currentDrawObject = DynamicCast<DrawObject>(sourceObject);
     if (currentDrawObject == nullptr ||
         currentDrawObject->GetTimeFrames()->GetArrays().empty()) {
         m_IsAnimationPlaying = false;
@@ -213,6 +326,60 @@ void igQtAnimationWidget::playAnimation_snap(unsigned int keyframe_idx) {
     // 缓存设置由 comboBox_AnimationCacheNum 控制，不在播放时覆盖
     currentDrawObject->UpdateAnimation(keyframe_idx);
 
+    if (auto attrSet = currentDrawObject->GetAttributeSet()) {
+        for (int i = 0; i < attrSet->GetNumberOfAttributes(); i++) {
+            auto& par = attrSet->GetAttribute(i);
+            if (!par.rangeLocked || !par.pointer || !par.dataRange) continue;
+            if (!currentDrawObject->HasSubDataObject()) continue;
+            for (auto it = currentDrawObject->SubDataObjectIteratorBegin();
+                 it != currentDrawObject->SubDataObjectIteratorEnd(); it++) {
+                auto sub = DynamicCast<DataObject>(it->second);
+                if (!sub) continue;
+                auto subAttrs = sub->GetAttributeSet();
+                const int si = subAttrs ? subAttrs->GetAttributeIndex(par.pointer->GetName()) : -1;
+                if (si < 0) continue;
+                auto& sa = subAttrs->GetAttribute(si);
+                auto sr = sa.GetDataRange();
+                if (!sr) continue;
+                sr->SetElement(0, {par.dataRange->GetValue(0), par.dataRange->GetValue(1)});
+                sr->Modified();
+                sa.rangeLocked = true;
+            }
+        }
+        currentDrawObject->ForceReConvertToDrawableData();
+    }
+
+    if (m_DiffAutoCompute && !m_DiffSourceAttr.empty()) {
+        EnsureTimeDifferenceForCurrentFrame(currentDrawObject, m_DiffSourceAttr,
+                                           static_cast<int>(keyframe_idx));
+    }
+
+    DataObject::Pointer displayObject = currentDrawObject;
+    if (filterSelected) {
+        QString error;
+        igQtAnimationFrameContext context;
+        context.input = currentDrawObject;
+        context.sourceFrameIndex = static_cast<int>(keyframe_idx);
+        context.outputFrameIndex = static_cast<int>(keyframe_idx);
+        if (!executeSelectedAnimationFilter(context, displayObject, error)) {
+            std::cout << "[Animation][Filter][" << filterId.toStdString()
+                      << "] " << error.toStdString() << std::endl;
+            VcrController->onPause();
+            m_IsAnimationPlaying = false;
+            return;
+        }
+        const auto* descriptor = m_AnimationFilterManager.descriptor(filterId);
+        if (descriptor && descriptor->outputPolicy ==
+                                  igQtAnimationFilterOutputPolicy::ReplaceFrame) {
+            currentModel->SetDataObject(displayObject);
+        }
+    }
+    auto displayDrawObject = DynamicCast<DrawObject>(displayObject);
+    if (!displayDrawObject) {
+        m_IsAnimationPlaying = false;
+        return;
+    }
+
     currentScene->MakeCurrent();
 
 
@@ -225,14 +392,14 @@ void igQtAnimationWidget::playAnimation_snap(unsigned int keyframe_idx) {
         }
     }
 
-    currentDrawObject->SetViewStyle(currentDrawObject->GetViewStyle());
+    displayDrawObject->SetViewStyle(displayDrawObject->GetViewStyle());
 
 
-    const int curAttrIdx = currentDrawObject->GetAttributeIndex();
-    const int curAttrDim = currentDrawObject->GetAttributeDimension();
+    const int curAttrIdx = displayDrawObject->GetAttributeIndex();
+    const int curAttrDim = displayDrawObject->GetAttributeDimension();
     if (curAttrIdx != -1) {
         int probeIdx = -1;
-        if (auto attrSet = currentDrawObject->GetAttributeSet()) {
+        if (auto attrSet = displayDrawObject->GetAttributeSet()) {
             const int cnt = static_cast<int>(attrSet->GetNumberOfAttributes());
             if (curAttrIdx > 0) {
                 probeIdx = curAttrIdx - 1;
@@ -241,30 +408,30 @@ void igQtAnimationWidget::playAnimation_snap(unsigned int keyframe_idx) {
             }
         }
         if (probeIdx >= 0) {
-            currentDrawObject->ViewCloudPicture(currentScene, probeIdx, curAttrDim);
+            displayDrawObject->ViewCloudPicture(currentScene, probeIdx, curAttrDim);
         }
-        currentDrawObject->ViewCloudPicture(currentScene, curAttrIdx, curAttrDim);
+        displayDrawObject->ViewCloudPicture(currentScene, curAttrIdx, curAttrDim);
     }
 
     // Force reconvert to generate new shell data for this frame
-    currentDrawObject->ForceReConvertToDrawableData();
+    displayDrawObject->ForceReConvertToDrawableData();
     // Explicitly call ConvertToDrawableData NOW to create the shell (RenderableMesh)
-    currentDrawObject->ConvertToDrawableData();
+    displayDrawObject->ConvertToDrawableData();
 
     // CRITICAL: Also call the RenderableMesh's ConvertToDrawableData to populate
     // its m_Positions. Otherwise GetRenderPoints() returns an empty array and
     // the RenderableMesh's ConvertToDrawableData would run during render,
     // overwriting our deformation.
-    auto renderableObj = currentDrawObject->GetRenderableObject();
-    if (renderableObj && renderableObj.get() != currentDrawObject) {
+    auto renderableObj = displayDrawObject->GetRenderableObject();
+    if (renderableObj && renderableObj.get() != displayDrawObject.get()) {
         renderableObj->ForceReConvertToDrawableData();
         renderableObj->ConvertToDrawableData();
     }
     
     // For MultiSubFiles: also need to convert sub-objects' RenderableObjects
-    if (currentDrawObject->HasSubDataObject()) {
-        for (auto it = currentDrawObject->SubDataObjectIteratorBegin(); 
-             it != currentDrawObject->SubDataObjectIteratorEnd(); ++it) {
+    if (displayDrawObject->HasSubDataObject()) {
+        for (auto it = displayDrawObject->SubDataObjectIteratorBegin();
+             it != displayDrawObject->SubDataObjectIteratorEnd(); ++it) {
             auto subDrawObj = iGame::DynamicCast<iGame::DrawObject>(it->second);
             if (subDrawObj) {
                 // Force convert the sub-object's RenderableObject
@@ -279,16 +446,16 @@ void igQtAnimationWidget::playAnimation_snap(unsigned int keyframe_idx) {
     
     // 抽壳网格重建后再同步一次值域：UpdateSubDataObjectDataRange 按下标把父容器的
     // dataRange 写给子对象与抽壳网格，而抽壳发生在其之后时新壳会拿不到值域。
-    if (curAttrIdx != -1 && currentDrawObject->HasSubDataObject()) {
-        currentDrawObject->ReCollectSubDataObjectDataRange();
-        currentDrawObject->UpdateSubDataObjectDataRange();
+    if (curAttrIdx != -1 && displayDrawObject->HasSubDataObject()) {
+        displayDrawObject->ReCollectSubDataObjectDataRange();
+        displayDrawObject->UpdateSubDataObjectDataRange();
     }
 
     // Apply deformation AFTER both parent and RenderableMesh have been converted
     // but BEFORE the render pass
-    if(currentDrawObject->GetDeformationData()->GetEnableStatus()){
+    if(displayDrawObject->GetDeformationData()->GetEnableStatus()){
         StressDeformationFilter::Pointer deformFilter = iGame::StressDeformationFilter::New();
-        deformFilter->SetInput(currentDrawObject);
+        deformFilter->SetInput(displayDrawObject);
         if(!deformFilter->Execute()) std::cout << " deformation error \n";
     }
 
@@ -312,66 +479,74 @@ void igQtAnimationWidget::playAnimation_interpolate(int keyframe_0, float t) {
     m_IsAnimationPlaying = true;
     
     auto currentScene = SceneManager::Instance()->GetCurrentScene();
-    auto currentDrawObject = DynamicCast<DrawObject>(
-            currentScene->GetCurrentModel()->GetDataObject());
-    if (currentDrawObject == nullptr
-        ||  currentDrawObject->GetTimeFrames()->GetArrays().empty()
-        ||  keyframe_0 + 1 == currentDrawObject->GetTimeFrames()->GetArrays().size()) {
+    if (!currentScene || !currentScene->GetCurrentModel()) {
         m_IsAnimationPlaying = false;
         return;
     }
-    auto frameSubFiles_0 = currentDrawObject->GetTimeFrames()
-            ->GetTargetTimeFrame(keyframe_0)
-            .GetMetaData();
-    std::vector<iGame::DataObject::Pointer> results_0(frameSubFiles_0->GetNumberOfElements());
-    {
-        std::vector<std::future<iGame::DataObject::Pointer>> tasks;
-        for (int i = 0; i < frameSubFiles_0->GetNumberOfElements(); i++) {
-            tasks.emplace_back(iGame::ThreadPool::Instance()->Commit(
-                    [i, &results_0](const std::string& fileName) {
-                        auto res = FileIO::ReadFile(fileName);
-                        res->SetName(fileName);
-                        results_0[i] = res;
-                        return res;
-                    },
-                    frameSubFiles_0->GetElement(i)));
-        }
-        currentDrawObject->ClearSubDataObject();
-
-        for (auto& task: tasks) {
-            task.get();
-        }
-        for(const auto& obj : results_0){
-            currentDrawObject->AddSubDataObject(obj);
-        }
-        currentDrawObject->UpdateSubDataObjectDataRange();
+    auto currentModel = currentScene->GetCurrentModel();
+    const QString filterId = selectedAnimationFilterId();
+    const bool filterSelected = m_AnimationFilterManager.contains(filterId);
+    if (filterSelected && m_AnimationFilterSourceModel &&
+        m_AnimationFilterSourceModel.GetPointer() != currentModel.GetPointer()) {
+        restoreAnimationFilterSource();
     }
-    auto frameSubFiles_1 = currentDrawObject->GetTimeFrames()
-            ->GetTargetTimeFrame(keyframe_0 + 1)
-            .GetMetaData();
-    {
-        std::vector<std::future<iGame::DataObject::Pointer>> tasks;
-        std::vector<iGame::DataObject::Pointer> results(frameSubFiles_1->GetNumberOfElements());
-        for (int i = 0; i < frameSubFiles_1->GetNumberOfElements(); i++) {
-            tasks.emplace_back(iGame::ThreadPool::Instance()->Commit(
-                    [i, &results](const std::string& fileName) {
-                        auto res = FileIO::ReadFile(fileName);
-                        res->SetName(fileName);
-                        results[i] = res;
-                        return res;
-                    },
-                    frameSubFiles_1->GetElement(i)));
+    if (filterSelected && !m_AnimationFilterSourceModel) {
+        m_AnimationFilterSourceModel = currentModel;
+        m_AnimationFilterSourceObject = currentModel->GetDataObject();
+    }
+    auto sourceObject = filterSelected && m_AnimationFilterSourceObject
+                                ? m_AnimationFilterSourceObject
+                                : currentModel->GetDataObject();
+    auto currentDrawObject = DynamicCast<DrawObject>(sourceObject);
+    if (currentDrawObject == nullptr || currentDrawObject->GetTimeFrames() == nullptr
+        || currentDrawObject->GetTimeFrames()->GetArrays().empty()
+        || keyframe_0 < 0
+        || static_cast<size_t>(keyframe_0 + 1) >=
+                   currentDrawObject->GetTimeFrames()->GetArrays().size()) {
+        m_IsAnimationPlaying = false;
+        return;
+    }
+    auto timeFrames = currentDrawObject->GetTimeFrames();
+    auto frameSubFiles_0 = timeFrames->GetTargetTimeFrame(keyframe_0).GetMetaData();
+    auto frameSubFiles_1 = timeFrames->GetTargetTimeFrame(keyframe_0 + 1).GetMetaData();
+    if (!frameSubFiles_0 || !frameSubFiles_1
+        || frameSubFiles_0->GetNumberOfElements() != frameSubFiles_1->GetNumberOfElements()) {
+        m_IsAnimationPlaying = false;
+        return;
+    }
+
+    // ReadFile may create Qt-owned objects. Keep both reading and scene mutation
+    // on the GUI thread; only the raw numerical interpolation is thread-safe.
+    std::vector<iGame::DataObject::Pointer> results_0(frameSubFiles_0->GetNumberOfElements());
+    std::vector<iGame::DataObject::Pointer> results_1(frameSubFiles_1->GetNumberOfElements());
+    for (int i = 0; i < frameSubFiles_0->GetNumberOfElements(); i++) {
+        results_0[i] = FileIO::ReadFile(frameSubFiles_0->GetElement(i));
+        results_1[i] = FileIO::ReadFile(frameSubFiles_1->GetElement(i));
+        if (!results_0[i] || !results_1[i]) {
+            m_IsAnimationPlaying = false;
+            return;
         }
-        for(auto& task : tasks){
-            task.get();
-        }
+        results_0[i]->SetName(frameSubFiles_0->GetElement(i));
+        results_1[i]->SetName(frameSubFiles_1->GetElement(i));
+    }
+
+    currentDrawObject->ClearSubDataObject();
+    for(const auto& obj : results_0) {
+        currentDrawObject->AddSubDataObject(obj);
+    }
+    currentDrawObject->UpdateSubDataObjectDataRange();
 
 //        auto it = currentDrawObject->SubDataObjectIteratorBegin();
 //        for (int i = 0; i < tasks.size(); i ++, it ++) {
-        for (int i = 0; i < tasks.size(); i ++) {
+    for (int i = 0; i < static_cast<int>(results_0.size()); i ++) {
 //            const auto& subObject_0 = DynamicCast<PointSet>(it->second);
             const auto& subObject_0 = DynamicCast<PointSet>(results_0[i]);
-            const auto& subObject_1 = DynamicCast<PointSet>(results[i]);
+            const auto& subObject_1 = DynamicCast<PointSet>(results_1[i]);
+            if (!subObject_0 || !subObject_1
+                || subObject_0->GetNumberOfPoints() != subObject_1->GetNumberOfPoints()) {
+                m_IsAnimationPlaying = false;
+                return;
+            }
             /* Process interpolate. */
             const auto& ps_0 = subObject_0->GetPoints().get();
             const auto& ps_1 = subObject_1->GetPoints().get();
@@ -386,9 +561,19 @@ void igQtAnimationWidget::playAnimation_interpolate(int keyframe_0, float t) {
             /* Process Vector's Interpolation to adapt Interpolation's Deformation Filter. */
             const auto& attributes_0 = subObject_0->GetAttributeSet()->GetAllAttributes();
             const auto& attributes_1 = subObject_1->GetAttributeSet()->GetAllAttributes();
+            if (attributes_0->Size() != attributes_1->Size()) {
+                m_IsAnimationPlaying = false;
+                return;
+            }
             for(int j = 0; j < attributes_0->Size(); j ++){
-                const auto& attribute_0 = attributes_0[j].RawPointer()->pointer;
-                const auto& attribute_1 = attributes_1[j].RawPointer()->pointer;
+                const auto& attribute_0 = attributes_0->GetElement(j).pointer;
+                const auto& attribute_1 = attributes_1->GetElement(j).pointer;
+                if (!attribute_0 || !attribute_1
+                    || attribute_0->GetDimension() != attribute_1->GetDimension()
+                    || attribute_0->GetNumberOfElements() != attribute_1->GetNumberOfElements()) {
+                    m_IsAnimationPlaying = false;
+                    return;
+                }
                 /* If attribute's dimension is minus one, means it needn't to process in Deformation. */
 //                if(attribute_0->GetDimension() < 2) continue;
                 int dimension = attribute_0->GetDimension();
@@ -402,7 +587,53 @@ void igQtAnimationWidget::playAnimation_interpolate(int keyframe_0, float t) {
             }
             subObject_0->GetPoints()->Modified();
             subObject_0->GetAttributeSet()->Modified();
-            subObject_0->ConvertToDrawableData();
+    }
+
+    DataObject::Pointer displayObject = currentDrawObject;
+    if (filterSelected) {
+        QString error;
+        igQtAnimationFrameContext context;
+        context.input = currentDrawObject;
+        context.sourceFrameIndex = keyframe_0;
+        context.outputFrameIndex = keyframe_0;
+        context.outputTime = t;
+        if (!executeSelectedAnimationFilter(context, displayObject, error)) {
+            std::cout << "[Animation][Filter][" << filterId.toStdString()
+                      << "] " << error.toStdString() << std::endl;
+            VcrController->onPause();
+            m_IsAnimationPlaying = false;
+            return;
+        }
+        const auto* descriptor = m_AnimationFilterManager.descriptor(filterId);
+        if (descriptor && descriptor->outputPolicy ==
+                                  igQtAnimationFilterOutputPolicy::ReplaceFrame) {
+            currentModel->SetDataObject(displayObject);
+        }
+    }
+    auto displayDrawObject = DynamicCast<DrawObject>(displayObject);
+    if (!displayDrawObject) {
+        m_IsAnimationPlaying = false;
+        return;
+    }
+
+    // Drawable conversion and all OpenGL-related work must happen while the
+    // scene's context is current on this GUI thread.
+    currentScene->MakeCurrent();
+    const auto* descriptor = m_AnimationFilterManager.descriptor(filterId);
+    const bool replacesFrame = descriptor && descriptor->outputPolicy ==
+                                               igQtAnimationFilterOutputPolicy::ReplaceFrame;
+    if (!replacesFrame) {
+        for (const auto& obj : results_0) {
+            auto subObject = DynamicCast<PointSet>(obj);
+            if (subObject) subObject->ConvertToDrawableData();
+        }
+    } else {
+        displayDrawObject->ForceReConvertToDrawableData();
+        displayDrawObject->ConvertToDrawableData();
+        auto renderableObj = displayDrawObject->GetRenderableObject();
+        if (renderableObj && renderableObj.get() != displayDrawObject.get()) {
+            renderableObj->ForceReConvertToDrawableData();
+            renderableObj->ConvertToDrawableData();
         }
     }
 
@@ -414,12 +645,11 @@ void igQtAnimationWidget::playAnimation_interpolate(int keyframe_0, float t) {
 //    if(!deformFilter->Execute()) std::cout << " error \n";
 
 
-    currentScene->MakeCurrent();
-    currentDrawObject->SetViewStyle(currentDrawObject->GetViewStyle());
+    displayDrawObject->SetViewStyle(displayDrawObject->GetViewStyle());
 
-    if (currentDrawObject->GetAttributeIndex() != -1) {
-        currentDrawObject->ViewCloudPicture(
-                currentScene, currentDrawObject->GetAttributeIndex());
+    if (displayDrawObject->GetAttributeIndex() != -1) {
+        displayDrawObject->ViewCloudPicture(
+                currentScene, displayDrawObject->GetAttributeIndex());
     }
     currentScene->DoneCurrent();
 
@@ -437,6 +667,215 @@ void igQtAnimationWidget::playAnimation_interpolate(int keyframe_0, float t) {
     m_IsAnimationPlaying = false;
 }
 
+void igQtAnimationWidget::onAnimationFilterChanged(int index) {
+    const QString filterId = index >= 0
+                                     ? ui->comboBoxAnimationFilter
+                                               ->itemData(index).toString()
+                                     : QString();
+    if (filterId != m_SelectedAnimationFilterId) {
+        restoreAnimationFilterSource();
+        m_SelectedAnimationFilterId = filterId;
+    }
+
+    ui->btnAnimationFilterParameters->setEnabled(
+            m_AnimationFilterManager.contains(filterId));
+    updateAnimationFilterSummary();
+}
+
+void igQtAnimationWidget::openAnimationFilterParameters() {
+    const QString filterId = selectedAnimationFilterId();
+    const auto* descriptor = m_AnimationFilterManager.descriptor(filterId);
+    if (!descriptor) return;
+
+    QString error;
+    auto input = animationFilterInput();
+    auto schema = m_AnimationFilterManager.parameterSchema(
+            filterId, input, &error);
+    if (!error.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("动画 Filter"), error);
+        return;
+    }
+
+    auto* dialog = new igQtFilterDialogDockWidget(this, true);
+    dialog->setFilterTitle(
+            QStringLiteral("动画 Filter 参数 - %1").arg(descriptor->displayName));
+    dialog->setFilterDescription(QStringLiteral("参数将在播放或导出时应用到每一帧。"));
+
+    const QVariantMap existing = m_AnimationFilterParameters.value(filterId);
+    QMap<QString, int> widgetIds;
+    for (const auto& parameter : schema) {
+        const QVariant initial = existing.contains(parameter.key)
+                                         ? existing.value(parameter.key)
+                                         : parameter.defaultValue;
+        int widgetId = -1;
+        switch (parameter.type) {
+            case igQtAnimationFilterParameterType::Boolean:
+                widgetId = dialog->addParameter(
+                        igQtFilterDialogDockWidget::QT_CHECK_BOX,
+                        parameter.title,
+                        initial.toBool() ? QStringLiteral("true")
+                                         : QStringLiteral("false"));
+                break;
+            case igQtAnimationFilterParameterType::Choice: {
+                std::vector<QString> choices(parameter.choices.cbegin(),
+                                             parameter.choices.cend());
+                widgetId = dialog->addParameter(
+                        igQtFilterDialogDockWidget::QT_COMBO_BOX,
+                        parameter.title, choices);
+                if (auto* combo = qobject_cast<QComboBox*>(
+                            dialog->getWidget(widgetId))) {
+                    const int initialIndex = combo->findText(initial.toString());
+                    if (initialIndex >= 0) combo->setCurrentIndex(initialIndex);
+                }
+                break;
+            }
+            case igQtAnimationFilterParameterType::String:
+            case igQtAnimationFilterParameterType::Integer:
+            case igQtAnimationFilterParameterType::Double:
+                widgetId = dialog->addParameter(
+                        igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                        parameter.title, initial.toString());
+                break;
+        }
+        if (widgetId >= 0) widgetIds.insert(parameter.key, widgetId);
+    }
+
+    dialog->setApplyFunctor(
+            [this, dialog, filterId, schema, widgetIds]() {
+                QVariantMap values;
+                for (const auto& parameter : schema) {
+                    const int widgetId = widgetIds.value(parameter.key, -1);
+                    QWidget* widget = dialog->getWidget(widgetId);
+                    if (!widget) continue;
+
+                    switch (parameter.type) {
+                        case igQtAnimationFilterParameterType::Boolean: {
+                            auto* check = qobject_cast<QCheckBox*>(widget);
+                            values.insert(parameter.key,
+                                          check && check->isChecked());
+                            break;
+                        }
+                        case igQtAnimationFilterParameterType::Choice: {
+                            auto* combo = qobject_cast<QComboBox*>(widget);
+                            values.insert(parameter.key,
+                                          combo ? combo->currentText() : QString());
+                            break;
+                        }
+                        case igQtAnimationFilterParameterType::Integer: {
+                            bool ok = false;
+                            const int value = qobject_cast<QLineEdit*>(widget)
+                                                      ->text().toInt(&ok);
+                            values.insert(parameter.key,
+                                          ok ? QVariant(value) : QVariant(QString()));
+                            break;
+                        }
+                        case igQtAnimationFilterParameterType::Double: {
+                            bool ok = false;
+                            const double value = qobject_cast<QLineEdit*>(widget)
+                                                         ->text().toDouble(&ok);
+                            values.insert(parameter.key,
+                                          ok ? QVariant(value) : QVariant(QString()));
+                            break;
+                        }
+                        case igQtAnimationFilterParameterType::String:
+                            values.insert(parameter.key,
+                                          qobject_cast<QLineEdit*>(widget)->text());
+                            break;
+                    }
+                }
+
+                QString error;
+                if (!m_AnimationFilterManager.validateParameters(
+                            filterId, values, animationFilterInput(), error)) {
+                    QMessageBox::warning(dialog,
+                                         QStringLiteral("动画 Filter"), error);
+                    return;
+                }
+                m_AnimationFilterParameters.insert(filterId, values);
+                updateAnimationFilterSummary();
+            });
+
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
+}
+
+QString igQtAnimationWidget::selectedAnimationFilterId() const {
+    return ui->comboBoxAnimationFilter->currentData().toString();
+}
+
+iGame::DataObject::Pointer igQtAnimationWidget::animationFilterInput() const {
+    auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
+    auto model = scene ? scene->GetCurrentModel() : nullptr;
+    if (!model) return nullptr;
+    if (m_AnimationFilterSourceModel && m_AnimationFilterSourceObject &&
+        m_AnimationFilterSourceModel.GetPointer() == model.GetPointer()) {
+        return m_AnimationFilterSourceObject;
+    }
+    return model->GetDataObject();
+}
+
+void igQtAnimationWidget::updateAnimationFilterSummary() {
+    const QString filterId = selectedAnimationFilterId();
+    const auto* descriptor = m_AnimationFilterManager.descriptor(filterId);
+    if (!descriptor) {
+        ui->labelAnimationFilterSummary->setText(QStringLiteral("无需参数"));
+        return;
+    }
+
+    const QVariantMap parameters = m_AnimationFilterParameters.value(filterId);
+    if (parameters.isEmpty()) {
+        ui->labelAnimationFilterSummary->setText(QStringLiteral("未设置参数"));
+        return;
+    }
+
+    QStringList summary;
+    const auto schema = descriptor->parameterSchema
+                                ? descriptor->parameterSchema(animationFilterInput())
+                                : igQtAnimationFilterParameterSchema{};
+    for (const auto& parameter : schema) {
+        if (parameters.contains(parameter.key)) {
+            summary.push_back(QStringLiteral("%1 %2")
+                                      .arg(parameter.title,
+                                           parameters.value(parameter.key).toString()));
+        }
+    }
+    ui->labelAnimationFilterSummary->setText(
+            summary.isEmpty() ? QStringLiteral("参数已设置")
+                              : summary.join(QStringLiteral(" / ")));
+}
+
+bool igQtAnimationWidget::executeSelectedAnimationFilter(
+        const igQtAnimationFrameContext& context,
+        iGame::DataObject::Pointer& output,
+        QString& error) {
+    const QString filterId = selectedAnimationFilterId();
+    if (!m_AnimationFilterManager.contains(filterId)) {
+        output = context.input;
+        error.clear();
+        return true;
+    }
+
+    const auto result = m_AnimationFilterManager.execute(
+            filterId, context, m_AnimationFilterParameters.value(filterId));
+    if (!result.success) {
+        output = nullptr;
+        error = result.error;
+        return false;
+    }
+    output = result.output;
+    error.clear();
+    return true;
+}
+
+void igQtAnimationWidget::restoreAnimationFilterSource() {
+    if (m_AnimationFilterSourceModel && m_AnimationFilterSourceObject) {
+        m_AnimationFilterSourceModel->SetDataObject(m_AnimationFilterSourceObject);
+    }
+    m_AnimationFilterSourceModel = nullptr;
+    m_AnimationFilterSourceObject = nullptr;
+}
+
 void igQtAnimationWidget::btnPlay_finishLoop() {
     ui->btnPlayOrPause->setChecked(false);
     ui->btnReverseOrPause->setChecked(false);
@@ -446,11 +885,50 @@ void igQtAnimationWidget::updateAnimationComponentsKeyframeSum(
         int keyframeSum) {
     VcrController->setKeyframe_sum(keyframeSum);
     ui->SliderAnimationTrack->setValue(0);
-    ui->SliderAnimationTrack->setMaximum(keyframeSum - 1);
+    ui->SliderAnimationTrack->setMaximum(std::max(0, keyframeSum - 1));
+}
+
+void igQtAnimationWidget::updateAnimationModeControls() {
+    const bool interpolateMode = ui->rbtnInterpolateTimeMode->isChecked();
+
+    ui->label_19->setText(interpolateMode ? QStringLiteral("关键帧数量")
+                                          : QStringLiteral("原始帧数"));
+    ui->lineEditKeyframeNum->setEnabled(interpolateMode);
+    ui->lineEditStartTime->setEnabled(interpolateMode);
+    ui->lineEditEndTime->setEnabled(interpolateMode);
+    ui->label_19->setEnabled(interpolateMode);
+    ui->label_20->setEnabled(interpolateMode);
+    ui->label_21->setEnabled(interpolateMode);
+    ui->btnApplyAnimationOperation->setEnabled(interpolateMode);
+
+    if (interpolateMode) {
+        if (m_InterpolateFrameCount > 0) {
+            ui->lineEditKeyframeNum->setText(
+                    QString::number(m_InterpolateFrameCount));
+            ui->lineEditStartTime->setText(
+                    QString::number(m_InterpolateStartTime, 'g', 10));
+            ui->lineEditEndTime->setText(
+                    QString::number(m_InterpolateEndTime, 'g', 10));
+        }
+    } else {
+        ui->lineEditKeyframeNum->setText(
+                QString::number(m_SourceFrameCount));
+        ui->lineEditStartTime->setText(
+                QString::number(m_SourceStartTime, 'g', 10));
+        ui->lineEditEndTime->setText(
+                QString::number(m_SourceEndTime, 'g', 10));
+    }
 }
 
 void igQtAnimationWidget::changeAnimationMode() {
     if (ui->rbtnSnapTimeMode->isChecked()) {
+        // 切换前保存插值模式的设置，切回时恢复。
+        if (m_InterpolateFrameCount > 0) {
+            m_InterpolateStartTime = ui->lineEditStartTime->text().toFloat();
+            m_InterpolateEndTime = ui->lineEditEndTime->text().toFloat();
+            m_InterpolateFrameCount = ui->lineEditKeyframeNum->text().toInt();
+        }
+
         ui->treeWidget_interpolate->hide();
         ui->treeWidget_snap->show();
         updateAnimationComponentsKeyframeSum(
@@ -463,6 +941,7 @@ void igQtAnimationWidget::changeAnimationMode() {
                 ui->treeWidget_interpolate->getKeyframeSize());
         VcrController->setInterpolateMode(true);
     }
+    updateAnimationModeControls();
 }
 
 void igQtAnimationWidget::onCacheNumChanged(int cacheNum) {
@@ -631,6 +1110,12 @@ void igQtAnimationWidget::initAnimationComponents() {
             m_VortexSourceAttr.clear();
             m_VortexBoundModel = nullptr;
         }
+
+        if (m_DiffAutoCompute && curObj != m_DiffBoundModel) {
+            m_DiffAutoCompute = false;
+            m_DiffSourceAttr.clear();
+            m_DiffBoundModel = nullptr;
+        }
     }
 
 
@@ -657,6 +1142,12 @@ void igQtAnimationWidget::initAnimationComponents() {
     std::vector<float> timeValues;
     timeValues.reserve(timeArrays.size());
     for (auto& timeArray: timeArrays) timeValues.push_back(timeArray.GetTimeValue());
+    m_SourceFrameCount = static_cast<int>(timeValues.size());
+    m_SourceStartTime = timeValues.front();
+    m_SourceEndTime = timeValues.back();
+    m_InterpolateStartTime = timeValues.front();
+    m_InterpolateEndTime = timeValues.back();
+    m_InterpolateFrameCount = m_SourceFrameCount;
     VcrController->initController(static_cast<int>(timeValues.size()), 1);
     ui->treeWidget_snap->initAnimationTreeWidget(timeValues);
     ui->treeWidget_interpolate->initAnimationTreeWidget(timeValues);
@@ -711,9 +1202,16 @@ void igQtAnimationWidget::initAnimationComponents() {
             &igQtAnimationVcrController::updateCurrentKeyframe);
     connect(ui->comboBoxCurrentAnimation, QOverload<int>::of(&QComboBox::currentIndexChanged),
             VcrController, &igQtAnimationVcrController::updateCurrentKeyframe, Qt::UniqueConnection);
+    updateAnimationModeControls();
 }
 
 void igQtAnimationWidget::ClearAnimationVCRInfo() {
+    m_SourceFrameCount = 1;
+    m_SourceStartTime = 0.0f;
+    m_SourceEndTime = 0.0f;
+    m_InterpolateStartTime = 0.0f;
+    m_InterpolateEndTime = 0.0f;
+    m_InterpolateFrameCount = 1;
     VcrController->initController(1, 1);
     std::vector<float> tmpTimeSteps(1, 0.f);
     ui->treeWidget_snap->initAnimationTreeWidget(tmpTimeSteps);
@@ -741,6 +1239,7 @@ void igQtAnimationWidget::ClearAnimationVCRInfo() {
             QString::asprintf("%.f", *tmpTimeSteps.begin()));
     ui->lineEditEndTime->setText(
             QString::asprintf("%.20f", *(tmpTimeSteps.end() - 1)));
+    updateAnimationModeControls();
 }
 
 //#include <fstream>
@@ -753,13 +1252,24 @@ bool igQtAnimationWidget::saveAnimation() {
 #if defined(FFMPEG_ENABLE)
     using namespace iGame;
     auto currentScene = SceneManager::Instance()->GetCurrentScene();
-    if (currentScene->GetCurrentModel() == nullptr ||
-        currentScene->GetCurrentModel()->GetDataObject()->GetTimeFrames()->GetArrays().empty()) {
+    auto currentModel = currentScene ? currentScene->GetCurrentModel() : nullptr;
+    if (!currentModel) {
         igQtShowDarkFramelessMessage(this, QStringLiteral("保存动画"),
                                      QStringLiteral("请导入带时间帧的文件"), true);
         return false;
     }
-    auto currentObject = currentScene->GetCurrentModel()->GetDataObject();
+    const QString filterId = selectedAnimationFilterId();
+    const bool filterSelected = m_AnimationFilterManager.contains(filterId);
+    auto currentObject = (filterSelected && m_AnimationFilterSourceModel &&
+                          m_AnimationFilterSourceModel.GetPointer() == currentModel.GetPointer())
+                                 ? m_AnimationFilterSourceObject
+                                 : currentModel->GetDataObject();
+    if (!currentObject || !currentObject->PeekTimeFrames() ||
+        currentObject->PeekTimeFrames()->GetArrays().empty()) {
+        igQtShowDarkFramelessMessage(this, QStringLiteral("保存动画"),
+                                     QStringLiteral("请导入带时间帧的文件"), true);
+        return false;
+    }
     size_t timeStepSize = currentObject->GetTimeFrames()->GetTimeNum();
 
     igQtRenderWidget* rendererWidget =
@@ -897,3 +1407,75 @@ bool igQtAnimationWidget::saveAnimation() {
     return true;
 }
 
+std::string igQtAnimationWidget::GetDiffOutputName(const std::string& sourceAttrName) const {
+    static const char* modeSuffix[] = {"", "_abs", "_rel"};
+    const int mode = (m_DiffMode >= 0 && m_DiffMode <= 2) ? m_DiffMode : 0;
+    return sourceAttrName + "_diff" + modeSuffix[mode];
+}
+
+int igQtAnimationWidget::currentFrameIndex() const {
+    // VcrController 记录的是“源时间序列”的下标：数据转换要作用于当前帧而不是第一帧。
+    if (VcrController != nullptr) { return VcrController->currentKeyframeIndex(); }
+    if (ui && ui->comboBoxCurrentAnimation) { return ui->comboBoxCurrentAnimation->currentIndex(); }
+    return 0;
+}
+
+void igQtAnimationWidget::SetDiffAutoCompute(bool enabled, const std::string& sourceAttrName) {
+    using namespace iGame;
+    m_DiffAutoCompute = enabled;
+    if (!sourceAttrName.empty()) { m_DiffSourceAttr = sourceAttrName; }
+    if (!enabled) {
+        m_DiffSourceAttr.clear();
+        m_DiffBoundModel = nullptr;
+        return;
+    }
+    auto scene = SceneManager::Instance()->GetCurrentScene();
+    if (scene && scene->GetCurrentModel()) {
+        m_DiffBoundModel = scene->GetCurrentModel()->GetDataObject().GetPointer();
+    }
+}
+
+int igQtAnimationWidget::EnsureTimeDifferenceForCurrentFrame(iGame::DataObject::Pointer obj,
+                                                             const std::string& sourceAttrName, int frameIndex) {
+    using namespace iGame;
+    if (!obj || sourceAttrName.empty() || frameIndex < 0) return -1;
+    const std::string outputName = GetDiffOutputName(sourceAttrName);
+
+    bool needCompute = false;
+    if (obj->HasSubDataObject()) {
+        for (auto it = obj->SubDataObjectIteratorBegin(); it != obj->SubDataObjectIteratorEnd(); it++) {
+            if (!it->second) continue;
+            auto attr = it->second->GetAttributeSet();
+            if (!attr || attr->GetAttributeIndex(outputName) < 0) {
+                needCompute = true;
+                break;
+            }
+        }
+    } else {
+        auto attr = obj->GetAttributeSet();
+        needCompute = (!attr || attr->GetAttributeIndex(outputName) < 0);
+    }
+
+    if (needCompute) {
+        auto progressObserver = ProgressObserver::Instance();
+        progressObserver->UpdateText("计算属性差值 第 " + std::to_string(frameIndex + 1) + " 帧");
+
+        auto filter = iGameAttrDiff::New();
+        filter->SetInput(obj);
+        filter->SetAttributeByName(sourceAttrName);
+        filter->SetFrameIndex(frameIndex);
+        filter->SetDiffMode(m_DiffMode);
+        filter->SetOutputName(outputName);
+        const bool ok = filter->Execute();
+        progressObserver->UpdateText("");
+        progressObserver->UpdateProgress(1.0);
+        if (!ok) {
+            std::cout << "[AttrDiff] frame compute failed: " << filter->GetMessage() << std::endl;
+            return -1;
+        }
+    }
+
+    auto parentAttr = obj->GetAttributeSet();
+    if (!parentAttr) return -1;
+    return parentAttr->GetAttributeIndex(outputName);
+}

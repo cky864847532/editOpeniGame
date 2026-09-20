@@ -379,6 +379,40 @@ void igQtModelDialogWidget::updateAllAttriubute(iGame::DataObject::Pointer obj) 
     iGame::DynamicCast<iGame::DrawObject>(obj)->ForceReConvertToDrawableData();
 }
 
+QString igQtModelDialogWidget::renameModelRow(iGame::DataObject::Pointer obj, const QString& newName) {
+    if (obj == nullptr || modelTreeWidget == nullptr || newName.isEmpty()) { return newName; }
+    auto* item = getItemFromObject(obj);
+    if (item == nullptr) { return newName; }
+
+    // 重名检查时排除本行自己：这样“把 A 改成 A”不会变成 A_2
+    QStringList existing;
+    for (int i = 0; i < modelTreeWidget->topLevelItemCount(); ++i) {
+        auto* row = modelTreeWidget->topLevelItem(i);
+        if (row == nullptr || row == item) { continue; }
+        existing << row->text(0);
+    }
+    QString finalName = newName;
+    if (existing.contains(finalName)) {
+        for (int n = 2; n < 10000; ++n) {
+            const QString candidate = QStringLiteral("%1_%2").arg(newName).arg(n);
+            if (!existing.contains(candidate)) {
+                finalName = candidate;
+                break;
+            }
+        }
+    }
+
+    // 同步对象自己的名字与树上那一行。
+    // 注意：这里**不能**调 updateCurrentModelInfo()——它会发 CurrendModelChanged →
+    // AnimationWidget::initAnimationComponents()，而那条链路里（interpolate 树的
+    // updateComponentsKeyframeSum → VcrController::setKeyframe_sum）会把当前帧硬重置到 0，
+    // 用户看到的就是“转换后自动跳回第一帧”。改名只影响文字，模型信息面板直接刷新即可。
+    obj->SetName(finalName.toStdString());
+    item->setName(finalName);
+    ui->ModelInformationWidget->updateInformationFrame();
+    return finalName;
+}
+
 int igQtModelDialogWidget::addDataObjectToModelTree(iGame::DataObject::Pointer obj, ItemSource source) {
     ModelTreeWidgetItem* item = new ModelTreeWidgetItem(modelTreeWidget);
     //modelTreeWidget->setCurrentModelItem(item);
@@ -419,6 +453,52 @@ int igQtModelDialogWidget::addDataObjectToModelTree(iGame::DataObject::Pointer o
     //QTreeWidgetItem* currentItem = modelTreeWidget->getCurrentModelItem();
     //std::cout << "add current model: " << currentItem << std::endl;
     return id;
+}
+
+void igQtModelDialogWidget::refreshAttributeBadges(iGame::DataObject::Pointer obj) {
+    auto item = getItemFromObject(obj);
+    if (item == nullptr) { return; }
+
+    auto updateBadge = [](QTreeWidgetItem* row, iGame::AttributeSet::Attribute& attr) {
+        if (row == nullptr || attr.isDeleted || attr.pointer == nullptr) { return; }
+        if (attr.attachmentType == IG_CELL) {
+            row->setIcon(0, igQtModelTreeIcons::Cell());
+        } else if (attr.attachmentType == IG_POINT) {
+            row->setIcon(0, igQtModelTreeIcons::Point());
+        }
+        row->setToolTip(0, QString::fromStdString(attr.pointer->GetName()));
+    };
+
+    auto refreshRows = [&updateBadge](QTreeWidgetItem* parentRow, iGame::AttributeSet* attrs,
+                                      bool subAttribRows) {
+        if (parentRow == nullptr || attrs == nullptr) { return; }
+        for (int i = 0; i < parentRow->childCount(); ++i) {
+            int index = -1;
+            if (subAttribRows) {
+                auto* row = dynamic_cast<SubAttribTreeWidgetItem*>(parentRow->child(i));
+                if (row == nullptr) { continue; }
+                index = row->attributeIndex();
+            } else {
+                auto* row = dynamic_cast<AttribTreeWidgetItem*>(parentRow->child(i));
+                if (row == nullptr) { continue; }
+                index = row->attributeIndex();
+            }
+            if (index < 0 || index >= static_cast<int>(attrs->GetNumberOfAttributes())) { continue; }
+            updateBadge(parentRow->child(i), attrs->GetAttribute(index));
+        }
+    };
+
+    // 顶层模型行的属性行
+    if (auto attrs = obj->GetAttributeSet()) { refreshRows(item, attrs, false); }
+
+    // 已经展开（属性行已生成）的子块行
+    for (int i = 0; i < item->childCount(); ++i) {
+        auto* sub = dynamic_cast<SubObjectTreeWidgetItem*>(item->child(i));
+        if (sub == nullptr) { continue; }
+        auto subObject = sub->getDataObject();
+        if (subObject == nullptr) { continue; }
+        refreshRows(sub, subObject->GetAttributeSet(), true);
+    }
 }
 
 int igQtModelDialogWidget::addModelToModelTree(iGame::Model::Pointer model) {

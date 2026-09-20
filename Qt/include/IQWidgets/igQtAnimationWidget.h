@@ -5,8 +5,11 @@
 
 #pragma once
 #include <ui_Animation.h>
+#include <IQCore/igQtAnimationFilterManager.h>
 #include <IQCore/igQtExportModule.h>
 #include <iGameDataObject.h>
+#include <iGameModel.h>
+#include <QMap>
 class igQtAnimationVcrController;
 class IG_QT_MODULE_EXPORT igQtAnimationWidget : public QWidget{
 
@@ -38,12 +41,34 @@ public:
     int ensureVortexForCurrentFrame(iGame::DataObject::Pointer obj, const std::string& sourceAttrName,
                                     int frameIndexForDisplay = -1);
 
+    // 播放时按需计算属性差值(diff)，开启后每次切帧都会检查当前帧是否已有 <源属性名>_diff_<类型>：
+    // 命中缓存直接复用，否则用 iGameAttrDiff 与前一帧做差再继续渲染。
+    void SetDiffAutoCompute(bool enabled, const std::string& sourceAttrName = std::string());
+    bool IsDiffAutoCompute() const { return m_DiffAutoCompute; }
+    // 0 带符号差(cur-prev)，1 绝对差，2 相对变化率
+    void SetDiffMode(int mode) { m_DiffMode = mode; }
+    // 确保obj的当前帧已有 <源属性名>_diff_<类型>，已存在直接返回，
+    // 不存在才计算。frameIndex 是真实帧号（>=0）：第 0 帧写全 0，第 i 帧对比第 i-1 帧。
+    // 返回 diff 在父容器 AttributeSet 中的索引；失败返回 -1。
+    int EnsureTimeDifferenceForCurrentFrame(iGame::DataObject::Pointer obj,
+                                            const std::string& sourceAttrName,
+                                            int frameIndex);
+    std::string GetDiffOutputName(const std::string& sourceAttrName) const;
+
+    // 当前显示帧在“源时间序列”中的下标（0 基）。
+    // 供「数据转换」等需要“作用于当前帧而不是第一帧”的功能读取。
+    int currentFrameIndex() const;
+
 public slots:
     void initAnimationComponents();
 
     bool saveAnimation();
 
     void ClearAnimationVCRInfo();
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
 private slots:
     void playAnimation_snap(unsigned int keyframe_idx);
     void playAnimation_interpolate(int keyframe_0, float t);
@@ -51,6 +76,8 @@ private slots:
     void updateAnimationComponentsKeyframeSum(int keyframeSum);
     void changeAnimationMode();
     void onCacheNumChanged(int cacheNum);  // 缓存数量变化槽函数
+    void onAnimationFilterChanged(int index);
+    void openAnimationFilterParameters();
 
 
 signals:
@@ -63,13 +90,40 @@ signals:
 
 
 private:
+    void updateAnimationModeControls();
+    QString selectedAnimationFilterId() const;
+    iGame::DataObject::Pointer animationFilterInput() const;
+    void updateAnimationFilterSummary();
+    bool executeSelectedAnimationFilter(
+            const igQtAnimationFrameContext& context,
+            iGame::DataObject::Pointer& output,
+            QString& error);
+    void restoreAnimationFilterSource();
+
     Ui::Animation* ui;
     igQtAnimationVcrController* VcrController;
     bool m_IsAnimationPlaying{false}; // 动画播放状态标记
+    int m_SourceFrameCount{0};         // 原始时间模式使用的帧数
+    float m_SourceStartTime{0.0f};
+    float m_SourceEndTime{0.0f};
+    float m_InterpolateStartTime{0.0f};
+    float m_InterpolateEndTime{0.0f};
+    int m_InterpolateFrameCount{0};    // 插值时间模式使用的输出帧数
     int m_PreferredCacheNum{0};       // 外部声明的最小缓存帧数，见 setPreferredCacheNum
     bool m_VortexAutoCompute{false};  // 播放时按需补算涡量，见 setVortexAutoCompute
     std::string m_VortexSourceAttr;   // 计算涡量所用的源矢量属性名
     // 上次绑定按需计算的模型；用于「切换模型时自动关闭」，
     // 而在同一模型上选属性（同样会触发 initAnimationComponents）时保持开启
     iGame::DataObject* m_VortexBoundModel{nullptr};
+    
+    bool m_DiffAutoCompute{false};     // 播放时按需补算 diff
+    std::string m_DiffSourceAttr;      // 计算 diff 所用的源属性名
+    int m_DiffMode{0};                 // 0 带符号差(cur-prev)，1 绝对差，2 相对变化率
+    iGame::DataObject* m_DiffBoundModel{nullptr};  // 绑定模型，切换模型时自动关闭
+
+    igQtAnimationFilterManager m_AnimationFilterManager;
+    QMap<QString, QVariantMap> m_AnimationFilterParameters;
+    QString m_SelectedAnimationFilterId;
+    iGame::Model::Pointer m_AnimationFilterSourceModel{nullptr};
+    iGame::DataObject::Pointer m_AnimationFilterSourceObject{nullptr};
 };
