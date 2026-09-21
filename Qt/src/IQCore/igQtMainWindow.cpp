@@ -5993,14 +5993,19 @@ void igQtMainWindow::rebuildToolbarRow(int iconSize) {
         const QStringList names = {QStringLiteral("toolBar_meshfile"), QStringLiteral("toolBar_3"),
                                    QStringLiteral("toolBar_2"), QStringLiteral("toolBar_4")};
         int maxH = 0;
+        QList<QWidget*> containers;
         for (const QString& n : names) {
             if (QWidget* c = this->findChild<QWidget*>(QStringLiteral("toolbarContainer_") + n)) {
+                containers.push_back(c);
                 maxH = qMax(maxH, c->sizeHint().height());
             }
         }
-        for (const QString& n : names) {
-            if (QWidget* c = this->findChild<QWidget*>(QStringLiteral("toolbarContainer_") + n)) {
-                if (maxH > 0) c->setFixedHeight(maxH);
+        // 容器内部 vLayout 带 SetFixedSize 约束，会按自身 sizeHint 反压高度，
+        // 必须先解除该约束，统一 setFixedHeight 才能让四组底部分隔线对齐。
+        for (QWidget* c : containers) {
+            if (maxH > 0) {
+                if (QLayout* lay = c->layout()) { lay->setSizeConstraint(QLayout::SetDefaultConstraint); }
+                c->setFixedHeight(maxH);
             }
         }
     }
