@@ -256,7 +256,7 @@ QLabel* igQtModelInformationWidget::createLabel(const QString& text) {
     const int styleModeNow = igQtRenderWidget::globalStyleMode();
     const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);
     const QString color = light ? QStringLiteral("#2D3748")
-                                : (matte ? QStringLiteral("#D4D4D4") : QStringLiteral("#E2E8F0"));
+                                : (matte ? QStringLiteral("#D4D4D4") : QStringLiteral("#D6D6D6"));
     label->setStyleSheet(QStringLiteral("QLabel { font-size: 12px !important; color: %1; background: transparent; font-weight: 600; }").arg(color));
     return label;
 }
@@ -271,9 +271,9 @@ void igQtModelInformationWidget::createPropertyLabel(QFormLayout* formLayout, co
     const int styleModeNow = igQtRenderWidget::globalStyleMode();
     const bool matte = (styleModeNow == 10 || styleModeNow == 11 || styleModeNow == 15);
     const QString nameColor = light ? QStringLiteral("#4A5568")
-                                    : (matte ? QStringLiteral("#858585") : QStringLiteral("#C8C8C8"));
+                                    : (matte ? QStringLiteral("#858585") : QStringLiteral("#A8A8A8"));
     const QString valueColor = light ? QStringLiteral("#1F2A3A")
-                                     : (matte ? QStringLiteral("#CCCCCC") : QStringLiteral("#FFFFFF"));
+                                     : (matte ? QStringLiteral("#CCCCCC") : QStringLiteral("#C8C8C8"));
 
     QLabel* nameLabel = new QLabel(name + ":", row);
     nameLabel->setAlignment(Qt::AlignCenter);
