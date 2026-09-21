@@ -5,9 +5,12 @@
  * @class   igQtFileLoader
  * @brief   igQtFileLoader's brief
  */
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #include "iGameFileIO.h"
+#include "VTK/iGameGhostVTKReader.h"
 //#include "CSTest.h"
 //#include "iGameMeshCodec/iGameMeshEncoder.h"
 //#include "iGameMeshCodec/iGameMeshDecoder.h"
@@ -46,6 +49,19 @@ std::string ToUtf8FilePath(const QString& path) {
 
 QString FromUtf8FilePath(const std::string& path) {
     return QString::fromUtf8(path.data(), static_cast<int>(path.size()));
+}
+
+iGame::DataObject::Pointer ReadFileWithGhostSupport(const std::string& filePath) {
+    std::string suffix;
+    const auto dotPos = filePath.find_last_of('.');
+    if (dotPos != std::string::npos) {
+        suffix = filePath.substr(dotPos + 1);
+        std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
+
+    if (suffix == "vtk") { return iGame::GhostVTKReader::ReadFile(filePath); }
+    return iGame::FileIO::ReadFile(filePath);
 }
 }
 
@@ -184,7 +200,7 @@ void igQtFileLoader::OpenFile(const std::string& filePath) {
     }
 #endif
 
-    auto obj = iGame::FileIO::ReadFile(filePath);
+    auto obj = ReadFileWithGhostSupport(filePath);
     //_obj = obj;
     if (obj == nullptr) {
         igDebug("This file read error.");
@@ -246,7 +262,7 @@ void igQtFileLoader::OpenFiles(const QStringList& filePaths) {
 #endif
     }
 
-    auto obj = iGame::FileIO::ReadFile(first_file_path);
+    auto obj = ReadFileWithGhostSupport(first_file_path);
     //_obj = obj;
     if (obj == nullptr) {
         igDebug("This file read error.");
