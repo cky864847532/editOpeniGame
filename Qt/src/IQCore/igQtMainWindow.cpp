@@ -1600,7 +1600,9 @@ void igQtMainWindow::initAllFilters() {
                     showDarkFramelessMessage(title, QStringLiteral("提取点坐标失败。"));
                     return;
                 }
-                refreshFilterResult(obj, filter->GetOutput(), title, true);
+                // PointCoordinatesFilter returns an independent deep-copy output.
+                // Add it to the model tree instead of treating it as an in-place update.
+                refreshFilterResult(obj, filter->GetOutput(), title);
             });
             return true;
         }

@@ -107,6 +107,7 @@ bool PointCoordinatesFilter::Execute() {
         igDebug("PointCoordinatesFilter failed to deep copy the input.");
         return false;
     }
+    output->SetName(input->GetName() + "_Coordinates");
 
     auto outPoints = output->GetPoints();
     auto outCoordinates = outPoints->ConvertToArray();
