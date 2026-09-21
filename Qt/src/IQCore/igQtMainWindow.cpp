@@ -1709,7 +1709,8 @@ void igQtMainWindow::initAllFilters() {
                         showDarkFramelessMessage(title, QStringLiteral("生成高程标量失败。"));
                         return;
                     }
-                    refreshFilterResult(obj, filter->GetOutput(), title, true);
+                    // 独立输出：GetOutput() 返回新对象，refreshFilterResult 在模型树挂独立节点
+                    refreshFilterResult(obj, filter->GetOutput(), title);
                     dialog->close();
                 });
             });

@@ -4,6 +4,8 @@
 #include "iGameFlatArray.h"
 #include "iGameMacro.h"
 #include "iGamePointSet.h"
+#include "iGameSurfaceMesh.h"
+#include "iGameUnstructuredMesh.h"
 
 #include <limits>
 #include <string>
@@ -106,13 +108,81 @@ bool ElevationFilter::Execute() {
         elevArr->SetValue(i, out);
     }
 
-    mesh->GetAttributeSet()->AddAttribute(IG_SCALAR, IG_POINT, elevArr);
+    // ===== 独立输出：不修改输入对象 =====
+    // 继承语义：输出新的数据对象，几何（点/面/单元）与输入共享；
+    // 结果属性集 = 输入属性集的拷贝（跳过与输出数组同名的旧数组，即覆盖语义）+ 新增 Elevation 数组。
+    // 输入对象保持原样（不挂 Elevation 数组），输出可在模型树中作为独立节点展示。
+    // 注意：不能用 DeleteAttribute 标记删除（渲染路径按索引遍历会解引用空指针），
+    // 拷贝时直接跳过同名旧数组，保证结果属性集不含 isDeleted 残留项。
+    auto inputAttrSet = mesh->GetAttributeSet();
+    auto resultAttrSet = AttributeSet::New();
+    if (inputAttrSet != nullptr) {
+        auto allAttributes = inputAttrSet->GetAllAttributes();
+        if (allAttributes != nullptr) {
+            for (IGsize i = 0; i < allAttributes->GetNumberOfElements(); ++i) {
+                auto& src = allAttributes->GetElement(i);
+                if (src.IsNone()) { continue; }
+                // 覆盖语义：跳过与输出数组同名的旧数组
+                if (src.pointer->GetName() == m_ArrayName) { continue; }
+                ArrayObject::Pointer copied;
+                if (DynamicCast<FloatArray>(src.pointer) != nullptr) {
+                    auto p = FloatArray::New();
+                    p->DeepCopy(DynamicCast<FloatArray>(src.pointer));
+                    p->SetName(src.pointer->GetName());
+                    copied = p;
+                } else if (DynamicCast<DoubleArray>(src.pointer) != nullptr) {
+                    auto p = DoubleArray::New();
+                    p->DeepCopy(DynamicCast<DoubleArray>(src.pointer));
+                    p->SetName(src.pointer->GetName());
+                    copied = p;
+                } else {
+                    copied = src.pointer;  // 其他类型共享指针（只读属性，安全）
+                }
+                resultAttrSet->AddAttribute(src.type, src.attachmentType, copied);
+            }
+        }
+    }
+    resultAttrSet->AddAttribute(IG_SCALAR, IG_POINT, elevArr);
 
-    IGAME_CORE_INFO("ElevationFilter: Added {} (IG_SCALAR/IG_POINT), elements = {}",
+    IGAME_CORE_INFO("ElevationFilter: Added {} (IG_SCALAR/IG_POINT) to independent output, "
+                    "elements = {}",
                     m_ArrayName, elevArr->GetNumberOfElements());
 
-    SetOutput(0, mesh);
-    IGAME_CORE_INFO("ElevationFilter: Execute() done, returning true");
+    // 按输入的具体网格类型派生输出对象（几何共享、属性独立）
+    if (auto unstructured = DynamicCast<UnstructuredMesh>(mesh); unstructured != nullptr) {
+        auto result = UnstructuredMesh::New();
+        result->SetName(unstructured->GetName() + "_Elevation");
+        result->SetPoints(unstructured->GetPoints());
+        result->SetCells(unstructured->GetCells(),
+                         UnsignedIntArray::Pointer(unstructured->GetCellTypes()));
+        result->SetAttributeSet(resultAttrSet);
+        SetOutput(0, result);
+        IGAME_CORE_INFO("ElevationFilter: Execute() done (independent UnstructuredMesh output)");
+        return true;
+    }
+
+    // SurfaceMesh 及其派生类（VolumeMesh / StructuredMesh）都走表面网格分支，
+    // 共享输入的几何指针，不修改输入拓扑
+    if (auto surface = DynamicCast<SurfaceMesh>(mesh); surface != nullptr) {
+        auto result = SurfaceMesh::New();
+        result->SetName(surface->GetName() + "_Elevation");
+        result->SetPoints(surface->GetPoints());
+        result->SetFaces(surface->GetFaces());
+        result->SetAttributeSet(resultAttrSet);
+        SetOutput(0, result);
+        IGAME_CORE_INFO("ElevationFilter: Execute() done (independent SurfaceMesh output)");
+        return true;
+    }
+
+    // 兜底：裸 PointSet（点云）只共享点几何
+    {
+        auto result = PointSet::New();
+        result->SetName(mesh->GetName() + "_Elevation");
+        result->SetPoints(mesh->GetPoints());
+        result->SetAttributeSet(resultAttrSet);
+        SetOutput(0, result);
+        IGAME_CORE_INFO("ElevationFilter: Execute() done (independent PointSet output)");
+    }
     return true;
 }
 
