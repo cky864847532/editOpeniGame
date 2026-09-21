@@ -27,15 +27,16 @@ using namespace iGame;
 std::string SlopeModelPath = "Models/ElevationSlopeTerrain.vtk";
 std::string TerracesModelPath = "Models/ElevationTerraces.vtk";
 
-// 主测试网格：4 点 2 三角形，z = x + 2y（斜面）
-//   p0(0,0,0)  p1(1,0,1)  p2(0,1,2)  p3(1,1,3)
-// 沿 Z 投影 h = 0,1,2,3；沿 (1,1,0) 投影 h = x+y = 0,1,1,2
-SurfaceMesh::Pointer MakeSlopeMesh() {
+// 主测试网格：4 点 2 三角形，z = x + 2y + dz（斜面）
+//   p0(0,0,dz)  p1(1,0,1+dz)  p2(0,1,2+dz)  p3(1,1,3+dz)
+// 沿 Z 投影 h = 0,1,2,3 + dz；沿 (1,1,0) 归一化投影 h = (x+y)/√2
+// dz 偏移参数用于验证绝对标尺语义：标尺不变、平移点位 → 输出改变
+SurfaceMesh::Pointer MakeSlopeMesh(double dz = 0.0) {
     auto points = Points::New();
-    points->AddPoint(0.f, 0.f, 0.f);
-    points->AddPoint(1.f, 0.f, 1.f);
-    points->AddPoint(0.f, 1.f, 2.f);
-    points->AddPoint(1.f, 1.f, 3.f);
+    points->AddPoint(0.f, 0.f, static_cast<float>(dz));
+    points->AddPoint(1.f, 0.f, static_cast<float>(1.0 + dz));
+    points->AddPoint(0.f, 1.f, static_cast<float>(2.0 + dz));
+    points->AddPoint(1.f, 1.f, static_cast<float>(3.0 + dz));
 
     auto faces = CellArray::New();
     faces->AddCellId3(0, 1, 2);
@@ -47,7 +48,7 @@ SurfaceMesh::Pointer MakeSlopeMesh() {
     return mesh;
 }
 
-// 平面网格：所有点 z = 5（沿 Z 投影退化）
+// 平面网格：所有点 z = 5（沿 Z 投影恒定，验证标尺饱和 / 居中行为）
 SurfaceMesh::Pointer MakeFlatMesh() {
     auto points = Points::New();
     points->AddPoint(0.f, 0.f, 5.f);
@@ -79,6 +80,19 @@ FloatArray::Pointer FindElevationArray(DataObject::Pointer object) {
         if (attribute.pointer->GetName() == "Elevation") {
             return DynamicCast<FloatArray>(attribute.pointer);
         }
+    }
+    return nullptr;
+}
+
+// 找到输出对象上的 Elevation 属性（返回 Attribute 本体，用于读取 dataRange）
+const AttributeSet::Attribute* FindElevationAttribute(DataObject::Pointer object) {
+    if (!object || !object->GetAttributeSet()) { return nullptr; }
+    auto* attributes = object->GetAttributeSet();
+    for (IGsize i = 0; i < attributes->GetNumberOfAttributes(); ++i) {
+        auto& attribute = attributes->GetAttribute(i);
+        if (attribute.isDeleted || !attribute.pointer) { continue; }
+        if (attribute.attachmentType != IG_POINT) { continue; }
+        if (attribute.pointer->GetName() == "Elevation") { return &attribute; }
     }
     return nullptr;
 }
@@ -123,30 +137,44 @@ PointSet::Pointer LoadPointSetModel(const std::string& path) {
     return pointSet;
 }
 
-// 用例 1：默认方向 +Z、默认范围 [0,1]（端点钉扎 + 中间值）——独立输出上校验
+// 用例 1：默认标尺 [0,1] + 默认方向 +Z——斜面 h = 0,1,2,3
+// → {0, 1, 1, 1}（后两点高于标尺上限，饱和在 1）
 void TestAxisMapping() {
     auto mesh = MakeSlopeMesh();
     auto filter = ElevationFilter::New();
     filter->SetInput(mesh);
     Check(filter->Execute(), "Execute should succeed.");
     CheckIndependentOutput(filter, mesh, "axis mapping");
-    CheckValues(FindElevationArray(filter->GetOutput()), {0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0},
+    CheckValues(FindElevationArray(filter->GetOutput()), {0.0, 1.0, 1.0, 1.0},
                 "axis mapping");
 }
 
-// 用例 2：自定义输出范围 [10, 20]
-void TestCustomRange() {
+// 用例 2：标尺 [0,3] 恰好跨满数据——h = 0,1,2,3 → {0, 1/3, 2/3, 1}
+void TestRulerStraddle() {
     auto mesh = MakeSlopeMesh();
     auto filter = ElevationFilter::New();
-    filter->SetOutputRange(10.0, 20.0);
+    filter->SetRulerRange(0.0, 3.0);
     filter->SetInput(mesh);
     Check(filter->Execute(), "Execute should succeed.");
-    CheckIndependentOutput(filter, mesh, "custom range");
+    CheckIndependentOutput(filter, mesh, "ruler straddle");
     CheckValues(FindElevationArray(filter->GetOutput()),
-                {10.0, 10.0 + 10.0 / 3.0, 10.0 + 20.0 / 3.0, 20.0}, "custom range");
+                {0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0}, "ruler straddle");
 }
 
-// 用例 3：任意方向 (1,1,0)——h = x+y = 0,1,1,2 → 0,0.5,0.5,1
+// 用例 3：双向夹断——标尺 [1,2]，h = 0,1,2,3 → t = -1,0,1,2 → 夹断 {0, 0, 1, 1}
+void TestClamping() {
+    auto mesh = MakeSlopeMesh();
+    auto filter = ElevationFilter::New();
+    filter->SetRulerRange(1.0, 2.0);
+    filter->SetInput(mesh);
+    Check(filter->Execute(), "Execute should succeed.");
+    CheckIndependentOutput(filter, mesh, "clamping");
+    CheckValues(FindElevationArray(filter->GetOutput()), {0.0, 0.0, 1.0, 1.0},
+                "clamping");
+}
+
+// 用例 4：任意方向 (1,1,0) + 默认标尺 [0,1]——h = (x+y)/√2 = 0, 0.7071, 0.7071, 1.4142
+// → {0, 0.7071, 0.7071, 1}（末点高于标尺上限饱和）
 void TestArbitraryDirection() {
     auto mesh = MakeSlopeMesh();
     auto filter = ElevationFilter::New();
@@ -154,11 +182,12 @@ void TestArbitraryDirection() {
     filter->SetInput(mesh);
     Check(filter->Execute(), "Execute should succeed.");
     CheckIndependentOutput(filter, mesh, "arbitrary direction");
-    CheckValues(FindElevationArray(filter->GetOutput()), {0.0, 0.5, 0.5, 1.0},
+    const double s = 1.0 / std::sqrt(2.0);
+    CheckValues(FindElevationArray(filter->GetOutput()), {0.0, s, s, 1.0},
                 "arbitrary direction");
 }
 
-// 用例 4：缩放不变性——(2,2,0) 与 (1,1,0) 输出完全一致
+// 用例 5：缩放不变性——(2,2,0) 与 (1,1,0) 输出完全一致（默认标尺 [0,1]）
 void TestScaleInvariance() {
     auto meshA = MakeSlopeMesh();
     auto filterA = ElevationFilter::New();
@@ -184,51 +213,100 @@ void TestScaleInvariance() {
     }
 }
 
-// 用例 5：平面网格沿 Z 投影退化——全部输出 Low，无 NaN
-void TestFlatMeshDegenerate() {
-    auto mesh = MakeFlatMesh();
-    auto filter = ElevationFilter::New();
-    filter->SetInput(mesh);
-    Check(filter->Execute(), "Execute should succeed on flat mesh.");
-    CheckIndependentOutput(filter, mesh, "flat mesh");
-    CheckValues(FindElevationArray(filter->GetOutput()), {0.0, 0.0, 0.0, 0.0}, "flat mesh");
-
-    // 自定义范围时降级值跟随 Low
-    auto mesh2 = MakeFlatMesh();
-    auto filter2 = ElevationFilter::New();
-    filter2->SetOutputRange(10.0, 20.0);
-    filter2->SetInput(mesh2);
-    Check(filter2->Execute(), "Execute should succeed on flat mesh.");
-    CheckIndependentOutput(filter2, mesh2, "flat mesh custom Low");
-    CheckValues(FindElevationArray(filter2->GetOutput()), {10.0, 10.0, 10.0, 10.0},
-                "flat mesh custom Low");
+// 用例 6：平面网格 z=5（投影恒定，无退化特判，按标尺公式计算）——
+// 标尺 [0,1] → 全 1（高于上限饱和）；标尺 [5,10] → 全 0（等于下限）；
+// 标尺 [4,6] → 全 0.5（居中）。任何情况都不产生 NaN
+void TestFlatMesh() {
+    {
+        auto mesh = MakeFlatMesh();
+        auto filter = ElevationFilter::New();  // 默认标尺 [0,1]
+        filter->SetInput(mesh);
+        Check(filter->Execute(), "Execute should succeed on flat mesh.");
+        CheckIndependentOutput(filter, mesh, "flat mesh above ruler");
+        CheckValues(FindElevationArray(filter->GetOutput()), {1.0, 1.0, 1.0, 1.0},
+                    "flat mesh above ruler");
+    }
+    {
+        auto mesh = MakeFlatMesh();
+        auto filter = ElevationFilter::New();
+        filter->SetRulerRange(5.0, 10.0);
+        filter->SetInput(mesh);
+        Check(filter->Execute(), "Execute should succeed on flat mesh.");
+        CheckIndependentOutput(filter, mesh, "flat mesh at ruler low");
+        CheckValues(FindElevationArray(filter->GetOutput()), {0.0, 0.0, 0.0, 0.0},
+                    "flat mesh at ruler low");
+    }
+    {
+        auto mesh = MakeFlatMesh();
+        auto filter = ElevationFilter::New();
+        filter->SetRulerRange(4.0, 6.0);
+        filter->SetInput(mesh);
+        Check(filter->Execute(), "Execute should succeed on flat mesh.");
+        CheckIndependentOutput(filter, mesh, "flat mesh inside ruler");
+        CheckValues(FindElevationArray(filter->GetOutput()), {0.5, 0.5, 0.5, 0.5},
+                    "flat mesh inside ruler");
+    }
 }
 
-// 用例 6：非法输入防御——零向量、非法范围被拒绝且不影响执行结果
+// 用例 7：非法输入防御——零向量、非法标尺被拒绝且保持默认值
 void TestInvalidInputs() {
     auto filter = ElevationFilter::New();
     Check(!filter->SetDirection(0.f, 0.f, 0.f), "zero direction must be rejected.");
     Check(filter->GetDirection()[2] == 1.f, "rejected input must keep old direction.");
 
-    filter->SetOutputRange(1.0, 0.0);
-    Check(filter->GetLowValue() == 0.0 && filter->GetHighValue() == 1.0,
-          "invalid range must be rejected.");
-    filter->SetOutputRange(5.0, 5.0);
-    Check(filter->GetLowValue() == 0.0 && filter->GetHighValue() == 1.0,
-          "empty range must be rejected.");
+    filter->SetRulerRange(1.0, 0.0);
+    Check(filter->GetRulerLow() == 0.0 && filter->GetRulerHigh() == 1.0,
+          "invalid ruler must be rejected.");
+    filter->SetRulerRange(5.0, 5.0);
+    Check(filter->GetRulerLow() == 0.0 && filter->GetRulerHigh() == 1.0,
+          "empty ruler must be rejected.");
 }
 
-// ===== 模型文件用例（Examples/Models 下的配套测试模型）=====
+// 用例 8：绝对标尺语义（实验室需求核心）——标尺固定 [0,3]，仅平移点位 → 输出改变
+//   meshA(dz=0)： h = 0,1,2,3  → t = {0, 1/3, 2/3, 1}
+//   meshB(dz=+3)：h = 3,4,5,6  → t 全部 ≥ 1 → 饱和 {1,1,1,1}
+//   meshC(dz=-1)：h = -1,0,1,2 → t = {-1/3, 0, 1/3, 2/3} → 夹断 {0, 0, 1/3, 2/3}
+// 三个网格形状相同、仅位置不同；同一标尺下输出各不相同——证明标尺不随数据自适应，
+// 即"方向与 range 不变、改变 point，颜色会改变"（与 ParaView 行为一致）
+void TestAbsoluteRuler() {
+    {
+        auto mesh = MakeSlopeMesh(0.0);
+        auto filter = ElevationFilter::New();
+        filter->SetRulerRange(0.0, 3.0);
+        filter->SetInput(mesh);
+        Check(filter->Execute(), "Execute should succeed.");
+        CheckValues(FindElevationArray(filter->GetOutput()),
+                    {0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0}, "absolute ruler dz=0");
+    }
+    {
+        auto mesh = MakeSlopeMesh(3.0);
+        auto filter = ElevationFilter::New();
+        filter->SetRulerRange(0.0, 3.0);
+        filter->SetInput(mesh);
+        Check(filter->Execute(), "Execute should succeed.");
+        CheckValues(FindElevationArray(filter->GetOutput()), {1.0, 1.0, 1.0, 1.0},
+                    "absolute ruler dz=+3 (all above ruler)");
+    }
+    {
+        auto mesh = MakeSlopeMesh(-1.0);
+        auto filter = ElevationFilter::New();
+        filter->SetRulerRange(0.0, 3.0);
+        filter->SetInput(mesh);
+        Check(filter->Execute(), "Execute should succeed.");
+        CheckValues(FindElevationArray(filter->GetOutput()),
+                    {0.0, 0.0, 1.0 / 3.0, 2.0 / 3.0},
+                    "absolute ruler dz=-1 (first point below ruler)");
+    }
+}
 
-// 用例 7：斜坡地形模型 + 任意方向 (1,1,0) + 默认范围 [0,1]
+// 用例 9：斜坡地形模型 + 默认方向 +Z + 默认标尺 [0,1]
 // 模型 ElevationSlopeTerrain.vtk：11x11 顶点，x,y ∈ {0..10}，z = 0.1*(x+y)
-// 沿 (1,1,0) 投影 h = x+y ∈ [0,20]，期望 elevation = (x+y)/20（端点钉扎：(0,0)→0，(10,10)→1）
-void TestSlopeModelArbitraryDirection() {
+// 期望 elevation = clamp(0.1*(x+y), 0, 1)（x+y > 10 的区域饱和在 1）
+void TestSlopeModelClampedMapping() {
     auto mesh = LoadPointSetModel(SlopeModelPath);
     Check(mesh->GetNumberOfPoints() == 121, "slope model must have 121 points.");
 
     auto filter = ElevationFilter::New();
-    Check(filter->SetDirection(1.f, 1.f, 0.f), "SetDirection should accept (1,1,0).");
     filter->SetInput(mesh);
     Check(filter->Execute(), "Execute should succeed on the slope model.");
     CheckIndependentOutput(filter, mesh, "slope model");
@@ -240,27 +318,30 @@ void TestSlopeModelArbitraryDirection() {
     const float* values = array->RawPointer();
     for (IGsize i = 0; i < 121; ++i) {
         const Point& p = mesh->GetPoint(i);
-        const double expected = (p[0] + p[1]) / 20.0;
+        double expected = 0.1 * (p[0] + p[1]);
+        if (expected < 0.0) { expected = 0.0; }
+        else if (expected > 1.0) { expected = 1.0; }
         if (std::fabs(values[i] - expected) > 1e-5) {
             throw std::runtime_error("slope model: point " + std::to_string(i) +
                                      " elevation is " + std::to_string(values[i]) +
                                      ", expected " + std::to_string(expected));
         }
     }
-    // 端点钉扎：首点 (0,0) → 0；末点 (10,10) → 1
+    // 端点钉扎：首点 (0,0) → 0；远端 (10,10) 处 z = 2 > 标尺上限 → 饱和 1
     Check(std::fabs(values[0]) < 1e-6, "slope model: first point must map to 0.");
-    Check(std::fabs(values[120] - 1.0) < 1e-6, "slope model: last point must map to 1.");
+    Check(std::fabs(values[120] - 1.0) < 1e-6,
+          "slope model: last point must saturate at 1.");
 }
 
-// 用例 8：梯田地形模型 + 默认方向 +Z + 范围 [10,20]
+// 用例 10：梯田地形模型 + 默认方向 +Z + 标尺 [0,5]
 // 模型 ElevationTerraces.vtk：11x11 顶点，z = floor((x+y)/4) ∈ {0..5} 六层台阶
-// h = z 为精确整数，期望 elevation = 10 + 2z ∈ {10,12,...,20}，且恰好出现六个离散值
-void TestTerracesModelAxisMapping() {
+// 期望 elevation = z/5，恰好出现六个离散值 {0, 0.2, 0.4, 0.6, 0.8, 1}
+void TestTerracesModelRulerMapping() {
     auto mesh = LoadPointSetModel(TerracesModelPath);
     Check(mesh->GetNumberOfPoints() == 121, "terraces model must have 121 points.");
 
     auto filter = ElevationFilter::New();
-    filter->SetOutputRange(10.0, 20.0);
+    filter->SetRulerRange(0.0, 5.0);
     filter->SetInput(mesh);
     Check(filter->Execute(), "Execute should succeed on the terraces model.");
     CheckIndependentOutput(filter, mesh, "terraces model");
@@ -273,7 +354,7 @@ void TestTerracesModelAxisMapping() {
     std::set<double> distinct;
     for (IGsize i = 0; i < 121; ++i) {
         const Point& p = mesh->GetPoint(i);
-        const double expected = 10.0 + 2.0 * std::floor((p[0] + p[1]) / 4.0);
+        const double expected = std::floor((p[0] + p[1]) / 4.0) / 5.0;
         if (std::fabs(values[i] - expected) > 1e-5) {
             throw std::runtime_error("terraces model: point " + std::to_string(i) +
                                      " elevation is " + std::to_string(values[i]) +
@@ -284,7 +365,8 @@ void TestTerracesModelAxisMapping() {
     Check(distinct.size() == 6, "terraces model: expected exactly six terrace levels.");
 }
 
-// 用例 9：独立输出语义——输出为新对象、输入不被污染、几何与输入一致、类型保持、重复执行安全
+// 用例 11：独立输出语义——输出为新对象、输入不被污染、几何与输入一致、
+// 类型保持、重复执行安全（覆盖语义下仍只有一个 Elevation 数组）
 void TestIndependentOutput() {
     auto mesh = MakeSlopeMesh();
     auto filter = ElevationFilter::New();
@@ -330,19 +412,51 @@ void TestIndependentOutput() {
     Check(elevationCount == 1, "output must contain exactly one Elevation array.");
 }
 
+// 用例 12：取色范围锚定——数据未触满标尺时，dataRange 仍为 [0,1]（非数据推导）
+// meshC（dz=-1）+ 标尺 [0,3]：输出 {0, 0, 1/3, 2/3}，实际数据范围 [0, 2/3]；
+// Elevation 属性的 dataRange 行 0（模长范围）/ 行 1（分量范围）均应保持 {0,1}，
+// 证明渲染取色范围锚定在标尺语义的 [0,1]，而不是按数据 min-max 重算
+void TestDataRangeAnchor() {
+    auto mesh = MakeSlopeMesh(-1.0);
+    auto filter = ElevationFilter::New();
+    filter->SetRulerRange(0.0, 3.0);
+    filter->SetInput(mesh);
+    Check(filter->Execute(), "Execute should succeed.");
+
+    // 数据实际范围 [0, 2/3]，未触满标尺
+    CheckValues(FindElevationArray(filter->GetOutput()),
+                {0.0, 0.0, 1.0 / 3.0, 2.0 / 3.0}, "data range anchor values");
+
+    const auto* attribute = FindElevationAttribute(filter->GetOutput());
+    Check(attribute != nullptr, "data range anchor: attribute is missing.");
+    auto range = attribute->dataRange;
+    Check(range != nullptr, "data range anchor: explicit dataRange must be attached.");
+    Check(range->GetDimension() == 2 && range->GetNumberOfElements() == 2,
+          "data range anchor: dataRange layout must be 2 elements x 2 dims.");
+    // 扁平索引：0/1 = 行 0（模长范围 min/max），2/3 = 行 1（分量范围 min/max）
+    Check(std::fabs(range->GetValue(0) - 0.0) < 1e-9 &&
+              std::fabs(range->GetValue(1) - 1.0) < 1e-9 &&
+              std::fabs(range->GetValue(2) - 0.0) < 1e-9 &&
+              std::fabs(range->GetValue(3) - 1.0) < 1e-9,
+          "data range anchor: dataRange must be anchored to [0,1].");
+}
+
 } // namespace
 
 int main() {
     const std::vector<std::pair<std::string, void (*)()>> tests = {
         {"TestAxisMapping", TestAxisMapping},
-        {"TestCustomRange", TestCustomRange},
+        {"TestRulerStraddle", TestRulerStraddle},
+        {"TestClamping", TestClamping},
         {"TestArbitraryDirection", TestArbitraryDirection},
         {"TestScaleInvariance", TestScaleInvariance},
-        {"TestFlatMeshDegenerate", TestFlatMeshDegenerate},
+        {"TestFlatMesh", TestFlatMesh},
         {"TestInvalidInputs", TestInvalidInputs},
-        {"TestSlopeModelArbitraryDirection", TestSlopeModelArbitraryDirection},
-        {"TestTerracesModelAxisMapping", TestTerracesModelAxisMapping},
+        {"TestAbsoluteRuler", TestAbsoluteRuler},
+        {"TestSlopeModelClampedMapping", TestSlopeModelClampedMapping},
+        {"TestTerracesModelRulerMapping", TestTerracesModelRulerMapping},
         {"TestIndependentOutput", TestIndependentOutput},
+        {"TestDataRangeAnchor", TestDataRangeAnchor},
     };
 
     int failed = 0;

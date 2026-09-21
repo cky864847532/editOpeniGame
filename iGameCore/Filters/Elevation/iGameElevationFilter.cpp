@@ -7,7 +7,6 @@
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
 
-#include <limits>
 #include <string>
 #include <vector>
 
@@ -31,7 +30,7 @@ bool ElevationFilter::SetDirection(const Vector3f& d) {
     return SetDirection(d[0], d[1], d[2]);
 }
 
-void ElevationFilter::SetOutputRange(double low, double high) {
+void ElevationFilter::SetRulerRange(double low, double high) {
     if (low >= high) { return; }
     if (m_Low != low || m_High != high) {
         m_Low = low;
@@ -50,7 +49,7 @@ void ElevationFilter::SetArrayName(const std::string& name) {
 bool ElevationFilter::Execute() {
     const double dNorm = m_Direction.norm();
     IGAME_CORE_INFO("ElevationFilter: Execute() start (direction = ({}, {}, {}), "
-                    "output range = [{}, {}])",
+                    "scalar ruler = [{}, {}])",
                     m_Direction[0], m_Direction[1], m_Direction[2], m_Low, m_High);
 
     auto obj = GetInput(0);
@@ -74,39 +73,35 @@ bool ElevationFilter::Execute() {
         return false;
     }
 
-    // 第一趟：求投影范围 [hMin, hMax]
-    double hMin = std::numeric_limits<double>::max();
-    double hMax = std::numeric_limits<double>::lowest();
-    for (IGsize i = 0; i < nPoints; ++i) {
-        const double h = mesh->GetPoint(i).dot(m_Direction);
-        if (h < hMin) { hMin = h; }
-        if (h > hMax) { hMax = h; }
-    }
-    IGAME_CORE_INFO("ElevationFilter: projection range: [{}, {}]", hMin, hMax);
-
-    // 投影退化（网格垂直于方向）：降级输出常量 Low，避免除零产生 NaN
-    const bool degenerate = (hMax <= hMin);
-    if (degenerate) {
-        IGAME_CORE_INFO("ElevationFilter: WARNING - all projections are identical "
-                        "(flat mesh); every elevation value will be {}", m_Low);
-    }
+    // 方向归一化：只保留指向（公共缩放被约去，保证缩放不变性）
+    const Vector3f dir = m_Direction / static_cast<float>(dNorm);
 
     auto elevArr = FloatArray::New();
     elevArr->SetName(m_ArrayName);
     elevArr->SetDimension(1);
     elevArr->Resize(nPoints);
 
-    // 第二趟：仿射映射 h ∈ [hMin, hMax] → [Low, High]
-    const double srcSpan = hMax - hMin;
-    const double dstSpan = m_High - m_Low;
+    // 标尺语义（与 ParaView / vtkElevationFilter 一致）：
+    //   h = p·d̂（投影）→ t = (h − Low)/(High − Low)（标尺参数化）→ 夹断到 [0,1]
+    // 标尺固定、不随数据自适应：移动/修改点位会改变输出值与着色；
+    // 低于标尺下限输出 0、高于上限输出 1（饱和），任何输入都不产生 NaN。
+    const double span = m_High - m_Low;  // SetRulerRange 已保证 span > 0
     for (IGsize i = 0; i < nPoints; ++i) {
-        double out = m_Low;
-        if (!degenerate) {
-            const double h = mesh->GetPoint(i).dot(m_Direction);
-            out = m_Low + (h - hMin) / srcSpan * dstSpan;
-        }
-        elevArr->SetValue(i, out);
+        const double h = mesh->GetPoint(i).dot(dir);
+        double t = (h - m_Low) / span;
+        if (t < 0.0) { t = 0.0; }
+        else if (t > 1.0) { t = 1.0; }
+        elevArr->SetValue(i, static_cast<float>(t));
     }
+
+    // 取色范围锚定 [0,1]：为 Elevation 属性挂显式 dataRange（行 0 = 模长范围、
+    // 行 1 = 分量范围，均为 {0,1}）。渲染 / 标量面板 / 色条读取该范围着色，
+    // 颜色分布与标尺语义一致：模型占标尺哪段，颜色就占色带哪段，超出饱和在端色
+    auto elevRange = DoubleArray::New();
+    elevRange->SetDimension(2);
+    elevRange->Resize(2);
+    elevRange->SetElement(0, {0.0, 1.0});
+    elevRange->SetElement(1, {0.0, 1.0});
 
     // ===== 独立输出：不修改输入对象 =====
     // 继承语义：输出新的数据对象，几何（点/面/单元）与输入共享；
@@ -138,14 +133,15 @@ bool ElevationFilter::Execute() {
                 } else {
                     copied = src.pointer;  // 其他类型共享指针（只读属性，安全）
                 }
-                resultAttrSet->AddAttribute(src.type, src.attachmentType, copied);
+                resultAttrSet->AddAttribute(src.type, src.attachmentType, copied,
+                                             src.GetDataRange());
             }
         }
     }
-    resultAttrSet->AddAttribute(IG_SCALAR, IG_POINT, elevArr);
+    resultAttrSet->AddScalar(IG_POINT, elevArr, elevRange);
 
     IGAME_CORE_INFO("ElevationFilter: Added {} (IG_SCALAR/IG_POINT) to independent output, "
-                    "elements = {}",
+                    "elements = {}, values clamped to [0, 1], data range anchored to [0, 1]",
                     m_ArrayName, elevArr->GetNumberOfElements());
 
     // 按输入的具体网格类型派生输出对象（几何共享、属性独立）

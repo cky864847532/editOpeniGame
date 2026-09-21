@@ -1678,14 +1678,17 @@ void igQtMainWindow::initAllFilters() {
                 const QString title = QStringLiteral("高程 (elevation)");
                 auto obj = currentFilterInput(title);
                 if (!obj) return;
+                // 记住上次标尺输入（跨对话框调用保持，便于微调参数重跑）
+                static QString lastRulerLow = "0";
+                static QString lastRulerHigh = "1";
                 igQtFilterDialogDockWidget* dialog = new igQtFilterDialogDockWidget(this, true);
                 dialog->setFilterTitle(title);
-                dialog->setFilterDescription(QStringLiteral("按点坐标在方向向量上的投影生成点标量。"));
+                dialog->setFilterDescription(QStringLiteral("沿方向向量计算点投影，按标尺区间映射为 0~1 高程标量（超出标尺饱和在端色，语义与 ParaView Elevation 一致）。"));
                 int dxId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("方向 X"), "0");
                 int dyId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("方向 Y"), "0");
                 int dzId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("方向 Z"), "1");
-                int lowId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("输出下限"), "0");
-                int highId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("输出上限"), "1");
+                int lowId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("标尺下限"), lastRulerLow);
+                int highId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("标尺上限"), lastRulerHigh);
                 dialog->show();
                 dialog->setApplyFunctor([=, this]() {
                     bool okDx = false, okDy = false, okDz = false, okLow = false, okHigh = false;
@@ -1695,16 +1698,18 @@ void igQtMainWindow::initAllFilters() {
                     const double low = dialog->getDouble(lowId, okLow);
                     const double high = dialog->getDouble(highId, okHigh);
                     if (!okDx || !okDy || !okDz || !okLow || !okHigh || low >= high) {
-                        showDarkFramelessMessage(title, QStringLiteral("请输入有效方向和输出范围。"));
+                        showDarkFramelessMessage(title, QStringLiteral("请输入有效方向和标尺范围。"));
                         return;
                     }
+                    lastRulerLow = QString::number(low);
+                    lastRulerHigh = QString::number(high);
                     auto filter = ElevationFilter::New();
                     filter->SetInput(obj);
                     if (!filter->SetDirection(static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz))) {
                         showDarkFramelessMessage(title, QStringLiteral("方向向量不能为零。"));
                         return;
                     }
-                    filter->SetOutputRange(low, high);
+                    filter->SetRulerRange(low, high);
                     if (!filter->Execute()) {
                         showDarkFramelessMessage(title, QStringLiteral("生成高程标量失败。"));
                         return;
