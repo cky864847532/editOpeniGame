@@ -45,6 +45,7 @@
 #include <IQWidgets/igQtAiChat/igQtCommandManager.h>
 #include <IQWidgets/igQtCharts.h>
 #include <IQWidgets/igQtDeformationWidget.h>
+#include <IQWidgets/igQtElevationFilterPanel.h>
 #include <IQWidgets/igQtModelClipWidget.h>
 #include <IQWidgets/igQtModelDrawWidget.h>
 #include <IQWidgets/igQtModelInformationWidget.h>
@@ -58,6 +59,7 @@
 #include <iGameBlockMapping.h>
 #include <P3SAM/iGameP3SAMSegmenter.h>
 #include <QByteArray>
+#include <QButtonGroup>
 #include <QDebug>
 #include <QLabel>
 #include <QMessageBox>
@@ -1030,6 +1032,24 @@ void igQtMainWindow::initAllUnDefinedComponents() {
     DeformationDockWidget->hide();
     this->addDockWidget(Qt::RightDockWidgetArea, DeformationDockWidget);
 
+    // 高程 (Elevation) 实时参数面板：入口对话框首次执行后 BindSession 绑定并显示，
+    // 面板内可实时调整低/高点、按轴铺满包围盒、修改标量范围并应用（交互对齐 ParaView）
+    ElevationFilterPanel = new igQtElevationFilterPanel(this);
+    this->addDockWidget(Qt::RightDockWidgetArea, ElevationFilterPanel);
+    ElevationFilterPanel->hide();
+    // 「应用」成功后就地刷新：滤波器复用同一输出对象，模型树不堆叠新节点
+    connect(ElevationFilterPanel, &igQtElevationFilterPanel::elevationApplied, this,
+            [this](iGame::DataObject::Pointer output) {
+        if (!output) return;
+        modelTreeWidget->updateAllAttriubute(output);
+        if (auto drawObj = DynamicCast<DrawObject>(output)) { drawObj->ForceReConvertToDrawableData(); }
+        rendererWidget->update();
+    });
+    // 参数校验/执行失败时弹提示（与菜单入口一致的暗色无边框提示框）
+    connect(ElevationFilterPanel, &igQtElevationFilterPanel::applyFailed, this, [this](const QString& reason) {
+        showDarkFramelessMessage(QStringLiteral("高程 (elevation)"), reason);
+    });
+
 }
 void igQtMainWindow::initToolbarComponent() {
     // 用 QToolButton 行+标题替代 QToolBar（避免 QToolBar 进 layout 导致图标不渲染）
@@ -1680,39 +1700,111 @@ void igQtMainWindow::initAllFilters() {
                 const QString title = QStringLiteral("高程 (elevation)");
                 auto obj = currentFilterInput(title);
                 if (!obj) return;
+                // 防御：包围盒无效时无法按轴预填默认低/高点
+                const auto& bb = obj->GetBoundingBox();
+                if (bb.isNull()) {
+                    showDarkFramelessMessage(title, QStringLiteral("输入模型包围盒无效，无法计算高程。"));
+                    return;
+                }
+
                 igQtFilterDialogDockWidget* dialog = new igQtFilterDialogDockWidget(this, true);
                 dialog->setFilterTitle(title);
-                dialog->setFilterDescription(QStringLiteral("按点坐标在方向向量上的投影生成点标量。"));
-                int dxId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("方向 X"), "0");
-                int dyId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("方向 Y"), "0");
-                int dzId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("方向 Z"), "1");
-                int lowId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("输出下限"), "0");
-                int highId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("输出上限"), "1");
+                dialog->setFilterDescription(QStringLiteral("沿低点到高点的标尺线段计算投影高程标量（t 饱和于 [0,1] 后映射到标量范围），语义与 ParaView Elevation 一致。"));
+
+                // X/Y/Z 轴按钮行（占参数区第一行）：互斥选中，默认选中 X；
+                // 点击按包围盒铺满低/高点（被选轴取 min/max，其余轴取中心）
+                auto* axisRow = new QWidget(dialog);
+                auto* axisLayout = new QHBoxLayout(axisRow);
+                axisLayout->setContentsMargins(0, 0, 0, 0);
+                axisLayout->setSpacing(6);
+                axisLayout->addWidget(new QLabel(QStringLiteral("投影轴"), axisRow));
+                auto* axisGroup = new QButtonGroup(axisRow);
+                axisGroup->setExclusive(true);
+                QPushButton* axisBtns[3] = {};
+                for (int i = 0; i < 3; ++i) {
+                    auto* btn = new QPushButton(QString(QChar('X' + i)), axisRow);
+                    btn->setCheckable(true);
+                    axisGroup->addButton(btn);
+                    axisLayout->addWidget(btn);
+                    axisBtns[i] = btn;
+                }
+                axisBtns[0]->setChecked(true);
+                dialog->addRowWidget(axisRow);
+
+                // 8 个参数：低点 xyz、高点 xyz、标量范围下限/上限（默认按包围盒 X 轴铺满，范围 [0,1]）
+                const auto center = bb.center();
+                auto num = [](double v) { return QString::number(v); };
+                std::array<int, 3> lowIds{}, highIds{};
+                for (int i = 0; i < 3; ++i) {
+                    lowIds[i] = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                                                     QStringLiteral("低点 ") + QString(QChar('X' + i)),
+                                                     num(i == 0 ? bb.min[0] : center[i]));
+                }
+                for (int i = 0; i < 3; ++i) {
+                    highIds[i] = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT,
+                                                      QStringLiteral("高点 ") + QString(QChar('X' + i)),
+                                                      num(i == 0 ? bb.max[0] : center[i]));
+                }
+                int rangeLowId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("标量范围下限"), "0");
+                int rangeHighId = dialog->addParameter(igQtFilterDialogDockWidget::QT_LINE_EDIT, QStringLiteral("标量范围上限"), "1");
+
+                // 按轴回填输入框（回填规则与参数面板 fillRangeByAxis 一致）
+                auto fillByAxis = [dialog, bb, center, lowIds, highIds](int axis) {
+                    for (int i = 0; i < 3; ++i) {
+                        const double lowV = (i == axis) ? bb.min[i] : center[i];
+                        const double highV = (i == axis) ? bb.max[i] : center[i];
+                        if (auto* line = qobject_cast<QLineEdit*>(dialog->getWidget(lowIds[i]))) {
+                            line->setText(QString::number(lowV));
+                        }
+                        if (auto* line = qobject_cast<QLineEdit*>(dialog->getWidget(highIds[i]))) {
+                            line->setText(QString::number(highV));
+                        }
+                    }
+                };
+                for (int i = 0; i < 3; ++i) {
+                    connect(axisBtns[i], &QPushButton::clicked, dialog, [fillByAxis, i]() { fillByAxis(i); });
+                }
                 dialog->show();
                 dialog->setApplyFunctor([=, this]() {
-                    bool okDx = false, okDy = false, okDz = false, okLow = false, okHigh = false;
-                    const double dx = dialog->getDouble(dxId, okDx);
-                    const double dy = dialog->getDouble(dyId, okDy);
-                    const double dz = dialog->getDouble(dzId, okDz);
-                    const double low = dialog->getDouble(lowId, okLow);
-                    const double high = dialog->getDouble(highId, okHigh);
-                    if (!okDx || !okDy || !okDz || !okLow || !okHigh || low >= high) {
-                        showDarkFramelessMessage(title, QStringLiteral("请输入有效方向和输出范围。"));
+                    // 读取低点/高点 xyz（任一解析失败即中止）
+                    bool okAll = true;
+                    double lowPt[3] = {}, highPt[3] = {};
+                    for (int i = 0; i < 3; ++i) {
+                        bool okL = false, okH = false;
+                        lowPt[i] = dialog->getDouble(lowIds[i], okL);
+                        highPt[i] = dialog->getDouble(highIds[i], okH);
+                        okAll = okAll && okL && okH;
+                    }
+                    bool okRL = false, okRH = false;
+                    const double rLow = dialog->getDouble(rangeLowId, okRL);
+                    const double rHigh = dialog->getDouble(rangeHighId, okRH);
+                    if (!okAll || !okRL || !okRH) {
+                        showDarkFramelessMessage(title, QStringLiteral("请输入有效的低点、高点和标量范围。"));
                         return;
                     }
+                    // 前置校验：低点与高点重合 -> 投影方向为零向量；标量范围必须下限 < 上限
+                    const double vx = highPt[0] - lowPt[0], vy = highPt[1] - lowPt[1], vz = highPt[2] - lowPt[2];
+                    if (vx * vx + vy * vy + vz * vz == 0.0) {
+                        showDarkFramelessMessage(title, QStringLiteral("低点不能与高点重合。"));
+                        return;
+                    }
+                    if (rLow >= rHigh) {
+                        showDarkFramelessMessage(title, QStringLiteral("标量范围下限必须小于上限。"));
+                        return;
+                    }
+
                     auto filter = ElevationFilter::New();
                     filter->SetInput(obj);
-                    if (!filter->SetDirection(static_cast<float>(dx), static_cast<float>(dy), static_cast<float>(dz))) {
-                        showDarkFramelessMessage(title, QStringLiteral("方向向量不能为零。"));
-                        return;
-                    }
-                    filter->SetOutputRange(low, high);
+                    filter->SetLowPoint(lowPt[0], lowPt[1], lowPt[2]);
+                    filter->SetHighPoint(highPt[0], highPt[1], highPt[2]);
+                    filter->SetScalarRange(rLow, rHigh);
                     if (!filter->Execute()) {
                         showDarkFramelessMessage(title, QStringLiteral("生成高程标量失败。"));
                         return;
                     }
-                    // 独立输出：GetOutput() 返回新对象，refreshFilterResult 在模型树挂独立节点
+                    // 首次执行：独立输出挂模型树；随后绑定参数面板会话，供持续实时调整（对齐 ParaView Properties）
                     refreshFilterResult(obj, filter->GetOutput(), title);
+                    ElevationFilterPanel->BindSession(obj, filter);
                     dialog->close();
                 });
             });
@@ -4181,6 +4273,9 @@ void igQtMainWindow::initAllMySignalConnections() {
             DeformationWidget, &igQtDeformationWidget::updateInfo);
     connect(this->modelTreeWidget, &igQtModelDialogWidget::ModelDeleted,
             ui->widget_Animation, &igQtAnimationWidget::initAnimationComponents);
+    // 删除高程输出节点时自动关闭右侧 Elevation 参数面板
+    connect(this->modelTreeWidget, &igQtModelDialogWidget::ModelDeleted,
+            ElevationFilterPanel, &igQtElevationFilterPanel::onModelDeleted);
 
     // Update animation controls when model changes
     connect(this->modelTreeWidget, &igQtModelDialogWidget::CurrendModelChanged,
