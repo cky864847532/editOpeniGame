@@ -1,4 +1,5 @@
 #include "iGameCASReader.h"
+#include "iGameExternalProcess.h"
 #include <filesystem>
 #include <iGameFileIO.h>
 #include <iGameScene.h>
@@ -11,14 +12,14 @@ bool CASReader::Parsing() {
 
     // ??? .cas ???·??
     std::string casPath = this->GetFilePath();
-    fs::path inputPath(casPath);
+    fs::path inputPath = FileSystem::PathFromUtf8(casPath);
 
     // ===== ????????·?? =====
     fs::path tempDir = fs::current_path() / "temp";
     if (!fs::exists(tempDir)) { fs::create_directories(tempDir); }
 
     // ????¼??? temp ?????
-    std::string outputDir = tempDir.string();
+    std::string outputDir = FileSystem::PathToUtf8(tempDir);
 
     // ????¼?????????????¼
     //std::string outputDir = inputPath.parent_path().string();
@@ -36,8 +37,7 @@ bool CASReader::Parsing() {
     bool exeFound = false;
     for (const auto& path: exePaths) {
         // 简单检查文件是否存在
-        std::ifstream file(path);
-        if (file.good()) {
+        if (fs::exists(FileSystem::PathFromUtf8(path))) {
             exePath = path;
             exeFound = true;
             break;
@@ -56,12 +56,15 @@ bool CASReader::Parsing() {
 
     // ?????????????
 
-    std::string arguments = "--input " + casPath + " --output " + outputDir;
-    std::string fullCommand = "\"" + exePath + "\" " + arguments;
-    IGAME_CORE_DEBUG("[CASReader] Running command: {}", fullCommand);
+    // Pass UTF-8 arguments directly to the native process API, including spaces and Unicode.
+    std::vector<std::string> arguments = {"--input", casPath, "--output", outputDir};
+    IGAME_CORE_DEBUG("[CASReader] Running converter: {} --input {} --output {}", exePath, casPath, outputDir);
 
-    // ???????????
-    int returnCode = system(fullCommand.c_str());
+    int returnCode = 0;
+    if (!ExternalProcess::Run(exePath, arguments, returnCode)) {
+        IGAME_CORE_ERROR("[CASReader] Failed to start converter: {}", exePath);
+        return false;
+    }
     if (returnCode != 0) {
         IGAME_CORE_ERROR("CAS to VTK conversion failed. Return code: {}", returnCode);
         return false;
@@ -69,8 +72,10 @@ bool CASReader::Parsing() {
 
 
     // ???????????·??
-    fs::path outputFilePath = tempDir / (inputPath.stem().string() + ".vtk");
-    std::string outputFile = outputFilePath.string();
+    fs::path outputFileName = inputPath.stem();
+    outputFileName += ".vtk";
+    fs::path outputFilePath = tempDir / outputFileName;
+    std::string outputFile = FileSystem::PathToUtf8(outputFilePath);
 
     /*std::string outputFile = "";
     fs::path outputFilePath = inputPath.parent_path() / (inputPath.stem().string() + ".vtk");
@@ -95,13 +100,13 @@ bool CASReader::Parsing() {
     try {
         if (fs::exists(outputFilePath)) {
             fs::remove(outputFilePath);
-            IGAME_CORE_DEBUG("[Cleanup] Removed temporary file: {}", outputFilePath.string());
+            IGAME_CORE_DEBUG("[Cleanup] Removed temporary file: {}", FileSystem::PathToUtf8(outputFilePath));
         }
 
         // ??? temp ??????????????
         if (fs::exists(tempDir) && fs::is_empty(tempDir)) {
             fs::remove(tempDir);
-            IGAME_CORE_DEBUG("[Cleanup] Removed empty temp directory: {}", tempDir.string());
+            IGAME_CORE_DEBUG("[Cleanup] Removed empty temp directory: {}", FileSystem::PathToUtf8(tempDir));
         }
     } catch (const std::exception& e) {
         IGAME_CORE_WARN("Failed to clean temporary files: {}", e.what());

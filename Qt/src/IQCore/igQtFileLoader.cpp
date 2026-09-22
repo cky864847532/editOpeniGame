@@ -37,6 +37,8 @@
 
 #include <QCoreApplication>
 #include <QByteArray>
+#include <QDir>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <iostream>
 #include <qaction.h>
@@ -268,10 +270,10 @@ bool igQtFileLoader::TryOpenFile(const std::string& filePath) {
     if (strrchr(filePath.data(), '.') == nullptr &&
         FileIO::GetFileType(filePath) != FileIO::D3PLOT) return false;
 
+    const char* ext = strrchr(filePath.data(), '.');
 #if defined(AbqSDK_ENABLE)
     // ODB 走专用读取路径（IsRuntimeAvailable 守卫 + step 弹窗），避免通用路径崩溃
     // 覆盖"最近文件/在线客户端"等经 OpenFile 打开的入口
-    const char* ext = strrchr(filePath.data(), '.');
     if (ext != nullptr) {
         std::string suffix(ext + 1);
         std::transform(suffix.begin(), suffix.end(), suffix.begin(), ::tolower);
@@ -283,6 +285,37 @@ bool igQtFileLoader::TryOpenFile(const std::string& filePath) {
         }
     }
 #endif
+
+    // Match the local file dialog's XML/Spline dispatch for a package entry
+    // point. The spline reader owns its option dialog and emits NewModel on
+    // success, exactly as it does for File -> Load.
+    if (ext != nullptr) {
+        std::string suffix(ext + 1);
+        std::transform(suffix.begin(), suffix.end(), suffix.begin(), ::tolower);
+        if (suffix == "xml") {
+            this->OpenSplineFile(filePath);
+            return true;
+        }
+#if defined(NASTRAN_ENABLE)
+        if (suffix == "bdf") {
+            const QFileInfo bdfInfo(FromUtf8FilePath(filePath));
+            const QDir packageDirectory(bdfInfo.absolutePath());
+            const QStringList op2Files = packageDirectory.entryList(
+                    {QStringLiteral("*.op2")}, QDir::Files | QDir::NoSymLinks, QDir::Name);
+            if (op2Files.size() > 1) {
+                igError("Remote Nastran package has multiple OP2 companions for {}",
+                        filePath);
+                return false;
+            }
+            QStringList inputFiles{bdfInfo.filePath()};
+            if (op2Files.size() == 1) {
+                inputFiles.push_back(packageDirectory.filePath(op2Files.front()));
+            }
+            this->OpenNastranFile(inputFiles);
+            return true;
+        }
+#endif
+    }
 
     auto obj = ReadFileWithGhostSupport(filePath);
     //_obj = obj;

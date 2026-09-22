@@ -4,6 +4,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QSet>
 #include <QVector>
 #include <QXmlStreamReader>
 
@@ -17,6 +18,53 @@
 namespace
 {
 constexpr qsizetype MaximumReferenceCount = 1000000;
+
+// Keep this list aligned with the formats dispatched by FileIO::ReadFile(),
+// plus the XML spline path dispatched by igQtFileLoader. The remote package
+// layer cannot call either dispatch function here because the standalone
+// validation test target is intentionally independent from the application.
+bool IsRemoteReaderExtension(const QString& suffix)
+{
+    static const QSet<QString> extensions = {
+        QStringLiteral("vtk"), QStringLiteral("igc"), QStringLiteral("igcm"),
+        QStringLiteral("obj"), QStringLiteral("off"), QStringLiteral("mesh"),
+        QStringLiteral("stl"), QStringLiteral("ply"), QStringLiteral("xml"),
+        QStringLiteral("pvd"),
+        QStringLiteral("vts"), QStringLiteral("vtu"), QStringLiteral("vtp"),
+        QStringLiteral("vtm"), QStringLiteral("inp"), QStringLiteral("cas"),
+        QStringLiteral("bdf"), QStringLiteral("ccm"), QStringLiteral("rst"),
+        QStringLiteral("rth"), QStringLiteral("d3plot")
+#if defined(CGNS_ENABLE)
+        , QStringLiteral("cgns")
+#endif
+#if defined(AbqSDK_ENABLE)
+        , QStringLiteral("odb")
+#endif
+    };
+    return extensions.contains(suffix.toLower());
+}
+
+bool IsRemoteManifestExtension(const QString& suffix)
+{
+    // These formats describe other files and must win over their leaf files
+    // when both are present in the archive root.
+    const QString normalized = suffix.toLower();
+    return normalized == QStringLiteral("igcm") || normalized == QStringLiteral("pvd");
+}
+
+bool IsD3PlotEntryPoint(const QFileInfo& info)
+{
+    const QString baseName = info.fileName().toLower();
+    if (baseName == QStringLiteral("d3plot") ||
+        baseName == QStringLiteral("d3plot.d3plot")) {
+        return true;
+    }
+    if (!baseName.startsWith(QStringLiteral("d3plot"))) { return false; }
+    for (qsizetype index = 6; index < baseName.size(); ++index) {
+        if (!baseName.at(index).isDigit()) { return false; }
+    }
+    return baseName.size() > 6;
+}
 
 bool IsWithinRoot(const QString& candidate, const QString& root)
 {
@@ -41,6 +89,95 @@ bool AppendReference(const QString& reference,
         return false;
     }
     references.push_back(reference);
+    return true;
+}
+
+bool IsSafePackageReference(const QString& reference)
+{
+    if (reference.isEmpty() || reference.contains(QLatin1Char('\\')) ||
+        reference.contains(QLatin1Char(':')) || QDir::isAbsolutePath(reference)) {
+        return false;
+    }
+    const QString cleanReference = QDir::cleanPath(reference);
+    return cleanReference != QStringLiteral("..") &&
+           !cleanReference.startsWith(QStringLiteral("../"));
+}
+
+bool ValidatePvdRecursive(const QString& manifestPath,
+                          const QString& canonicalRoot,
+                          QSet<QString>& visiting,
+                          QSet<QString>& validated,
+                          qsizetype& referenceCount,
+                          QString& errorMessage)
+{
+    const QFileInfo manifestInfo(manifestPath);
+    const QString canonicalManifest = manifestInfo.canonicalFilePath();
+    if (canonicalManifest.isEmpty() || !manifestInfo.isFile() ||
+        igQtIsLinkOrReparsePoint(manifestPath) ||
+        !IsWithinRoot(canonicalManifest, canonicalRoot)) {
+        errorMessage = QStringLiteral("PVD entry point is missing, a link, or outside the package");
+        return false;
+    }
+    if (validated.contains(canonicalManifest)) { return true; }
+    if (visiting.contains(canonicalManifest)) {
+        errorMessage = QStringLiteral("PVD contains a cyclic manifest reference");
+        return false;
+    }
+
+    QFile manifest(manifestPath);
+    if (!manifest.open(QIODevice::ReadOnly)) {
+        errorMessage = QStringLiteral("Cannot read PVD entry point: %1").arg(manifest.errorString());
+        return false;
+    }
+    visiting.insert(canonicalManifest);
+    QXmlStreamReader xml(&manifest);
+    const QString manifestDirectory = manifestInfo.absolutePath();
+    while (!xml.atEnd()) {
+        xml.readNext();
+        if (!xml.isStartElement() || xml.name() != QStringLiteral("DataSet")) { continue; }
+        const auto fileAttribute = xml.attributes().value(QStringLiteral("file"));
+        if (fileAttribute.isNull()) { continue; }
+        if (++referenceCount > MaximumReferenceCount) {
+            errorMessage = QStringLiteral("PVD contains too many dataset references");
+            visiting.remove(canonicalManifest);
+            return false;
+        }
+        const QString reference = fileAttribute.toString();
+        if (!IsSafePackageReference(reference)) {
+            errorMessage = QStringLiteral("PVD contains an unsafe dataset reference: %1").arg(reference);
+            visiting.remove(canonicalManifest);
+            return false;
+        }
+        const QFileInfo resolvedInfo(QDir(manifestDirectory).filePath(QDir::cleanPath(reference)));
+        const QString resolved = resolvedInfo.canonicalFilePath();
+        if (resolved.isEmpty() || !resolvedInfo.isFile() ||
+            igQtIsLinkOrReparsePoint(resolvedInfo.filePath()) ||
+            !IsWithinRoot(resolved, canonicalRoot)) {
+            errorMessage = QStringLiteral("PVD dataset reference is missing, a link, or outside the package: %1")
+                    .arg(reference);
+            visiting.remove(canonicalManifest);
+            return false;
+        }
+        const QString suffix = resolvedInfo.suffix().toLower();
+        if (suffix != QStringLiteral("vtu") && suffix != QStringLiteral("vts") &&
+            suffix != QStringLiteral("pvd")) {
+            errorMessage = QStringLiteral("PVD references an unsupported dataset type: %1").arg(reference);
+            visiting.remove(canonicalManifest);
+            return false;
+        }
+        if (suffix == QStringLiteral("pvd") &&
+            !ValidatePvdRecursive(resolvedInfo.filePath(), canonicalRoot, visiting, validated,
+                                  referenceCount, errorMessage)) {
+            visiting.remove(canonicalManifest);
+            return false;
+        }
+    }
+    visiting.remove(canonicalManifest);
+    if (xml.hasError()) {
+        errorMessage = QStringLiteral("PVD XML is invalid: %1").arg(xml.errorString());
+        return false;
+    }
+    validated.insert(canonicalManifest);
     return true;
 }
 } // namespace
@@ -98,16 +235,41 @@ QString igQtFindRemoteDatasetEntryPoint(const QString& packageRoot, QString& err
         return igQtValidateRemoteVtmManifest(found, packageRoot, errorMessage) ? found : QString();
     }
 
-    const QStringList datasets = directory.entryList(
-            {QStringLiteral("*.vtp"), QStringLiteral("*.vtu")},
+    // A non-VTM package is opened through the same FileIO::ReadFile() path as
+    // a local file. Select one root entry point from every reader format that
+    // FileIO dispatches, instead of limiting remote packages to VTP/VTU.
+    // Manifest-like formats win over their referenced leaf files.
+    QFileInfoList candidates;
+    QFileInfoList manifests;
+    const QFileInfoList files = directory.entryInfoList(
             QDir::Files | QDir::NoSymLinks, QDir::Name);
-    if (datasets.size() != 1) {
-        errorMessage = datasets.isEmpty()
-                ? QStringLiteral("Package does not contain a VTM or standalone root VTP/VTU entry point")
-                : QStringLiteral("Package contains more than one standalone root VTP/VTU entry point");
+    for (const QFileInfo& info : files) {
+        const QString suffix = info.suffix().toLower();
+        if (IsRemoteManifestExtension(suffix)) {
+            manifests.push_back(info);
+        }
+        if (IsRemoteReaderExtension(suffix) || IsD3PlotEntryPoint(info)) {
+            candidates.push_back(info);
+        }
+    }
+    if (manifests.size() > 1) {
+        errorMessage = QStringLiteral("Package contains more than one root manifest entry point");
         return {};
     }
-    found = directory.filePath(datasets.front());
+    if (manifests.size() == 1) {
+        found = manifests.front().filePath();
+    } else if (candidates.size() == 1) {
+        found = candidates.front().filePath();
+    } else if (candidates.isEmpty()) {
+        errorMessage = QStringLiteral(
+                "Package does not contain a supported FileIO reader entry point");
+        return {};
+    } else {
+        errorMessage = QStringLiteral(
+                "Package contains multiple possible FileIO reader entry points; add one root model file");
+        return {};
+    }
+
     const QFileInfo datasetInfo(found);
     const QString canonicalDataset = datasetInfo.canonicalFilePath();
     if (igQtIsLinkOrReparsePoint(found) || canonicalDataset.isEmpty() ||
@@ -128,8 +290,22 @@ QString igQtFindRemoteDatasetEntryPoint(const QString& packageRoot, QString& err
     const int appendedStart = header.indexOf("<AppendedData");
     if (appendedStart >= 0) { header.truncate(appendedStart); }
     QXmlStreamReader xml(header);
-    const QString expectedType = datasetInfo.suffix().compare(QStringLiteral("vtp"), Qt::CaseInsensitive) == 0
-            ? QStringLiteral("PolyData") : QStringLiteral("UnstructuredGrid");
+    const QString suffix = datasetInfo.suffix().toLower();
+    if (suffix == QStringLiteral("pvd")) {
+        return igQtValidateRemotePvdManifest(found, packageRoot, errorMessage) ? found : QString();
+    }
+    // Keep the strict XML/header check for XML VTK standalone datasets.
+    // Legacy VTK, CGNS, OBJ, STL, solver formats, and binary iGame formats
+    // are validated by their existing Reader instead.
+    if (suffix != QStringLiteral("vtp") && suffix != QStringLiteral("vtu") &&
+        suffix != QStringLiteral("vts")) {
+        return found;
+    }
+    const QString expectedType = suffix == QStringLiteral("vtp")
+            ? QStringLiteral("PolyData")
+            : (suffix == QStringLiteral("vts")
+               ? QStringLiteral("StructuredGrid")
+               : QStringLiteral("UnstructuredGrid"));
     int depth = 0;
     bool datasetStarted = false;
     while (!xml.atEnd()) {
@@ -290,6 +466,35 @@ bool igQtValidateRemoteVtmManifest(const QString& manifestPath,
                     .arg(reference);
             return false;
         }
+    }
+    return true;
+}
+
+bool igQtValidateRemotePvdManifest(const QString& manifestPath,
+                                   const QString& packageRoot,
+                                   QString& errorMessage)
+{
+    errorMessage.clear();
+    const QFileInfo rootInfo(packageRoot);
+    if (!rootInfo.isDir() || igQtIsLinkOrReparsePoint(packageRoot)) {
+        errorMessage = QStringLiteral("Extracted package root is not a real directory");
+        return false;
+    }
+    const QString canonicalRoot = rootInfo.canonicalFilePath();
+    if (canonicalRoot.isEmpty()) {
+        errorMessage = QStringLiteral("Cannot resolve the extracted package root");
+        return false;
+    }
+    QSet<QString> visiting;
+    QSet<QString> validated;
+    qsizetype referenceCount = 0;
+    if (!ValidatePvdRecursive(manifestPath, canonicalRoot, visiting, validated,
+                              referenceCount, errorMessage)) {
+        return false;
+    }
+    if (referenceCount == 0) {
+        errorMessage = QStringLiteral("PVD does not reference any dataset files");
+        return false;
     }
     return true;
 }

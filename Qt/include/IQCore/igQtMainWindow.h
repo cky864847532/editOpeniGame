@@ -40,6 +40,7 @@ class QFontMetrics;
 class igQtChromeFramelessDialog;
 class igQtPartFocusWidget;
 class igQtAttributeSelectWidget;
+class igQtRemoteModelLibrary;
 
 class IG_QT_MODULE_EXPORT igQtMainWindow : public QMainWindow {
     Q_OBJECT
@@ -114,6 +115,9 @@ public:
     // 报告生成弹窗
     igQtChromeFramelessDialog* reportGenerateDialog{nullptr};
     igQtAttributeSelectWidget* reportGenerateWidget{nullptr};
+
+    // Remote Model Library dialog (C/S package catalog and cache controls)
+    igQtRemoteModelLibrary* remoteModelLibrary{nullptr};
 
 private slots:
     void updateRecentFilePaths();

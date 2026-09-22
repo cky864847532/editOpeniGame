@@ -517,6 +517,41 @@ bool testStandaloneDatasetEntryPoints()
                                    "<AppendedData encoding=\"raw\">_") +
                  QByteArray::fromHex("8098fffe")}, {});
     ok &= check("vtu", {"model.vtu"}, {vtu}, "model.vtu");
+    QStringList genericExtensions = {
+        QStringLiteral("vtk"), QStringLiteral("igc"), QStringLiteral("igcm"),
+        QStringLiteral("obj"), QStringLiteral("off"), QStringLiteral("mesh"),
+        QStringLiteral("stl"), QStringLiteral("ply"), QStringLiteral("xml"),
+        QStringLiteral("inp"), QStringLiteral("cas"), QStringLiteral("bdf"),
+        QStringLiteral("ccm"), QStringLiteral("rst"), QStringLiteral("rth")
+    };
+#if defined(CGNS_ENABLE)
+    genericExtensions.push_back(QStringLiteral("cgns"));
+#endif
+#if defined(AbqSDK_ENABLE)
+    genericExtensions.push_back(QStringLiteral("odb"));
+#endif
+    for (const QString& extension : genericExtensions) {
+        const QString fileName = QStringLiteral("model.") + extension;
+        ok &= check(QStringLiteral("reader-") + extension,
+                    QStringList{fileName}, QVector<QByteArray>{QByteArrayLiteral("reader-input")},
+                    fileName);
+    }
+    const QByteArray vts = QByteArrayLiteral(
+            "<VTKFile type=\"StructuredGrid\"><StructuredGrid><Piece NumberOfPoints=\"4\" "
+            "NumberOfCells=\"1\"/></StructuredGrid></VTKFile>");
+    ok &= check("vts", {"model.vts"}, {vts}, "model.vts");
+    ok &= check("d3plot-no-extension", {"d3plot01"},
+                {QByteArrayLiteral("d3plot-input")}, "d3plot01");
+    ok &= check("bdf-with-op2-companion", {"model.bdf", "model.op2"},
+                {QByteArrayLiteral("bdf"), QByteArrayLiteral("op2")}, "model.bdf");
+    const QByteArray pvd = QByteArrayLiteral(
+            "<VTKFile><Collection><DataSet timestep=\"0\" file=\"leaf.vtu\"/>"
+            "</Collection></VTKFile>");
+    ok &= check("manifest-precedence", {"series.pvd", "leaf.vtu"},
+                {pvd, vtu}, "series.pvd");
+    ok &= check("pvd-traversal", {"series.pvd"},
+                {QByteArrayLiteral("<VTKFile><Collection><DataSet file=\"../outside.vtu\"/>"
+                                   "</Collection></VTKFile>")}, {});
     ok &= check("ambiguous", {"model.vtp", "other.vtu"}, {vtp, vtu}, {});
     ok &= check("type-mismatch", {"model.vtp"}, {vtu}, {});
     ok &= check("invalid-points", {"model.vtp"}, {QByteArrayLiteral(

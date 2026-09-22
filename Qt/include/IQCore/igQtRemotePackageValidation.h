@@ -7,9 +7,10 @@
 /** Returns true for symbolic links and, on Windows, any reparse point. */
 IG_QT_MODULE_EXPORT bool igQtIsLinkOrReparsePoint(const QString& path);
 
-/** Finds a validated VTM entry point, or one standalone root VTP/VTU file.
- * Standalone XML headers are checked with bounded I/O; the normal dataset
- * reader validates their arrays, including appended raw binary payloads.
+/** Finds a validated VTM entry point, or one standalone root file handled by
+ * iGame::FileIO or the local XML spline dispatch. VTM references and standalone
+ * XML VTK headers are checked before opening. Other existing reader formats are
+ * containment-checked here and then validated by their normal reader.
  */
 IG_QT_MODULE_EXPORT QString igQtFindRemoteDatasetEntryPoint(
         const QString& packageRoot, QString& errorMessage);
@@ -24,6 +25,12 @@ IG_QT_MODULE_EXPORT QString igQtFindRemoteDatasetEntryPoint(
  * mirrors that selection rule before applying package containment checks.
  */
 IG_QT_MODULE_EXPORT bool igQtValidateRemoteVtmManifest(
+        const QString& manifestPath,
+        const QString& packageRoot,
+        QString& errorMessage);
+
+/** Validates all package-local VTS/VTU/PVD references consumed by iGamePVDReader. */
+IG_QT_MODULE_EXPORT bool igQtValidateRemotePvdManifest(
         const QString& manifestPath,
         const QString& packageRoot,
         QString& errorMessage);

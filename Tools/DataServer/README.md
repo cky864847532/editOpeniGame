@@ -170,11 +170,15 @@ archive is rechecked against the advertised SHA-256 before reuse. The extracted
 cache is accepted when it has one root VTM entry point and every referenced
 dataset resolves to a regular file within the extracted package. Legacy packages
 with one nested VTM remain supported. A package with no VTM may instead contain
-exactly one root `.vtp` or `.vtu` file; this opens directly as one dataset without
-a wrapper VTM. Its extension, XML dataset type, and safe package-local path are
-checked with bounded header I/O, including for raw appended-binary files. Normal
-dataset loading then validates the data arrays. More than one standalone root
-dataset is rejected as ambiguous.
+exactly one root file supported by the current `FileIO` Reader dispatch:
+VTK/VTP/VTU/VTS, IGC/IGCM, OBJ/OFF/MESH/STL/PLY, Spline XML, PVD, INP, BDF,
+CAS, CCM, RST/RTH, or LS-DYNA d3plot. CGNS and ODB are included only when their
+corresponding Reader is enabled in the client build. A BDF package may include
+one OP2 companion only in a NASTRAN-enabled build. PVD and IGCM take precedence over their
+package-local leaf files. XML VTK headers and package-local paths are
+checked before opening; other formats are containment-checked and validated by
+their normal Reader. More than one possible root entry point is rejected as
+ambiguous.
 
 ## Protocol v1
 

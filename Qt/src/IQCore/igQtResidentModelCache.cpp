@@ -307,6 +307,41 @@ void igQtResidentModelCache::CaptureDisplayState()
 
 bool igQtResidentModelCache::HasPreparedCpuData() const { return HasEntry() && m_PreparedCpu; }
 
+bool igQtResidentModelCache::RefreshPreparedCpuData(iGame::Scene::Pointer scene,
+                                                    const QString& key,
+                                                    QString& reason)
+{
+    reason.clear();
+    if (!HasPreparedCpuData()) { reason = QStringLiteral("prepared-data-not-present"); return false; }
+    if (key != m_Key) { reason = QStringLiteral("package-key-changed"); return false; }
+    if (!scene || scene.get() != m_Scene) { reason = QStringLiteral("scene-changed"); return false; }
+    auto pool = scene->GetModelList();
+    if (!pool || pool.get() != m_ModelPool) {
+        reason = QStringLiteral("scene-model-pool-replaced");
+        return false;
+    }
+
+    std::vector<Stamp> snapshot;
+    if (!BuildSnapshot(m_DataObject.get(), snapshot, reason)) return false;
+    auto* draw = dynamic_cast<iGame::DrawObject*>(m_DataObject.get());
+    if (!draw) { reason = QStringLiteral("prepared-display-missing"); return false; }
+    const auto state = draw->InspectCpuDisplayCache();
+    if (!state.ready) {
+        reason = QStringLiteral("prepared-display-state-changed");
+        return false;
+    }
+    QString surfaceReason;
+    if (!ValidateCpuSurface(m_DataObject.get(), surfaceReason)) {
+        reason = surfaceReason;
+        return false;
+    }
+    m_Snapshot = std::move(snapshot);
+    m_DisplaySignature = state.signature;
+    m_MemoryBytes = state.estimatedBytes;
+    m_PreparedCpu = true;
+    return true;
+}
+
 void igQtResidentModelCache::CaptureData(iGame::Scene::Pointer scene,
                                         iGame::DataObject::Pointer data,
                                         const QString& key,

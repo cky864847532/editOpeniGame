@@ -45,6 +45,12 @@ public:
     void CapturePreparedCpu(iGame::Scene::Pointer scene, iGame::DataObject::Pointer data,
                             const QString& key, const QString& datasetPath);
     bool HasPreparedCpuData() const;
+    // Refresh the identity/display snapshot after a remote model is detached
+    // from the Scene.  Tree removal may update harmless MTimes while the
+    // retained CPU draw arrays remain valid; this keeps the prepared entry
+    // reusable without rebuilding geometry.
+    bool RefreshPreparedCpuData(iGame::Scene::Pointer scene, const QString& key,
+                                QString& reason);
     // Eligibility for this first CPU-preload implementation: a static triangle
     // surface with one Float32 PressureCoefficient value per point on each leaf.
     // Does not require a Scene, Model, selected scalar, visibility, or GL context.

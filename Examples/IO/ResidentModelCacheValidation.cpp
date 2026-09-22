@@ -232,6 +232,88 @@ void CheckCpuPreload() {
     cache.Clear();
 }
 
+// Regression (2026-09-22). Fix commit subject:
+// fix: preserve C/S cache and support portable full-feature runtime
+// Locate this regression in the existing test file:
+// git log --format="%h %s" -S "void CheckSolidColorCacheReopen()" -- Examples/IO/ResidentModelCacheValidation.cpp
+// Selecting a model row calls
+// ViewCloudPicture(-1). A subsequent prepared-cache hit used to fail the Cp
+// coloring guard and evict the cache after the frame. Preserve that legitimate
+// solid-color state across repeated detach/reattach, while still rejecting
+// malformed physical Cp arrays and unsupported geometry/display metadata.
+void CheckSolidColorCacheReopen() {
+    auto scene = iGame::Scene::New(); // No GL context or Scene::Initialize.
+    auto mesh = PreparedSurface::New();
+    auto points = iGame::Points::New();
+    points->AddPoint(0, 0, 0); points->AddPoint(1, 0, 0); points->AddPoint(0, 1, 0);
+    auto faces = iGame::CellArray::New(); faces->AddCellId3(0, 1, 2);
+    auto cp = iGame::FloatArray::New(); cp->SetName("PressureCoefficient");
+    cp->AddValue(-1); cp->AddValue(0); cp->AddValue(1);
+    mesh->SetPoints(points); mesh->SetFaces(faces);
+    mesh->GetAttributeSet()->AddAttribute(IG_SCALAR, IG_POINT, cp);
+    mesh->Prepare();
+    auto model = iGame::Model::New(); model->SetDataObject(mesh);
+    auto id = RegisterHidden(scene, model); model->SetVisibility(true);
+    auto inspect = [&] { return igQtRemoteSurfaceSnapshot::Inspect(scene.get(), model.get()); };
+    Require(inspect().valid, "reopen-colored-surface-eligible");
+    const QString key = QStringLiteral("solid-color-reopen-v1");
+    igQtResidentModelCache cache;
+    cache.CapturePrepared(scene, model, key, QStringLiteral("solid.vtp"));
+    Require(cache.HasPreparedCpuData(), "reopen-initial-prepared-cache-ready");
+
+    // Use the actual model-tree operation, then settle CPU drawing state as a
+    // normal frame does. No reparse, GPU upload or forced default coloring.
+    model->ViewCloudPicture(-1);
+    mesh->ConvertToDrawableData();
+    Require(!mesh->IsUseColor() && mesh->GetCurrentAttributeIndex() == -1,
+            "model-row-operation-disables-scalar-coloring");
+    Require(inspect().valid, "solid-color-surface-remains-cache-eligible");
+    QString reason;
+    for (int round = 0; round < 3; ++round) {
+        scene->RemoveModel(id); model->SetScene(nullptr);
+        mesh->ReleaseGpuResourcesKeepCpuData();
+        Require(cache.RefreshPreparedCpuData(scene, key, reason),
+                "solid-color-detach-refreshes-prepared-cache");
+        auto hit = cache.LookupData(scene, key, reason);
+        Require(hit.get() == mesh.get() && cache.HasPreparedCpuData(),
+                "solid-color-reopen-reuses-original-prepared-data");
+        model = iGame::Model::New(); model->SetDataObject(hit);
+        id = RegisterHidden(scene, model); model->SetVisibility(true);
+        const auto snapshot = inspect();
+        Require(snapshot.valid && snapshot.leafCount == 1 && snapshot.pointCount == 3 && snapshot.faceCount == 1,
+                "solid-color-reattached-frame-passes-cache-admission");
+        cache.CapturePrepared(scene, model, key, QStringLiteral("solid.vtp"));
+        Require(cache.HasPreparedCpuData() && !mesh->IsUseColor() && mesh->GetCurrentAttributeIndex() == -1,
+                "solid-color-frame-retains-cache-without-enabling-coloring");
+    }
+
+    // Dropping a display-selection requirement must not admit broken data.
+    auto& attribute = mesh->GetAttributeSet()->GetAttribute(0);
+    cp->SetName("UnrelatedScalar");
+    Require(!inspect().valid, "solid-color-missing-cp-still-rejected");
+    cp->SetName("PressureCoefficient");
+    attribute.isDeleted = true;
+    Require(!inspect().valid, "solid-color-deleted-cp-still-rejected");
+    attribute.isDeleted = false;
+    attribute.attachmentType = IG_CELL;
+    Require(!inspect().valid, "solid-color-cell-cp-still-rejected");
+    attribute.attachmentType = IG_POINT;
+    cp->Resize(2);
+    Require(!inspect().valid, "solid-color-truncated-cp-still-rejected");
+    cp->Resize(3); cp->SetValue(2, 1);
+    mesh->SetViewStyle(IG_WIREFRAME);
+    Require(!inspect().valid, "solid-color-wireframe-still-rejected");
+    mesh->SetViewStyle(IG_SURFACE);
+    model->SetVisibility(false);
+    Require(!inspect().valid, "solid-color-hidden-model-still-rejected");
+    model->SetVisibility(true);
+    Require(inspect().valid, "solid-color-valid-metadata-restored");
+    model->ViewCloudPicture(0, 0);
+    Require(inspect().valid && mesh->IsUseColor(), "cp-coloring-can-still-be-enabled");
+    scene->RemoveModel(id); model->SetScene(nullptr);
+    mesh->ReleaseDrawableResources(); cache.Clear(); scene->Finalize();
+}
+
 void CheckSurfaceSnapshotLogicalConnectivity() {
     auto scene = iGame::Scene::New(); // Deliberately never Initialize or Draw.
     auto surface = iGame::SurfaceMesh::New();
@@ -296,6 +378,7 @@ int main() {
         CheckPreparedCpuCache();
         CheckCpuPreload();
         CheckSurfaceSnapshotLogicalConnectivity();
+        CheckSolidColorCacheReopen();
         auto scene = iGame::Scene::New();
         auto otherScene = iGame::Scene::New();
         auto data = ProbeData::New();

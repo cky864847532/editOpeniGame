@@ -120,12 +120,14 @@ struct igQtRemoteSurfaceSnapshot {
                 }
             }
 
-            const int attributeIndex = object->GetCurrentAttributeIndex();
+            // Cache eligibility follows the physical dataset, not the current
+            // scalar selection. Clicking the model row selects solid coloring;
+            // preserve that state on reattachment instead of evicting the cache.
+            // Prepared-cache lookup separately validates the display signature.
             auto* attributes = object->GetAttributeSet();
-            if (!draw->IsUseColor() || !attributes || attributeIndex < 0 ||
-                static_cast<quint64>(attributeIndex) >= static_cast<quint64>(attributes->GetNumberOfAttributes()) ||
-                object->GetCurrentAttributeDimension() != 0) {
-                return fail(path + QStringLiteral(": point PressureCoefficient component zero is not selected for coloring"));
+            const int attributeIndex = attributes ? attributes->GetAttributeIndex("PressureCoefficient") : -1;
+            if (attributeIndex < 0) {
+                return fail(path + QStringLiteral(": missing point PressureCoefficient"));
             }
             const auto& attribute = attributes->GetAttribute(attributeIndex);
             const auto scalar = attribute.pointer;
@@ -133,7 +135,7 @@ struct igQtRemoteSurfaceSnapshot {
                 !scalar || scalar->GetName() != "PressureCoefficient" || scalar->GetDimension() != 1 ||
                 scalar->GetArrayType() != IG_FloatArray ||
                 static_cast<quint64>(scalar->GetNumberOfValues()) != pointCount) {
-                return fail(path + QStringLiteral(": selected field is not one Float32 PressureCoefficient value per point"));
+                return fail(path + QStringLiteral(": PressureCoefficient must be one Float32 scalar per point"));
             }
             if (pointCount > std::numeric_limits<quint64>::max() - result.pointCount ||
                 cellCount > std::numeric_limits<quint64>::max() - result.faceCount) {
@@ -154,7 +156,7 @@ struct igQtRemoteSurfaceSnapshot {
                                 .arg(result.valid ? QStringLiteral("PASS") : QStringLiteral("FAIL"))
                                 .arg(result.leafCount).arg(result.pointCount).arg(result.faceCount)
                                 .arg(result.valid
-                                             ? QStringLiteral("visible, opaque Surface metadata with point Float32 PressureCoefficient; renderer mode/GPU output not checked; topology types/variable arity rely on prior offline validation")
+                                             ? QStringLiteral("visible, opaque Surface metadata with point Float32 PressureCoefficient; active scalar coloring is not required; renderer mode/GPU output not checked; topology types/variable arity rely on prior offline validation")
                                              : failure);
         return result;
     }

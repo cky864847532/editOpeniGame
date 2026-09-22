@@ -253,7 +253,6 @@ bool iGameVTMReader::Parsing() {
     tinyxml2::XMLElement* BlockElem = vtkMultiBlockElem->FirstChildElement("Block");
     tinyxml2::XMLElement* DataSetElem = vtkMultiBlockElem->FirstChildElement("DataSet");
     const bool isFlatDataSet = BlockElem == nullptr && DataSetElem != nullptr;
-
     std::size_t totalFileCount = 0;
     if (BlockElem) {
         for (auto* block = BlockElem; block; block = block->NextSiblingElement("Block")) {
@@ -278,12 +277,6 @@ bool iGameVTMReader::Parsing() {
     IGsize unstructuredCellRecords = 0;
     std::size_t unstructuredPieceCount = 0;
     IGAME_CORE_INFO("[VTM] Found {} referenced files in {}", totalFileCount, m_FilePath);
-    const bool disableEagerPieceLod = isFlatDataSet && totalFileCount > 1;
-    if (disableEagerPieceLod) {
-        IGAME_CORE_INFO(
-                "[VTM] Eager per-piece interaction LOD is disabled for this flat multi-piece data set; "
-                "interaction falls back to the complete piece geometry");
-    }
 
     std::vector<DataObject::Pointer> overall_multiBlock;
 
@@ -354,11 +347,6 @@ bool iGameVTMReader::Parsing() {
         }
 
         object->SetName(FileSystem::PathToUtf8(referencedPath.stem()));
-        if (disableEagerPieceLod) {
-            if (auto drawObject = DynamicCast<DrawObject>(object)) {
-                drawObject->SetAutoBuildInteractionLod(false);
-            }
-        }
         if (auto unstructuredMesh = DynamicCast<UnstructuredMesh>(object)) {
             unstructuredPointRecords += unstructuredMesh->GetNumberOfPoints();
             unstructuredCellRecords += unstructuredMesh->GetNumberOfCells();

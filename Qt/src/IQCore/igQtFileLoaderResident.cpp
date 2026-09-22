@@ -220,14 +220,27 @@ void igQtFileLoader::ReleaseDetachedRemoteGpuResources()
     if (QOpenGLContext::currentContext() != s.cacheContext.data()) return;
     const auto key = s.cache.Key();
     const auto path = s.cache.DatasetPath();
-    QString preparedReason;
-    const bool prepared = s.cache.HasPreparedCpuData() && s.cache.LookupData(scene, key, preparedReason);
+    // The cache entry has already been validated when the displayed frame was
+    // captured.  Removing the Scene::Model can legitimately change display
+    // bookkeeping/MTimes without changing the retained CPU draw arrays.  Do
+    // not re-run the strict identity lookup here: doing so used to downgrade
+    // a prepared entry to raw data during normal model-tree deletion.
+    const bool prepared = s.cache.HasPreparedCpuData();
     if (auto* draw = dynamic_cast<iGame::DrawObject*>(data.get())) {
-        if (prepared) draw->ReleaseGpuResourcesKeepCpuData();
-        else draw->ReleaseDrawableResources();
+        if (prepared) {
+            draw->ReleaseGpuResourcesKeepCpuData();
+            QString refreshReason;
+            if (!s.cache.RefreshPreparedCpuData(scene, key, refreshReason)) {
+                igDebug("[RemoteCpuCache] Prepared CPU refresh failed; falling back to raw CPU cache: {}",
+                        refreshReason.toStdString());
+                draw->ReleaseDrawableResources();
+                s.cache.CaptureCpu(scene, data, key, path);
+            }
+        } else {
+            draw->ReleaseDrawableResources();
+            s.cache.CaptureCpu(scene, data, key, path);
+        }
     }
-    if (prepared) s.cache.CapturePreparedCpu(scene, data, key, path);
-    else s.cache.CaptureCpu(scene, data, key, path);
     s.cacheContext.clear();
     if (!s.cache.HasEntry() || s.cache.MemoryBytes() > s.limitBytes) {
         // A detached prepared graph may contain shell/meshlet/self references.
