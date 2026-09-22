@@ -33,6 +33,7 @@ class igQtProgressBarWidget;
 class igQtModelDialogWidget;
 class igQtModelClipWidget;
 class igQtDeformationWidget;
+class igQtElevationFilterPanel;
 class igQtAiChatWidget;
 class igQtCommandManager;
 class QFontMetrics;
@@ -90,6 +91,9 @@ public:
     igQtModelClipWidget* SliceWidget;
     QDockWidget* DeformationDockWidget;
     igQtDeformationWidget* DeformationWidget;
+
+    // 高程 (Elevation) 实时参数面板：入口对话框首次执行后绑定会话并显示
+    igQtElevationFilterPanel* ElevationFilterPanel{nullptr};
 
     igQtProgressBarWidget* progressBarWidget;
     QComboBox* viewStyleCombox;
