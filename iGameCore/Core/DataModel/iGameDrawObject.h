@@ -65,6 +65,11 @@ public:
     void ReleaseDrawableResources();
     bool HasGpuResources() const;
 
+    // Per-dataset opt-in. Local files keep main's upload and wireframe path.
+    // Propagates to existing children, extracted surfaces and interaction LOD.
+    void SetRemoteRenderingEnabled(bool enabled);
+    bool GetRemoteRenderingEnabled() const { return m_RemoteRenderingEnabled; }
+
     bool IsUseColor();        //是否使用颜色
     bool IsUseNormalSmooth(); //是否使用法线平滑
 
@@ -156,6 +161,7 @@ protected:
 
     Object::Pointer m_ReConvertHelper = Object::New();
     bool m_AttributeChanged = false;
+    bool m_RemoteRenderingEnabled = false;
     bool m_ForceGpuBufferUpload = false;
     bool m_RestoreMeshletColoring = false;
     bool m_ReConvertToDrawableData; // 是否需要重新转换数据

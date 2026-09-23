@@ -305,7 +305,9 @@ void Model::Draw() {
 #ifndef __EMSCRIPTEN__
         if (viewStyle & IG_WIREFRAME && viewStyle & IG_SURFACE &&
             renderableObject->IsUseSinglePassWireframeRendering()) {
-            auto shader = m_Scene->GetShader(ShaderType::SINGLEPASSWIREFRAME);
+            const bool remoteRendering = renderableObject->GetRemoteRenderingEnabled();
+            auto shader = m_Scene->GetShader(remoteRendering ? ShaderType::REMOTE_SINGLEPASSWIREFRAME
+                                                            : ShaderType::SINGLEPASSWIREFRAME);
             shader->Use();
 
             shader->SetUniformf("lineWidth", renderableObject->GetLineWidth());
@@ -313,11 +315,15 @@ void Model::Draw() {
             auto edgeMaskTexture =
                     colorWithCell ? renderableObject->m_CellEdgeMaskTexture
                                   : renderableObject->m_EdgeMaskTexture;
-            const int constantEdgeMask = colorWithCell ? renderableObject->m_ConstantCellEdgeMask
-                                                      : renderableObject->m_ConstantEdgeMask;
-            if (constantEdgeMask < 0) { edgeMaskTexture->Active(GL_TEXTURE1); }
+            if (remoteRendering) {
+                const int constantEdgeMask = colorWithCell ? renderableObject->m_ConstantCellEdgeMask
+                                                          : renderableObject->m_ConstantEdgeMask;
+                if (constantEdgeMask < 0) { edgeMaskTexture->Active(GL_TEXTURE1); }
+                shader->SetUniformi("constantEdgeMask", constantEdgeMask);
+            } else {
+                edgeMaskTexture->Active(GL_TEXTURE1);
+            }
             shader->SetUniformi("edgeMasks", 1);
-            shader->SetUniformi("constantEdgeMask", constantEdgeMask);
 
             if (useColor && !colorWithCell) {
                 shader->SetUniformi("edgeColorMode", 0);

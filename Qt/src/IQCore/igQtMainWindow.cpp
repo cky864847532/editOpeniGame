@@ -4327,11 +4327,6 @@ void igQtMainWindow::initAllMySignalConnections() {
     connect(fileLoader, &igQtFileLoader::FinishReading, DeformationWidget, &igQtDeformationWidget::updateInfo);
 
     connect(fileLoader, &igQtFileLoader::FinishReading, this, [&]() {
-        if (qEnvironmentVariableIsSet("IGAMEVIS_DISABLE_DEFAULT_SCALAR_MAPPING")) {
-            qInfo() << "Default scalar mapping disabled by IGAMEVIS_DISABLE_DEFAULT_SCALAR_MAPPING";
-            return;
-        }
-
         auto scene = iGame::SceneManager::Instance()->GetCurrentScene();
         if (!scene) return;
 
@@ -4342,88 +4337,24 @@ void igQtMainWindow::initAllMySignalConnections() {
         if (!dataObject) return;
 
         auto attributeSet = dataObject->GetAttributeSet();
-        auto drawObject = DynamicCast<DrawObject>(dataObject);
-        if (!attributeSet || !drawObject) return;
+        if (!attributeSet) return;
 
         auto allAttributes = attributeSet->GetAllAttributes();
         if (!allAttributes || allAttributes->GetNumberOfElements() == 0) return;
 
-        // VTM readers publish common leaf attributes as zero-length proxies on
-        // the root object.  Prefer the physically meaningful Cp field, then
-        // fall back to the first valid scalar field.
-        int scalarIndex = -1;
-        int firstScalarIndex = -1;
-        for (int index = 0; index < allAttributes->GetNumberOfElements(); ++index) {
-            auto& attribute = allAttributes->GetElement(index);
-            if (attribute.isDeleted || attribute.type != IG_SCALAR || !attribute.pointer ||
-                attribute.pointer->GetDimension() < 1) {
-                continue;
-            }
-            if (firstScalarIndex < 0) firstScalarIndex = index;
-            if (attribute.pointer->GetName() == "PressureCoefficient") {
-                scalarIndex = index;
-                break;
+        auto drawObject = DynamicCast<DrawObject>(dataObject);
+        if (drawObject) {
+            auto item = modelTreeWidget->getItemFromObject(dataObject);
+            if (item && item->childCount() > 0) {
+                item->setExpanded(true);
+                auto child = item->child(0);
+                item->setCurrentChild(child);
+                item->setSelected(false);
+                item->viewAttribute(0, -1);
+                child->setSelected(true);
+                modelTreeWidget->setCurrentItem(child);
             }
         }
-        if (scalarIndex < 0) scalarIndex = firstScalarIndex;
-        if (scalarIndex < 0) return;
-
-        auto& scalarAttribute = allAttributes->GetElement(scalarIndex);
-        const std::string scalarName = scalarAttribute.pointer->GetName();
-        const int scalarComponents = scalarAttribute.pointer->GetDimension();
-        // A one-component scalar must map component zero.  Multi-component
-        // fields use magnitude, represented by dimension -1.
-        const int scalarDimension = scalarComponents == 1 ? 0 : -1;
-        const int rangeIndex = scalarDimension < 0 ? 0 : scalarDimension + 1;
-        auto fullDataRange = scalarAttribute.GetDataRange();
-        if (!fullDataRange ||
-            fullDataRange->GetNumberOfValues() < 2 * (scalarComponents + 1)) {
-            qWarning() << "Default scalar mapping skipped: invalid global range for"
-                       << QString::fromStdString(scalarName);
-            return;
-        }
-        const double fullMinimum = fullDataRange->GetValue(2 * rangeIndex);
-        const double fullMaximum = fullDataRange->GetValue(2 * rangeIndex + 1);
-        if (!std::isfinite(fullMinimum) || !std::isfinite(fullMaximum) ||
-            fullMinimum > fullMaximum) {
-            qWarning() << "Default scalar mapping skipped: non-finite global range for"
-                       << QString::fromStdString(scalarName);
-            return;
-        }
-
-        // Every flat-VTM leaf inherits the root mapper in AddSubDataObject().
-        // Keep the application's built-in palette and normal auto-rescale
-        // behaviour; only the scalar selection is automatic here.
-        auto mapper = dataObject->GetColorMapper();
-        if (!mapper) return;
-        mapper->SetRange(fullMinimum, fullMaximum);
-        mapper->SetRangeStable(false);
-
-        auto item = modelTreeWidget->getItemFromObject(dataObject);
-        if (!item) return;
-        AttribTreeWidgetItem* scalarItem = nullptr;
-        for (int childIndex = 0; childIndex < item->childCount(); ++childIndex) {
-            auto child = dynamic_cast<AttribTreeWidgetItem*>(item->child(childIndex));
-            if (child && child->text(0).toStdString() == scalarName) {
-                scalarItem = child;
-                break;
-            }
-        }
-        if (!scalarItem) return;
-
-        item->setExpanded(true);
-        item->setCurrentChild(scalarItem);
-        item->setSelected(false);
-        scalarItem->show();
-        scalarItem->setSelected(true);
-        modelTreeWidget->setCurrentItem(scalarItem);
-        item->viewAttribute(scalarIndex, scalarDimension);
-
-        qInfo() << "Default scalar mapping:"
-                << QString::fromStdString(scalarName)
-                << "dimension" << scalarDimension
-                << "full range" << fullMinimum << fullMaximum
-                << "display range" << mapper->GetRange()[0] << mapper->GetRange()[1];
     });
 
     connect(ui->widget_FlowField, &igQtStreamTracerWidget::AddStreamObject, this, [&](iGame::DataObject::Pointer res) {

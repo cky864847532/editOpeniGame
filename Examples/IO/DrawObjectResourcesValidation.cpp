@@ -3,6 +3,10 @@
 #include "iGameDrawObject.h"
 #include "iGameSurfaceMesh.h"
 #include "iGameUnstructuredMesh.h"
+#include "iGameFileIO.h"
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -80,8 +84,48 @@ ProbeSurface::Pointer MakeTriangleSurface() {
     return surface;
 }
 
+// BUG: C/S lazy edges and mask availability affected ordinary models as well.
+// Local models must eagerly prepare main's line indices; remote opt-in must be
+// per object and propagate to derived data without changing another local model.
+// Fix commit: 待提交 (C/S rendering isolation).
+// BUG: opting in after VTM AddSubDataObject was too late for eager preparation.
+// Verify the same real file opened locally stays local, and remote pieces are
+// already opted in before their extracted surface is constructed.
+// Fix commit: 待提交 (C/S rendering isolation).
+void CheckFileEntryIsolation() {
+    namespace fs = std::filesystem;
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto dir = fs::temp_directory_path() / ("igame-remote-policy-" + std::to_string(stamp));
+    Require(fs::create_directory(dir), "reader-policy-fixture-directory-created");
+    const auto piece = dir / "piece.vtu";
+    const auto manifest = dir / "model.vtm";
+    { std::ofstream f(piece); f << R"(<VTKFile type="UnstructuredGrid" version="0.1" byte_order="LittleEndian"><UnstructuredGrid><Piece NumberOfPoints="3" NumberOfCells="1"><Points><DataArray type="Float32" NumberOfComponents="3" format="ascii">0 0 0 1 0 0 0 1 0</DataArray></Points><Cells><DataArray type="Int32" Name="connectivity" format="ascii">0 1 2</DataArray><DataArray type="Int32" Name="offsets" format="ascii">3</DataArray><DataArray type="UInt8" Name="types" format="ascii">5</DataArray></Cells></Piece></UnstructuredGrid></VTKFile>)"; }
+    { std::ofstream f(manifest); f << R"(<VTKFile type="vtkMultiBlockDataSet" version="1.0"><vtkMultiBlockDataSet><DataSet index="0" file="piece.vtu"/></vtkMultiBlockDataSet></VTKFile>)"; }
+    const auto path = manifest.u8string();
+    const std::string utf8(reinterpret_cast<const char*>(path.data()), path.size());
+    auto localData = iGame::FileIO::ReadFile(utf8);
+    auto remoteData = iGame::FileIO::ReadRemoteFile(utf8);
+    auto* local = dynamic_cast<iGame::DrawObject*>(localData.get());
+    auto* remote = dynamic_cast<iGame::DrawObject*>(remoteData.get());
+    Require(local && remote && !local->GetRemoteRenderingEnabled() && remote->GetRemoteRenderingEnabled(),
+            "local-and-remote-file-entry-policies-are-independent");
+    auto* localPiece = dynamic_cast<iGame::DrawObject*>(local->SubDataObjectIteratorBegin()->second.get());
+    auto* remotePiece = dynamic_cast<iGame::DrawObject*>(remote->SubDataObjectIteratorBegin()->second.get());
+    Require(localPiece && remotePiece && !localPiece->GetRemoteRenderingEnabled() &&
+                remotePiece->GetRemoteRenderingEnabled() && remotePiece->GetRenderableObject()->GetRemoteRenderingEnabled(),
+            "remote-VTM-piece-and-eager-shell-inherit-policy");
+    local->ReleaseDrawableResources(); remote->ReleaseDrawableResources();
+    fs::remove(manifest); fs::remove(piece); fs::remove(dir);
+}
+
 void CheckLazyWireframeGeometry() {
+    auto local = MakeTriangleSurface();
+    local->ConvertToDrawableData();
+    Require(!local->GetRemoteRenderingEnabled() && local->HasBuiltEdges() &&
+                local->LineIndexValueCount() == 6 && local->IsUseSinglePassWireframeRendering(),
+            "ordinary-model-keeps-main-edges-and-mask-selection-without-GPU");
     auto surface = MakeTriangleSurface();
+    surface->SetRemoteRenderingEnabled(true);
     surface->ConvertToDrawableData();
     Require(!surface->HasBuiltEdges() && surface->LineIndexValueCount() == 0,
             "surface-only-display-skips-edge-topology-and-line-indices");
@@ -97,6 +141,7 @@ void CheckLazyWireframeGeometry() {
             "pure-wireframe-builds-explicit-line-indices-on-demand");
 
     auto transparent = MakeTriangleSurface();
+    transparent->SetRemoteRenderingEnabled(true);
     transparent->SetViewStyle(IG_SURFACE | IG_WIREFRAME);
     transparent->SetTransparency(0.5f);
     transparent->ConvertToDrawableData();
@@ -139,6 +184,7 @@ void CheckCpuReleaseAndRebuild() {
     surface->AddFallbackSelfCycle();
     surface->AliasOriginalArrays(cp);
     surface->SetRenderWithMeshlet(true);
+    root->SetRemoteRenderingEnabled(true);
 
     const auto pointsTime = points->GetMTime().GetMTime();
     const auto coordinatesTime = points->ConvertToArray()->GetMTime().GetMTime();
@@ -201,6 +247,7 @@ void CheckPreparedCpuRetention() {
     surface->SetPoints(points); surface->SetFaces(cells);
     surface->GetAttributeSet()->AddAttribute(IG_SCALAR, IG_POINT, cp);
     surface->SelectCp(); root->AddSubDataObject(surface);
+    root->SetRemoteRenderingEnabled(true);
     surface->PrepareCpuDisplay();
     auto lod = surface->GetRenderableObject(true);
     const auto before = root->InspectCpuDisplayCache();
@@ -249,6 +296,7 @@ void CheckUnstructuredShellRelease() {
 
 void CheckPreparedGridRetention() {
     auto grid = PreparedGrid::New();
+    grid->SetRemoteRenderingEnabled(true);
     auto points = iGame::Points::New();
     points->AddPoint(0.f, 0.f, 0.f); points->AddPoint(1.f, 0.f, 0.f); points->AddPoint(0.f, 1.f, 0.f);
     auto cells = iGame::CellArray::New(); cells->AddCellId3(0, 1, 2);
@@ -258,6 +306,8 @@ void CheckPreparedGridRetention() {
     auto shell = grid->GetRenderableObject(); auto lod = grid->GetRenderableObject(true);
     const auto before = grid->InspectCpuDisplayCache();
     Require(before.ready, "VTU-shell-and-LOD-prepared-ready");
+    Require(shell->GetRemoteRenderingEnabled() && lod->GetRemoteRenderingEnabled(),
+            "remote-rendering-policy-propagates-to-extracted-shell-and-LOD");
     grid->ReleaseGpuResourcesKeepCpuData();
     grid->PrepareCpuDisplay();
     const auto after = grid->InspectCpuDisplayCache();
@@ -269,6 +319,7 @@ void CheckPreparedGridRetention() {
 
 int main() {
     try {
+        CheckFileEntryIsolation();
         CheckLazyWireframeGeometry();
         CheckCpuReleaseAndRebuild();
         CheckUnstructuredShellRelease();

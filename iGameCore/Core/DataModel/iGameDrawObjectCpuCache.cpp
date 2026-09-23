@@ -10,6 +10,7 @@
 IGAME_NAMESPACE_BEGIN
 
 void DrawObject::ReleaseGpuResourcesKeepCpuData() {
+    if (!m_RemoteRenderingEnabled) return;
     std::unordered_set<DataObject*> visited;
     auto destroy = [](const auto& resource) { if (resource) resource->Destroy(); };
     std::function<void(DataObject*)> release = [&](DataObject* node) {
@@ -41,7 +42,7 @@ void DrawObject::ReleaseGpuResourcesKeepCpuData() {
 }
 
 bool DrawObject::UploadPreparedCpuData() {
-    if (HasGpuResources() || !InspectCpuDisplayCache().ready) return false;
+    if (!m_RemoteRenderingEnabled || HasGpuResources() || !InspectCpuDisplayCache().ready) return false;
     std::unordered_set<DataObject*> visited;
     std::function<void(DataObject*)> upload = [&](DataObject* node) {
         if (!node || !visited.insert(node).second) return;
@@ -221,7 +222,7 @@ DrawObject::CpuDisplayCacheState DrawObject::InspectCpuDisplayCache() {
                 static_cast<std::uint64_t>(draw->m_AttributeDimension),
                 draw->m_ShellRendering, draw->m_AccelerationOption, draw->m_UseColor,
                 draw->m_ColorWithCell, draw->m_UseNormalSmooth, draw->m_AutoUpdateDrawData,
-                draw->m_ReConvertToDrawableData, draw->m_AttributeChanged});
+                draw->m_ReConvertToDrawableData, draw->m_AttributeChanged, draw->m_RemoteRenderingEnabled});
             drawArray(draw->m_Positions); drawArray(draw->m_Colors);
             drawArray(draw->m_Normals); drawArray(draw->m_Textures);
             drawArray(draw->m_PointIndices); drawArray(draw->m_LineIndices);

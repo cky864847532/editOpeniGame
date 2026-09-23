@@ -346,6 +346,9 @@ bool iGameVTMReader::Parsing() {
             return nullptr;
         }
 
+        if (m_RemoteRenderingEnabled) {
+            if (auto draw = DynamicCast<DrawObject>(object)) draw->SetRemoteRenderingEnabled(true);
+        }
         object->SetName(FileSystem::PathToUtf8(referencedPath.stem()));
         if (auto unstructuredMesh = DynamicCast<UnstructuredMesh>(object)) {
             unstructuredPointRecords += unstructuredMesh->GetNumberOfPoints();
@@ -364,6 +367,7 @@ bool iGameVTMReader::Parsing() {
             // 因为Scene中都用到了DrawObject的属性，后续多块要特殊处理
             // DataObject::Pointer curMultiBlock = DataObject::New();
             DataObject::Pointer curMultiBlock = DrawObject::New();
+            if (m_RemoteRenderingEnabled) DynamicCast<DrawObject>(curMultiBlock)->SetRemoteRenderingEnabled(true);
 
             while (elem) {
                 // TODO: Not finish Reading the Nested block.
@@ -390,6 +394,7 @@ bool iGameVTMReader::Parsing() {
     // Handle <DataSet> format (flat structure)
     else if (DataSetElem) {
         DataObject::Pointer curMultiBlock = DrawObject::New();
+        if (m_RemoteRenderingEnabled) DynamicCast<DrawObject>(curMultiBlock)->SetRemoteRenderingEnabled(true);
 
         while (DataSetElem) {
             const char* existAttribute = DataSetElem->Attribute("file");

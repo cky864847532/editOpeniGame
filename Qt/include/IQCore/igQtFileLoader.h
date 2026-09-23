@@ -107,7 +107,11 @@ public slots:
     void NotifyRemoteFrameCompleted(quint64 requestId, bool success, const QString& detail);
 
 protected:
-	bool TryOpenFile(const std::string& fileName);
+	bool TryOpenFile(const std::string& fileName, bool remoteRendering = false);
+    void OpenSplineFile(const std::string& fileName, bool remoteRendering);
+    void OpenODBFile(const std::string& fileName, bool remoteRendering);
+    void OpenNastranFile(const QStringList& fileNames, bool remoteRendering);
+    bool TryOpenRemoteDataset(const std::string& fileName);
     void InitializeResidentRemoteSupport();
     bool StartResidentRemoteRequest(const QString& address, quint16 port,
                                     const QString& packageId, const QString& cacheDirectory,

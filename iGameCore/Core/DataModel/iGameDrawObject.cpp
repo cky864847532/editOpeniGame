@@ -148,14 +148,40 @@ void DrawObject::ConvertToDrawableData() {
 
 bool DrawObject::IsUseSinglePassWireframeRendering() {
     if (m_TriangleIndices->GetNumberOfElements() && m_TriangleEdgeMasks->GetNumberOfElements() &&
-        (m_ColorWithCell ? m_CellEdgeMaskAvailable : m_EdgeMaskAvailable)) {
+        (!m_RemoteRenderingEnabled || (m_ColorWithCell ? m_CellEdgeMaskAvailable : m_EdgeMaskAvailable))) {
         return true;
     } else {
         return false;
     }
 }
 
+void DrawObject::SetRemoteRenderingEnabled(bool enabled) {
+    std::unordered_set<DataObject*> visited;
+    std::function<void(DataObject*)> apply = [&](DataObject* node) {
+        if (!node || !visited.insert(node).second) return;
+        if (auto* draw = dynamic_cast<DrawObject*>(node)) {
+            if (draw->m_RemoteRenderingEnabled != enabled) {
+                draw->m_RemoteRenderingEnabled = enabled;
+                // Rebuild existing CPU geometry when switching policies; no GL work here.
+                draw->m_ReConvertToDrawableData = true;
+                draw->m_TriangleEdgeMasks->Modified();
+                draw->m_CellTriangleEdgeMasks->Modified();
+                draw->m_ConstantEdgeMask = draw->m_ConstantCellEdgeMask = -1;
+                draw->m_EdgeMaskAvailable = draw->m_CellEdgeMaskAvailable = false;
+            }
+            apply(draw->m_RenderableMesh.SurfaceMesh.get());
+            apply(draw->m_RenderableMesh.SimplifiedMesh.get());
+        }
+        if (node->HasSubDataObject()) {
+            for (auto it = node->SubDataObjectIteratorBegin(); it != node->SubDataObjectIteratorEnd(); ++it)
+                apply(it->second.get());
+        }
+    };
+    apply(this);
+}
+
 bool DrawObject::NeedsExplicitWireframeGeometry(IGenum viewStyle) {
+    if (!m_RemoteRenderingEnabled) return true; // main eagerly prepares explicit edges.
     if ((viewStyle & IG_WIREFRAME) == 0) { return false; }
 #ifdef __EMSCRIPTEN__
     return true;
@@ -168,6 +194,7 @@ bool DrawObject::NeedsExplicitWireframeGeometry(IGenum viewStyle) {
 }
 
 void DrawObject::MarkWireframeGeometryDirtyIfNeeded(IGenum viewStyle) {
+    if (!m_RemoteRenderingEnabled) return;
     // Composite parents only forward state, and shell-rendered sources forward
     // drawing to their SurfaceMesh. Mark only the leaf owning the draw arrays.
     if (this->HasSubDataObject() || m_RenderableMesh.SurfaceMesh) { return; }
@@ -639,6 +666,7 @@ void DrawObject::BuildSimplifiedRenderableObject() {
 void DrawObject::SyncRenderableState(const DrawObject::Pointer& renderableObject) {
     if (renderableObject == nullptr) { return; }
 
+    renderableObject->m_RemoteRenderingEnabled = m_RemoteRenderingEnabled;
     renderableObject->m_ViewStyle = this->m_ViewStyle;
     renderableObject->m_ForceExplicitWireframeGeometry = this->m_AccelerationOption;
     renderableObject->m_Visibility = this->m_Visibility;
@@ -670,8 +698,10 @@ void DrawObject::SetShellRenderingOption(bool option) {
 bool DrawObject::GetShellRenderingOption() { return m_ShellRendering; }
 
 void DrawObject::SetOpacityMappingEnabled(bool enabled) {
-    if (m_RenderableMesh.SurfaceMesh) { m_RenderableMesh.SurfaceMesh->SetOpacityMappingEnabled(enabled); }
-    if (m_RenderableMesh.SimplifiedMesh) { m_RenderableMesh.SimplifiedMesh->SetOpacityMappingEnabled(enabled); }
+    if (m_RemoteRenderingEnabled) {
+        if (m_RenderableMesh.SurfaceMesh) { m_RenderableMesh.SurfaceMesh->SetOpacityMappingEnabled(enabled); }
+        if (m_RenderableMesh.SimplifiedMesh) { m_RenderableMesh.SimplifiedMesh->SetOpacityMappingEnabled(enabled); }
+    }
 
     auto mapper = this->GetColorMapper();
     int attrIdx = this->GetAttributeIndex();
@@ -854,6 +884,10 @@ void DrawObject::SyncGpuBuffers() {
 #endif
     // 多子块文件只需要处理子块
     if (this->HasSubDataObject()) {
+        if (m_RemoteRenderingEnabled) {
+            // New time-frame/child objects inherit only their own remote parent's policy.
+            SetRemoteRenderingEnabled(true);
+        }
         ProcessSubDataObjects(&DrawObject::SyncGpuBuffers);
 #ifdef __EMSCRIPTEN__
         const auto syncEnd = RenderTimingClock::now();
@@ -888,7 +922,8 @@ void DrawObject::SyncGpuBuffers() {
     if (m_AccelerationOption) { m_RenderableMesh.mMeshleter->SyncGpuBuffers(); }
 
     this->CreateDrawBuffer();
-    if (m_ForceGpuBufferUpload || m_Positions->GetMTime() > m_PositionVBO->GetMTime()) {
+    const bool forceUpload = m_RemoteRenderingEnabled && m_ForceGpuBufferUpload;
+    if (forceUpload || m_Positions->GetMTime() > m_PositionVBO->GetMTime()) {
         GLAllocateGLBuffer(m_PositionVBO, m_Positions->GetNumberOfValues() * sizeof(float), m_Positions->RawPointer());
         m_PositionVBO->Modified();
         SetPositionBufferToVAO(m_PointVAO, m_PositionVBO);
@@ -896,7 +931,7 @@ void DrawObject::SyncGpuBuffers() {
         SetPositionBufferToVAO(m_TriangleVAO, m_PositionVBO);
     }
 
-    if (m_ForceGpuBufferUpload || m_Colors->GetMTime() > m_ColorVBO->GetMTime()) {
+    if (forceUpload || m_Colors->GetMTime() > m_ColorVBO->GetMTime()) {
         GLAllocateGLBuffer(m_ColorVBO, m_Colors->GetNumberOfValues() * sizeof(float), m_Colors->RawPointer());
         m_ColorVBO->Modified();
         SetColorBufferToVAO(m_PointVAO, m_ColorVBO);
@@ -904,25 +939,29 @@ void DrawObject::SyncGpuBuffers() {
         SetColorBufferToVAO(m_TriangleVAO, m_ColorVBO);
     }
 
-    if (m_ForceGpuBufferUpload || m_Normals->GetMTime() > m_NormalVBO->GetMTime()) {
+    if (forceUpload || m_Normals->GetMTime() > m_NormalVBO->GetMTime()) {
         GLAllocateGLBuffer(m_NormalVBO, m_Normals->GetNumberOfValues() * sizeof(float), m_Normals->RawPointer());
         m_NormalVBO->Modified();
 
-        SetNormalBufferToVAO(m_PointVAO, m_NormalVBO);
-        SetNormalBufferToVAO(m_LineVAO, m_NormalVBO);
-        SetNormalBufferToVAO(m_TriangleVAO, m_NormalVBO);
+        if (!m_RemoteRenderingEnabled || m_Normals->GetNumberOfValues() != 0) {
+            SetNormalBufferToVAO(m_PointVAO, m_NormalVBO);
+            SetNormalBufferToVAO(m_LineVAO, m_NormalVBO);
+            SetNormalBufferToVAO(m_TriangleVAO, m_NormalVBO);
+        }
     }
 
-    if (m_ForceGpuBufferUpload || m_Textures->GetMTime() > m_TextureVBO->GetMTime()) {
+    if (forceUpload || m_Textures->GetMTime() > m_TextureVBO->GetMTime()) {
         GLAllocateGLBuffer(m_TextureVBO, m_Textures->GetNumberOfValues() * sizeof(float), m_Textures->RawPointer());
         m_TextureVBO->Modified();
 
-        SetTextureBufferToVAO(m_PointVAO, m_TextureVBO);
-        SetTextureBufferToVAO(m_LineVAO, m_TextureVBO);
-        SetTextureBufferToVAO(m_TriangleVAO, m_TextureVBO);
+        if (!m_RemoteRenderingEnabled || m_Textures->GetNumberOfValues() != 0) {
+            SetTextureBufferToVAO(m_PointVAO, m_TextureVBO);
+            SetTextureBufferToVAO(m_LineVAO, m_TextureVBO);
+            SetTextureBufferToVAO(m_TriangleVAO, m_TextureVBO);
+        }
     }
 
-    if (m_ForceGpuBufferUpload || m_PointIndices->GetMTime() > m_PointEBO->GetMTime()) {
+    if (forceUpload || m_PointIndices->GetMTime() > m_PointEBO->GetMTime()) {
         GLAllocateGLBuffer(m_PointEBO, m_PointIndices->GetNumberOfValues() * sizeof(igIndex),
                            m_PointIndices->RawPointer());
         m_PointEBO->Modified();
@@ -930,7 +969,7 @@ void DrawObject::SyncGpuBuffers() {
         m_PointVAO->ElementBuffer(m_PointEBO);
     }
 
-    if (m_ForceGpuBufferUpload || m_LineIndices->GetMTime() > m_LineEBO->GetMTime()) {
+    if (forceUpload || m_LineIndices->GetMTime() > m_LineEBO->GetMTime()) {
         GLAllocateGLBuffer(m_LineEBO, m_LineIndices->GetNumberOfValues() * sizeof(igIndex),
                            m_LineIndices->RawPointer());
         m_LineEBO->Modified();
@@ -938,7 +977,7 @@ void DrawObject::SyncGpuBuffers() {
         m_LineVAO->ElementBuffer(m_LineEBO);
     }
 
-    if (m_ForceGpuBufferUpload || m_TriangleIndices->GetMTime() > m_TriangleEBO->GetMTime()) {
+    if (forceUpload || m_TriangleIndices->GetMTime() > m_TriangleEBO->GetMTime()) {
         GLAllocateGLBuffer(m_TriangleEBO, m_TriangleIndices->GetNumberOfValues() * sizeof(igIndex),
                            m_TriangleIndices->RawPointer());
         m_TriangleEBO->Modified();
@@ -949,6 +988,15 @@ void DrawObject::SyncGpuBuffers() {
 #ifndef __EMSCRIPTEN__
     auto syncEdgeMasks = [this](UnsignedCharArray::Pointer masks, GLBuffer::Pointer buffer,
                                 GLTextureBuffer::Pointer texture, int& constantMask, bool& available) {
+        if (!m_RemoteRenderingEnabled) {
+            // Preserve main's texture-buffer upload exactly for ordinary models.
+            if (masks->GetMTime() > buffer->GetMTime()) {
+                GLAllocateGLBuffer(buffer, masks->GetNumberOfValues() * sizeof(unsigned char), masks->RawPointer());
+                buffer->Modified();
+                texture->Buffer(GL_R8, buffer);
+            }
+            return;
+        }
         if (!m_ForceGpuBufferUpload && masks->GetMTime() <= buffer->GetMTime()) { return; }
         const IGsize count = masks->GetNumberOfValues();
         constantMask = -1;
@@ -983,7 +1031,7 @@ void DrawObject::SyncGpuBuffers() {
                   m_ConstantEdgeMask, m_EdgeMaskAvailable);
 #endif
 
-    if (m_ForceGpuBufferUpload || m_CellPositions->GetMTime() > m_CellPositionVBO->GetMTime()) {
+    if (forceUpload || m_CellPositions->GetMTime() > m_CellPositionVBO->GetMTime()) {
         GLAllocateGLBuffer(m_CellPositionVBO, m_CellPositions->GetNumberOfValues() * sizeof(float),
                            m_CellPositions->RawPointer());
         m_CellPositionVBO->Modified();
@@ -991,7 +1039,7 @@ void DrawObject::SyncGpuBuffers() {
         SetPositionBufferToVAO(m_CellVAO, m_CellPositionVBO);
     }
 
-    if (m_ForceGpuBufferUpload || m_CellColors->GetMTime() > m_CellColorVBO->GetMTime()) {
+    if (forceUpload || m_CellColors->GetMTime() > m_CellColorVBO->GetMTime()) {
         GLAllocateGLBuffer(m_CellColorVBO, m_CellColors->GetNumberOfValues() * sizeof(float),
                            m_CellColors->RawPointer());
         m_CellColorVBO->Modified();

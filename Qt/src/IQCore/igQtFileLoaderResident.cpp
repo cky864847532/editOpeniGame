@@ -528,7 +528,7 @@ bool igQtFileLoader::ReadResidentRemotePreload(const QString& datasetPath)
     // Existing readers/progress observers are GUI-thread-only. Deliberately
     // serialize with normal file reading; no unsafe worker-thread GUI callbacks.
     iGame::DataObject::Pointer data;
-    try { data = iGame::FileIO::ReadFile(datasetPath.toUtf8().toStdString()); }
+    try { data = iGame::FileIO::ReadRemoteFile(datasetPath.toUtf8().toStdString()); }
     catch (const std::exception& e) {
         igError("[RemoteCpuCache] CPU reader exception: {}", e.what());
         return false;

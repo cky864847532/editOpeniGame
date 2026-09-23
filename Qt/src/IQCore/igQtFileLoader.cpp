@@ -55,7 +55,7 @@ QString FromUtf8FilePath(const std::string& path) {
     return QString::fromUtf8(path.data(), static_cast<int>(path.size()));
 }
 
-iGame::DataObject::Pointer ReadFileWithGhostSupport(const std::string& filePath) {
+iGame::DataObject::Pointer ReadFileWithGhostSupport(const std::string& filePath, bool remoteRendering = false) {
     std::string suffix;
     const auto dotPos = filePath.find_last_of('.');
     if (dotPos != std::string::npos) {
@@ -65,7 +65,7 @@ iGame::DataObject::Pointer ReadFileWithGhostSupport(const std::string& filePath)
     }
 
     if (suffix == "vtk") { return iGame::GhostVTKReader::ReadFile(filePath); }
-    return iGame::FileIO::ReadFile(filePath);
+    return remoteRendering ? iGame::FileIO::ReadRemoteFile(filePath) : iGame::FileIO::ReadFile(filePath);
 }
 }
 
@@ -101,7 +101,7 @@ igQtFileLoader::igQtFileLoader(QObject* parent) : QObject(parent) {
                             "CPU preload failed (reader, unsupported/static-data guard or cache admission limit); check the log. No model was displayed.")); }
                     return;
                 }
-                const bool opened = this->TryOpenFile(vtmPath.toStdString());
+                const bool opened = this->TryOpenRemoteDataset(vtmPath.toStdString());
                 if (ResidentRemoteEnabled() && !ResidentRemoteAcceptsDataset()) {
                     m_RemotePackageLoader->FinalizeDatasetOpen(false);
                     return;
@@ -263,22 +263,22 @@ void igQtFileLoader::OpenFile(const std::string& filePath) {
     (void)TryOpenFile(filePath);
 }
 
-bool igQtFileLoader::TryOpenFile(const std::string& filePath) {
+bool igQtFileLoader::TryOpenFile(const std::string& filePath, bool remoteRendering) {
     using namespace iGame;
     if (filePath.empty()) return false;
     // d3plot 文件无扩展名（d3plot / d3plot01 / ...），需放行；其余无扩展名文件仍拒绝
     if (strrchr(filePath.data(), '.') == nullptr &&
         FileIO::GetFileType(filePath) != FileIO::D3PLOT) return false;
 
-    const char* ext = strrchr(filePath.data(), '.');
 #if defined(AbqSDK_ENABLE)
     // ODB 走专用读取路径（IsRuntimeAvailable 守卫 + step 弹窗），避免通用路径崩溃
     // 覆盖"最近文件/在线客户端"等经 OpenFile 打开的入口
+    const char* ext = strrchr(filePath.data(), '.');
     if (ext != nullptr) {
         std::string suffix(ext + 1);
         std::transform(suffix.begin(), suffix.end(), suffix.begin(), ::tolower);
         if (suffix == "odb") {
-            this->OpenODBFile(filePath);
+            this->OpenODBFile(filePath, remoteRendering);
             // This interactive path has no synchronous result. Remote model
             // packages use VTM, so preserve the existing ODB dispatch here.
             return true;
@@ -286,14 +286,38 @@ bool igQtFileLoader::TryOpenFile(const std::string& filePath) {
     }
 #endif
 
-    // Match the local file dialog's XML/Spline dispatch for a package entry
-    // point. The spline reader owns its option dialog and emits NewModel on
-    // success, exactly as it does for File -> Load.
+    auto obj = ReadFileWithGhostSupport(filePath, remoteRendering);
+    //_obj = obj;
+    if (obj == nullptr) {
+        igDebug("This file read error.");
+        return false;
+    }
+    auto filename = filePath.substr(filePath.find_last_of('/') + 1);
+    obj->SetName(filename.substr(0, filename.find_last_of('.')).c_str());
+    obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(filePath);
+    //Q_EMIT AddFileToModelList(QString(filePath.substr(filePath.find_last_of('/') + 1).c_str()));
+
+    this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
+
+
+    //return;
+    if (remoteRendering) {
+        if (auto draw = DynamicCast<DrawObject>(obj)) draw->SetRemoteRenderingEnabled(true);
+    }
+    emit NewModel(obj, ItemSource::File);
+    emit FinishReading();
+    return true;
+}
+
+bool igQtFileLoader::TryOpenRemoteDataset(const std::string& filePath) {
+    const char* ext = strrchr(filePath.data(), '.');
+    // Package-specific dispatch: ordinary OpenFile must keep main's behavior.
+    // Only a verified remote package may infer an OP2 companion from its directory.
     if (ext != nullptr) {
         std::string suffix(ext + 1);
         std::transform(suffix.begin(), suffix.end(), suffix.begin(), ::tolower);
         if (suffix == "xml") {
-            this->OpenSplineFile(filePath);
+            this->OpenSplineFile(filePath, true);
             return true;
         }
 #if defined(NASTRAN_ENABLE)
@@ -311,30 +335,13 @@ bool igQtFileLoader::TryOpenFile(const std::string& filePath) {
             if (op2Files.size() == 1) {
                 inputFiles.push_back(packageDirectory.filePath(op2Files.front()));
             }
-            this->OpenNastranFile(inputFiles);
+            this->OpenNastranFile(inputFiles, true);
             return true;
         }
 #endif
     }
 
-    auto obj = ReadFileWithGhostSupport(filePath);
-    //_obj = obj;
-    if (obj == nullptr) {
-        igDebug("This file read error.");
-        return false;
-    }
-    auto filename = filePath.substr(filePath.find_last_of('/') + 1);
-    obj->SetName(filename.substr(0, filename.find_last_of('.')).c_str());
-    obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(filePath);
-    //Q_EMIT AddFileToModelList(QString(filePath.substr(filePath.find_last_of('/') + 1).c_str()));
-
-    this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
-
-
-    //return;
-    emit NewModel(obj, ItemSource::File);
-    emit FinishReading();
-    return true;
+    return TryOpenFile(filePath, true);
 }
 
 bool igQtFileLoader::OpenRemotePackage(const QString& serverAddress,
@@ -497,6 +504,10 @@ void igQtFileLoader::OpenFiles(const QStringList& filePaths) {
     emit FinishReading();
 }
 void igQtFileLoader::OpenODBFile(const std::string& filePath) {
+    OpenODBFile(filePath, false);
+}
+
+void igQtFileLoader::OpenODBFile(const std::string& filePath, bool remoteRendering) {
     igDebug("Open ODB file: {}", filePath);
 #if defined(AbqSDK_ENABLE)
     igDebug("ABAQUS SDK is enabled.");
@@ -537,6 +548,9 @@ void igQtFileLoader::OpenODBFile(const std::string& filePath) {
             //Q_EMIT AddFileToModelList(QString(filePath.substr(filePath.find_last_of('/') + 1).c_str()));
 
             this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
+            if (remoteRendering) {
+                if (auto draw = DynamicCast<DrawObject>(obj)) draw->SetRemoteRenderingEnabled(true);
+            }
             emit NewModel(obj, ItemSource::File);
             emit FinishReading();
         }
@@ -546,6 +560,10 @@ void igQtFileLoader::OpenODBFile(const std::string& filePath) {
 }
 
 void igQtFileLoader::OpenSplineFile(const std::string& filePath) {
+    OpenSplineFile(filePath, false);
+}
+
+void igQtFileLoader::OpenSplineFile(const std::string& filePath, bool remoteRendering) {
     using namespace iGame;
     if (filePath.empty() || strrchr(filePath.data(), '.') == nullptr) return;
     igQtSplineOptionDialog dialog;
@@ -606,6 +624,9 @@ void igQtFileLoader::OpenSplineFile(const std::string& filePath) {
     //Q_EMIT AddFileToModelList(QString(filePath.substr(filePath.find_last_of('/') + 1).c_str()));
 
     this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
+    if (remoteRendering) {
+        if (auto draw = DynamicCast<DrawObject>(obj)) draw->SetRemoteRenderingEnabled(true);
+    }
     emit NewModel(obj, ItemSource::File);
     emit FinishReading();
 
@@ -627,11 +648,18 @@ void igQtFileLoader::OpenSplineFile(const std::string& filePath) {
     obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(filePath);
 
     this->SaveCurrentFileToRecentFile(FromUtf8FilePath(filePath));
+    if (remoteRendering) {
+        if (auto draw = DynamicCast<DrawObject>(obj)) draw->SetRemoteRenderingEnabled(true);
+    }
     emit NewModel(obj, ItemSource::File);
     emit FinishReading();
 #endif
 }
 void igQtFileLoader::OpenNastranFile(const QStringList& fileNames) {
+    OpenNastranFile(fileNames, false);
+}
+
+void igQtFileLoader::OpenNastranFile(const QStringList& fileNames, bool remoteRendering) {
 #if defined(NASTRAN_ENABLE)
     // --- 校验阶段 ---
 
@@ -698,6 +726,7 @@ void igQtFileLoader::OpenNastranFile(const QStringList& fileNames) {
 
     // --- 执行阶段 ---
     iGame::NastranReader::Pointer reader = iGame::NastranReader::New();
+    reader->SetRemoteConversionEnabled(remoteRendering);
     reader->SetBDFFileName(bdfPath.toStdString());
     if (!op2Path.isEmpty()) reader->SetOP2FileName(op2Path.toStdString());
     reader->Execute();
@@ -713,6 +742,9 @@ void igQtFileLoader::OpenNastranFile(const QStringList& fileNames) {
     obj->GetProperties()->AddProperty(Variant::String, "FilePath")->SetValue(filePath);
 
     this->SaveCurrentFileToRecentFile(QString::fromStdString(filePath));
+    if (remoteRendering) {
+        if (auto draw = DynamicCast<DrawObject>(obj)) draw->SetRemoteRenderingEnabled(true);
+    }
     emit NewModel(obj, ItemSource::File);
     emit FinishReading();
 

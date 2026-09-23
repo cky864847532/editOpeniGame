@@ -90,7 +90,9 @@ bool NastranReader::Parsing() {
     bool exeFound = false;
     for (const auto& path : exePaths) {
         // 简单检查文件是否存在
-        if (std::filesystem::exists(FileSystem::PathFromUtf8(path))) {
+        const bool exists = m_RemoteConversionEnabled
+                ? std::filesystem::exists(FileSystem::PathFromUtf8(path)) : std::ifstream(path).good();
+        if (exists) {
             exePath = path;
             exeFound = true;
             break;
@@ -104,22 +106,31 @@ bool NastranReader::Parsing() {
     }
 
 
-    std::filesystem::path outputFilePath = FileSystem::PathFromUtf8(m_BDFFilePath);
-    outputFilePath += ".vtu";
-    std::string outputPath = FileSystem::PathToUtf8(outputFilePath);
-
-    // Pass UTF-8 arguments directly to the native process API, including spaces and Unicode.
-    std::vector<std::string> arguments = {"--force", "--bdf", m_BDFFilePath, "--output", outputPath};
-    if (!m_OP2FilePath.empty()) {
-        arguments.push_back("--op2");
-        arguments.push_back(m_OP2FilePath);
-    } else {
-        IGAME_WARN("Not set op2");
-    }
+    std::string outputPath = m_BDFFilePath + ".vtu";
     int returnCode = 0;
-    if (!ExternalProcess::Run(exePath, arguments, returnCode)) {
-        IGAME_ERROR("[NastranReader] Failed to start converter: {}", exePath);
-        return false;
+    if (m_RemoteConversionEnabled) {
+        std::filesystem::path outputFilePath = FileSystem::PathFromUtf8(m_BDFFilePath);
+        outputFilePath += ".vtu";
+        outputPath = FileSystem::PathToUtf8(outputFilePath);
+        // C/S package paths may contain Unicode and spaces.
+        std::vector<std::string> arguments = {"--force", "--bdf", m_BDFFilePath, "--output", outputPath};
+        if (!m_OP2FilePath.empty()) {
+            arguments.push_back("--op2");
+            arguments.push_back(m_OP2FilePath);
+        } else {
+            IGAME_WARN("Not set op2");
+        }
+        if (!ExternalProcess::Run(exePath, arguments, returnCode)) {
+            IGAME_ERROR("[NastranReader] Failed to start converter: {}", exePath);
+            return false;
+        }
+    } else {
+        // Preserve main's command construction and shell invocation for ordinary files.
+        std::string arguments = " --force --bdf " + m_BDFFilePath + " --output " + outputPath;
+        if (!m_OP2FilePath.empty()) arguments += " --op2 " + m_OP2FilePath;
+        else IGAME_WARN("Not set op2");
+        std::string fullCommand = exePath + arguments;
+        returnCode = std::system(fullCommand.c_str());
     }
 
     if (returnCode == 0) {
